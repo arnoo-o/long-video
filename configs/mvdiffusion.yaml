@@ -1,0 +1,18 @@
+repo_path: /ephemeral/mdu/long-video-third-party/MVDiffusion
+python_executable: /ephemeral/mdu/envs/longvideo-mvdiffusion/bin/python
+checkpoint: /ephemeral/mdu/long-video-data/models/mvdiffusion/pano_outpaint.ckpt
+base_model_path: /ephemeral/mdu/long-video-data/models/mvdiffusion/stable-diffusion-2-inpainting
+runner_script: /ephemeral/mdu/long-video/scripts/run_mvdiffusion_completion.py
+model_id: stabilityai/stable-diffusion-2-inpainting
+height: 512
+width: 512
+target_yaws_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
+target_pitch_degrees: 0
+target_fov_degrees: 90
+synthesized_confidence: 0.4
+seam_confidence_scale: 0.65
+conflict_color_threshold: 0.12
+conflict_confidence_scale: 0.5
+timeout_seconds: 1800
+hf_home: /ephemeral/mdu/long-video-data/cache/huggingface
+output_root: /ephemeral/mdu/long-video/outputs/mvdiffusion

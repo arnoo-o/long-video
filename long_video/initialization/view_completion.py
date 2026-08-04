@@ -1,6 +1,7 @@
 import numpy as np
 from ..types import ViewSet, RAY_DISTANCE
 from ..data.panorama_projection import equirectangular_to_perspective, build_canonical_view_cameras
+from .mvdiffusion_backend import MVDiffusionCompletion
 
 class HoloOracleCompletion:
     """Geometry upper bound: unobserved views are labeled synthesized but sampled from held-out panorama."""
@@ -27,9 +28,3 @@ class PrecomputedCompletion:
         p=self.root; rgb=np.load(p/"views_rgb.npy"); depth=np.load(p/"views_depth.npy"); c2w=np.load(p/"view_poses.npy"); k=np.load(p/"intrinsics.npy")
         source=np.load(p/"source_maps.npy"); confidence=np.load(p/"image_confidence.npy")
         return ViewSet(rgb,depth,np.isfinite(depth).astype(np.float32),c2w,k,source,confidence,RAY_DISTANCE)
-
-class MVDiffusionCompletion:
-    def __init__(self,repo_path,python_executable,weights_path=None):
-        self.repo_path=repo_path; self.python_executable=python_executable; self.weights_path=weights_path
-    def complete(self,*args,**kwargs):
-        raise RuntimeError("MVDiffusion is configured as an external file/subprocess backend. Install its official environment and weights before invocation; no synthetic fallback is used.")

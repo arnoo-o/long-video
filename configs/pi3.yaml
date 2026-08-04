@@ -1,0 +1,11 @@
+backend: pi3_holo360d_8views
+repo_path: /ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d
+checkpoint: /ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin
+device: cuda
+input_size: 518
+view_count: 8
+depth_convention: Z_DEPTH
+default_median_depth_m: 3.0
+scale_alignment:
+  use_ground_truth_when_available: true
+  estimator: median_ratio

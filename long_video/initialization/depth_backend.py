@@ -1,5 +1,6 @@
 import numpy as np
 from ..types import RAY_DISTANCE
+from .geometry_backend import Pi3GeometryBackend
 
 class GroundTruthDepthBackend:
     depth_convention=RAY_DISTANCE
@@ -17,3 +18,7 @@ class Pi3XDepthBackend:
     def predict(self, view_rgb, view_c2w, intrinsics, known_depth=None, known_mask=None):
         if known_depth is not None: return GroundTruthDepthBackend().predict(view_rgb,view_c2w,intrinsics,known_depth,known_mask)
         raise RuntimeError("Pi3X invocation is not installed. Configure pi3x.repo_path and checkpoint; this backend intentionally fails rather than returning fabricated geometry.")
+
+
+class Pi3DepthBackend(Pi3GeometryBackend):
+    """Compatibility alias for the verified Holo360D Pi3 8-view checkpoint."""

@@ -1,0 +1,10 @@
+data_root: /ephemeral/mdu/long-video-data/raw/holo360d
+train_scene: train/Indoor_013.zip
+test_scene: test/Indoor_016.zip
+depth_convention: RAY_DISTANCE
+fov_degrees: 90
+height: 256
+width: 256
+yaws_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
+checkpoint_8views: /ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin
+geometry_debug_dir: /ephemeral/mdu/long-video/outputs/geometry_debug

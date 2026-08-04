@@ -1,3 +1,11 @@
-wah_path: /opt/Warp-as-History
-helios_path: /opt/Helios
-data_root: /data/long_video
+project_root: /ephemeral/mdu/long-video
+data_root: /ephemeral/mdu/long-video-data
+wah_path: /ephemeral/mdu/long-video/third_party/Warp-as-History
+helios_path: /ephemeral/mdu/long-video-assets/helios-distilled
+pi3_repo_path: /ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d
+pi3_checkpoint: /ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin
+mvdiffusion_path: /ephemeral/mdu/long-video-third-party/MVDiffusion
+mvdiffusion_checkpoint: /ephemeral/mdu/long-video-data/models/mvdiffusion/pano_outpaint.ckpt
+habitat_environment: /ephemeral/mdu/envs/longvideo-habitat
+replicacad_root: /ephemeral/mdu/long-video-data/raw/replicacad
+outputs_root: /ephemeral/mdu/long-video/outputs

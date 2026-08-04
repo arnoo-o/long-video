@@ -1,5 +1,44 @@
 {
-  "WAH": {"path": null, "remote": "https://github.com/yyfz/Warp-as-History", "commit": null},
-  "Helios": {"path": null, "remote": null, "commit": null},
-  "environment": {"python": null, "cuda": null, "pytorch": null}
+  "wah": {
+    "path": "/ephemeral/mdu/long-video/third_party/Warp-as-History",
+    "remote": "https://github.com/yyfz/Warp-as-History",
+    "commit": "09aa6461355b298bfced51007bd709a251d6033a",
+    "patch": "patches/wah_confidence.patch"
+  },
+  "helios": {
+    "path": "/ephemeral/mdu/long-video-assets/helios-distilled",
+    "model": "BestWishYsh/Helios-Distilled",
+    "size": "75G"
+  },
+  "pi3": {
+    "repo_path": "/ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d",
+    "parent_remote": "https://github.com/PKU-YuanGroup/Holo360",
+    "parent_commit": "a54b75abc5d009aa98ec165f3a45ab19b48953e4",
+    "checkpoint": "/ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin",
+    "checkpoint_bytes": 3569900346
+  },
+  "mvdiffusion": {
+    "path": "/ephemeral/mdu/long-video-third-party/MVDiffusion",
+    "remote": "https://github.com/Tangshitao/MVDiffusion",
+    "commit": "4cd4e513e259be07a6c5e6a813258f77374afa59",
+    "checkpoint": "/ephemeral/mdu/long-video-data/models/mvdiffusion/pano_outpaint.ckpt",
+    "checkpoint_sha256": "5fd8027072c3f8d6f87bb18c4e39b0db06fa3c949483c32ae7725d0d1dc66ae5"
+  },
+  "h100_wah_environment": {
+    "python": "3.12.3",
+    "pytorch": "2.5.1+cu124",
+    "cuda": "12.4",
+    "diffusers": "0.36.0"
+  },
+  "mvdiffusion_environment": {
+    "python": "3.10",
+    "pytorch": "2.0.0+cu117",
+    "cuda": "11.7",
+    "diffusers": "0.16.1",
+    "transformers": "4.28.1"
+  },
+  "habitat_environment": {
+    "path": "/ephemeral/mdu/envs/longvideo-habitat",
+    "habitat_sim": "0.3.3"
+  }
 }

@@ -2,28 +2,24 @@
 
 Last audited: 2026-08-04
 
-## Completed and tested
-- Holo360D reader matches RGB, mesh-depth EXR, mask and individual 3x4 pose files by timestamp.
-- Official Holo360D code was audited at commit a54b75abc5d009aa98ec165f3a45ab19b48953e4. Individual pose files are treated as panorama c2w.
-- Depth convention is RAY_DISTANCE. Invalid EXR values and invalid mask pixels become NaN.
-- Equirectangular projection now follows OpenCV axes (+x right, +y down, +z forward); latitude uses -asin(y), fixing the vertical inversion.
-- Eight canonical views have distinct c2w matrices and FOV-derived intrinsics.
-- Backprojection applies inverse(K) and supports RAY_DISTANCE and Z_DEPTH.
-- Node builder performs confidence-weighted voxel fusion. NodeStore writes atomically and verifies NPZ SHA-256.
-- Point renderer has a PyTorch GPU scatter_reduce z-buffer implementation and a NumPy reference renderer.
+## Completed and actually tested
 
-## Actual tests
-- REAL_HOLO_READER_OK: one official Indoor_013 RGB 1440x2880, mesh-depth 1440x2880, mask and pose read successfully; 3,878,121 valid depth pixels.
-- Eight 128x128 perspective views and distinct canonical c2w matrices generated from the real sample.
-- Existing synthetic smoke test passed before the geometry rewrite; it must be replaced with the real-data test suite.
+- Holo360D Indoor_013/Indoor_016 and 8views.bin downloads completed with official byte sizes.
+- RGB, EXR mesh depth, mask, and 3x4 panorama c2w are strictly matched by frame ID.
+- Corrected equirectangular projection uses OpenCV axes and eight distinct canonical c2w matrices.
+- RAY_DISTANCE/Z_DEPTH backprojection, confidence-weighted voxel fusion, atomic node storage, GPU scatter-reduce z-buffer, chunk_points, and point splatting are implemented.
+- Real Indoor_013 geometry loop at 128x128: RGB MAE 0.005556, Z-depth MAE 0.004173 m; GPU/NumPy reference passed.
+- Official Holo360D Pi3 8views.bin loaded and ran on Indoor_016. Median-scale-aligned Z-depth MAE is 0.075230 m, AbsRel 0.077395, valid ratio 0.85747. The released checkpoint has no confidence head; deterministic local-depth continuity is recorded as the fallback.
+- Official MVDiffusion repository and pano_outpaint.ckpt are installed. Indoor_016 observed-view projection/overlay smoke passed with eight 128x128 views and observed ratio 0.24234.
+- Official WAH at commit 09aa646... is patched for warp_confidence_mask and compiles. Unit tests pass for exact confidence-one baseline path, negative low-confidence key bias, token pooling, and future index preservation.
+- Unified initialization and online WAH adapter are implemented.
+- MemoryManager deterministic geometry test passed through M0 -> candidate M1 -> active M1 with coverage 1.0 and zero test-scene reprojection error.
+- Habitat-Sim 0.3.3 is installed in an isolated environment.
+- Real confidence-aware WAH/Helios ran on physical GPU 1 with a full 33-frame warp rollout and produced 33 frames at 384x640. GPU 0's vLLM remained untouched.
+- ReplicaCAD baked-lighting v1.6 downloaded successfully (1.6 GB); an 85-frame 128x128 RGB/depth sequence rendered on GPU 1.
 
-## In progress
-- Holo360D downloads: Indoor_013 is complete. Indoor_016 and 8views.bin are downloading in the background.
-- A local sample contains a real RGB, EXR, mask, pose and corrected eight-view projection.
+## External or runtime blockers
 
-## Not yet complete
-- Pi3X inference invocation is intentionally fail-fast until official runner/checkpoint wiring is configured.
-- MVDiffusion has an external-backend interface only; the official environment and weights are not installed.
-- WAH confidence is not yet injected into official WAH/Helios. No WAH patch has been applied.
-- Online pipeline still needs real WAH generation and M1 reconstruction/verification.
-- README, remaining configs, full integration tests and Habitat/ReplicaCAD are pending.
+- MVDiffusion inference still needs licensed stabilityai/stable-diffusion-2-inpainting files. Hugging Face returned 401 until the user accepts the license and supplies HF_TOKEN.
+- The WAH project training cache primarily renders online Pi3X warps. This repository provides canonical confidence/source sample loading, but a full training run is intentionally out of scope.
+- M1's deterministic state-machine test is complete; a fully coupled M1 reconstruction from newly generated Helios frames remains an end-to-end follow-up.

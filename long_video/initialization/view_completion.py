@@ -1,8 +1,35 @@
 import numpy as np
-from ..types import ViewSet
-from ..data.panorama_projection import panorama_to_perspective
+from ..types import ViewSet, RAY_DISTANCE
+from ..data.panorama_projection import equirectangular_to_perspective, build_canonical_view_cameras
+
 class HoloOracleCompletion:
-    def __init__(self, fov=90., height=64, width=64): self.fov=fov; self.height=height; self.width=width
-    def complete(self, panorama, depth, pose=None, observed_indices=(0,)):
-        yaws=np.arange(8)*np.pi/4; rgb=np.stack([panorama_to_perspective(panorama,y,self.fov and 0,self.fov,self.height,self.width) for y in yaws]); dep=np.stack([panorama_to_perspective(depth,y,0,self.fov,self.height,self.width) for y in yaws]); dep=dep.astype(np.float32)
-        src=np.ones((8,self.height,self.width),np.int8); src[list(observed_indices)]=0; conf=np.where(src==0,1.,.4).astype(np.float32); c2w=np.repeat(np.eye(4,dtype=np.float32)[None],8,0); intr=np.repeat(np.array([[[self.width/2,0,self.width/2],[0,self.width/2,self.height/2],[0,0,1]]],np.float32),8,0); return ViewSet(rgb,dep,np.isfinite(dep).astype(np.float32),c2w,intr,src,conf)
+    """Geometry upper bound: unobserved views are labeled synthesized but sampled from held-out panorama."""
+    def __init__(self,fov_degrees=90.,height=512,width=512,observed_confidence=1.,synthesized_confidence=.4):
+        self.fov_degrees=fov_degrees; self.height=height; self.width=width; self.observed_confidence=observed_confidence; self.synthesized_confidence=synthesized_confidence
+    def complete(self,panorama,depth,panorama_c2w=None,mask=None,observed_indices=(0,)):
+        center=np.eye(4,dtype=np.float32) if panorama_c2w is None else np.asarray(panorama_c2w,np.float32)
+        c2w,k=build_canonical_view_cameras(center,self.fov_degrees,self.width,self.height)
+        yaws=np.deg2rad(np.arange(8)*45.)
+        rgb=np.stack([equirectangular_to_perspective(panorama,y,0,self.fov_degrees,self.height,self.width,"bilinear") for y in yaws])
+        dep=np.stack([equirectangular_to_perspective(depth,y,0,self.fov_degrees,self.height,self.width,"bilinear") for y in yaws]).astype(np.float32)
+        valid=np.isfinite(dep)&(dep>0)
+        if mask is not None:
+            p_mask=np.stack([equirectangular_to_perspective(np.asarray(mask,dtype=np.uint8),y,0,self.fov_degrees,self.height,self.width,"nearest") for y in yaws])>0
+            valid &= p_mask
+        dep[~valid]=np.nan
+        source=np.ones((8,self.height,self.width),np.int8); source[list(observed_indices)]=0
+        confidence=np.where(source==0,self.observed_confidence,self.synthesized_confidence).astype(np.float32)
+        return ViewSet(rgb,dep,valid.astype(np.float32),c2w,k,source,confidence,RAY_DISTANCE)
+
+class PrecomputedCompletion:
+    def __init__(self,root): self.root=__import__("pathlib").Path(root)
+    def complete(self,*_args,**_kwargs):
+        p=self.root; rgb=np.load(p/"views_rgb.npy"); depth=np.load(p/"views_depth.npy"); c2w=np.load(p/"view_poses.npy"); k=np.load(p/"intrinsics.npy")
+        source=np.load(p/"source_maps.npy"); confidence=np.load(p/"image_confidence.npy")
+        return ViewSet(rgb,depth,np.isfinite(depth).astype(np.float32),c2w,k,source,confidence,RAY_DISTANCE)
+
+class MVDiffusionCompletion:
+    def __init__(self,repo_path,python_executable,weights_path=None):
+        self.repo_path=repo_path; self.python_executable=python_executable; self.weights_path=weights_path
+    def complete(self,*args,**kwargs):
+        raise RuntimeError("MVDiffusion is configured as an external file/subprocess backend. Install its official environment and weights before invocation; no synthetic fallback is used.")

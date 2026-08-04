@@ -1,0 +1,15 @@
+repo_path: /ephemeral/mdu/long-video/third_party/Warp-as-History
+python_executable: /ephemeral/mdu/venvs/wah/bin/python
+conditioning_type: warp
+warp_history_downsample_mode: short
+rope_alignment: true
+visible_token_drop: true
+attention:
+  history_visible_token_threshold: 0.05
+  history_confidence_threshold: 0.1
+  history_confidence_lambda: 1.0
+  history_confidence_epsilon: 1.0e-6
+generation:
+  height: 384
+  width: 640
+  output_type: np

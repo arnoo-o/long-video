@@ -1,0 +1,560 @@
+diff --git a/helios/diffusers_version/transformer_helios_diffusers.py b/helios/diffusers_version/transformer_helios_diffusers.py
+index 92a976b..cd7ba4f 100644
+--- a/helios/diffusers_version/transformer_helios_diffusers.py
++++ b/helios/diffusers_version/transformer_helios_diffusers.py
+@@ -69,6 +69,25 @@ def pool_history_visible_mask(mask: torch.Tensor | None, patch_size):
+     mask = pad_for_3d_conv(mask.float(), patch_size)
+     return torch.nn.functional.avg_pool3d(mask, kernel_size=patch_size, stride=patch_size)
+ 
++def pool_history_confidence(
++    confidence: torch.Tensor | None,
++    visibility: torch.Tensor | None,
++    patch_size,
++):
++    if confidence is None:
++        return None
++    if confidence.ndim == 4:
++        confidence = confidence.unsqueeze(1)
++    if visibility is None:
++        visibility = torch.ones_like(confidence)
++    elif visibility.ndim == 4:
++        visibility = visibility.unsqueeze(1)
++    confidence = pad_for_3d_conv(confidence.float(), patch_size)
++    visibility = pad_for_3d_conv(visibility.float(), patch_size)
++    numerator = torch.nn.functional.avg_pool3d(confidence * visibility, patch_size, stride=patch_size)
++    denominator = torch.nn.functional.avg_pool3d(visibility, patch_size, stride=patch_size)
++    return numerator / denominator.clamp_min(1e-6)
++
+ 
+ def resolve_history_keep_mask(
+     keep_mask: torch.Tensor | None,
+@@ -235,6 +254,24 @@ class HeliosAttnProcessor:
+                     key,
+                 )
+ 
++        history_key_bias = getattr(attn, "history_key_bias", None)
++        if not attn.is_cross_attention and history_key_bias is not None:
++            history_key_bias = history_key_bias.to(device=query.device, dtype=query.dtype)
++            if history_key_bias.ndim == 1:
++                history_key_bias = history_key_bias.unsqueeze(0)
++            if history_key_bias.ndim != 2 or history_key_bias.shape != (query.shape[0], key.shape[1]):
++                raise ValueError(
++                    "history_key_bias must be [batch,key_tokens], got "
++                    f"{tuple(history_key_bias.shape)} for key shape {tuple(key.shape)}."
++                )
++            if bool((history_key_bias != 0).any()):
++                additive_bias = history_key_bias[:, None, None, :]
++                attention_mask = (
++                    additive_bias
++                    if attention_mask is None
++                    else attention_mask.to(additive_bias) + additive_bias
++                )
++
+         hidden_states = dispatch_attention_fn(
+             query,
+             key,
+@@ -850,6 +887,7 @@ class HeliosTransformer3DModel(
+         history_visible_mask_short=None,
+         history_visible_mask_mid=None,
+         history_visible_mask_long=None,
++        history_confidence_short=None,
+         target_channel_fusion_latents=None,
+         return_dict: bool = True,
+         attention_kwargs: dict[str, Any] | None = None,
+@@ -859,12 +897,20 @@ class HeliosTransformer3DModel(
+         history_visible_token_mode = "drop"
+         history_key_boost_mode = "none"
+         history_key_boost_scale = 1.0
++        history_confidence_threshold = 0.0
++        history_confidence_lambda = 1.0
++        history_confidence_epsilon = 1e-6
+         if attention_kwargs:
+             history_threshold = float(attention_kwargs.get("history_visible_token_threshold", 0.5) or 0.5)
+             history_invisible_token_mode = str(attention_kwargs.get("history_invisible_token_mode", "none") or "none")
+             history_visible_token_mode = str(attention_kwargs.get("history_visible_token_mode", "drop") or "drop")
+             history_key_boost_mode = str(attention_kwargs.get("history_key_boost_mode", "none") or "none")
+             history_key_boost_scale = float(attention_kwargs.get("history_key_boost_scale", 1.0) or 1.0)
++            history_confidence_threshold = float(attention_kwargs.get("history_confidence_threshold", 0.0) or 0.0)
++            history_confidence_lambda = float(attention_kwargs.get("history_confidence_lambda", 1.0) or 1.0)
++            history_confidence_epsilon = float(
++                attention_kwargs.get("history_confidence_epsilon", 1e-6) or 1e-6
++            )
+         if history_visible_token_mode not in {"drop", "none"}:
+             raise ValueError(f"Unsupported history_visible_token_mode: {history_visible_token_mode}")
+         history_key_boost_enabled = history_key_boost_mode in {
+@@ -911,6 +957,9 @@ class HeliosTransformer3DModel(
+         original_context_length = hidden_states.shape[1]
+         history_key_boost_mask = torch.zeros(original_context_length, device=hidden_states.device, dtype=torch.bool)
+ 
++        history_key_confidence = torch.ones(
++            batch_size, original_context_length, device=hidden_states.device, dtype=torch.float32
++        )
+         # 3. Process short history latents
+         if latents_history_short is not None and indices_latents_history_short is not None:
+             latents_history_short = latents_history_short.to(hidden_states)
+@@ -943,10 +992,25 @@ class HeliosTransformer3DModel(
+                 if history_visible_token_mode == "drop" or history_invisible_token_mode != "none"
+                 else None
+             )
+-            if boost_mask_short is not None:
+-                keep_short = resolve_history_keep_mask(keep_mask_short, threshold=history_threshold)
+-                if keep_short is not None:
+-                    boost_mask_short = boost_mask_short[keep_short.to(device=boost_mask_short.device)]
++            pooled_confidence_short = pool_history_confidence(
++                history_confidence_short, history_visible_mask_short, mask_pool_size
++            )
++            confidence_short = (
++                torch.ones(
++                    batch_size,
++                    latents_history_short.shape[1],
++                    device=latents_history_short.device,
++                    dtype=torch.float32,
++                )
++                if pooled_confidence_short is None
++                else pooled_confidence_short[:, 0].flatten(1).clamp(0, 1)
++            )
++            if pooled_confidence_short is not None and history_confidence_threshold > 0:
++                confidence_keep = pooled_confidence_short >= history_confidence_threshold
++                keep_mask_short = confidence_keep if keep_mask_short is None else keep_mask_short * confidence_keep
++            keep_short = resolve_history_keep_mask(keep_mask_short, threshold=history_threshold)
++            if boost_mask_short is not None and keep_short is not None:
++                boost_mask_short = boost_mask_short[keep_short.to(device=boost_mask_short.device)]
+             if history_invisible_token_mode == "global":
+                 latents_history_short = replace_history_tokens_by_mask(
+                     latents_history_short,
+@@ -961,9 +1025,12 @@ class HeliosTransformer3DModel(
+                     keep_mask_short,
+                     threshold=history_threshold,
+                 )
++                if keep_short is not None:
++                    confidence_short = confidence_short[:, keep_short.to(device=confidence_short.device)]
+ 
+             hidden_states = torch.cat([latents_history_short, hidden_states], dim=1)
+             rotary_emb = torch.cat([rotary_emb_history_short, rotary_emb], dim=1)
++            history_key_confidence = torch.cat([confidence_short, history_key_confidence], dim=1)
+             if boost_mask_short is None:
+                 boost_mask_short = torch.zeros(
+                     latents_history_short.shape[1],
+@@ -1012,6 +1079,13 @@ class HeliosTransformer3DModel(
+ 
+             hidden_states = torch.cat([latents_history_mid, hidden_states], dim=1)
+             rotary_emb = torch.cat([rotary_emb_history_mid, rotary_emb], dim=1)
++            history_key_confidence = torch.cat(
++                [
++                    torch.ones(batch_size, latents_history_mid.shape[1], device=hidden_states.device),
++                    history_key_confidence,
++                ],
++                dim=1,
++            )
+             history_key_boost_mask = torch.cat(
+                 [
+                     torch.zeros(
+@@ -1061,6 +1135,13 @@ class HeliosTransformer3DModel(
+ 
+             hidden_states = torch.cat([latents_history_long, hidden_states], dim=1)
+             rotary_emb = torch.cat([rotary_emb_history_long, rotary_emb], dim=1)
++            history_key_confidence = torch.cat(
++                [
++                    torch.ones(batch_size, latents_history_long.shape[1], device=hidden_states.device),
++                    history_key_confidence,
++                ],
++                dim=1,
++            )
+             history_key_boost_mask = torch.cat(
+                 [
+                     torch.zeros(
+@@ -1116,6 +1197,14 @@ class HeliosTransformer3DModel(
+             for block in self.blocks:
+                 block.attn1.history_key_boost_mask = None
+                 block.attn1.history_key_boost_scale = 1.0
++        history_key_bias = history_confidence_lambda * torch.log(
++            history_key_confidence.clamp(min=history_confidence_epsilon, max=1.0)
++        )
++        if not bool((history_key_bias != 0).any()):
++            history_key_bias = None
++        for block in self.blocks:
++            block.attn1.history_key_bias = history_key_bias
++
+         if torch.is_grad_enabled() and self.gradient_checkpointing:
+             for block in self.blocks:
+                 hidden_states = self._gradient_checkpointing_func(
+diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
+index 9c0fff0..37189f1 100644
+--- a/warp_as_history/pipeline.py
++++ b/warp_as_history/pipeline.py
+@@ -1132,6 +1132,20 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                     f"{chunk_index}: need frames [{frame_start}, {frame_end}), got {warp_video_tensor.shape[2]}."
+                 )
+             visibility_chunk = visibility_mask[:, :, frame_start:frame_end].clone()
++        if state.get("using_camera_warp", False):
++            confidence_chunk = visibility_chunk
++        elif online_conditioning_type == "warp":
++            confidence_chunk = state.get("online_confidence_mask")
++            if confidence_chunk is None:
++                confidence_chunk = visibility_chunk
++            confidence_chunk = confidence_chunk.to(device=device, dtype=torch.float32)
++        else:
++            confidence_mask = state.get("confidence_mask")
++            confidence_chunk = (
++                visibility_chunk if confidence_mask is None
++                else confidence_mask[:, :, frame_start:frame_end].to(device=device, dtype=torch.float32)
++            )
++        confidence_chunk = confidence_chunk * visibility_chunk
+ 
+         if base_latents_history_short is None or base_latents_history_short.shape[2] < 1:
+             raise RuntimeError("warp_as_history rollout is missing the official first-frame history prefix.")
+@@ -1215,6 +1229,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+             latent_width=int(state["width"] // self.vae_scale_factor_spatial),
+             temporal_scale=int(self.vae_scale_factor_temporal),
+         )
++        weighted_confidence_latents = self._visibility_mask_to_history_latents(
++            confidence_chunk,
++            latent_frames=WAH_NUM_LATENT_FRAMES_PER_CHUNK,
++            latent_height=int(state["height"] // self.vae_scale_factor_spatial),
++            latent_width=int(state["width"] // self.vae_scale_factor_spatial),
++            temporal_scale=int(self.vae_scale_factor_temporal),
++        )
++        confidence_latents = weighted_confidence_latents / visibility_latents.clamp_min(1e-6)
++        confidence_latents = confidence_latents.clamp(0, 1)
+ 
+         prev_chunk_history_sizes = tuple(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))
+         total_prev_history = sum(prev_chunk_history_sizes)
+@@ -1298,6 +1321,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+ 
+         short_indices_parts = [torch.zeros(1, device=device, dtype=torch.long)]
+         short_history_parts = [prefix_latent]
++        short_confidence_parts = [torch.ones_like(visibility_latents[:, :, :1])]
+         short_visible_parts = [] if state["visible_token_drop"] else None
+         if short_visible_parts is not None:
+             short_visible_parts.append(
+@@ -1314,6 +1338,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         if short_size > 0:
+             short_indices_parts.append(prev_short_indices)
+             short_history_parts.append(prev_short)
++            short_confidence_parts.append(torch.ones_like(prev_visible_short))
+             if short_visible_parts is not None:
+                 short_visible_parts.append(prev_visible_short)
+ 
+@@ -1334,6 +1359,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         else:
+             short_indices_parts.append(warp_indices)
+             short_history_parts.append(warp_latents)
++            short_confidence_parts.append(confidence_latents)
+             if short_visible_parts is not None:
+                 short_visible_parts.append(visibility_latents)
+ 
+@@ -1354,6 +1380,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+             "history_visible_mask_short": None
+             if short_visible_parts is None
+             else torch.cat(short_visible_parts, dim=2),
++            "history_confidence_short": torch.cat(short_confidence_parts, dim=2),
+             "history_visible_mask_mid": history_visible_mask_mid,
+             "history_visible_mask_long": None
+             if not state["visible_token_drop"] or long_size <= 0
+@@ -1772,6 +1799,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         state: dict[str, Any],
+         warp_video: Any,
+         warp_visibility_mask: Any | None,
++        warp_confidence_mask: Any | None,
+     ) -> None:
+         if state.get("conditioning_type") != "warp":
+             raise ValueError("This autoregressive state was initialized for camera chunks, not warp_video chunks.")
+@@ -1813,11 +1841,26 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                 width=width,
+                 device=device,
+             )
++        confidence_mask = self._coerce_visibility_mask(warp_confidence_mask)
++        if confidence_mask is None:
++            confidence_mask = torch.ones_like(visibility_mask)
++        else:
++            confidence_mask = self._resize_visibility_mask(
++                confidence_mask,
++                batch_size=warp_video_tensor.shape[0],
++                num_frames=window_num_frames,
++                height=height,
++                width=width,
++                device=device,
++            )
++        confidence_mask = confidence_mask * visibility_mask
++
+ 
+         state["online_conditioning_type"] = "warp"
+         state["using_camera_warp"] = False
+         state["online_warp_video_tensor"] = warp_video_tensor
+         state["online_visibility_mask"] = visibility_mask
++        state["online_confidence_mask"] = confidence_mask
+         self._record_warp_debug_chunk(
+             state,
+             int(state.get("chunk_index", 0)),
+@@ -1976,6 +2019,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         target_intrinsics: torch.Tensor | np.ndarray | None = None,
+         warp_video: Any | None = None,
+         warp_visibility_mask: Any | None = None,
++        warp_confidence_mask: Any | None = None,
+         output_type: str | None = None,
+     ) -> tuple[Any, dict[str, Any]]:
+         """Generate one autoregressive WAH chunk and return the finalized video delta plus next state."""
+@@ -1985,7 +2029,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         if conditioning_type == "camera":
+             if camera_poses is None:
+                 raise ValueError("camera_poses is required for a camera autoregressive state.")
+-            if warp_video is not None or warp_visibility_mask is not None:
++            if warp_video is not None or warp_visibility_mask is not None or warp_confidence_mask is not None:
+                 raise ValueError("warp_video inputs cannot be passed to a camera autoregressive state.")
+             self._prepare_autoregressive_camera_chunk(state, camera_poses, target_intrinsics)
+         elif conditioning_type == "warp":
+@@ -1993,7 +2037,9 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                 raise ValueError("warp_video is required for a warp autoregressive state.")
+             if camera_poses is not None or target_intrinsics is not None:
+                 raise ValueError("camera inputs cannot be passed to a warp autoregressive state.")
+-            self._prepare_autoregressive_warp_chunk(state, warp_video, warp_visibility_mask)
++            self._prepare_autoregressive_warp_chunk(
++                state, warp_video, warp_visibility_mask, warp_confidence_mask
++            )
+         else:
+             raise ValueError("state is missing a valid conditioning_type.")
+ 
+@@ -2118,6 +2164,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         warp_video: Any | None = None,
+         *,
+         warp_visibility_mask: Any | None = None,
++        warp_confidence_mask: Any | None = None,
+         camera_poses: torch.Tensor | np.ndarray | None = None,
+         target_intrinsics: torch.Tensor | np.ndarray | None = None,
+         lora_path: str | Path | None = "auto",
+@@ -2164,6 +2211,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         **helios_kwargs: Any,
+     ) -> Any:
+         if warp_video is None and camera_poses is None:
++            if warp_confidence_mask is not None:
++                raise ValueError("warp_confidence_mask requires warp_video.")
+             if lora_prompt_embeds is not None:
+                 raise ValueError("lora_prompt_embeds is only supported for Warp-as-History conditioning.")
+             if str(warp_history_downsample_mode or "short") != "short":
+@@ -2203,7 +2252,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         if using_camera_warp:
+             if camera_poses is None:
+                 raise ValueError("Either warp_video or camera_poses must be provided.")
+-            if warp_visibility_mask is not None:
++            if warp_visibility_mask is not None or warp_confidence_mask is not None:
+                 raise ValueError("warp_visibility_mask is only supported when warp_video is provided.")
+         elif camera_poses is not None:
+             raise ValueError("Pass either warp_video or camera_poses, not both.")
+@@ -2258,6 +2307,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         window_num_frames = int(state["window_num_frames"])
+         warp_video_tensor = None
+         visibility_mask = None
++        confidence_mask = None
+         if not using_camera_warp:
+             device = self._wah_execution_device()
+             total_warp_frames = num_chunks * window_num_frames
+@@ -2295,6 +2345,20 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                     width=int(width),
+                     device=device,
+                 )
++            confidence_mask = self._coerce_visibility_mask(warp_confidence_mask)
++            if confidence_mask is None:
++                confidence_mask = torch.ones_like(visibility_mask)
++            else:
++                confidence_mask = self._resize_visibility_mask(
++                    confidence_mask,
++                    batch_size=warp_video_tensor.shape[0],
++                    num_frames=total_warp_frames,
++                    height=int(height),
++                    width=int(width),
++                    device=device,
++                )
++            confidence_mask = confidence_mask * visibility_mask
++
+ 
+         try:
+             for chunk_index in range(num_chunks):
+@@ -2338,6 +2402,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         state,
+                         warp_video=warp_video_tensor[:, :, frame_start:frame_end],
+                         warp_visibility_mask=visibility_mask[:, :, frame_start:frame_end],
++                        warp_confidence_mask=confidence_mask[:, :, frame_start:frame_end],
+                         output_type="latent",
+                     )
+ 
+@@ -2508,6 +2573,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         current_history_visible_mask_short = pyramid_base_histories["history_visible_mask_short"]
+                         current_history_visible_mask_mid = pyramid_base_histories["history_visible_mask_mid"]
+                         current_history_visible_mask_long = pyramid_base_histories["history_visible_mask_long"]
++                        current_history_confidence_short = pyramid_base_histories["history_confidence_short"]
+                     else:
+                         current_indices_hidden_states = indices_hidden_states
+                         current_indices_latents_history_short = indices_latents_history_short
+@@ -2519,6 +2585,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         current_history_visible_mask_short = None
+                         current_history_visible_mask_mid = None
+                         current_history_visible_mask_long = None
++                        current_history_confidence_short = None
+ 
+                     timestep = t.expand(latents.shape[0]).to(torch.int64)
+                     model_latents = latents.to(transformer_dtype)
+@@ -2545,6 +2612,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                             latents_history_mid=_optional_to_dtype(current_latents_history_mid, transformer_dtype),
+                             latents_history_long=_optional_to_dtype(current_latents_history_long, transformer_dtype),
+                             history_visible_mask_short=current_history_visible_mask_short,
++                            history_confidence_short=current_history_confidence_short,
+                             history_visible_mask_mid=current_history_visible_mask_mid,
+                             history_visible_mask_long=current_history_visible_mask_long,
+                         )[0]
+@@ -2569,6 +2637,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                                     current_latents_history_long, transformer_dtype
+                                 ),
+                                 history_visible_mask_short=current_history_visible_mask_short,
++                                history_confidence_short=current_history_confidence_short,
+                                 history_visible_mask_mid=current_history_visible_mask_mid,
+                                 history_visible_mask_long=current_history_visible_mask_long,
+                             )[0]
+diff --git a/warp_as_history/training/core.py b/warp_as_history/training/core.py
+index 24eccd4..336d1e3 100644
+--- a/warp_as_history/training/core.py
++++ b/warp_as_history/training/core.py
+@@ -465,6 +465,36 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
+             sampled = sampled.clamp_(0.0, 1.0)
+             return sampled
+         return None
++    def _load_video_confidence_latents(video_frames_count, visibility_latents):
++        if video_frames_count <= 0 or not args.use_warp_as_history:
++            return None
++        extra_frames = getattr(args, "history_confidence_extra_mask_frames", None)
++        if not extra_frames:
++            return visibility_latents
++        if len(extra_frames) < int(args.num_frames):
++            raise ValueError(
++                "history_confidence_extra_mask_frames has "
++                f"{len(extra_frames)} frames, need at least {int(args.num_frames)}."
++            )
++        values = np.stack(
++            [
++                np.asarray(frame.convert("L"), dtype=np.float32) / 255.0
++                for frame in extra_frames[: int(args.num_frames)]
++            ],
++            axis=0,
++        )
++        sampled_ids = np.arange(video_frames_count, dtype=np.int64) * int(
++            pipe.vae_scale_factor_temporal
++        )
++        sampled_ids = np.clip(sampled_ids, 0, values.shape[0] - 1)
++        sampled = torch.from_numpy(values[sampled_ids]).to(device=device, dtype=torch.float32)
++        sampled = sampled.unsqueeze(0).unsqueeze(0)
++        sampled = F.interpolate(
++            sampled, size=(video_frames_count, h, w), mode="trilinear", align_corners=False
++        ).clamp_(0.0, 1.0)
++        if visibility_latents is not None:
++            sampled = sampled * visibility_latents
++        return sampled
+ 
+     if bool(getattr(args, "use_warp_as_history", False)):
+         if video_latents is None:
+@@ -486,6 +516,17 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
+         warp_count = min(video_frames, latent_window_size)
+         if warp_count > 0:
+             warp_latents[:, :, -warp_count:] = video_latents[:, :, -warp_count:]
++        video_visible_for_confidence = _load_video_visibility_latents(video_frames)
++        video_confidence_latents = _load_video_confidence_latents(
++            video_frames, video_visible_for_confidence
++        )
++        confidence_history_warp = torch.ones(
++            batch_size, 1, latent_window_size, h, w, device=device, dtype=torch.float32
++        )
++        if warp_count > 0 and video_confidence_latents is not None:
++            confidence_history_warp[:, :, -warp_count:] = video_confidence_latents[
++                :, :, -warp_count:
++            ]
+ 
+         visible_history_short = None
+         visible_history_mid = None
+@@ -604,12 +645,18 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
+         short_latent_parts = [latents_prefix]
+         short_index_parts = [prefix_index]
+         short_visible_parts = None
++        short_confidence_parts = [
++            torch.ones(batch_size, 1, 1, h, w, device=device, dtype=torch.float32)
++        ]
+         if visible_history_warp is not None:
+             short_visible_parts = [torch.ones(batch_size, 1, 1, h, w, device=device, dtype=torch.float32)]
+ 
+         if short_size > 0:
+             short_latent_parts.append(latents_history_prev_short)
+             short_index_parts.append(indices_latents_history_prev_short)
++            short_confidence_parts.append(
++                torch.ones(batch_size, 1, short_size, h, w, device=device, dtype=torch.float32)
++            )
+             if short_visible_parts is not None:
+                 prev_short_visible = torch.zeros(batch_size, 1, short_size, h, w, device=device, dtype=torch.float32)
+                 if fake_prev_short_count > 0:
+@@ -630,12 +677,14 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
+         else:
+             short_latent_parts.append(warp_latents)
+             short_index_parts.append(indices_warp_history)
++            short_confidence_parts.append(confidence_history_warp)
+             if short_visible_parts is not None:
+                 short_visible_parts.append(visible_history_warp)
+ 
+         latents_history_short = torch.cat(short_latent_parts, dim=2)
+         indices_latents_history_short = torch.cat(short_index_parts, dim=0)
+         visible_history_short = torch.cat(short_visible_parts, dim=2) if short_visible_parts is not None else None
++        confidence_history_short = torch.cat(short_confidence_parts, dim=2)
+         has_mid_history = int(latents_history_mid.shape[2]) > 0
+         item = {
+             "event": "history_prepared",
+@@ -696,6 +745,7 @@ def make_histories(pipe, image_latents, fake_image_latents, args, device, video_
+             "history_visible_mask_short": visible_history_short,
+             "history_visible_mask_mid": visible_history_mid,
+             "history_visible_mask_long": visible_history_long,
++            "history_confidence_short": confidence_history_short,
+         }
+ 
+     if video_latents is not None and num_history_latents > 0:
+@@ -1366,6 +1416,7 @@ def transformer_model_forward(
+         history_visible_mask_short=histories.get("history_visible_mask_short"),
+         history_visible_mask_mid=histories.get("history_visible_mask_mid"),
+         history_visible_mask_long=histories.get("history_visible_mask_long"),
++        history_confidence_short=histories.get("history_confidence_short"),
+         target_channel_fusion_latents=target_channel_fusion_latents,
+     )[0]
+ 
+diff --git a/warp_as_history/training/data.py b/warp_as_history/training/data.py
+index 4a29921..f024be8 100644
+--- a/warp_as_history/training/data.py
++++ b/warp_as_history/training/data.py
+@@ -373,6 +373,7 @@ class OnlineWarpTrainingCache:
+             "target_indices": target_indices,
+             "warp_frames": warp_frames,
+             "warp_mask_frames": warp_mask_frames,
++            "warp_confidence_frames": warp_mask_frames,
+         }
+ 
+ 
+@@ -452,10 +453,14 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
+     target_frames = case["target_frames"]
+     history_frames = case["warp_frames"]
+     mask_frames = case["warp_mask_frames"]
++    confidence_frames = case.get("warp_confidence_frames", mask_frames)
+ 
+     had_extra_mask = hasattr(exact_args, "history_visibility_extra_mask_frames")
+     old_extra_mask = getattr(exact_args, "history_visibility_extra_mask_frames", None)
++    had_extra_confidence = hasattr(exact_args, "history_confidence_extra_mask_frames")
++    old_extra_confidence = getattr(exact_args, "history_confidence_extra_mask_frames", None)
+     exact_args.history_visibility_extra_mask_frames = mask_frames
++    exact_args.history_confidence_extra_mask_frames = confidence_frames
+ 
+     try:
+         with torch.no_grad():
+@@ -490,6 +495,12 @@ def prepare_online_warp_item(pipe, row_index, exact_args, device, mean, std, kee
+             )
+     finally:
+         _restore_optional_attr(exact_args, "history_visibility_extra_mask_frames", had_extra_mask, old_extra_mask)
++        _restore_optional_attr(
++            exact_args,
++            "history_confidence_extra_mask_frames",
++            had_extra_confidence,
++            old_extra_confidence,
++        )
+ 
+     item = {
+         "seq": seq,

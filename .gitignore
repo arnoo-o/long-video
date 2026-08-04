@@ -9,3 +9,4 @@ logs/
 configs/paths.yaml
 *.mp4
 *.npz
+third_party/

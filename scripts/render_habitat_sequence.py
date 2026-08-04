@@ -16,11 +16,13 @@ def main():
     parser.add_argument("--hfov", type=float, default=90)
     parser.add_argument("--move-speed", type=float, default=0.5)
     args = parser.parse_args()
-    poses, controls = generate_validation_trajectory(move_speed=args.move_speed)
     renderer = HabitatSequenceRenderer(
         args.scene_dataset_config, args.scene_id, args.height, args.width, args.hfov
     )
     try:
+        poses, controls = generate_validation_trajectory(
+            renderer.initial_c2w(), move_speed=args.move_speed
+        )
         renderer.render(poses, args.output, controls)
     finally:
         renderer.close()

@@ -28,16 +28,27 @@ class HabitatSequenceRenderer:
         rgb.sensor_type = habitat_sim.SensorType.COLOR
         rgb.resolution = [int(height), int(width)]
         rgb.hfov = float(hfov)
+        rgb.position = [0.0, 1.5, 0.0]
         depth = habitat_sim.CameraSensorSpec()
         depth.uuid = "depth_sensor"
         depth.sensor_type = habitat_sim.SensorType.DEPTH
         depth.resolution = [int(height), int(width)]
         depth.hfov = float(hfov)
+        depth.position = [0.0, 1.5, 0.0]
         agent = habitat_sim.agent.AgentConfiguration()
         agent.sensor_specifications = [rgb, depth]
         self.sim = habitat_sim.Simulator(habitat_sim.Configuration(simulator, [agent]))
+        self.sim.seed(0)
         self.agent = self.sim.initialize_agent(0)
         self.height, self.width, self.hfov = int(height), int(width), float(hfov)
+
+    def initial_c2w(self):
+        pose = np.eye(4, dtype=np.float32)
+        if self.sim.pathfinder.is_loaded:
+            pose[:3, 3] = self.sim.pathfinder.get_random_navigable_point()
+        else:
+            pose[:3, 3] = np.asarray(self.agent.get_state().position, np.float32)
+        return pose
 
     def close(self):
         self.sim.close()

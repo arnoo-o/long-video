@@ -8,6 +8,6 @@ def integrate_controls(initial_c2w,controls,move_speed=1.0):
     for item in controls:
         dt=float(item.get("delta_time",1/30)); yaw=float(item.get("yaw_delta",0)); pitch=float(item.get("pitch_delta",0))
         pose[:3,:3]=pose[:3,:3]@_rotation([0,1,0],yaw)@_rotation([1,0,0],pitch)
-        local=np.array([item.get("strafe_right",0)-item.get("strafe_left",0),0,item.get("backward",0)-item.get("forward",0)],np.float32)
+        local=np.array([item.get("strafe_right",0)-item.get("strafe_left",0),0,item.get("forward",0)-item.get("backward",0)],np.float32)
         pose[:3,3]+=pose[:3,:3]@(local*move_speed*dt); output.append(pose.copy())
     return np.stack(output) if output else np.empty((0,4,4),np.float32)

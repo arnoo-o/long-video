@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+weights/
+outputs/
+nodes/
+logs/
+configs/paths.yaml
+*.mp4
+*.npz

@@ -1,0 +1,9 @@
+source_prior:
+  observed: 1.0
+  verified: 0.9
+  synthesized: 0.4
+  generated: 0.25
+  invalid: 0.0
+token_visible_threshold: 0.05
+token_confidence_threshold: 0.1
+lambda_confidence: 1.0

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..types import SpatialNode
+from ..types import ScaleMetadata, SpatialNode
 
 
 class NodeStore:
@@ -48,6 +48,11 @@ class NodeStore:
                 "observation_count",
             )
         }
+        for key in ("view_source", "view_image_confidence", "view_depth_confidence",
+                    "point_view_mask"):
+            value = getattr(node, key, None)
+            if value is not None:
+                arrays[key] = value
         if node.points_normal is not None:
             arrays["points_normal"] = node.points_normal
         array_path = temporary / "node_arrays.npz"
@@ -64,6 +69,8 @@ class NodeStore:
             "bbox_min": node.bbox_min.tolist(),
             "bbox_max": node.bbox_max.tolist(),
             "depth_convention": node.depth_convention,
+            "scale":vars(node.scale),
+            "model_versions":node.model_versions,
             "quality_metrics": node.quality_metrics,
             "node_arrays_sha256": digest,
         }
@@ -80,10 +87,14 @@ class NodeStore:
             if backup is not None and backup.exists():
                 os.replace(backup, final)
             raise
-        else:
-            if backup is not None:
-                shutil.rmtree(backup)
-        self._update_session(node)
+        try:
+            self._update_session(node)
+        except Exception:
+            if final.exists(): shutil.rmtree(final)
+            if backup is not None and backup.exists(): os.replace(backup, final)
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
 
     def load(self, node_id):
         path = self.root / "nodes" / node_id
@@ -101,6 +112,11 @@ class NodeStore:
                 )
             }
             normal = arrays["points_normal"].copy() if "points_normal" in arrays.files else None
+            optional = {
+                key: arrays[key].copy() if key in arrays.files else None
+                for key in ("view_source","view_image_confidence",
+                            "view_depth_confidence","point_view_mask")
+            }
         return SpatialNode(
             metadata["node_id"], metadata["status"], metadata.get("parent_id"),
             np.asarray(metadata["center_c2w"], np.float32), metadata["created_frame"],
@@ -111,5 +127,16 @@ class NodeStore:
             values["points_confidence"], values["points_source"],
             values["observation_count"], normal,
             metadata.get("depth_convention", "RAY_DISTANCE"),
-            metadata.get("schema_version", 1), metadata.get("quality_metrics", {}),
+            max(3, metadata.get("schema_version", 1)), metadata.get("quality_metrics", {}),
+            view_source=(optional["view_source"] if optional["view_source"] is not None
+                         else np.full(values["view_depth"].shape, 4, np.int8)),
+            view_image_confidence=(optional["view_image_confidence"]
+                         if optional["view_image_confidence"] is not None
+                         else np.ones(values["view_depth"].shape, np.float32)),
+            view_depth_confidence=(optional["view_depth_confidence"]
+                         if optional["view_depth_confidence"] is not None
+                         else np.isfinite(values["view_depth"]).astype(np.float32)),
+            point_view_mask=optional["point_view_mask"],
+            scale=ScaleMetadata(**metadata.get("scale", {})),
+            model_versions=metadata.get("model_versions", {}),
         )

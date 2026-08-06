@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from long_video.data.holo360d import Holo360DReader
 from long_video.initialization.geometry_backend import Pi3GeometryBackend
 from long_video.initialization.view_completion import HoloOracleCompletion
+from long_video.types import RAY_DISTANCE, ScaleMetadata
 
 
 def extract_first(zip_path, destination):
@@ -50,6 +51,7 @@ def main():
     parser.add_argument("--height", type=int, default=518)
     parser.add_argument("--width", type=int, default=518)
     parser.add_argument("--fov", type=float, default=90.0)
+    parser.add_argument("--device", required=True)
     args = parser.parse_args()
 
     output = Path(args.output)
@@ -59,8 +61,9 @@ def main():
     views = HoloOracleCompletion(args.fov, args.height, args.width).complete(
         frame.rgb, frame.depth, frame.c2w, frame.mask, observed_indices=(0,)
     )
-    prediction = Pi3GeometryBackend(args.checkpoint, args.repo).predict(
-        views.rgb, views.c2w, views.intrinsics, views.depth, np.isfinite(views.depth)
+    prediction = Pi3GeometryBackend(args.checkpoint, args.repo, args.device).predict(
+        views.rgb, views.c2w, views.intrinsics, views.depth, np.isfinite(views.depth),
+        RAY_DISTANCE, ScaleMetadata("dataset_calibrated", 1.0, 0.0, "Holo360D_mesh_depth"),
     )
     for index in range(8):
         Image.fromarray(views.rgb[index]).save(output / f"rgb_{index:02d}.png")

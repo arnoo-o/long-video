@@ -1,79 +1,93 @@
 # long-video
 
-Confidence-aware, extensible spatial memory for Warp-as-History (WAH). The project keeps local 3D nodes outside Helios: each generation chunk renders the active point cloud into an incomplete future warp, then sends RGB, visibility, and confidence through the official WAH short-history path.
+Confidence-aware, extensible spatial memory for Warp-as-History (WAH). Local 3D nodes remain outside Helios: each chunk renders the active node into a future warp, then official WAH encodes warp RGB while visibility and confidence control the short-history keys Helios may trust.
+
+All poses are float32 OpenCV camera-to-world matrices: +x right, +y down, +z forward.
 
 ## Pipeline
 
-1. Project 1-N user images (yaw, pitch, FOV) into eight canonical horizontal cameras.
-2. Complete missing RGB with Holo oracle, precomputed views, or MVDiffusion.
-3. Predict geometry with ground truth or the official Holo360D-finetuned Pi3 8-view checkpoint.
-4. Fuse views into active node M0 with source-aware point confidence.
-5. Integrate WASD/mouse controls into OpenCV camera-to-world poses.
-6. GPU-render warp RGB, Z-depth, visibility, confidence, and source.
-7. Encode warp RGB with the official WAH VAE and retain it in short history with future-aligned frame indices.
-8. Pool spatial confidence with the exact VAE temporal sampling and Helios patch_short layout.
-9. Add lambda*log(confidence) only to retained warp key columns in Helios self-attention.
-10. When coverage falls, buffer generated keyframes, reconstruct and validate M1, and reactivate an archived node when it covers a revisited view better.
+1. Validate 1-N same-optical-center images and yaw, pitch, FOV or pinhole intrinsics.
+2. Project observations into a periodic 2048x1024 ERP.
+3. Complete missing RGB with official DiT360 on FLUX.1-dev, then restore every observed pixel.
+4. Project to eight 512x512, 90-degree views at yaw 0..315 degrees.
+5. Predict geometry with the Holo360D-finetuned Pi3 8-view checkpoint.
+6. Fuse RGB, depth, source, confidence and distinct-view provenance into M0.
+7. Integrate scale-aware WASD/mouse controls into future c2w poses.
+8. Render warp RGB, Z-depth, visibility, confidence and source.
+9. Run official WAH VAE and patch_short with warp indices aligned to target frames.
+10. Pool confidence over the exact latent/patch layout and bias only retained warp key logits.
+11. On sustained coverage loss, buffer at least 12 frames: eight mapping plus four held-out.
+12. Align Pi3 geometry to parent overlap, validate M1, promote it, and reactivate better archived nodes.
 
-All project poses are float32 OpenCV c2w (+x right, +y down, +z forward). Holo360D mesh depth is RAY_DISTANCE; Pi3 and renderer depth are Z_DEPTH.
+## H100 installation
 
-## Installation
-
-Create a project environment without modifying WAH:
+Project and third-party environments remain separate:
 
     pip install -r requirements-project.txt
     cp configs/paths.example.yaml configs/paths.yaml
+    bash scripts/install_dit360.sh
+    HF_TOKEN=... bash scripts/download_dit360_weights.sh
+    bash scripts/install_habitat.sh
+    bash scripts/download_replicacad.sh
 
-External environments and weights remain on the H100 data disk. Apply the tracked WAH patch to the exact recorded upstream commit:
+Every tested GPU command uses physical GPU 1:
 
-    WAH_ROOT=/ephemeral/mdu/long-video/third_party/Warp-as-History bash scripts/apply_wah_patch.sh
-    WAH_ROOT=/ephemeral/mdu/long-video/third_party/Warp-as-History WAH_PYTHON=/ephemeral/mdu/venvs/wah/bin/python bash scripts/check_wah_patch.sh
+    CUDA_VISIBLE_DEVICES=1 ...
+
+Inside that process the configured device is cuda:0. GPU 0 is never selected.
 
 ## Initialization modes
 
-- holo_oracle: complete eight views from a full Holo360D panorama and use mesh depth. This is the geometry upper bound.
-- precomputed: load views_rgb.npy, views_depth.npy, view_poses.npy, intrinsics.npy, source_maps.npy, and image_confidence.npy.
-- mvdiffusion_pi3: run official panorama outpainting in an isolated subprocess, overlay every observed pixel, then run official Pi3 8views geometry.
+- holo_oracle: full Holo360D panorama and mesh RAY_DISTANCE depth.
+- precomputed: externally prepared canonical views and depth.
+- sparse_images_pi3: configurable completion backend, currently DiT360, followed by Pi3 and M0 construction.
 
-MVDiffusion setup:
+DiT360 uses a subprocess manifest. It supports non-square pinhole inputs, applies EXIF orientation, rejects explicit intrinsics invalidated by EXIF rotation, rejects distortion unless pre-undistorted, and verifies a common optical center when c2w translations exist. Output includes ERP RGB/valid/fusion/conflict maps and eight canonical views with per-pixel source/confidence.
 
-    bash scripts/install_mvdiffusion.sh
-    HF_TOKEN=... bash scripts/download_mvdiffusion_weights.sh
-    /ephemeral/mdu/envs/longvideo-mvdiffusion/bin/python scripts/run_mvdiffusion_completion.py --manifest manifest.json
+    CUDA_VISIBLE_DEVICES=1 /ephemeral/mdu/envs/longvideo-dit360/bin/python       scripts/test_dit360_indoor016.py       --input outputs/pi3_8views_indoor016_fixed/rgb_00.png       --dit360-config configs/dit360.yaml --pi3-config configs/pi3.yaml       --output outputs/dit360_indoor016_final
 
-The released panorama checkpoint is installed, but Stable Diffusion 2 Inpainting requires accepting its Hugging Face license and a token.
+## Scale policy
 
-## Geometry and M0
+A same-center M0 has no translation parallax and cannot determine meters. Pi3 normalizes median valid depth to one node unit and stores ScaleMetadata mode relative; there is no default 3 m assumption. Motion speed, voxel size, near/far, coverage radius and transition baselines are interpreted in node scale.
 
-    PYTHONPATH=. python scripts/test_holo_geometry.py --zip /ephemeral/mdu/long-video-data/raw/holo360d/train/Indoor_013.zip --output outputs/geometry_debug --height 128 --width 128
-    PYTHONPATH=. python scripts/test_pi3_8views.py --zip /ephemeral/mdu/long-video-data/raw/holo360d/test/Indoor_016.zip --checkpoint /ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin --repo /ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d --output outputs/pi3_test
+Metric dataset or sensor depth produces dataset_calibrated or metric_anchor. M1 uses parent Z-depth overlap for robust median/MAD alignment. A relative parent stays relative; a metric parent propagates meters_per_world_unit. The known-depth convention is mandatory. known_mask affects scale/error fitting without deleting predictions outside the mask.
 
-SpatialNode stores its source views, world-space points, confidence, source class, observation count, schema version, and quality metrics. NodeStore uses an atomic directory replacement and verifies the NPZ SHA-256 on load.
+## SpatialNode and rendering
 
-## WAH confidence
+Schema v3 stores source views, view source/image/depth confidence, world points, normals, confidence, semantic source, distinct-view bit provenance, observation count, scale metadata and model versions. NodeStore checksums arrays, migrates older nodes, and rolls back node replacement if session-graph update fails.
 
-The patch preserves the official sequence:
+The renderer has explicit device, near/far clipping, chunking, deterministic z-buffer ties and splatting. Coverage uses a fixed angular occupancy grid, independent of point radius and output resolution.
 
-    warp RGB -> official VAE -> warp latent -> patch_short -> short history -> Helios
+    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. /ephemeral/mdu/venvs/wah/bin/python       scripts/test_holo_geometry.py       --zip /ephemeral/mdu/long-video-data/raw/holo360d/train/Indoor_013.zip       --output outputs/geometry_debug --height 128 --width 128
 
-Visibility and confidence use identical chunk slicing, temporal indices, latent interpolation, patch kernel/stride, and token keep indices. Confidence one produces no mask and therefore preserves the official attention backend path. Lower confidence creates a negative additive key bias; ordinary history and target keys remain zero.
+## WAH confidence patch
 
-    PYTHONPATH=. python scripts/test_wah_confidence.py --wah-root /ephemeral/mdu/long-video/third_party/Warp-as-History
+Apply only to the WAH commit recorded in third_party_versions.json:
 
-Canonical training samples contain first_frame.png, target_video.mp4, camera_poses.npy, warp_video.mp4, warp_visibility_mask.npy, warp_confidence.npy, warp_source.npy, prompt.txt, and metadata.json. Missing confidence remains backward-compatible and defaults to visibility.
+    WAH_ROOT=/ephemeral/mdu/long-video/third_party/Warp-as-History       bash scripts/apply_wah_patch.sh
+    WAH_ROOT=/ephemeral/mdu/long-video/third_party/Warp-as-History       WAH_PYTHON=/ephemeral/mdu/venvs/wah/bin/python       bash scripts/check_wah_patch.sh
+
+The preserved path is:
+
+    warp RGB -> official VAE -> warp latent -> short history / patch_short -> Helios
+
+Visibility and confidence share chunk slicing, temporal sampling, latent interpolation and keep indices. Missing or all-one confidence takes the exact original path and creates no attention mask. Lower confidence adds a negative bias only to warp key columns; first-frame history, ordinary history and target keys stay at zero.
+
+Training samples include warp_visibility_mask.npy, warp_confidence.npy and warp_source.npy. Legacy samples without confidence use one on visible pixels.
 
 ## Online memory
 
-OnlineSpatialHistoryPipeline returns generated_video, target_c2w, WarpBatch, and generation statistics. MemoryManager implements ACTIVE -> TRANSITION -> CANDIDATE -> VALIDATING -> ACTIVE_NEW_NODE and a coverage-based archived-node revisit check.
+OnlineSpatialHistoryPipeline reactivates archived nodes before rendering, creates the target trajectory, renders the warp, calls real WAH/Helios, and returns video, c2w, WarpBatch and statistics.
+
+M1 promotion reports overlap RGB/depth, held-out RGB/depth, scale dispersion, pose error, valid depth ratio, new-point ratio and confidence-weighted coverage. A generated point becomes verified only after distinct translated-view support plus RGB, depth and occlusion agreement.
 
     PYTHONPATH=. python scripts/test_memory_transition.py
-
-The deterministic test verifies the complete M0-to-active-M1 state transition. A real confidence-aware WAH/Helios chunk also ran on physical GPU 1 with full 33-frame warp conditioning and produced 33 frames at 384x640; GPU 0's vLLM was untouched.
+    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. /ephemeral/mdu/venvs/wah/bin/python       scripts/test_helios_memory_expansion.py       --video outputs/wah_full_chunk/bmx_17f.mp4       --pi3-repo third_party/Holo360D/Pi3_Finetuned_Holo360d       --checkpoint /ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin       --output outputs/helios_memory_expansion --device cuda:0
 
 ## Habitat
 
-    bash scripts/install_habitat.sh
-    bash scripts/download_replicacad.sh
-    PYTHONPATH=. /ephemeral/mdu/envs/longvideo-habitat/bin/python scripts/render_habitat_sequence.py --scene-dataset-config PATH --scene-id Baked_sc1_staging_00 --output outputs/habitat_sequence
+ReplicaCAD output stores true RGB/depth sensor c2w and sensor extrinsics. Validation poses are constrained using snap_point and try_step on a loaded navmesh.
 
-The output follows the unified sequence format documented in docs/DATA_FORMATS.md. See docs/IMPLEMENTATION_STATUS.md for measured results and remaining external blockers.
+    CUDA_VISIBLE_DEVICES=1 PYTHONPATH=.       /ephemeral/mdu/envs/longvideo-habitat/bin/python       scripts/render_habitat_sequence.py       --scene-dataset-config /ephemeral/mdu/long-video-data/raw/replicacad/replica_cad_baked_lighting/replicaCAD_baked.scene_dataset_config.json       --scene-id Baked_sc1_staging_00       --output outputs/habitat_sensor_pose --height 128 --width 128
+
+See docs/IMPLEMENTATION_STATUS.md for measurements and remaining limitations.

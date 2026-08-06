@@ -7,8 +7,7 @@
   },
   "helios": {
     "path": "/ephemeral/mdu/long-video-assets/helios-distilled",
-    "model": "BestWishYsh/Helios-Distilled",
-    "size": "75G"
+    "model": "BestWishYsh/Helios-Distilled"
   },
   "pi3": {
     "repo_path": "/ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d",
@@ -17,12 +16,14 @@
     "checkpoint": "/ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin",
     "checkpoint_bytes": 3569900346
   },
-  "mvdiffusion": {
-    "path": "/ephemeral/mdu/long-video-third-party/MVDiffusion",
-    "remote": "https://github.com/Tangshitao/MVDiffusion",
-    "commit": "4cd4e513e259be07a6c5e6a813258f77374afa59",
-    "checkpoint": "/ephemeral/mdu/long-video-data/models/mvdiffusion/pano_outpaint.ckpt",
-    "checkpoint_sha256": "5fd8027072c3f8d6f87bb18c4e39b0db06fa3c949483c32ae7725d0d1dc66ae5"
+  "dit360": {
+    "repo_path": "/ephemeral/mdu/long-video-third-party/DiT360",
+    "remote": "https://github.com/Insta360-Research-Team/DiT360.git",
+    "commit": "3779fe7965473f6824994c663a0ae7a76bc7aafa",
+    "base_model": "black-forest-labs/FLUX.1-dev",
+    "base_model_path": "/ephemeral/mdu/long-video-data/models/dit360/FLUX.1-dev",
+    "lora": "Insta360-Research/DiT360-Panorama-Image-Generation",
+    "lora_path": "/ephemeral/mdu/long-video-data/models/dit360/DiT360-Panorama-Image-Generation"
   },
   "h100_wah_environment": {
     "python": "3.12.3",
@@ -30,15 +31,21 @@
     "cuda": "12.4",
     "diffusers": "0.36.0"
   },
-  "mvdiffusion_environment": {
-    "python": "3.10",
-    "pytorch": "2.0.0+cu117",
-    "cuda": "11.7",
-    "diffusers": "0.16.1",
-    "transformers": "4.28.1"
+  "dit360_environment": {
+    "path": "/ephemeral/mdu/envs/longvideo-dit360",
+    "python": "3.12.3",
+    "pytorch": "2.6.0+cu124",
+    "diffusers": "0.36.0",
+    "transformers": "4.52.4",
+    "accelerate": "1.9.0",
+    "peft": "0.17.1"
   },
   "habitat_environment": {
     "path": "/ephemeral/mdu/envs/longvideo-habitat",
     "habitat_sim": "0.3.3"
-  }
+  },
+  "removed_after_dit360_validation": [
+    "/ephemeral/mdu/long-video-third-party/MVDiffusion",
+    "/ephemeral/mdu/long-video-data/models/mvdiffusion"
+  ]
 }

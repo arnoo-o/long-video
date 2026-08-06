@@ -7,10 +7,11 @@ from typing import Any
 import numpy as np
 
 from ..memory.node_builder import build_from_views
+from ..types import ScaleMetadata
 
 
 def _completion_result(completion_backend, observed_images, camera_specs, prompt, config):
-    mode = str(config.get("mode", "mvdiffusion_pi3"))
+    mode = str(config.get("mode", "sparse_images_pi3"))
     if mode == "holo_oracle":
         if not isinstance(observed_images, dict):
             raise TypeError("holo_oracle expects panorama/depth/mask/c2w input fields")
@@ -23,7 +24,7 @@ def _completion_result(completion_backend, observed_images, camera_specs, prompt
         )
     if mode == "precomputed":
         return completion_backend.complete()
-    if mode != "mvdiffusion_pi3":
+    if mode != "sparse_images_pi3":
         raise ValueError(f"Unsupported initialization mode: {mode}")
     return completion_backend.complete(
         observed_images,
@@ -55,6 +56,7 @@ def initialize_spatial_node(
         views.intrinsics,
         known_depth=views.depth if has_known_depth else None,
         known_mask=np.isfinite(views.depth) if has_known_depth else None,
+        known_depth_convention=views.depth_convention if has_known_depth else None,
     )
     completed = replace(
         views,
@@ -71,10 +73,22 @@ def initialize_spatial_node(
         status="active",
     )
     node.quality_metrics.update(
-        initialization_mode=str(config.get("mode", "mvdiffusion_pi3")),
+        initialization_mode=str(config.get("mode", "sparse_images_pi3")),
+        source_priors=({
+            {"observed":0,"synthesized":1,"generated":2,"verified":3,"invalid":4}[key]:float(value)
+            for key,value in config.get("source_prior",{}).items()
+        } or None),
         geometry_diagnostics=prediction.diagnostics,
         scale_info=prediction.scale_info,
         prompt=str(prompt),
+    )
+    node.scale = ScaleMetadata(
+        mode=prediction.scale_info.get("mode", "relative"),
+        meters_per_world_unit=prediction.scale_info.get("meters_per_world_unit"),
+        uncertainty=float(prediction.scale_info.get("uncertainty", 1.0)),
+        anchor_source=prediction.scale_info.get("anchor_source", "unspecified"),
+        diagnostics={k:v for k,v in prediction.scale_info.items()
+                     if k not in {"mode","meters_per_world_unit","uncertainty","anchor_source"}},
     )
     store = config.get("node_store")
     if store is not None:

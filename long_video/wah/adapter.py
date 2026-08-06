@@ -6,6 +6,15 @@ class WAHAdapter:
         self.lambda_confidence = float(lambda_confidence)
         self.confidence_threshold = float(confidence_threshold)
         self.confidence_epsilon = float(confidence_epsilon)
+    @classmethod
+    def from_config(cls,wah_pipeline,confidence_config):
+        return cls(
+            wah_pipeline=wah_pipeline,
+            lambda_confidence=confidence_config["lambda_confidence"],
+            confidence_threshold=confidence_config["token_confidence_threshold"],
+            confidence_epsilon=float(confidence_config.get("epsilon",1e-6)),
+        )
+
 
     @staticmethod
     def warp_inputs(warp_batch):

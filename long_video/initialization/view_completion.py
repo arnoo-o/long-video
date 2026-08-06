@@ -1,7 +1,7 @@
 import numpy as np
 from ..types import ViewSet, RAY_DISTANCE
 from ..data.panorama_projection import equirectangular_to_perspective, build_canonical_view_cameras
-from .mvdiffusion_backend import MVDiffusionCompletion
+from .dit360_backend import DiT360Completion
 
 class HoloOracleCompletion:
     """Geometry upper bound: unobserved views are labeled synthesized but sampled from held-out panorama."""

@@ -5,7 +5,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WAH_ROOT="${WAH_ROOT:-/ephemeral/mdu/long-video/third_party/Warp-as-History}"
 PATCH="${PROJECT_ROOT}/patches/wah_confidence.patch"
 
-if [[ ! -d "${WAH_ROOT}/.git" ]]; then
+if ! git -C "${WAH_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "WAH repository not found: ${WAH_ROOT}" >&2
   exit 1
 fi

@@ -23,6 +23,7 @@ def main():
         poses, controls = generate_validation_trajectory(
             renderer.initial_c2w(), move_speed=args.move_speed
         )
+        poses=renderer.constrain_to_navmesh(poses)
         renderer.render(poses, args.output, controls)
     finally:
         renderer.close()

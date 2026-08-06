@@ -16,11 +16,13 @@ class PlaneGeometry:
             depth_confidence=confidence,
             diagnostics={"backend": "deterministic_plane"},
             depth_convention=Z_DEPTH,
+            scale_info={"mode":"metric_anchor","meters_per_world_unit":1.0,
+                        "uncertainty":0.0,"anchor_source":"parent_overlap"},
         )
 
 
 def main():
-    frames, height, width = 8, 24, 24
+    frames, height, width = 12, 24, 24
     rgb = np.full((frames, height, width, 3), 128, np.uint8)
     intrinsics = np.repeat(
         np.array([[20.0, 0, width / 2], [0, 20.0, height / 2], [0, 0, 1]], np.float32)[None],
@@ -56,16 +58,18 @@ def main():
         geometry_backend=PlaneGeometry(),
         coverage_threshold=0.5,
         low_coverage_chunks=1,
-        min_transition_frames=8,
+        min_transition_frames=12,
         min_translation_baseline=0.1,
         min_view_diversity=0.1,
         min_new_area_ratio=0.5,
         min_overlap_coverage=0.1,
-        candidate_coverage_threshold=0.01,
-        max_reprojection_error=1.0,
+        min_confidence_weighted_coverage=0.01,
+        max_overlap_rgb_error=1.0,max_heldout_rgb_error=1.0,
         max_overlap_depth_error=1.0,
+        max_heldout_depth_error=1.0,
         min_new_point_ratio=0.01,
         keyframe_count=8,
+        heldout_count=4,
     )
     active, event = manager.process_chunk(
         m0, rgb, CameraBatch(poses, intrinsics, height, width), warp, 0
@@ -74,7 +78,12 @@ def main():
     assert m0.status == "archived"
     assert active.node_id == "node_001" and active.status == "active"
     assert active.parent_id == "node_000"
-    print("memory transition passed", event["metrics"])
+    assert active.quality_metrics["verified_point_ratio"] > 0
+    print("memory transition passed", event["metrics"], {
+        "verified_point_ratio": active.quality_metrics["verified_point_ratio"],
+        "verified_support_mean": active.quality_metrics["verified_support_mean"],
+        "verified_baseline_mean": active.quality_metrics["verified_baseline_mean"],
+    })
 
 
 if __name__ == "__main__":

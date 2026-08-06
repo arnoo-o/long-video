@@ -2,6 +2,7 @@
 """Run dependency-light project tests; model/data tests remain explicit commands."""
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 
@@ -12,7 +13,9 @@ def main():
         "scripts/test_memory_transition.py",
     )
     for test in tests:
-        subprocess.run([sys.executable, str(root / test)], cwd=root, check=True)
+        env=os.environ.copy()
+        env["PYTHONPATH"]=str(root)+os.pathsep+env.get("PYTHONPATH","")
+        subprocess.run([sys.executable,str(root/test)],cwd=root,env=env,check=True)
     print("dependency-light full smoke passed")
 
 

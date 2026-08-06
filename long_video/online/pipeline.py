@@ -18,6 +18,7 @@ class OnlineSpatialHistoryPipeline:
         memory_manager=None,
         prompt="",
         renderer_kwargs=None,
+        control_kwargs=None,
         wah_state_kwargs=None,
     ):
         self.wah_pipeline = wah_pipeline
@@ -25,7 +26,8 @@ class OnlineSpatialHistoryPipeline:
         self.active_node = active_node
         self.memory_manager = memory_manager
         self.prompt = str(prompt)
-        self.renderer_kwargs = dict(renderer_kwargs or {})
+        self.renderer_kwargs = {"device":"cpu",**dict(renderer_kwargs or {})}
+        self.control_kwargs = dict(control_kwargs or {})
         self.wah_state_kwargs = dict(wah_state_kwargs or {})
         self.current_camera_c2w = (
             active_node.center_c2w.copy() if active_node is not None else np.eye(4, dtype=np.float32)
@@ -90,7 +92,8 @@ class OnlineSpatialHistoryPipeline:
             raise RuntimeError("initialize() must establish M0 before generation")
         if self.wah_adapter is None or self.autoregressive_state is None:
             raise RuntimeError("A loaded patched WAH pipeline and autoregressive state are required")
-        poses = integrate_controls(self.current_camera_c2w, controls)
+        poses = integrate_controls(self.current_camera_c2w, controls,
+                                   scale=self.active_node.scale,**self.control_kwargs)
         if not len(poses):
             raise ValueError("controls must contain at least one output frame")
         intrinsics = np.asarray(intrinsics, np.float32)
@@ -99,7 +102,11 @@ class OnlineSpatialHistoryPipeline:
         if len(intrinsics) != len(poses):
             raise ValueError("intrinsics count must match generated camera poses")
         cameras = CameraBatch(poses, intrinsics, int(height), int(width))
-        warp = render(self.active_node, cameras, **self.renderer_kwargs)
+        reactivation_event=None
+        if self.memory_manager is not None:
+            self.active_node,reactivation_event=self.memory_manager.maybe_reactivate(
+                self.active_node,cameras)
+        warp = render(self.active_node,cameras,**self.renderer_kwargs)
         generated_video, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
             self.autoregressive_state, warp, output_type="np"
         )
@@ -131,6 +138,7 @@ class OnlineSpatialHistoryPipeline:
             "mean_coverage": float(warp.coverage_per_frame.mean()),
             "high_conf_coverage": high_conf.reshape(len(poses), -1).mean(1).tolist(),
             "new_area_ratio": (1.0 - warp.coverage_per_frame).tolist(),
+            "reactivation_event":reactivation_event,
             "active_node_id": self.active_node.node_id,
             "memory_event": memory_event,
         }

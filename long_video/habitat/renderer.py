@@ -44,14 +44,43 @@ class HabitatSequenceRenderer:
 
     def initial_c2w(self):
         pose = np.eye(4, dtype=np.float32)
+        self.sensor_position=np.array([0.0,1.5,0.0],np.float32)
+        self.cv_to_habitat=np.diag([1.0,-1.0,-1.0]).astype(np.float32)
+        self.trajectory_validation={}
         if self.sim.pathfinder.is_loaded:
-            pose[:3, 3] = self.sim.pathfinder.get_random_navigable_point()
+            pose[:3,:3]=self.cv_to_habitat
+            pose[:3, 3] = self.sim.pathfinder.get_random_navigable_point()+self.sensor_position
         else:
-            pose[:3, 3] = np.asarray(self.agent.get_state().position, np.float32)
+            pose[:3,:3]=self.cv_to_habitat
+            pose[:3,3]=np.asarray(self.agent.get_state().position,np.float32)+self.sensor_position
         return pose
 
     def close(self):
         self.sim.close()
+    def constrain_to_navmesh(self,poses_c2w):
+        if not self.sim.pathfinder.is_loaded:
+            raise RuntimeError("Habitat trajectory validation requires a loaded navmesh")
+        corrected=[]; corrections=[]; previous=None
+        for index,pose in enumerate(np.asarray(poses_c2w,np.float32)):
+            value=pose.copy(); agent_rotation=value[:3,:3]@self.cv_to_habitat
+            desired=value[:3,3]-agent_rotation@self.sensor_position
+            if previous is None:
+                allowed=self.sim.pathfinder.snap_point(desired)
+            else:
+                allowed=self.sim.pathfinder.try_step(previous,desired)
+            if not np.isfinite(allowed).all():
+                raise ValueError(f"navmesh returned invalid point for frame {index}")
+            correction=float(np.linalg.norm(allowed-desired))
+            value[:3,3]=allowed+agent_rotation@self.sensor_position
+            corrected.append(value); corrections.append(correction); previous=allowed
+        self.trajectory_validation={
+            "navmesh_loaded":True,"collision_checked":True,
+            "max_position_correction":float(max(corrections,default=0)),
+            "mean_position_correction":float(np.mean(corrections) if corrections else 0),
+            "corrected_frame_count":int(np.count_nonzero(np.asarray(corrections)>1e-5)),
+        }
+        return np.stack(corrected)
+
 
     def render(self, poses_c2w, output_dir, controls=None, prompt="indoor room"):
         root = Path(output_dir)
@@ -60,9 +89,14 @@ class HabitatSequenceRenderer:
         for index, pose in enumerate(np.asarray(poses_c2w, np.float32)):
             state = self.agent.get_state()
             # OpenCV y-down/z-forward to Habitat y-up/-z-forward.
-            basis = np.diag([1.0, -1.0, -1.0]).astype(np.float32)
-            state.position = pose[:3, 3]
-            state.rotation = _habitat_quaternion(pose[:3, :3] @ basis)
+            agent_rotation=pose[:3,:3]@self.cv_to_habitat
+            agent_position=pose[:3,3]-agent_rotation@self.sensor_position
+            if self.sim.pathfinder.is_loaded:
+                snapped=self.sim.pathfinder.snap_point(agent_position)
+                if not np.isfinite(snapped).all() or np.linalg.norm(snapped-agent_position)>0.15:
+                    raise ValueError(f"trajectory frame {index} leaves navmesh/collides")
+            state.position = agent_position
+            state.rotation = _habitat_quaternion(agent_rotation)
             self.agent.set_state(state)
             observations = self.sim.get_sensor_observations()
             rgb = np.asarray(observations["color_sensor"])[..., :3]
@@ -84,5 +118,12 @@ class HabitatSequenceRenderer:
         (root / "metadata.json").write_text(json.dumps({
             "depth_convention": "Z_DEPTH", "coordinate_convention": "OpenCV_c2w",
             "height": self.height, "width": self.width, "hfov_degrees": self.hfov,
+            "sensor_extrinsics": {
+                "agent_to_rgb_translation": self.sensor_position.tolist(),
+                "agent_to_depth_translation": self.sensor_position.tolist(),
+                "agent_to_sensor_rotation": np.eye(3,dtype=np.float32).tolist(),
+            },
+            "poses_are_sensor_c2w": True,
+            "trajectory_validation": self.trajectory_validation,
         }, indent=2), encoding="utf-8")
         return root

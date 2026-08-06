@@ -1,5 +1,13 @@
+mode: sparse_images_pi3
+completion_backend: dit360
+geometry_backend: pi3_holo360d_8views
 view_count: 8
 fov_degrees: 90
-height: 256
-width: 256
+height: 512
+width: 512
 observed_indices: [0]
+voxel_size: 0.02
+scale:
+  same_center_mode: relative
+  relative_median_world_units: 1.0
+  require_explicit_known_depth_convention: true

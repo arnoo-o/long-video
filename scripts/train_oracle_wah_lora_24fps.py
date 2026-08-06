@@ -54,6 +54,19 @@ def _gpu_processes():
     result=subprocess.run(["nvidia-smi","--query-compute-apps=gpu_uuid,pid,used_gpu_memory,name","--format=csv,noheader,nounits"],text=True,capture_output=True)
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
+def _tree_to(value, device):
+    """Move a nested tensor tree without changing its non-tensor metadata."""
+    import torch
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device, non_blocking=False)
+    if isinstance(value, dict):
+        return {key:_tree_to(item,device) for key,item in value.items()}
+    if isinstance(value, list):
+        return [_tree_to(item,device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_tree_to(item,device) for item in value)
+    return value
+
 def main():
     args=_args(); repo=Path(__file__).resolve().parents[1]; sys.path.insert(0,str(repo))
     from long_video.config import load_yaml
@@ -115,6 +128,28 @@ def main():
         prompt,histories=_history(opt,pipe,exact,device,mean,std,sample["target"][0],sample["prompt"],sample["warp"],sample["visibility"],sample["confidence"],sample["metadata"]["sequence_id"])
         return target_latents,prompt,histories
 
+    # VAE encoding and external-warp history construction are deterministic for
+    # a prepared window and dominated formal-training wall time. Keep only
+    # these encoded conditioning values in CPU RAM. Flow-matching noise,
+    # timestep and stage items are still freshly sampled on every microstep.
+    encoded_train_cache={}
+    def cached_train_sample(path):
+        key=str(path)
+        if key not in encoded_train_cache:
+            sample=_read_sample(path,exact.num_frames)
+            latents,prompt,histories=encode(sample)
+            encoded_train_cache[key]=(
+                _tree_to(latents,"cpu"),
+                _tree_to(prompt,"cpu"),
+                _tree_to(histories,"cpu"),
+                sample["weights"].copy(),
+            )
+            del latents,prompt,histories
+            torch.cuda.empty_cache()
+        latents_cpu,prompt_cpu,histories_cpu,weights=encoded_train_cache[key]
+        return (_tree_to(latents_cpu,device),_tree_to(prompt_cpu,device),
+                _tree_to(histories_cpu,device),weights)
+
     fixed=_read_sample(diagnostic_paths[0],exact.num_frames); fixed_latents,fixed_prompt,fixed_histories=encode(fixed)
     opt.seed_global_rng(exact.seed); fixed_items=opt.flow_matching_train_exact_items(pipe,fixed_latents,exact,device)
     def fixed_loss():
@@ -143,8 +178,8 @@ def main():
         for micro in range(accumulation):
             if args.mode=="smoke": latents,prompt,histories,weights=fixed_latents,fixed_prompt,fixed_histories,fixed["weights"]
             else:
-                sample=_read_sample(train_paths[int(rng.integers(len(train_paths)))],exact.num_frames)
-                latents,prompt,histories=encode(sample); weights=sample["weights"]
+                latents,prompt,histories,weights=cached_train_sample(
+                    train_paths[int(rng.integers(len(train_paths)))])
             loss,_,_=masked_flow_matching_loss(pipe,prompt,latents,histories,exact,device,weights,fixed_stage_items=fixed_items if args.mode=="smoke" else None)
             if not torch.isfinite(loss): raise FloatingPointError("non-finite weighted flow-matching loss")
             (loss/accumulation).backward(); micro_losses.append(float(loss.detach().cpu()))

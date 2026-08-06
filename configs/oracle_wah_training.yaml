@@ -22,6 +22,17 @@ output_root: null
 checkpoint_root: null
 production_threshold_config: configs/online_memory.yaml
 assumed_fps: 3.0
+data_fps_nominal: 3
+model_fps: 24
+output_fps: 24
+anchor_stride: 8
+chunk_frames: 33
+chunk_stride: 32
+vae_temporal_scale: 4
+gap_factor: 2.5
+rife_root: null
+rife_checkpoint: null
+rife_python: null
 oracle_voxel_size: 0.01
 renderer:
   near: 0.05
@@ -29,9 +40,14 @@ renderer:
   point_radius: 1
   chunk_points: 1000000
 training:
-  max_steps: 20
+  max_steps: 1000
+  batch_size: 1
+  gradient_accumulation_steps: 4
   learning_rate: 0.0001
   max_grad_norm: 1.0
+  warmup_steps: 50
+  checkpoint_every: 100
+  seed: 42
   lora_rank: 8
   lora_alpha: 8
   lora_dropout: 0.0

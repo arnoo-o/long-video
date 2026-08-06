@@ -116,3 +116,12 @@ ReplicaCAD output stores true RGB/depth sensor c2w and sensor extrinsics. Valida
     CUDA_VISIBLE_DEVICES=1 PYTHONPATH=.       /ephemeral/mdu/envs/longvideo-habitat/bin/python       scripts/render_habitat_sequence.py       --scene-dataset-config /ephemeral/mdu/long-video-data/raw/replicacad/replica_cad_baked_lighting/replicaCAD_baked.scene_dataset_config.json       --scene-id Baked_sc1_staging_00       --output outputs/habitat_sensor_pose --height 128 --width 128
 
 See docs/IMPLEMENTATION_STATUS.md for measurements and remaining limitations.
+## 24 FPS Practical-RIFE Oracle adaptation
+
+`build_holo_oracle_24fps.py` scans Holo timestamps, rejects acquisition gaps, and allocates eight train windows, two diagnostic windows, and one disjoint four-chunk rollout window. Five real anchors become 33 model frames; seventeen anchors become 129 frames. Practical-RIFE 4.25 full generates exactly seven frames at 1/8 through 7/8 between anchors. Real anchors are byte-preserved.
+
+Camera translation is linearly interpolated and rotation uses SLERP. Source ERP depth remains RAY_DISTANCE; rendered warp and anchor-only evaluation depth use Z_DEPTH. Interpolated evaluation depth is NaN. RGB supervision weights are 0 for the source prefix, 1 for real anchors, and 0.25 for RIFE-only frames, then averaged over the real VAE temporal groups.
+
+Multi-window training is invoked through `scripts/train_oracle_wah_lora.py --mode smoke|train --manifest ...`. It uses the official WAH/Helios VAE, external short warp history, confidence patch, train-exact flow matching, and LoRA. Formal training uses four fresh random-window microsteps per optimizer step. Checkpoints contain LoRA, optimizer, scheduler, global step, RNG state, manifest SHA, Git SHA, and RIFE checkpoint SHA.
+
+The four-chunk rollout renders each chunk from the active SpatialNode, initializes WAH state once, passes only generated RGB to MemoryManager, evaluates only real anchors, and writes 129 frames at 24 FPS. M1 uses parent warp evidence plus generated RGB and Pi3 geometry; target supervision never enters memory.

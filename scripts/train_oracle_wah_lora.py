@@ -266,4 +266,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--manifest" in sys.argv:
+        from train_oracle_wah_lora_24fps import main as multiwindow_main
+        multiwindow_main()
+    else:
+        main()

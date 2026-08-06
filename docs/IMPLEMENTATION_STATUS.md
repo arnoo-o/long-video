@@ -56,3 +56,8 @@ Last validated: 2026-08-06. H100 host: h100-demo. All GPU tests used physical GP
 - ReplicaCAD package reports missing navmeshes for unrelated sc4 scenes and the Habitat environment lacks Bullet articulated-object support. The selected static baked sc1 scene and its navmesh work.
 - Pi3 uses the slower PyTorch RoPE2D fallback because the optional CUDA extension is unavailable.
 - Single-chunk optimizer training and four-chunk no-grad rollout are complete. Multi-chunk optimizer training, M2, reactivation in this Oracle P0, and production threshold calibration remain out of scope.
+## 24 FPS Oracle WAH status
+
+- Implemented: gap-safe split allocation; exact 8x Practical-RIFE adapter; midpoint regression test; 24 FPS c2w interpolation; dense supervision weights; multi-window LoRA trainer; RNG-complete checkpoints; streaming active-node rollout; anchor metrics; seven-artifact rendering entrypoints.
+- Real validation: official RIFE 4.25 full midpoint gate passed; all 11 Indoor_013 windows validated; focused CPU suite passed 15 tests.
+- Pending at this code revision: real LoRA smoke/formal optimizer runs, 1000-step completion, final four-chunk rollout, MP4 verification, and final result documentation. These must not be reported complete until H100 outputs exist.

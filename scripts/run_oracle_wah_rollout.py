@@ -80,7 +80,6 @@ def main():
     gpu0_and_gpu1_before = _gpu_processes()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu)
     os.environ.setdefault("XFORMERS_DISABLED", "1")
-    import imageio.v2 as imageio
     import numpy as np
     import torch
     from PIL import Image
@@ -98,6 +97,7 @@ def main():
     from long_video.memory.node_store import NodeStore
     from long_video.oracle_training.contracts import GeneratedMemoryBatch
     from long_video.oracle_training.dataset import attach_warp_provenance
+    from long_video.oracle_training.rollout_artifacts import RolloutArtifacts
     from long_video.types import CameraBatch
 
     sequence = Path(args.sequence)
@@ -145,7 +145,7 @@ def main():
     if int(state["window_num_frames"]) != chunk_frames:
         raise ValueError("dataset chunk_frames differs from official WAH state.window_num_frames")
     rollout_root.mkdir(parents=True, exist_ok=True)
-    writer = imageio.get_writer(rollout_root / "rollout.mp4", fps=float(config.get("assumed_fps", 16.0)), macro_block_size=1)
+    artifacts = RolloutArtifacts(rollout_root, sequence / "target" / "target_rgb_for_loss", fps=int(config.get("output_fps", 24)), anchor_stride=int(config.get("anchor_stride", 8)))
     chunk_records = []
     try:
         with torch.no_grad():
@@ -198,8 +198,9 @@ def main():
                     frame_start=global_start + (1 if drop_boundary else 0),
                 )
                 output_uint8 = generated_rgb_for_memory if generated_rgb_for_memory.dtype == np.uint8 else np.rint(np.clip(generated_rgb_for_memory, 0, 1) * 255).astype(np.uint8)
-                for frame in output_uint8:
-                    writer.append_data(frame)
+                artifacts.append_chunk(output_uint8, memory_warp.rgb, memory_warp.visibility, memory_warp.confidence,
+                    global_start=global_start + (1 if drop_boundary else 0), chunk_index=chunk_index,
+                    node_id=node_at_start.node_id, event=event)
                 del output_uint8, generated_full, generated_video
                 decoded_before_clear = _clear_decoded_history(state)
                 torch.cuda.empty_cache()
@@ -223,7 +224,7 @@ def main():
                     "boundary_frame_state_bytes": int(_tensor_bytes(state.get("prev_chunk_last_frame"))),
                 })
     finally:
-        writer.close()
+        artifact_result = artifacts.close()
     promotion_chunks = [record["chunk_index"] for record in chunk_records if record["candidate_event"].get("accepted")]
     switched_after_promotion = all(
         index + 1 < len(chunk_records) and chunk_records[index + 1]["warp_renderer_node_id"] == chunk_records[index]["active_node_for_next_chunk"]
@@ -239,7 +240,7 @@ def main():
         "state_bounded": all(record["gpu_decoded_history_tensor_bytes"] == 0 for record in chunk_records),
         "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(0)),
         "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(0)),
-        "elapsed_seconds": time.perf_counter() - started,
+        "elapsed_seconds": time.perf_counter() - started, "artifacts": artifact_result,
         "gpu_processes_before": gpu0_and_gpu1_before, "gpu_processes_after": _gpu_processes(),
     }
     (rollout_root / "rollout_result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")

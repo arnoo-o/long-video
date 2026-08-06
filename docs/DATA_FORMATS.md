@@ -16,7 +16,7 @@ The subprocess manifest lists prompt, observed image path, yaw/pitch, FOV or int
 
 Output contains views_rgb.npy [8,H,W,3], view_poses.npy [8,4,4], intrinsics.npy [8,3,3], observed_masks.npy, source_maps.npy, image_confidence.npy, erp_rgb.npy, erp_valid_mask.npy, erp_fusion_weight.npy, erp_conflict.npy, metadata.json and preview_panorama.png.
 
-## Spatial node schema v3
+## Spatial node schema v4
 
 metadata.json stores node ID/status/parent, center c2w, bounds, coverage radius, depth convention, ScaleMetadata, model versions, quality metrics and the NPZ SHA-256.
 
@@ -31,3 +31,38 @@ Each buffered frame carries generated RGB, c2w, intrinsics, old-node warp RGB/Z-
 ## WAH sample
 
 sample_xxx contains first_frame.png, target_video.mp4, camera_poses.npy, warp_video.mp4, warp_visibility_mask.npy, warp_confidence.npy, warp_source.npy, prompt.txt and metadata.json. Visibility/confidence/source share [T,H,W]. Legacy samples without confidence use one on visible pixels and zero elsewhere.
+## Oracle WAH sequence
+
+Each sequence_id contains:
+
+    source/
+      source_erp_rgb.png
+      source_erp_depth_ray_distance.npy
+      source_erp_mask.png
+      source_c2w_world.npy
+      source_perspective.png
+    target/
+      target_rgb_for_loss/
+      target_z_depth_for_eval.npy
+      target_ray_distance_for_reference.npy
+      target_valid_mask.npy
+      target_c2w_world.npy
+      target_c2w_local.npy
+      intrinsics.npy
+    single_chunk_warp/
+      warp_rgb/
+      warp_z_depth.npy
+      warp_visibility.npy
+      warp_confidence.npy
+      rgb_content_origin.npy
+      depth_content_origin.npy
+      evidence_role.npy
+      rgb_evidence_role.npy
+      depth_evidence_role.npy
+    session/nodes/node_000/
+    primary_loss_mask_rgb.npy
+    primary_loss_mask_latent.npy
+    prompt.txt
+    metadata.json
+
+The ERP is 2:1 and source depth is RAY_DISTANCE. Perspective target evaluation depth and renderer depth are Z_DEPTH at 384x640. geometry_source_frame_ids contains only the source frame and future_geometry_used is false. Content origins are separate from evidence roles: Oracle M0 is oracle_source/direct_source; parent-warp pixels inherit parent origins; candidate new RGB is model_generated/current_generation; candidate new depth is pi3_prediction.

@@ -13,6 +13,11 @@ class TransitionFrame:
     warp_visibility: np.ndarray
     old_node_warp_depth: np.ndarray
     old_node_warp_source: np.ndarray
+    old_node_warp_rgb_content_origin: np.ndarray
+    old_node_warp_depth_content_origin: np.ndarray
+    old_node_warp_evidence_role: np.ndarray
+    old_node_warp_rgb_evidence_role: np.ndarray
+    old_node_warp_depth_evidence_role: np.ndarray
     old_node_depth_convention: str
     warp_confidence: np.ndarray
     coverage: float

@@ -4,6 +4,7 @@ Camera convention is OpenCV: +x right, +y down, +z forward.  Equirectangular
 latitude is positive up, so latitude equals -asin(direction_y).
 """
 import numpy as np
+from .erp_geometry import perspective_unit_rays
 
 def intrinsics_from_fov(fov_degrees, width, height):
     f = 0.5 * width / np.tan(np.deg2rad(float(fov_degrees)) * 0.5)
@@ -32,9 +33,7 @@ def equirectangular_to_perspective(image, yaw, pitch=0., fov_degrees=90., height
     image = np.asarray(image)
     ph, pw = image.shape[:2]
     k = intrinsics_from_fov(fov_degrees, width, height)
-    y, x = np.indices((height, width), dtype=np.float32)
-    rays = np.stack(((x-k[0,2])/k[0,0], (y-k[1,2])/k[1,1], np.ones_like(x)), -1)
-    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    rays = perspective_unit_rays(k, height, width)
     direction = rays @ rotation_yaw_pitch(yaw, pitch).T
     longitude = np.arctan2(direction[...,0], direction[...,2])
     latitude = -np.arcsin(np.clip(direction[...,1], -1., 1.))

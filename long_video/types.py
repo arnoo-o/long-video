@@ -5,6 +5,16 @@ import numpy as np
 RAY_DISTANCE = "RAY_DISTANCE"
 Z_DEPTH = "Z_DEPTH"
 SCALE_MODES = {"metric_anchor", "dataset_calibrated", "relative"}
+RGB_CONTENT_ORIGINS = {
+    "oracle_source", "model_generated", "ground_truth_supervision_only"
+}
+DEPTH_CONTENT_ORIGINS = {
+    "oracle_source", "pi3_prediction", "model_generated_geometry",
+    "ground_truth_supervision_only",
+}
+EVIDENCE_ROLES = {
+    "direct_source", "parent_warp", "current_generation", "geometry_prediction"
+}
 
 
 @dataclass
@@ -74,6 +84,16 @@ class SpatialNode:
     point_view_mask: Optional[np.ndarray] = None
     scale: ScaleMetadata = field(default_factory=ScaleMetadata)
     model_versions: dict = field(default_factory=dict)
+    points_rgb_content_origin: Optional[np.ndarray] = None
+    points_depth_content_origin: Optional[np.ndarray] = None
+    points_evidence_role: Optional[np.ndarray] = None
+    view_rgb_content_origin: Optional[np.ndarray] = None
+    view_depth_content_origin: Optional[np.ndarray] = None
+    view_evidence_role: Optional[np.ndarray] = None
+    points_rgb_evidence_role: Optional[np.ndarray] = None
+    points_depth_evidence_role: Optional[np.ndarray] = None
+    view_rgb_evidence_role: Optional[np.ndarray] = None
+    view_depth_evidence_role: Optional[np.ndarray] = None
 
 @dataclass
 class WarpBatch:
@@ -83,3 +103,8 @@ class WarpBatch:
     confidence: np.ndarray
     source: np.ndarray
     coverage_per_frame: np.ndarray
+    rgb_content_origin: Optional[np.ndarray] = None
+    depth_content_origin: Optional[np.ndarray] = None
+    evidence_role: Optional[np.ndarray] = None
+    rgb_evidence_role: Optional[np.ndarray] = None
+    depth_evidence_role: Optional[np.ndarray] = None

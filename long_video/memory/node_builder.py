@@ -36,7 +36,7 @@ def build_from_views(view_set:ViewSet,node_id="node_000",center_c2w=None,created
         bmin.astype(np.float32),bmax.astype(np.float32),
         rgb_to_uint8(view_set.rgb),view_set.depth,view_set.c2w,view_set.intrinsics,
         pos.astype(np.float32),col,confidence,source,count,None,
-        view_set.depth_convention,3,metrics,
+        view_set.depth_convention,4,metrics,
         view_source=np.asarray(view_set.source,np.int8),
         view_image_confidence=np.asarray(view_set.image_confidence,np.float32),
         view_depth_confidence=np.asarray(view_set.depth_confidence,np.float32),

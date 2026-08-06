@@ -122,7 +122,7 @@ class ScaleGeometryTests(unittest.TestCase):
             NodeStore(root).save(two)
             loaded=NodeStore(root).load(two.node_id)
             np.testing.assert_array_equal(loaded.point_view_mask,two.point_view_mask)
-            self.assertEqual(loaded.schema_version,3)
+            self.assertEqual(loaded.schema_version,4)
 
     def test_intrinsics_resize_and_controls(self):
         k=np.array([[100,0,49.5],[0,120,39.5],[0,0,1]],np.float32)

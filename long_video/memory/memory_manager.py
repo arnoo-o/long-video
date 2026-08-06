@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 
 from ..geometry.point_renderer import render
+from ..data.camera import rgb_to_float01
 from ..types import CameraBatch, ScaleMetadata, ViewSet, Z_DEPTH
 from .node_builder import build_from_views
 from ..online.transition_buffer import TransitionBuffer
@@ -101,33 +102,74 @@ class MemoryManager:
             and overlap >= self.min_overlap_coverage
         )
 
-    def _append_chunk(self, generated, cameras, warp, frame_start):
-        for index in range(len(generated)):
+    def _append_chunk(self, generated_rgb_for_memory, cameras, warp, frame_start):
+        from ..oracle_training.contracts import assert_no_supervision_content
+        assert_no_supervision_content({"generated_rgb_for_memory": generated_rgb_for_memory}, "MemoryManager")
+        for index in range(len(generated_rgb_for_memory)):
             self.buffer.append(
-                generated_rgb=np.asarray(generated[index]),
+                generated_rgb=np.asarray(generated_rgb_for_memory[index]),
                 camera_c2w=np.asarray(cameras.c2w[index], np.float32),
                 intrinsics=np.asarray(cameras.intrinsics[index], np.float32),
                 old_node_warp=np.asarray(warp.rgb[index]),
                 warp_visibility=np.asarray(warp.visibility[index]),
                 old_node_warp_depth=np.asarray(warp.depth[index],np.float32),
                 old_node_warp_source=np.asarray(warp.source[index],np.int8),
+                old_node_warp_rgb_content_origin=np.asarray(
+                    warp.rgb_content_origin[index] if warp.rgb_content_origin is not None
+                    else np.where(warp.source[index] == 0, "oracle_source", "model_generated")
+                ),
+                old_node_warp_depth_content_origin=np.asarray(
+                    warp.depth_content_origin[index] if warp.depth_content_origin is not None
+                    else np.where(warp.source[index] == 0, "oracle_source", "pi3_prediction")
+                ),
+                old_node_warp_evidence_role=np.asarray(
+                    warp.evidence_role[index] if warp.evidence_role is not None
+                    else np.full(warp.source[index].shape, "parent_warp", dtype="U24")
+                ),
+                old_node_warp_rgb_evidence_role=np.asarray(
+                    warp.rgb_evidence_role[index] if warp.rgb_evidence_role is not None
+                    else (warp.evidence_role[index] if warp.evidence_role is not None
+                          else np.full(warp.source[index].shape,"parent_warp",dtype="U24"))
+                ),
+                old_node_warp_depth_evidence_role=np.asarray(
+                    warp.depth_evidence_role[index] if warp.depth_evidence_role is not None
+                    else (warp.evidence_role[index] if warp.evidence_role is not None
+                          else np.full(warp.source[index].shape,"parent_warp",dtype="U24"))
+                ),
                 old_node_depth_convention=Z_DEPTH,
                 warp_confidence=np.asarray(warp.confidence[index]),
                 coverage=float(warp.coverage_per_frame[index]),
                 global_frame_index=int(frame_start + index),
             )
 
+    @staticmethod
+    def _generated_image_confidence(rgb, known_mask, base_confidence):
+        """Per-pixel generated-RGB confidence from texture and parent proximity."""
+        from scipy.ndimage import distance_transform_edt
+        value = rgb_to_float01(rgb)
+        gray = value.mean(axis=-1)
+        grad_y, grad_x = np.gradient(gray)
+        gradient = np.sqrt(grad_x * grad_x + grad_y * grad_y)
+        scale = float(np.percentile(gradient, 95))
+        texture = np.clip(gradient / max(scale, 1e-6), 0.0, 1.0)
+        distance = distance_transform_edt(~np.asarray(known_mask, bool))
+        height, width = known_mask.shape
+        proximity = np.exp(-distance / max(0.25 * np.hypot(height, width), 1.0))
+        confidence = float(base_confidence) * (0.4 + 0.3 * texture + 0.3 * proximity)
+        return np.clip(confidence, 0.0, 1.0).astype(np.float32)
     def build_candidate(self, active_node, created_frame):
         if self.geometry_backend is None:
             raise RuntimeError("MemoryManager requires a geometry backend to construct M1")
         frames, heldout = self.buffer.select_keyframes(self.keyframe_count,self.heldout_count)
         if len(frames) != self.keyframe_count or len(heldout) != self.heldout_count:
             raise RuntimeError("Need 8 mapping and at least 4 held-out transition frames")
-        rgb = np.stack([frame.generated_rgb for frame in frames])
+        generated_rgb = rgb_to_float01(np.stack([frame.generated_rgb for frame in frames]))
+        parent_rgb = rgb_to_float01(np.stack([frame.old_node_warp for frame in frames]))
+        known_mask = np.stack([frame.warp_visibility for frame in frames])
+        rgb = np.where(known_mask[..., None], parent_rgb, generated_rgb)
         c2w = np.stack([frame.camera_c2w for frame in frames]).astype(np.float32)
         intrinsics = np.stack([frame.intrinsics for frame in frames]).astype(np.float32)
         known_depth=np.stack([frame.old_node_warp_depth for frame in frames])
-        known_mask=np.stack([frame.warp_visibility for frame in frames])
         prediction = self.geometry_backend.predict(
             rgb,c2w,intrinsics,known_depth=known_depth,known_mask=known_mask,
             known_depth_convention=Z_DEPTH,known_scale=active_node.scale,
@@ -135,16 +177,33 @@ class MemoryManager:
         source=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_source,2)
             for frame in frames]).astype(np.int8)
+        # Each factor is applied exactly once by node_builder:
+        # source_prior x image_confidence x depth_confidence.
+        generated_image_confidence=np.stack([
+            self._generated_image_confidence(generated_rgb[index],frame.warp_visibility,
+                                             self.generated_confidence)
+            for index,frame in enumerate(frames)]).astype(np.float32)
         image_confidence=np.stack([
-            np.where(frame.warp_visibility,frame.warp_confidence,
-                     self.generated_confidence*prediction.depth_confidence[index])
+            np.where(frame.warp_visibility,1.0,generated_image_confidence[index])
             for index,frame in enumerate(frames)]).astype(np.float32)
         depth=np.asarray(prediction.depth,np.float32).copy()
         depth_confidence=np.asarray(prediction.depth_confidence,np.float32).copy()
+        from ..geometry.confidence import DEFAULT_SOURCE_PRIOR
         for index,frame in enumerate(frames):
             valid=frame.warp_visibility & np.isfinite(frame.old_node_warp_depth)
             depth[index][valid]=frame.old_node_warp_depth[valid]
-            depth_confidence[index][valid]=frame.warp_confidence[valid]
+            prior=np.asarray([
+                DEFAULT_SOURCE_PRIOR.get(int(item),0.0)
+                for item in frame.old_node_warp_source.ravel()
+            ],np.float32).reshape(frame.old_node_warp_source.shape)
+            inherited=np.divide(
+                frame.warp_confidence,prior,
+                out=np.zeros_like(frame.warp_confidence,dtype=np.float32),
+                where=prior>0,
+            )
+            # Multiplication by source_prior in node_builder reconstructs the
+            # inherited parent confidence instead of applying that prior twice.
+            depth_confidence[index][valid]=np.clip(inherited[valid],0.0,1.0)
         views = ViewSet(
             rgb=rgb,
             depth=depth,
@@ -165,6 +224,45 @@ class MemoryManager:
             status="candidate",
             parent_id=active_node.node_id,
         )
+        view_rgb_origin=np.stack([
+            np.where(frame.warp_visibility,frame.old_node_warp_rgb_content_origin,
+                     "model_generated") for frame in frames])
+        view_depth_origin=np.stack([
+            np.where(frame.warp_visibility,frame.old_node_warp_depth_content_origin,
+                     "pi3_prediction") for frame in frames])
+        view_rgb_evidence=np.stack([
+            np.where(frame.warp_visibility,"parent_warp","current_generation")
+            for frame in frames])
+        view_depth_evidence=np.stack([
+            np.where(frame.warp_visibility,"parent_warp","geometry_prediction")
+            for frame in frames])
+        candidate.view_rgb_content_origin=view_rgb_origin
+        candidate.view_depth_content_origin=view_depth_origin
+        candidate.view_evidence_role=view_rgb_evidence
+        candidate.view_rgb_evidence_role=view_rgb_evidence
+        candidate.view_depth_evidence_role=view_depth_evidence
+        generated_points=np.isin(candidate.points_source,(2,3))
+        candidate.points_rgb_content_origin=np.where(
+            generated_points,"model_generated","oracle_source").astype("U24")
+        candidate.points_depth_content_origin=np.where(
+            generated_points,"pi3_prediction","oracle_source").astype("U24")
+        candidate.points_rgb_evidence_role=np.where(
+            generated_points,"current_generation","parent_warp").astype("U24")
+        candidate.points_depth_evidence_role=np.where(
+            generated_points,"geometry_prediction","parent_warp").astype("U24")
+        candidate.points_evidence_role=candidate.points_rgb_evidence_role.copy()
+        from ..oracle_training.contracts import validate_content_labels
+        validate_content_labels(
+            candidate.view_rgb_content_origin,candidate.view_depth_content_origin,
+            candidate.view_rgb_evidence_role,candidate.view_depth_evidence_role)
+        generated_region=candidate.view_rgb_evidence_role=="current_generation"
+        generated_confidence_values=candidate.view_image_confidence[generated_region]
+        candidate.quality_metrics["generated_image_confidence_min"]=float(
+            generated_confidence_values.min() if generated_confidence_values.size else 0.0)
+        candidate.quality_metrics["generated_image_confidence_max"]=float(
+            generated_confidence_values.max() if generated_confidence_values.size else 0.0)
+        candidate.quality_metrics["generated_image_confidence_std"]=float(
+            generated_confidence_values.std() if generated_confidence_values.size else 0.0)
         candidate.quality_metrics["distinct_view_ratio"] = float((candidate.observation_count>=2).mean())
         candidate.quality_metrics["relative_pose"] = (
             np.linalg.inv(active_node.center_c2w) @ candidate.center_c2w
@@ -234,11 +332,32 @@ class MemoryManager:
             height,
             width,
         )
+        validation_frames=list(heldout[:4])+list(frames[:4])
+        if len(validation_frames)!=8:
+            raise RuntimeError("held-out Pi3 validation requires four held-out and four mapping references")
+        validation_generated=rgb_to_float01(np.stack([
+            frame.generated_rgb for frame in validation_frames]))
+        validation_parent=rgb_to_float01(np.stack([
+            frame.old_node_warp for frame in validation_frames]))
+        validation_known_mask=np.stack([
+            frame.warp_visibility for frame in validation_frames])
+        validation_rgb=np.where(
+            validation_known_mask[...,None],validation_parent,validation_generated)
+        validation_prediction=self.geometry_backend.predict(
+            validation_rgb,
+            np.stack([frame.camera_c2w for frame in validation_frames]).astype(np.float32),
+            np.stack([frame.intrinsics for frame in validation_frames]).astype(np.float32),
+            known_depth=np.stack([
+                frame.old_node_warp_depth for frame in validation_frames]).astype(np.float32),
+            known_mask=validation_known_mask,
+            known_depth_convention=Z_DEPTH,
+            known_scale=candidate.scale,
+        )
         rendered = render(candidate, cameras, point_radius=0, device="cpu")
         def rgb01(value):
             value=np.asarray(value,np.float32)
             return value/255.0 if value.size and value.max()>1 else value
-        overlap_rgb=[]; overlap_depth=[]; held_rgb=[]; held_depth=[]
+        overlap_rgb=[]; overlap_depth=[]; held_rgb=[]; held_depth=[]; held_depth_pixels=[]
         for index,frame in enumerate(all_frames):
             overlap=(rendered.visibility[index] & frame.warp_visibility &
                      np.isfinite(rendered.depth[index]) &
@@ -253,20 +372,54 @@ class MemoryManager:
                 if valid.any():
                     held_rgb.append(float(np.abs(rendered.rgb[index][valid]-
                                                rgb01(frame.generated_rgb)[valid]).mean()))
-                depth_valid=overlap
+                heldout_index=index-len(frames)
+                predicted_depth=np.asarray(
+                    validation_prediction.depth[heldout_index],np.float32)
+                depth_valid=(rendered.visibility[index] & ~frame.warp_visibility &
+                             np.isfinite(rendered.depth[index]) &
+                             np.isfinite(predicted_depth) & (predicted_depth>0))
+                held_depth_pixels.append(int(depth_valid.sum()))
                 if depth_valid.any():
-                    held_depth.append(float(np.median(np.abs(rendered.depth[index][depth_valid]-
-                                                           frame.old_node_warp_depth[depth_valid]))))
+                    held_depth.append(float(np.median(np.abs(
+                        rendered.depth[index][depth_valid]-predicted_depth[depth_valid]))))
         metrics = {
             "overlap_rgb_error": float(np.mean(overlap_rgb)) if overlap_rgb else float("inf"),
             "overlap_depth_error": float(np.mean(overlap_depth)) if overlap_depth else float("inf"),
             "heldout_rgb_error": float(np.mean(held_rgb)) if held_rgb else float("inf"),
             "heldout_depth_error": float(np.mean(held_depth)) if held_depth else float("inf"),
+            "heldout_depth_valid_pixels": int(sum(held_depth_pixels)),
             "scale_dispersion": float(candidate.scale.uncertainty),
             "pose_error": float(candidate.quality_metrics["geometry_diagnostics"].get("pose_error",0.0)),
             "valid_depth_ratio": float(np.isfinite(candidate.view_depth).mean()),
             "new_point_ratio": float(candidate.quality_metrics.get("new_point_ratio",0.0)),
+            "pixel_coverage": float(rendered.visibility.mean()),
             "confidence_weighted_coverage": float((rendered.visibility*rendered.confidence).mean()),
+            "distinct_view_count": int(candidate.observation_count.max(initial=0)),
+            "confidence_source": candidate.quality_metrics["geometry_diagnostics"].get(
+                "confidence_source","unknown"),
+            "confidence_type": candidate.quality_metrics["geometry_diagnostics"].get(
+                "confidence_type","unknown"),
+            "heldout_confidence_source": validation_prediction.diagnostics.get(
+                "confidence_source","unknown"),
+            "heldout_confidence_type": validation_prediction.diagnostics.get(
+                "confidence_type","unknown"),
+            "known_rgb_content_origins": sorted(np.unique(
+                candidate.view_rgb_content_origin[
+                    candidate.view_rgb_evidence_role=="parent_warp"]).tolist()),
+            "known_depth_content_origins": sorted(np.unique(
+                candidate.view_depth_content_origin[
+                    candidate.view_depth_evidence_role=="parent_warp"]).tolist()),
+            "known_evidence_role": "parent_warp",
+            "new_rgb_content_origin": "model_generated",
+            "new_rgb_evidence_role": "current_generation",
+            "new_depth_content_origin": "pi3_prediction",
+            "new_depth_evidence_role": "geometry_prediction",
+            "generated_image_confidence_min": candidate.quality_metrics[
+                "generated_image_confidence_min"],
+            "generated_image_confidence_max": candidate.quality_metrics[
+                "generated_image_confidence_max"],
+            "generated_image_confidence_std": candidate.quality_metrics[
+                "generated_image_confidence_std"],
         }
         candidate.quality_metrics.update(metrics)
         accepted = (
@@ -286,7 +439,9 @@ class MemoryManager:
             candidate.quality_metrics["verified_point_ratio"]=float(verified.mean())
         return accepted, metrics
 
-    def promote(self, active, candidate):
+    def promote(self, active, candidate, offline_gt_metrics=None):
+        if offline_gt_metrics is not None:
+            raise ValueError("promotion cannot consume offline ground-truth metrics")
         active.status = "archived"
         candidate.status = "active"
         candidate.parent_id = active.node_id
@@ -300,24 +455,37 @@ class MemoryManager:
         self.state = self.ACTIVE_NEW_NODE
         return candidate
 
-    def process_chunk(self, active_node, generated, cameras, warp, frame_start):
+    def process_chunk(self, active_node, generated_rgb_for_memory, cameras, warp, frame_start, **forbidden):
+        from ..oracle_training.contracts import assert_no_supervision_content
+        assert_no_supervision_content(forbidden, "MemoryManager")
         self.register(active_node)
         mean_coverage = float(np.mean(warp.coverage_per_frame))
         self.observe(mean_coverage)
         event = {"state": self.state, "coverage": mean_coverage}
         if self.low_count >= self.low_coverage_chunks:
             self.state = self.TRANSITION
-            self._append_chunk(generated, cameras, warp, frame_start)
+            self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
         if (self.state==self.TRANSITION and self._ready() and
-                self.buffer.can_attempt(frame_start+len(generated))):
-            candidate, frames, heldout = self.build_candidate(active_node, frame_start + len(generated))
+                self.buffer.can_attempt(frame_start+len(generated_rgb_for_memory))):
+            candidate, frames, heldout = self.build_candidate(active_node, frame_start + len(generated_rgb_for_memory))
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)
             event.update(candidate_id=candidate.node_id, accepted=accepted, metrics=metrics)
             if accepted:
                 active_node = self.promote(active_node, candidate)
             else:
-                self.buffer.reject(frame_start+len(generated), metrics)
-                event["rejection_reason"] = metrics
+                rejection_reasons=[
+                    key for key, failed in {
+                        "confidence_weighted_coverage":metrics["confidence_weighted_coverage"]<self.min_confidence_weighted_coverage,
+                        "heldout_rgb_error":metrics["heldout_rgb_error"]>self.max_heldout_rgb_error,
+                        "overlap_rgb_error":metrics["overlap_rgb_error"]>self.max_overlap_rgb_error,
+                        "overlap_depth_error":metrics["overlap_depth_error"]>self.max_overlap_depth_error,
+                        "heldout_depth_error":metrics["heldout_depth_error"]>self.max_heldout_depth_error,
+                        "new_point_ratio":metrics["new_point_ratio"]<self.min_new_point_ratio,
+                        "scale_dispersion":metrics["scale_dispersion"]>self.max_scale_dispersion,
+                        "pose_error":metrics["pose_error"]>self.max_pose_error,
+                    }.items() if failed]
+                self.buffer.reject(frame_start+len(generated_rgb_for_memory), rejection_reasons)
+                event["rejection_reason"] = rejection_reasons
                 self.state = self.TRANSITION
         event["state"] = self.state
         self.events.append(event)

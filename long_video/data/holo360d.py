@@ -27,7 +27,7 @@ class Holo360DReader:
     def _read_pose(self,path):
         values=np.loadtxt(path,dtype=np.float32).reshape(-1)
         if values.size!=12: raise ValueError(f"Expected 12 c2w values, got {values.size}: {path}")
-        pose=np.eye(4,dtype=np.float32); pose[:3,:4]=values.reshape(3,4); return pose
+        pose=np.eye(4,dtype=np.float32); pose[:3,3]=values[:3]; pose[:3,:3]=values[3:].reshape(3,3); return pose
     def read(self,index):
         fid=self._ids[index] if isinstance(index,int) else str(index); rgb=np.asarray(Image.open(self.root/"rgb"/f"{fid}.jpg").convert("RGB")); mask=np.asarray(Image.open(self.root/"mask"/f"{fid}.jpg").convert("L"))>0; depth=self._read_depth(self.root/"depth"/"mesh_depth"/f"{fid}.exr")
         if depth.shape!=mask.shape: raise ValueError(f"Depth/mask mismatch {fid}: {depth.shape} vs {mask.shape}")

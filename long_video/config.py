@@ -13,6 +13,13 @@ REQUIRED={
                      "coverage_threshold","voxel_size"),
     "dit360":("repo_path","python_executable","base_model_path","lora_path",
               "erp_height","erp_width","device"),
+    "oracle_wah_training":(
+        "holo_root", "scene_id", "source_frame", "source_starts", "frame_stride",
+        "num_chunks", "erp_resolution", "perspective_resolution", "fov_degrees",
+        "pixel_center", "wah_root", "wah_model", "wah_upstream_sha",
+        "pi3_checkpoint", "physical_gpu", "prompt", "seed", "output_root",
+        "checkpoint_root", "production_threshold_config",
+    ),
 }
 
 def _coerce(value):
@@ -52,4 +59,13 @@ def validate_config(kind,config):
                   "rope_alignment":True}
         wrong={k:(config.get(k),v) for k,v in expected.items() if config.get(k)!=v}
         if wrong: raise ValueError(f"WAH spatial-history invariants violated: {wrong}")
+    if kind=="oracle_wah_training":
+        if list(config["erp_resolution"])[1] != 2 * list(config["erp_resolution"])[0]:
+            raise ValueError("Oracle ERP resolution must be 2:1")
+        if list(config["perspective_resolution"]) != [384,640]:
+            raise ValueError("WAH perspective resolution must be exactly 384x640")
+        if int(config["physical_gpu"]) != 1:
+            raise ValueError("H100 production runs are restricted to physical GPU 1")
+        if float(config["pixel_center"]) not in {0.0,0.5}:
+            raise ValueError("pixel_center must be 0.0 or 0.5")
     return config

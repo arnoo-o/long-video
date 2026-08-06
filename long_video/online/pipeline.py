@@ -112,12 +112,10 @@ class OnlineSpatialHistoryPipeline:
         )
         generated = self._video_array(generated_video)
         if len(generated) != len(poses):
-            usable = min(len(generated), len(poses))
-            generated, poses = generated[:usable], poses[:usable]
-            cameras = CameraBatch(poses, intrinsics[:usable], int(height), int(width))
-            for name in ("rgb", "depth", "visibility", "confidence", "source"):
-                setattr(warp, name, getattr(warp, name)[:usable])
-            warp.coverage_per_frame = warp.coverage_per_frame[:usable]
+            raise ValueError(
+                f"WAH generated {len(generated)} frames but trajectory/warp has {len(poses)}; "
+                "silent truncation is forbidden"
+            )
         frame_start = self.frame_index
         self.frame_index += len(poses)
         self.current_camera_c2w = poses[-1].copy()
@@ -126,7 +124,7 @@ class OnlineSpatialHistoryPipeline:
         memory_event = None
         if self.memory_manager is not None:
             self.active_node, memory_event = self.memory_manager.process_chunk(
-                self.active_node, generated, cameras, warp, frame_start
+                self.active_node, generated_rgb_for_memory=generated, cameras=cameras, warp=warp, frame_start=frame_start
             )
         high_conf = warp.visibility & (warp.confidence >= (
             self.memory_manager.high_confidence_threshold if self.memory_manager else 0.5

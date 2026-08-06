@@ -268,6 +268,7 @@ class Pi3GeometryBackend(MultiViewGeometryBackend):
             "valid_ratio": float(valid.mean()),
             "checkpoint": self.checkpoint,
             "confidence_source": confidence_source,
+            "confidence_type": "model_head" if self._has_confidence_head else "heuristic",
             **load_diagnostics,
         }
         diagnostics.update(_pose_consistency(predicted_c2w,np.asarray(view_c2w,np.float32)))

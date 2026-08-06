@@ -1,9 +1,9 @@
-repo_path: /ephemeral/mdu/long-video-third-party/DiT360
-python_executable: /ephemeral/mdu/envs/longvideo-dit360/bin/python
-base_model_path: /ephemeral/mdu/long-video-data/models/dit360/FLUX.1-dev
-lora_path: /ephemeral/mdu/long-video-data/models/dit360/DiT360-Panorama-Image-Generation
-runner_script: /ephemeral/mdu/long-video/scripts/run_dit360_completion.py
-output_root: /ephemeral/mdu/long-video/outputs/dit360
+repo_path: null
+python_executable: null
+base_model_path: null
+lora_path: null
+runner_script: null
+output_root: null
 device: cuda:0
 erp_height: 1024
 erp_width: 2048

@@ -1,6 +1,6 @@
 backend: pi3_holo360d_8views
-repo_path: /ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d
-checkpoint: /ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin
+repo_path: null
+checkpoint: null
 device: cuda:0
 input_size: 518
 view_count: 8

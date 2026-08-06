@@ -1,5 +1,5 @@
-repo_path: /ephemeral/mdu/long-video/third_party/Warp-as-History
-python_executable: /ephemeral/mdu/venvs/wah/bin/python
+repo_path: null
+python_executable: null
 conditioning_type: warp
 warp_history_downsample_mode: short
 rope_alignment: true

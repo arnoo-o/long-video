@@ -54,7 +54,7 @@ Metric dataset or sensor depth produces dataset_calibrated or metric_anchor. M1 
 
 ## SpatialNode and rendering
 
-Schema v3 stores source views, view source/image/depth confidence, world points, normals, confidence, semantic source, distinct-view bit provenance, observation count, scale metadata and model versions. NodeStore checksums arrays, migrates older nodes, and rolls back node replacement if session-graph update fails.
+Schema v4 stores source views, view source/image/depth confidence, world points, normals, confidence, semantic source, distinct-view bit provenance, observation count, scale metadata and model versions. NodeStore checksums arrays, migrates older nodes, and rolls back node replacement if session-graph update fails.
 
 The renderer has explicit device, near/far clipping, chunking, deterministic z-buffer ties and splatting. Coverage uses a fixed angular occupancy grid, independent of point radius and output resolution.
 
@@ -75,6 +75,31 @@ Visibility and confidence share chunk slicing, temporal sampling, latent interpo
 
 Training samples include warp_visibility_mask.npy, warp_confidence.npy and warp_source.npy. Legacy samples without confidence use one on visible pixels.
 
+## Oracle-initialized single-scene WAH training
+
+The P0 training path uses exactly one source frame per window. Its full 2048x1024 Holo360D ERP RGB, mesh RAY_DISTANCE depth, mask and world c2w are transformed into a source-relative frame and directly backprojected into a metric Oracle M0. It does not rebuild M0 from eight crops. WAH inputs are generated directly at 384x640 with one shared K and pixel-center convention.
+
+target_rgb_for_loss is used only by the masked flow-matching loss. target_z_depth_for_eval is Z_DEPTH and is offline-only. Runtime contracts reject either target field from WAH history, TransitionBuffer, MemoryManager, candidate construction and promotion. M1 known pixels use parent-warp RGB/Z-depth while new pixels use WAH-generated RGB and Pi3 depth.
+
+Machine paths are passed through --set or an untracked local override:
+
+    python scripts/build_holo_oracle_sequences.py \
+      --config configs/oracle_wah_training.yaml \
+      --set holo_root=/path/to/Indoor_013.zip \
+      --set wah_root=/path/to/Warp-as-History \
+      --set wah_model=/path/to/helios-distilled \
+      --set output_root=/path/to/oracle_sequences
+
+    CUDA_VISIBLE_DEVICES=1 python scripts/train_oracle_wah_lora.py \
+      --config configs/oracle_wah_training.yaml \
+      --sequence /path/to/Indoor_013_train_000 \
+      --set wah_root=/path/to/Warp-as-History \
+      --set wah_model=/path/to/helios-distilled \
+      --set checkpoint_root=/path/to/checkpoints
+
+The official state reports 33 RGB frames per chunk and VAE temporal scale 4. Chunk stride is 32: chunk k>0 shares its first RGB boundary frame with chunk k-1, and the duplicate decoded frame is omitted when writing the long video. The one-frame source prefix is excluded from loss. The RGB primary mask is mapped by exact VAE temporal groups to nine latent frames; eight latent frames participate in loss.
+
+Single-chunk training uses precomputed M0 warp. Four-chunk rollout initializes WAH state once and renders each chunk online from the node active at that chunk boundary. Candidate creation, validation, promotion or rejection happen only after a chunk. Only generated RGB enters memory. The current validation run completed four chunks and two Pi3 candidate validations; production thresholds rejected M1, so all four chunks correctly remained on M0. Multi-chunk optimizer training, M2 and reactivation are outside this P0.
 ## Online memory
 
 OnlineSpatialHistoryPipeline reactivates archived nodes before rendering, creates the target trajectory, renders the warp, calls real WAH/Helios, and returns video, c2w, WarpBatch and statistics.

@@ -48,8 +48,14 @@ class NodeStore:
                 "observation_count",
             )
         }
-        for key in ("view_source", "view_image_confidence", "view_depth_confidence",
-                    "point_view_mask"):
+        for key in (
+            "view_source", "view_image_confidence", "view_depth_confidence",
+            "point_view_mask", "points_rgb_content_origin",
+            "points_depth_content_origin", "points_evidence_role",
+            "view_rgb_content_origin", "view_depth_content_origin", "view_evidence_role",
+            "points_rgb_evidence_role", "points_depth_evidence_role",
+            "view_rgb_evidence_role", "view_depth_evidence_role",
+        ):
             value = getattr(node, key, None)
             if value is not None:
                 arrays[key] = value
@@ -114,8 +120,14 @@ class NodeStore:
             normal = arrays["points_normal"].copy() if "points_normal" in arrays.files else None
             optional = {
                 key: arrays[key].copy() if key in arrays.files else None
-                for key in ("view_source","view_image_confidence",
-                            "view_depth_confidence","point_view_mask")
+                for key in (
+                    "view_source", "view_image_confidence", "view_depth_confidence",
+                    "point_view_mask", "points_rgb_content_origin",
+                    "points_depth_content_origin", "points_evidence_role",
+                    "view_rgb_content_origin", "view_depth_content_origin", "view_evidence_role",
+            "points_rgb_evidence_role", "points_depth_evidence_role",
+            "view_rgb_evidence_role", "view_depth_evidence_role",
+                )
             }
         return SpatialNode(
             metadata["node_id"], metadata["status"], metadata.get("parent_id"),
@@ -127,7 +139,7 @@ class NodeStore:
             values["points_confidence"], values["points_source"],
             values["observation_count"], normal,
             metadata.get("depth_convention", "RAY_DISTANCE"),
-            max(3, metadata.get("schema_version", 1)), metadata.get("quality_metrics", {}),
+            max(4, metadata.get("schema_version", 1)), metadata.get("quality_metrics", {}),
             view_source=(optional["view_source"] if optional["view_source"] is not None
                          else np.full(values["view_depth"].shape, 4, np.int8)),
             view_image_confidence=(optional["view_image_confidence"]
@@ -139,4 +151,14 @@ class NodeStore:
             point_view_mask=optional["point_view_mask"],
             scale=ScaleMetadata(**metadata.get("scale", {})),
             model_versions=metadata.get("model_versions", {}),
+            points_rgb_content_origin=optional["points_rgb_content_origin"],
+            points_depth_content_origin=optional["points_depth_content_origin"],
+            points_evidence_role=optional["points_evidence_role"],
+            view_rgb_content_origin=optional["view_rgb_content_origin"],
+            view_depth_content_origin=optional["view_depth_content_origin"],
+            view_evidence_role=optional["view_evidence_role"],
+            points_rgb_evidence_role=optional["points_rgb_evidence_role"],
+            points_depth_evidence_role=optional["points_depth_evidence_role"],
+            view_rgb_evidence_role=optional["view_rgb_evidence_role"],
+            view_depth_evidence_role=optional["view_depth_evidence_role"],
         )

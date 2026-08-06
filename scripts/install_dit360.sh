@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${DIT360_REPO:=/ephemeral/mdu/long-video-third-party/DiT360}"
-: "${DIT360_ENV:=/ephemeral/mdu/envs/longvideo-dit360}"
+: "${DIT360_REPO:?Set DIT360_REPO outside the repository}"
+: "${DIT360_ENV:?Set DIT360_ENV to an isolated environment}"
 if [[ ! -d "$DIT360_REPO/.git" ]]; then
   git clone https://github.com/Insta360-Research-Team/DiT360.git "$DIT360_REPO"
 fi

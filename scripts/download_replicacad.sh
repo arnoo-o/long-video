@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-ENV_PREFIX="${HABITAT_ENV_PREFIX:-/ephemeral/mdu/envs/longvideo-habitat}"
-DATA_ROOT="${REPLICACAD_ROOT:-/ephemeral/mdu/long-video-data/raw/replicacad}"
+: "${HABITAT_ENV_PREFIX:?Set HABITAT_ENV_PREFIX to the isolated Habitat environment}"
+ENV_PREFIX="${HABITAT_ENV_PREFIX}"
+: "${REPLICACAD_ROOT:?Set REPLICACAD_ROOT outside the repository}"
+DATA_ROOT="${REPLICACAD_ROOT}"
 export PATH="${ENV_PREFIX}/bin:${PATH}"
 mkdir -p "${DATA_ROOT}"
 git lfs install --skip-repo

@@ -1,0 +1,39 @@
+holo_root: null
+scene_id: Indoor_013
+source_frame: 1
+source_starts:
+  train: [1]
+  diagnostic: [160]
+frame_stride: 1
+num_chunks: 4
+erp_resolution: [1024, 2048]
+perspective_resolution: [384, 640]
+fov_degrees: 90.0
+pixel_center: 0.5
+wah_root: null
+wah_model: null
+wah_upstream_sha: 09aa6461355b298bfced51007bd709a251d6033a
+pi3_checkpoint: null
+pi3_repo: null
+physical_gpu: 1
+prompt: "A stable indoor room viewed by a smoothly moving camera."
+seed: 42
+output_root: null
+checkpoint_root: null
+production_threshold_config: configs/online_memory.yaml
+assumed_fps: 3.0
+oracle_voxel_size: 0.01
+renderer:
+  near: 0.05
+  far: 100.0
+  point_radius: 1
+  chunk_points: 1000000
+training:
+  max_steps: 20
+  learning_rate: 0.0001
+  max_grad_norm: 1.0
+  lora_rank: 8
+  lora_alpha: 8
+  lora_dropout: 0.0
+  lora_target_modules: "attn1.to_q,attn1.to_k,attn1.to_v,attn1.to_out.0"
+  pyramid_num_inference_steps_list: [1, 1, 1]

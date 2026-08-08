@@ -1,0 +1,38 @@
+physical_gpu: 1
+perspective_resolution: [384, 640]
+chunk_frames: 33
+chunk_stride: 32
+vae_temporal_scale: 4
+scene_scale_default: 1.0
+source_checkpoint: null
+wah_root: null
+wah_model: null
+run_dir: null
+seed: 42
+training:
+  phase_a_steps: 600
+  phase_b_steps: 600
+  gradient_accumulation_steps: 4
+  lora_learning_rate: 0.00003
+  new_module_learning_rate: 0.0001
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  warmup_steps: 50
+  checkpoint_every: 100
+  diagnostic_every: 100
+  status_every: 10
+  lora_rank: 8
+  lora_alpha: 8
+  lora_dropout: 0.0
+  lora_target_modules: "attn1.to_q,attn1.to_k,attn1.to_v,attn1.to_out.0"
+  anchor_rank: 64
+  anchor_blocks: [0, 10, 20, 30]
+  gate_init: 0.05
+  phase_a_camera_only_probability: 0.15
+  phase_b_mix: {revisit: 0.70, large_motion: 0.20, corruption: 0.10}
+  history_corruption_sigma: 0.02
+  history_bank_refresh_first: 50
+  history_bank_refresh_final: 25
+  gradient_checkpointing: true
+  pyramid_num_inference_steps_list: [1, 1, 1]
+  flow_matching_stage_id: 2

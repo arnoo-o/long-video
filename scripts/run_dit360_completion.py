@@ -156,12 +156,20 @@ def main():
         generated=np.rint(observed*255).clip(0,255).astype(np.uint8)
     else:
         generated,dit_gpu=run_dit360(manifest,observed,valid)
-    # Model output is never allowed to alter a real observed ERP pixel.
+    np.save(output/"erp_generated_rgb.npy",generated)
+    Image.fromarray(generated).save(output/"preview_generated_panorama.png")
+    restore_observations=bool(manifest.get("restore_observations",True))
     restored=generated.copy()
-    restored[valid]=np.rint(observed[valid]*255).clip(0,255).astype(np.uint8)
+    if restore_observations:
+        restored[valid]=np.rint(observed[valid]*255).clip(0,255).astype(np.uint8)
     np.save(output/"erp_rgb.npy",restored)
     Image.fromarray(restored).save(output/"preview_panorama.png")
-    erp_conf=confidence_map(valid,conflict,float(manifest["synthesized_confidence"]))
+    if restore_observations:
+        erp_conf=confidence_map(valid,conflict,float(manifest["synthesized_confidence"]))
+        source_valid=valid
+    else:
+        erp_conf=np.full(valid.shape,float(manifest["synthesized_confidence"]),np.float32)
+        source_valid=np.zeros_like(valid)
     views=[]; masks=[]; confidences=[]
     yaws=manifest["target_yaws_degrees"]
     for yaw in yaws:
@@ -170,7 +178,7 @@ def main():
             restored,radians,pitch,manifest["target_fov_degrees"],
             manifest["height"],manifest["width"],"bilinear"))
         masks.append(equirectangular_to_perspective(
-            valid.astype(np.uint8),radians,pitch,manifest["target_fov_degrees"],
+            source_valid.astype(np.uint8),radians,pitch,manifest["target_fov_degrees"],
             manifest["height"],manifest["width"],"nearest")>0)
         confidences.append(equirectangular_to_perspective(
             erp_conf,radians,pitch,manifest["target_fov_degrees"],
@@ -189,6 +197,8 @@ def main():
     metadata={
         "backend":"official DiT360 FLUX.1-dev panorama editing",
         "prepare_only":bool(manifest.get("prepare_only",False)),
+        "restore_observations":restore_observations,
+        "erp_rgb_source":"observations_restored" if restore_observations else "dit360_generated_only",
         "observed_erp_ratio":float(valid.mean()),
         "conflict_erp_ratio":float(conflict.mean()),
         "elapsed_seconds":time.time()-start,

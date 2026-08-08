@@ -18,6 +18,7 @@ def masked_flow_matching_loss(
     primary_loss_mask_latent,
     *,
     fixed_stage_items=None,
+    spatial_conditioning=None,
 ):
     """Official train-exact flow matching with a temporal primary-loss mask."""
     import torch
@@ -38,22 +39,34 @@ def masked_flow_matching_loss(
         raise ValueError("primary_loss_mask_latent selects no latent frames")
     stage_items = fixed_stage_items or opt.flow_matching_train_exact_items(pipe, target_latents, args, device)
     transformer_dtype = opt.transformer_compute_dtype(pipe.transformer)
-    predictions = opt.transformer_model_forward(
-        pipe,
-        [item["noisy_latents"].to(dtype=transformer_dtype) for item in stage_items],
-        [item["timesteps"] for item in stage_items],
-        prompt_embeds,
-        histories,
-        attention_kwargs={
-            "history_visible_token_mode": str(getattr(args, "visible_token_mode", "drop")),
-            "history_visible_token_threshold": float(getattr(args, "history_visible_token_threshold", 0.1)),
-            "history_confidence_threshold": float(getattr(args, "history_confidence_threshold", 0.0)),
-            "history_confidence_lambda": float(getattr(args, "history_confidence_lambda", 1.0)),
-            "history_confidence_epsilon": float(getattr(args, "history_confidence_epsilon", 1e-6)),
-        },
-        target_channel_fusion_latents=None,
-        is_first_denoising_step=False,
-    )
+    controller = getattr(pipe.transformer, "spatial_reanchor", None)
+    if spatial_conditioning is not None:
+        if controller is None:
+            raise RuntimeError("spatial conditioning was provided without an installed controller")
+        controller.prepare_context(**spatial_conditioning)
+    try:
+        predictions = opt.transformer_model_forward(
+            pipe,
+            [item["noisy_latents"].to(dtype=transformer_dtype) for item in stage_items],
+            [item["timesteps"] for item in stage_items],
+            prompt_embeds,
+            histories,
+            attention_kwargs={
+                "history_visible_token_mode": str(getattr(args, "visible_token_mode", "drop")),
+                "history_visible_token_threshold": float(getattr(args, "history_visible_token_threshold", 0.1)),
+                "history_confidence_threshold": float(getattr(args, "history_confidence_threshold", 0.0)),
+                "history_confidence_lambda": float(getattr(args, "history_confidence_lambda", 1.0)),
+                "history_confidence_epsilon": float(getattr(args, "history_confidence_epsilon", 1e-6)),
+            },
+            target_channel_fusion_latents=None,
+            is_first_denoising_step=False,
+        )
+    except Exception:
+        if spatial_conditioning is not None:
+            controller.clear_context()
+        raise
+    if spatial_conditioning is not None and not torch.is_grad_enabled():
+        controller.clear_context()
     if not isinstance(predictions, list) or len(predictions) != len(stage_items):
         raise TypeError("official train-exact Helios forward must return one NaViT prediction per stage")
     stage_losses, stats = [], {}
@@ -140,3 +153,108 @@ def assert_only_lora_gradients(transformer, trainable_params):
         raise RuntimeError(f"non-LoRA parameters received gradients: {illegal[:10]}")
     if not any(parameter.grad is not None for parameter in trainable_params):
         raise RuntimeError("no LoRA parameter received a gradient")
+
+
+def load_source_trainable_state(path, transformer):
+    """Load legacy step1000 LoRA/trainable tensors without restoring optimizer state."""
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    state = payload.get("trainable_state") or payload.get("lora_state")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("source checkpoint contains no trainable state")
+    named = dict(transformer.named_parameters())
+    expected = {name for name, parameter in named.items() if parameter.requires_grad}
+    missing = sorted(expected - set(state))
+    if missing:
+        raise ValueError(f"source checkpoint is missing current LoRA parameters: {missing[:10]}")
+    loaded = []
+    with torch.no_grad():
+        for name, value in state.items():
+            if name not in named:
+                continue
+            named[name].copy_(value.to(device=named[name].device, dtype=named[name].dtype))
+            loaded.append(name)
+    if not loaded:
+        raise ValueError("source checkpoint did not match any current transformer parameters")
+    return {"loaded_count": len(loaded), "source_global_step": int(payload.get("global_step", 0))}
+
+
+def save_spatial_training_checkpoint(
+    path,
+    transformer,
+    optimizer,
+    scheduler,
+    *,
+    global_step,
+    phase,
+    phase_step,
+    metadata,
+):
+    import random
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    trainable_state = {
+        name: parameter.detach().cpu()
+        for name, parameter in transformer.named_parameters()
+        if parameter.requires_grad
+    }
+    if not trainable_state:
+        raise RuntimeError("refusing to save a checkpoint without trainable parameters")
+    payload = {
+        "schema_version": 2,
+        "global_step": int(global_step),
+        "phase": str(phase),
+        "phase_step": int(phase_step),
+        "trainable_state": trainable_state,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "metadata": dict(metadata),
+        "rng_state": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        },
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+    return path
+
+
+def load_spatial_training_checkpoint(path, transformer, optimizer, scheduler):
+    import random
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("schema_version", 0)) != 2:
+        raise ValueError("spatial training resume requires checkpoint schema version 2")
+    named = dict(transformer.named_parameters())
+    state = payload.get("trainable_state") or {}
+    missing = [name for name in state if name not in named]
+    if missing:
+        raise ValueError(f"checkpoint parameters are missing from the model: {missing[:10]}")
+    missing_state = [name for name, parameter in named.items() if parameter.requires_grad and name not in state]
+    if missing_state:
+        raise ValueError(f"checkpoint is missing current trainable parameters: {missing_state[:10]}")
+    with torch.no_grad():
+        for name, value in state.items():
+            named[name].copy_(value.to(device=named[name].device, dtype=named[name].dtype))
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
+    rng = payload.get("rng_state") or {}
+    if rng:
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch_cpu"])
+        if torch.cuda.is_available() and rng.get("torch_cuda"):
+            torch.cuda.set_rng_state_all(rng["torch_cuda"])
+    return {
+        "global_step": int(payload["global_step"]),
+        "phase": str(payload["phase"]),
+        "phase_step": int(payload["phase_step"]),
+        "metadata": dict(payload.get("metadata") or {}),
+    }

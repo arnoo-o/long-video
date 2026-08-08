@@ -66,9 +66,9 @@ def build_dense_oracle_sequence(scene_root,output_root,*,sequence_id,split,ancho
     for name,value in {"warp_z_depth":warp.depth,"warp_visibility":warp.visibility,"warp_confidence":warp.confidence,
                        "rgb_content_origin":warp.rgb_content_origin,"depth_content_origin":warp.depth_content_origin,
                        "evidence_role":warp.evidence_role}.items(): np.save(warp_dir/f"{name}.npy",value)
-    latent=temporal_weights_to_latent(weights[:timing.chunk_frames],timing.vae_temporal_scale)
-    np.save(out/"primary_loss_weight_rgb.npy",weights[:timing.chunk_frames]); np.save(out/"primary_loss_weight_latent.npy",latent)
-    np.save(out/"primary_loss_mask_rgb.npy",weights[:timing.chunk_frames]>0); np.save(out/"primary_loss_mask_latent.npy",latent>0)
+    latent=temporal_weights_to_latent(weights,timing.vae_temporal_scale)
+    np.save(out/"primary_loss_weight_rgb.npy",weights); np.save(out/"primary_loss_weight_latent.npy",latent)
+    np.save(out/"primary_loss_mask_rgb.npy",weights>0); np.save(out/"primary_loss_mask_latent.npy",latent>0)
     (out/"prompt.txt").write_text(prompt,encoding="utf-8")
     metadata={"sequence_id":sequence_id,"split":split,"scene_id":Path(scene_root).name,"data_fps_nominal":3,
       "model_fps":24,"output_fps":24,"anchor_stride":8,"anchor_count":anchor_count,"model_frame_count":len(dense_rgb),

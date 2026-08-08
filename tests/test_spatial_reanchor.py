@@ -67,6 +67,19 @@ def test_later_chunk_keeps_sequence_canonical_frame_without_identity_requirement
         torch.testing.assert_close(current, rays)
 
 
+def test_local_window_at_zero_does_not_claim_full_sequence_source_origin():
+    poses, intrinsics = _cameras()
+    poses[:, 0, 3] += 3.0
+    rays = plucker_camera_rays(
+        poses, intrinsics, image_height=384, image_width=640,
+        token_height=24, token_width=40, latent_frames=9,
+        temporal_scale=4, scene_scale=1.0, sequence_frame_start=0,
+        validate_sequence_source_origin=False,
+    )
+    assert rays.shape == (1, 9, 24, 40, 6)
+    assert not torch.equal(rays[0, 0, ..., 3:], torch.zeros_like(rays[0, 0, ..., 3:]))
+
+
 def test_visibility_mapping_uses_exact_vae_temporal_groups():
     visibility = np.ones((33, 384, 640), np.float32)
     visibility[1:5] = 0

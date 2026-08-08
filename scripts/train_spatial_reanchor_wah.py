@@ -316,6 +316,7 @@ def main():
                 temporal_scale=int(config["vae_temporal_scale"]),
                 scene_scale=scene_scale,
                 sequence_frame_start=int(sample["start"]),
+                validate_sequence_source_origin=False,
             )
             geometry = (visibility, rays)
             spatial_geometry_cache[geometry_key] = geometry

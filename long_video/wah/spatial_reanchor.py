@@ -100,6 +100,7 @@ def plucker_camera_rays(
     temporal_scale: int,
     scene_scale: float,
     sequence_frame_start: int = 0,
+    validate_sequence_source_origin: bool = True,
 ):
     """Build target-patch-center Plucker rays in the frozen source frame."""
     import torch
@@ -113,14 +114,14 @@ def plucker_camera_rays(
     sequence_frame_start = int(sequence_frame_start)
     if sequence_frame_start < 0:
         raise ValueError("sequence_frame_start must be non-negative")
-    if sequence_frame_start == 0:
+    if validate_sequence_source_origin and sequence_frame_start == 0:
         identity = torch.eye(4, dtype=c2w.dtype, device=c2w.device)
         if not torch.allclose(c2w[:, 0], identity.expand_as(c2w[:, 0]), atol=1e-5, rtol=0):
             raise ValueError("the full sequence frame0 source-relative c2w must be identity")
 
     groups = _temporal_groups(c2w.shape[1], latent_frames, temporal_scale)
     representative_c2w, representative_k = _group_representative_cameras(c2w, k, groups)
-    if sequence_frame_start == 0 and not torch.allclose(
+    if validate_sequence_source_origin and sequence_frame_start == 0 and not torch.allclose(
         representative_c2w[:, 0, :3, 3], torch.zeros_like(representative_c2w[:, 0, :3, 3]),
         atol=1e-6, rtol=0,
     ):

@@ -71,6 +71,7 @@ def main():
             candidate = add_renderer_overlap(
                 candidate, _renderer_overlap(record, candidate), sample_type=record["sample_type"],
             )
+            candidate["scene_id"] = record["scene_id"]
             candidate["sequence_id"] = record["sequence_id"]
             candidates[record["sample_type"]].append(candidate)
 

@@ -326,16 +326,27 @@ def windows_highly_overlap(left, right, threshold=0.8):
 
 
 def choose_independent_final_candidates(revisit_candidates, motion_candidates):
-    """Choose renderer-scored revisit/motion records, preferring independent windows."""
+    """Choose one revisit/motion pair per scene and curriculum length."""
     final_revisit, final_motion = [], []
-    chunk_counts = sorted({int(item["chunks"]) for item in revisit_candidates + motion_candidates})
-    for chunks in chunk_counts:
+    groups = sorted({
+        (str(item.get("scene_id", "")), int(item["chunks"]))
+        for item in revisit_candidates + motion_candidates
+    })
+    for scene_id, chunks in groups:
         revisit = sorted(
-            [item for item in revisit_candidates if int(item["chunks"]) == chunks],
+            [
+                item for item in revisit_candidates
+                if str(item.get("scene_id", "")) == scene_id
+                and int(item["chunks"]) == chunks
+            ],
             key=lambda item: item["revisit_score"], reverse=True,
         )
         motion = sorted(
-            [item for item in motion_candidates if int(item["chunks"]) == chunks],
+            [
+                item for item in motion_candidates
+                if str(item.get("scene_id", "")) == scene_id
+                and int(item["chunks"]) == chunks
+            ],
             key=lambda item: item["large_motion_score"], reverse=True,
         )
         if not revisit or not motion:

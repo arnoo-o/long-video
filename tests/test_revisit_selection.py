@@ -66,6 +66,24 @@ def test_renderer_overlap_controls_final_score_and_independent_choice():
     assert selected_motion[0]["independent_from_revisit"] is True
 
 
+def test_final_candidates_are_selected_per_scene_and_chunk_length():
+    base = {
+        "start": 0, "anchor_count": 33, "chunks": 8,
+        "max_translation": 2.0, "max_rotation_degrees": 20.0,
+        "selection_translation": 1.0, "selection_rotation_degrees": 10.0,
+        "selection_temporal_gap_anchors": 12, "pose_overlap_proxy": 0.8,
+        "training_chunk_index": 3,
+    }
+    revisits, motions = [], []
+    for scene_id in ("Indoor_013", "Outdoor_008"):
+        candidate = {**base, "scene_id": scene_id}
+        revisits.append(add_renderer_overlap(candidate, 0.7, sample_type="revisit"))
+        motions.append(add_renderer_overlap(candidate, 0.1, sample_type="large_motion"))
+    selected_revisit, selected_motion = choose_independent_final_candidates(revisits, motions)
+    assert {item["scene_id"] for item in selected_revisit} == {"Indoor_013", "Outdoor_008"}
+    assert {item["scene_id"] for item in selected_motion} == {"Indoor_013", "Outdoor_008"}
+
+
 def test_scan_accepts_official_consolidated_pose_file(tmp_path):
     archive = tmp_path / "Outdoor_008.zip"
     timestamps = [f"{index + 1:.6f}" for index in range(4)]

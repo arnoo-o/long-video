@@ -34,6 +34,60 @@ def _temporal_groups(frame_count: int, latent_frames: int, temporal_scale: int):
     ]
 
 
+def resize_latents_spatial(latents, *, height: int, width: int):
+    """Match WAH train_exact's bilinear spatial pyramid without changing T."""
+    import torch
+    import torch.nn.functional as functional
+
+    value = torch.as_tensor(latents)
+    if value.ndim != 5:
+        raise ValueError(f"latents must be [B,C,T,H,W], got {tuple(value.shape)}")
+    height, width = int(height), int(width)
+    if height <= 0 or width <= 0:
+        raise ValueError("target latent height and width must be positive")
+    if tuple(value.shape[-2:]) == (height, width):
+        return value
+    batch, channels, frames, source_height, source_width = value.shape
+    flattened = value.permute(0, 2, 1, 3, 4).reshape(
+        batch * frames, channels, source_height, source_width
+    )
+    resized = functional.interpolate(flattened.float(), size=(height, width), mode="bilinear")
+    resized = resized.to(dtype=value.dtype)
+    return resized.reshape(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
+
+
+def _group_representative_cameras(c2w, intrinsics, groups):
+    """Represent each VAE temporal group in pose space, never Plucker space."""
+    import torch
+    from scipy.spatial.transform import Rotation, Slerp
+
+    representative_poses = []
+    representative_intrinsics = []
+    for batch_index in range(c2w.shape[0]):
+        batch_poses = []
+        batch_intrinsics = []
+        for start, end in groups:
+            group = c2w[batch_index, start:end]
+            translation = group[:, :3, 3].mean(dim=0)
+            if end - start == 1:
+                rotation = group[0, :3, :3]
+            else:
+                endpoint_matrices = torch.stack(
+                    (group[0, :3, :3], group[-1, :3, :3]), dim=0
+                ).detach().cpu().double().numpy()
+                endpoint_rotations = Rotation.from_matrix(endpoint_matrices)
+                rotation_matrix = Slerp([0.0, 1.0], endpoint_rotations)([0.5]).as_matrix()[0]
+                rotation = torch.as_tensor(rotation_matrix, dtype=c2w.dtype, device=c2w.device)
+            pose = torch.eye(4, dtype=c2w.dtype, device=c2w.device)
+            pose[:3, :3] = rotation
+            pose[:3, 3] = translation
+            batch_poses.append(pose)
+            batch_intrinsics.append(intrinsics[batch_index, start:end].mean(dim=0))
+        representative_poses.append(torch.stack(batch_poses, dim=0))
+        representative_intrinsics.append(torch.stack(batch_intrinsics, dim=0))
+    return torch.stack(representative_poses, dim=0), torch.stack(representative_intrinsics, dim=0)
+
+
 def plucker_camera_rays(
     source_relative_c2w,
     intrinsics,
@@ -59,6 +113,16 @@ def plucker_camera_rays(
     if not torch.allclose(c2w[:, 0], identity.expand_as(c2w[:, 0]), atol=1e-5, rtol=0):
         raise ValueError("the first source-relative c2w must be identity")
 
+    groups = _temporal_groups(c2w.shape[1], latent_frames, temporal_scale)
+    representative_c2w, representative_k = _group_representative_cameras(c2w, k, groups)
+    if not torch.allclose(
+        representative_c2w[:, 0, :3, 3],
+        torch.zeros_like(representative_c2w[:, 0, :3, 3]),
+        atol=1e-6,
+        rtol=0,
+    ):
+        raise RuntimeError("the first latent group must retain the source canonical origin")
+
     yy = (torch.arange(int(token_height), dtype=torch.float32, device=c2w.device) + 0.5) * (
         float(image_height) / float(token_height)
     )
@@ -68,23 +132,29 @@ def plucker_camera_rays(
     grid_y, grid_x = torch.meshgrid(yy, xx, indexing="ij")
     pixels = torch.stack((grid_x, grid_y, torch.ones_like(grid_x)), dim=-1)
     pixels = pixels.view(1, 1, token_height, token_width, 3, 1)
-    inverse_k = torch.linalg.inv(k).view(*k.shape[:2], 1, 1, 3, 3)
+    inverse_k = torch.linalg.inv(representative_k).view(
+        *representative_k.shape[:2], 1, 1, 3, 3
+    )
     d_camera = torch.matmul(inverse_k, pixels).squeeze(-1)
     d_camera = torch.nn.functional.normalize(d_camera, dim=-1)
-    rotation = c2w[:, :, :3, :3].view(*c2w.shape[:2], 1, 1, 3, 3)
+    rotation = representative_c2w[:, :, :3, :3].view(
+        *representative_c2w.shape[:2], 1, 1, 3, 3
+    )
     direction = torch.matmul(rotation, d_camera.unsqueeze(-1)).squeeze(-1)
     direction = torch.nn.functional.normalize(direction, dim=-1)
-    origin = c2w[:, :, :3, 3] / float(scene_scale)
+    origin = representative_c2w[:, :, :3, 3] / float(scene_scale)
     origin = origin[:, :, None, None].expand_as(direction)
     moment = torch.cross(origin, direction, dim=-1)
-    per_frame = torch.cat((direction, moment), dim=-1)
-    groups = _temporal_groups(c2w.shape[1], latent_frames, temporal_scale)
-    result = torch.stack(
-        [per_frame[:, start:end].mean(dim=1) for start, end in groups], dim=1
-    )
+    result = torch.cat((direction, moment), dim=-1)
     expected = (c2w.shape[0], latent_frames, token_height, token_width, 6)
     if tuple(result.shape) != expected or not bool(torch.isfinite(result).all()):
         raise RuntimeError(f"invalid Plucker result {tuple(result.shape)}, expected {expected}")
+    direction_norm = result[..., :3].norm(dim=-1)
+    orthogonality = (result[..., :3] * result[..., 3:]).sum(dim=-1).abs()
+    if not torch.allclose(direction_norm, torch.ones_like(direction_norm), atol=1e-5, rtol=0):
+        raise RuntimeError("Plucker ray directions must have unit norm")
+    if bool((orthogonality > 1e-5).any()):
+        raise RuntimeError("Plucker direction and moment must be orthogonal")
     return result
 
 
@@ -187,6 +257,7 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
             self.camera_gate = nn.Parameter(torch.tensor(float(gate_init)))
             self.spatial_warp_role = nn.Parameter(torch.zeros(self.hidden_size))
             self._context = None
+            self._contexts = {}
             self._handles = []
             self.last_metrics = {}
 
@@ -206,13 +277,14 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
 
         def prepare_context(
             self,
-            warp_latents,
-            visibility_tokens,
-            plucker_tokens,
+            warp_latents=None,
+            visibility_tokens=None,
+            plucker_tokens=None,
             *,
             anchor_enabled=True,
             camera_enabled=True,
             spatial_warp_enabled=True,
+            stage_contexts=None,
         ):
             transformer = self._transformer_ref()
             if transformer is None:
@@ -220,49 +292,98 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
             patch = transformer.patch_embedding
             if any(parameter.requires_grad for parameter in patch.parameters()):
                 raise RuntimeError("target/anchor patch_embedding must remain frozen")
-            warp = warp_latents.to(device=patch.weight.device, dtype=patch.weight.dtype)
-            warp_tokens = patch(warp).flatten(2).transpose(1, 2).detach()
-            visibility_tokens = visibility_tokens.to(device=warp_tokens.device, dtype=torch.float32)
-            plucker_tokens = plucker_tokens.reshape(plucker_tokens.shape[0], -1, 6).to(warp_tokens.device)
-            if warp_tokens.shape[:2] != visibility_tokens.shape[:2] or warp_tokens.shape[:2] != plucker_tokens.shape[:2]:
-                raise ValueError(
-                    f"target/warp/visibility/Plucker token mismatch: {tuple(warp_tokens.shape)}, "
-                    f"{tuple(visibility_tokens.shape)}, {tuple(plucker_tokens.shape)}"
+            raw_contexts = stage_contexts or [{
+                "warp_latents": warp_latents,
+                "visibility_tokens": visibility_tokens,
+                "plucker_tokens": plucker_tokens,
+            }]
+            contexts = {}
+            for raw in raw_contexts:
+                stage_warp = raw["warp_latents"]
+                warp = stage_warp.to(device=patch.weight.device, dtype=patch.weight.dtype)
+                warp_tokens = patch(warp).flatten(2).transpose(1, 2).detach()
+                stage_visibility = raw["visibility_tokens"].to(
+                    device=warp_tokens.device, dtype=torch.float32
                 )
-            self._context = ReanchorContext(
-                warp_tokens=warp_tokens,
-                visibility_tokens=visibility_tokens,
-                plucker_tokens=plucker_tokens,
-                target_token_count=int(warp_tokens.shape[1]),
-                warp_latent_frames=int(warp_latents.shape[2]),
-                anchor_enabled=bool(anchor_enabled),
-                camera_enabled=bool(camera_enabled),
-                spatial_warp_enabled=bool(spatial_warp_enabled),
-            )
+                stage_plucker = raw["plucker_tokens"].reshape(
+                    raw["plucker_tokens"].shape[0], -1, 6
+                ).to(warp_tokens.device)
+                if (
+                    warp_tokens.shape[:2] != stage_visibility.shape[:2]
+                    or warp_tokens.shape[:2] != stage_plucker.shape[:2]
+                ):
+                    raise ValueError(
+                        f"target/warp/visibility/Plucker token mismatch: {tuple(warp_tokens.shape)}, "
+                        f"{tuple(stage_visibility.shape)}, {tuple(stage_plucker.shape)}"
+                    )
+                count = int(warp_tokens.shape[1])
+                if count in contexts:
+                    raise ValueError(f"duplicate spatial stage token count: {count}")
+                contexts[count] = ReanchorContext(
+                    warp_tokens=warp_tokens,
+                    visibility_tokens=stage_visibility,
+                    plucker_tokens=stage_plucker,
+                    target_token_count=count,
+                    warp_latent_frames=int(stage_warp.shape[2]),
+                    anchor_enabled=bool(anchor_enabled),
+                    camera_enabled=bool(camera_enabled),
+                    spatial_warp_enabled=bool(spatial_warp_enabled),
+                )
+            self._contexts = contexts
+            self._context = next(iter(contexts.values())) if len(contexts) == 1 else None
             self.last_metrics = {}
 
         def clear_context(self):
             self._context = None
+            self._contexts = {}
+
+        def _context_for_hidden(self, hidden, args, kwargs):
+            if self._context is not None:
+                return self._context
+            if not self._contexts:
+                return None
+            target_count = kwargs.get("original_context_length")
+            if target_count is None:
+                lengths = kwargs.get("original_context_length_list")
+                if lengths is not None:
+                    target_count = sum(int(value) for value in lengths)
+            if target_count is None and len(args) > 6 and args[6] is not None:
+                target_count = int(args[6])
+            if target_count is None:
+                raise RuntimeError(
+                    "multiple spatial pyramid contexts require the transformer's target token count"
+                )
+            context = self._contexts.get(int(target_count))
+            if context is None:
+                raise RuntimeError(
+                    f"no spatial pyramid context for target token count {target_count}; "
+                    f"available={sorted(self._contexts)} hidden={tuple(hidden.shape)}"
+                )
+            return context
 
         def _patch_short_hook(self, _module, _args, output):
-            context = self._context
-            if context is None or not context.spatial_warp_enabled:
+            contexts = list(self._contexts.values())
+            if not contexts or not any(context.spatial_warp_enabled for context in contexts):
                 return output
+            warp_latent_frames = {context.warp_latent_frames for context in contexts}
+            if len(warp_latent_frames) != 1:
+                raise RuntimeError("all spatial pyramid contexts must use the same latent T")
+            frame_count = next(iter(warp_latent_frames))
             if output.ndim != 5 or output.shape[1] != self.hidden_size:
                 raise RuntimeError(f"unexpected patch_short output {tuple(output.shape)}")
-            if output.shape[2] < context.warp_latent_frames:
+            if output.shape[2] < frame_count:
                 raise RuntimeError("patch_short output is shorter than current SPATIAL_WARP")
             result = output.clone()
             role = self.spatial_warp_role.to(device=result.device, dtype=result.dtype).view(1, -1, 1, 1, 1)
-            result[:, :, -context.warp_latent_frames:] = result[:, :, -context.warp_latent_frames:] + role
+            result[:, :, -frame_count:] = result[:, :, -frame_count:] + role
             return result
 
         def _block_hook(self, gate_index, block_index):
             def hook(_module, args, kwargs):
-                context = self._context
+                hidden = args[0]
+                context = self._context_for_hidden(hidden, args, kwargs)
                 if context is None:
                     return args, kwargs
-                hidden = args[0]
                 count = context.target_token_count
                 if hidden.shape[1] < count:
                     raise RuntimeError("transformer hidden state is shorter than target token count")

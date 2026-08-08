@@ -35,4 +35,4 @@ training:
   history_bank_refresh_final: 25
   gradient_checkpointing: true
   pyramid_num_inference_steps_list: [1, 1, 1]
-  flow_matching_stage_id: 2
+  flow_matching_stage_id: 0

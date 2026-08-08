@@ -102,7 +102,8 @@ def main():
     )
     from long_video.oracle_training.history_bank import HistoryBankKey, validate_history_bank_entry
     from long_video.wah.spatial_reanchor import (
-        install_spatial_reanchor, plucker_camera_rays, visibility_to_target_tokens,
+        install_spatial_reanchor, plucker_camera_rays, resize_latents_spatial,
+        visibility_to_target_tokens,
     )
 
     if torch.cuda.device_count() != 1:
@@ -173,8 +174,6 @@ def main():
     exact.flow_matching_mode = "train_exact"
     exact.flow_matching_stage_sampling = "fixed"
     exact.flow_matching_stage_id = int(training["flow_matching_stage_id"])
-    if exact.flow_matching_stage_id != len(exact.pyramid_num_inference_steps_list) - 1:
-        raise ValueError("spatial re-anchoring requires the full-resolution final pyramid stage")
     exact.flow_matching_train_exact_timestep_sampling = "training_density"
     exact.flow_matching_use_dynamic_shifting = "off"
     exact.weighting_scheme = "none"
@@ -272,29 +271,79 @@ def main():
             "confidence": confidence, "metadata": metadata, "start": start,
         }
 
-    def spatial_conditioning(sample, warp_latents, *, anchor=True, camera=True, spatial_warp=True):
+    spatial_geometry_cache = {}
+
+    def spatial_conditioning(
+        sample, warp_latents, stage_latents, *, anchor=True, camera=True, spatial_warp=True,
+    ):
         patch = tuple(int(value) for value in pipe.transformer.config.patch_size)
-        latent_h, latent_w = map(int, warp_latents.shape[-2:])
+        if int(stage_latents.shape[2]) != int(warp_latents.shape[2]):
+            raise ValueError(
+                f"stage target/anchor latent T mismatch: {stage_latents.shape[2]} vs {warp_latents.shape[2]}"
+            )
+        latent_h, latent_w = map(int, stage_latents.shape[-2:])
+        stage_warp = resize_latents_spatial(
+            warp_latents, height=latent_h, width=latent_w,
+        )
         token_h = latent_h // patch[-2]
         token_w = latent_w // patch[-1]
-        visibility = visibility_to_target_tokens(
-            sample["visibility"], latent_frames=warp_latents.shape[2],
-            latent_height=latent_h, latent_width=latent_w,
-            patch_height=patch[-2], patch_width=patch[-1],
-            temporal_scale=int(config["vae_temporal_scale"]),
+        if latent_h != token_h * patch[-2] or latent_w != token_w * patch[-1]:
+            raise ValueError(
+                f"stage latent {(latent_h, latent_w)} is not divisible by patch {patch[-2:]}"
+            )
+        scene_scale = float(sample["metadata"].get("scene_scale", 1.0))
+        geometry_key = (
+            str(sample["root"]), int(sample["start"]),
+            str(sample.get("spatial_geometry_variant", "canonical")),
+            int(stage_warp.shape[2]), latent_h, latent_w, tuple(patch), scene_scale,
         )
-        rays = plucker_camera_rays(
-            sample["poses"], sample["intrinsics"],
-            image_height=exact.height, image_width=exact.width,
-            token_height=token_h, token_width=token_w,
-            latent_frames=warp_latents.shape[2],
-            temporal_scale=int(config["vae_temporal_scale"]),
-            scene_scale=float(sample["metadata"].get("scene_scale", 1.0)),
-        )
+        geometry = spatial_geometry_cache.get(geometry_key)
+        if geometry is None:
+            visibility = visibility_to_target_tokens(
+                sample["visibility"], latent_frames=stage_warp.shape[2],
+                latent_height=latent_h, latent_width=latent_w,
+                patch_height=patch[-2], patch_width=patch[-1],
+                temporal_scale=int(config["vae_temporal_scale"]),
+            )
+            rays = plucker_camera_rays(
+                sample["poses"], sample["intrinsics"],
+                image_height=exact.height, image_width=exact.width,
+                token_height=token_h, token_width=token_w,
+                latent_frames=stage_warp.shape[2],
+                temporal_scale=int(config["vae_temporal_scale"]),
+                scene_scale=scene_scale,
+            )
+            geometry = (visibility, rays)
+            spatial_geometry_cache[geometry_key] = geometry
+        visibility, rays = geometry
         return {
-            "warp_latents": warp_latents,
+            "warp_latents": stage_warp,
             "visibility_tokens": visibility,
             "plucker_tokens": rays,
+            "anchor_enabled": anchor,
+            "camera_enabled": camera,
+            "spatial_warp_enabled": spatial_warp,
+        }
+
+    def pyramid_spatial_conditioning(
+        sample, warp_latents, stage_latents_list, *, anchor=True, camera=True, spatial_warp=True,
+    ):
+        contexts = [
+            spatial_conditioning(
+                sample, warp_latents, stage_latents, anchor=anchor,
+                camera=camera, spatial_warp=spatial_warp,
+            )
+            for stage_latents in stage_latents_list
+        ]
+        return {
+            "stage_contexts": [
+                {
+                    "warp_latents": context["warp_latents"],
+                    "visibility_tokens": context["visibility_tokens"],
+                    "plucker_tokens": context["plucker_tokens"],
+                }
+                for context in contexts
+            ],
             "anchor_enabled": anchor,
             "camera_enabled": camera,
             "spatial_warp_enabled": spatial_warp,
@@ -346,7 +395,19 @@ def main():
     fixed = phase_a_item(phase_a_diag[0])
     opt.seed_global_rng(exact.seed)
     fixed_stage_items = opt.flow_matching_train_exact_items(pipe, fixed["target"], exact, device)
-    fixed_condition = spatial_conditioning(fixed["sample"], fixed["warp_latents"])
+    if len(fixed_stage_items) != 1:
+        raise ValueError("the restored formal WAH fixed-stage strategy must sample exactly one stage")
+    fixed_stage = fixed_stage_items[0]
+    fixed_condition = spatial_conditioning(
+        fixed["sample"], fixed["warp_latents"], fixed_stage["noisy_latents"],
+    )
+    pyramid_latents = opt.training_exact_pyramid_latents(
+        fixed["target"], len(exact.pyramid_num_inference_steps_list),
+    )
+    pyramid_conditions = [
+        spatial_conditioning(fixed["sample"], fixed["warp_latents"], stage_latents)
+        for stage_latents in pyramid_latents
+    ]
     startup_report = {
         "git_sha": git_sha,
         "source_checkpoint": str(config["source_checkpoint"]),
@@ -375,7 +436,9 @@ def main():
             "total": int(sum(item.numel() for item in trainable)),
         },
         "target_latent_shape": list(fixed["target"].shape),
-        "warp_latent_shape": list(fixed["warp_latents"].shape),
+        "full_warp_latent_shape": list(fixed["warp_latents"].shape),
+        "actual_stage_target_shape": list(fixed_stage["noisy_latents"].shape),
+        "actual_stage_anchor_shape": list(fixed_condition["warp_latents"].shape),
         "target_token_shape": list(fixed_condition["visibility_tokens"].shape[:-1])
         + [int(pipe.transformer.patch_embedding.out_channels)],
         "visibility_token_shape": list(fixed_condition["visibility_tokens"].shape),
@@ -392,6 +455,19 @@ def main():
         "spatial_warp_role_independent": True,
         "temporal_history_weights": {"TEMP_SHORT": 1.0, "TEMP_MID": 1.0, "TEMP_LONG": 1.0},
         "flow_matching_stage_id": exact.flow_matching_stage_id,
+        "pyramid_stage_shapes": [
+            {
+                "stage_id": stage_id,
+                "target_latent": list(stage_latents.shape),
+                "anchor_latent": list(condition["warp_latents"].shape),
+                "visibility_tokens": list(condition["visibility_tokens"].shape),
+                "plucker": list(condition["plucker_tokens"].shape),
+                "token_count": int(condition["visibility_tokens"].shape[1]),
+            }
+            for stage_id, (stage_latents, condition) in enumerate(
+                zip(pyramid_latents, pyramid_conditions)
+            )
+        ],
         "anchor_blocks": list(controller.refresh_blocks),
         "initial_anchor_gates": controller.anchor_gates.detach().cpu().tolist(),
         "initial_camera_gate": float(controller.camera_gate.detach().cpu()),
@@ -399,19 +475,31 @@ def main():
         "gpu_uuid": str(torch.cuda.get_device_properties(0).uuid),
         "gpu_processes": _gpu_snapshot(),
     }
-    if startup_report["warp_latent_shape"] != [1, 16, 9, 48, 80]:
-        raise ValueError(f"unexpected current warp latent shape: {startup_report['warp_latent_shape']}")
-    if startup_report["target_token_shape"] != [1, 8640, 5120]:
-        raise ValueError(f"unexpected target token shape: {startup_report['target_token_shape']}")
+    if startup_report["full_warp_latent_shape"] != [1, 16, 9, 48, 80]:
+        raise ValueError(
+            f"unexpected current full warp latent shape: {startup_report['full_warp_latent_shape']}"
+        )
+    expected_stage_shapes = [
+        ([1, 16, 9, 12, 20], 540),
+        ([1, 16, 9, 24, 40], 2160),
+        ([1, 16, 9, 48, 80], 8640),
+    ]
+    observed_stage_shapes = [
+        (entry["target_latent"], entry["token_count"])
+        for entry in startup_report["pyramid_stage_shapes"]
+    ]
+    if observed_stage_shapes != expected_stage_shapes:
+        raise ValueError(f"unexpected train_exact pyramid shapes: {observed_stage_shapes}")
     if not startup_report["warp_target_rope_aligned"]:
         raise ValueError("SPATIAL_WARP and target RoPE indices are not aligned")
     _atomic_json(run_dir / "startup_report.json", startup_report)
 
     def loss_for(item, *, histories=None, anchor=True, camera=True, spatial_warp=True, fixed_items=None):
-        condition = spatial_conditioning(
-            item["sample"], item["warp_latents"], anchor=anchor,
-            camera=camera, spatial_warp=spatial_warp,
-        )
+        def condition(stage_item):
+            return spatial_conditioning(
+                item["sample"], item["warp_latents"], stage_item["noisy_latents"],
+                anchor=anchor, camera=camera, spatial_warp=spatial_warp,
+            )
         return masked_flow_matching_loss(
             pipe, item["prompt"], item["target"], histories or item["histories"],
             exact, device, item["weights"], fixed_stage_items=fixed_items,
@@ -430,6 +518,9 @@ def main():
             shuffled = dict(fixed)
             order = np.random.default_rng(exact.seed).permutation(exact.num_frames)
             shuffled_sample = dict(fixed["sample"])
+            shuffled_sample["spatial_geometry_variant"] = (
+                "shuffled_" + hashlib.sha256(order.tobytes()).hexdigest()
+            )
             shuffled_sample["visibility"] = fixed["sample"]["visibility"][order]
             shuffled_sample["warp"] = [fixed["sample"]["warp"][index] for index in order]
             shuffled["sample"] = shuffled_sample
@@ -507,7 +598,12 @@ def main():
                         (1.0 - sigma) * current + sigma * noise
                     )
             warp_latents = encode_warp(sample["warp"])
-            controller.prepare_context(**spatial_conditioning(sample, warp_latents))
+            inference_pyramid = opt.training_exact_pyramid_latents(
+                warp_latents, len(exact.pyramid_num_inference_steps_list),
+            )
+            controller.prepare_context(**pyramid_spatial_conditioning(
+                sample, warp_latents, inference_pyramid,
+            ))
             try:
                 with torch.no_grad():
                     _, state = pipe.generate_next_chunk(

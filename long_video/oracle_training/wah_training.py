@@ -43,6 +43,12 @@ def masked_flow_matching_loss(
     if spatial_conditioning is not None:
         if controller is None:
             raise RuntimeError("spatial conditioning was provided without an installed controller")
+        if callable(spatial_conditioning):
+            if len(stage_items) != 1:
+                raise ValueError(
+                    "stage-aware spatial conditioning requires exactly one sampled train_exact stage"
+                )
+            spatial_conditioning = spatial_conditioning(stage_items[0])
         controller.prepare_context(**spatial_conditioning)
     try:
         predictions = opt.transformer_model_forward(

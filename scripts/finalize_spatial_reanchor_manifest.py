@@ -17,7 +17,9 @@ def _args():
 
 def _renderer_overlap(record, candidate):
     import numpy as np
+    from long_video.data.camera import resize_intrinsics
     from long_video.geometry.point_renderer import render
+    from long_video.oracle_training.revisit import bidirectional_depth_reprojection_overlap
     from long_video.memory.node_store import NodeStore
     from long_video.types import CameraBatch
 
@@ -26,14 +28,16 @@ def _renderer_overlap(record, candidate):
     poses = np.load(root / "target" / "target_c2w_local.npy")[::8]
     intrinsics = np.load(root / "target" / "intrinsics.npy")[::8]
     offsets = [int(candidate["earlier_anchor_offset"]), int(candidate["later_anchor_offset"])]
-    cameras = CameraBatch(poses[offsets], intrinsics[offsets], 192, 320)
+    render_hw = (192, 320)
+    scaled_intrinsics = resize_intrinsics(intrinsics[offsets], (384, 640), render_hw)
+    cameras = CameraBatch(poses[offsets], scaled_intrinsics, *render_hw)
     rendered = render(
         node, cameras, device="cpu", near=0.05, far=100.0,
         point_radius=1, chunk_points=1000000,
     )
-    left, right = np.asarray(rendered.visibility[0], bool), np.asarray(rendered.visibility[1], bool)
-    union = left | right
-    return float((left & right).sum() / max(int(union.sum()), 1))
+    return bidirectional_depth_reprojection_overlap(
+        rendered.depth, rendered.visibility, cameras.c2w, cameras.intrinsics,
+    )
 
 
 def main():

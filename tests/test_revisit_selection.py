@@ -6,10 +6,43 @@ from long_video.oracle_training.revisit import (
     MultiChunkContract,
     add_renderer_overlap,
     choose_independent_final_candidates,
+    bidirectional_depth_reprojection_overlap,
     scan_holo360d_zip,
     score_large_motion_window,
     score_revisit_window,
 )
+from long_video.data.camera import resize_intrinsics
+
+
+def _overlap_cameras(height=4, width=6):
+    c2w = np.repeat(np.eye(4, dtype=np.float32)[None], 2, axis=0)
+    intrinsics = np.repeat(np.array([[4.0, 0.0, 2.5], [0.0, 4.0, 1.5], [0.0, 0.0, 1.0]], np.float32)[None], 2, axis=0)
+    depth = np.full((2, height, width), 2.0, np.float32)
+    visibility = np.ones((2, height, width), bool)
+    return depth, visibility, c2w, intrinsics
+
+
+def test_bidirectional_depth_reprojection_same_pose_is_near_one():
+    depth, visibility, c2w, intrinsics = _overlap_cameras()
+    overlap = bidirectional_depth_reprojection_overlap(depth, visibility, c2w, intrinsics)
+    assert overlap == pytest.approx(1.0)
+
+
+def test_bidirectional_depth_reprojection_rejects_depth_inconsistency():
+    depth, visibility, c2w, intrinsics = _overlap_cameras()
+    c2w[1, 0, 3] = 0.8
+    depth[1].fill(9.0)
+    overlap = bidirectional_depth_reprojection_overlap(depth, visibility, c2w, intrinsics)
+    assert np.isfinite(overlap) and 0.0 <= overlap < 0.2
+
+
+def test_low_resolution_intrinsics_use_pixel_center_scaling():
+    _depth, _visibility, _c2w, intrinsics = _overlap_cameras(384, 640)
+    scaled = resize_intrinsics(intrinsics, (384, 640), (192, 320))
+    np.testing.assert_allclose(scaled[:, 0, 0], intrinsics[:, 0, 0] * 0.5)
+    np.testing.assert_allclose(scaled[:, 1, 1], intrinsics[:, 1, 1] * 0.5)
+    np.testing.assert_allclose(scaled[:, 0, 2], (intrinsics[:, 0, 2] + 0.5) * 0.5 - 0.5)
+    np.testing.assert_allclose(scaled[:, 1, 2], (intrinsics[:, 1, 2] + 0.5) * 0.5 - 0.5)
 
 
 def test_multi_chunk_contract():

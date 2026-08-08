@@ -11,6 +11,63 @@ import numpy as np
 from .dense24 import continuous_runs
 
 
+def bidirectional_depth_reprojection_overlap(
+    depth, visibility, c2w, intrinsics, *, depth_tolerance_m=0.05,
+    relative_depth_tolerance=0.03,
+):
+    """Measure mutual visible geometry using only renderer Z-depth outputs."""
+    depth = np.asarray(depth, np.float32)
+    visibility = np.asarray(visibility, bool)
+    c2w = np.asarray(c2w, np.float32)
+    intrinsics = np.asarray(intrinsics, np.float32)
+    if depth.shape != visibility.shape or depth.ndim != 3 or depth.shape[0] != 2:
+        raise ValueError("depth and visibility must describe exactly two [H,W] renderings")
+    if c2w.shape != (2, 4, 4) or intrinsics.shape != (2, 3, 3):
+        raise ValueError("bidirectional overlap requires two c2w and intrinsic matrices")
+    if not (np.isfinite(c2w).all() and np.isfinite(intrinsics).all()):
+        raise ValueError("camera inputs must be finite")
+    if depth_tolerance_m < 0 or relative_depth_tolerance < 0:
+        raise ValueError("depth tolerances must be non-negative")
+
+    def project(source, target):
+        source_depth = depth[source]
+        valid = visibility[source] & np.isfinite(source_depth) & (source_depth > 0)
+        denominator = int(valid.sum())
+        if denominator == 0:
+            return 0.0
+        y, x = np.nonzero(valid)
+        z = source_depth[y, x]
+        source_k = intrinsics[source]
+        camera_points = np.stack((
+            (x - source_k[0, 2]) * z / source_k[0, 0],
+            (y - source_k[1, 2]) * z / source_k[1, 1],
+            z,
+        ), axis=1)
+        world = camera_points @ c2w[source, :3, :3].T + c2w[source, :3, 3]
+        target_w2c = np.linalg.inv(c2w[target])
+        target_camera = world @ target_w2c[:3, :3].T + target_w2c[:3, 3]
+        target_z = target_camera[:, 2]
+        target_k = intrinsics[target]
+        u = np.rint(target_k[0, 0] * target_camera[:, 0] / np.maximum(target_z, 1e-8) + target_k[0, 2]).astype(np.int64)
+        v = np.rint(target_k[1, 1] * target_camera[:, 1] / np.maximum(target_z, 1e-8) + target_k[1, 2]).astype(np.int64)
+        target_depth = depth[target]
+        inside = (target_z > 0) & (u >= 0) & (u < target_depth.shape[1]) & (v >= 0) & (v < target_depth.shape[0])
+        matches = np.zeros(denominator, dtype=bool)
+        indices = np.flatnonzero(inside)
+        if len(indices):
+            sampled_depth = target_depth[v[indices], u[indices]]
+            sampled_visible = visibility[target, v[indices], u[indices]]
+            tolerance = np.maximum(float(depth_tolerance_m), float(relative_depth_tolerance) * sampled_depth)
+            matches[indices] = (
+                sampled_visible & np.isfinite(sampled_depth) & (sampled_depth > 0)
+                & (np.abs(target_z[indices] - sampled_depth) <= tolerance)
+            )
+        return float(matches.mean())
+
+    overlap = 0.5 * (project(0, 1) + project(1, 0))
+    return float(np.clip(overlap if np.isfinite(overlap) else 0.0, 0.0, 1.0))
+
+
 @dataclass(frozen=True)
 class MultiChunkContract:
     chunks: int

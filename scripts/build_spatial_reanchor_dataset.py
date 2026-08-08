@@ -84,6 +84,7 @@ def _renderer_overlap_for_candidate(extracted, candidate):
     from long_video.geometry.point_renderer import render
     from long_video.oracle_training.dataset import _perspective, _resize_erp
     from long_video.oracle_training.oracle_node import build_oracle_erp_node
+    from long_video.oracle_training.revisit import bidirectional_depth_reprojection_overlap
     from long_video.types import CameraBatch
 
     reader = Holo360DReader(extracted, normalize_first_pose=False)
@@ -108,9 +109,9 @@ def _renderer_overlap_for_candidate(extracted, candidate):
         node, CameraBatch(np.asarray(poses), np.asarray(intrinsics), 192, 320),
         device="cpu", near=0.05, far=100.0, point_radius=1, chunk_points=1000000,
     )
-    left, right = np.asarray(rendered.visibility[0], bool), np.asarray(rendered.visibility[1], bool)
-    union = left | right
-    return float((left & right).sum() / max(int(union.sum()), 1))
+    return bidirectional_depth_reprojection_overlap(
+        rendered.depth, rendered.visibility, np.asarray(poses), np.asarray(intrinsics),
+    )
 
 
 def _finalize_scene_candidates(scene, archive, output):

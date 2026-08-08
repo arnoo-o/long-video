@@ -36,4 +36,12 @@ def validate_history_bank_entry(entry):
     metadata = entry["metadata"]
     if metadata.get("uses_gt_future") is not False:
         raise ValueError("history bank metadata must explicitly declare uses_gt_future=false")
+    provenance = metadata.get("warp_provenance")
+    if not isinstance(provenance, list) or not provenance:
+        raise ValueError("history bank metadata must include causal warp provenance")
+    for item in provenance:
+        if not isinstance(item, dict) or item.get("causal") is not True:
+            raise ValueError("history bank warp provenance must be causal")
+        if item.get("uses_future_gt") is not False:
+            raise ValueError("history bank warp provenance must declare uses_future_gt=false")
     return True

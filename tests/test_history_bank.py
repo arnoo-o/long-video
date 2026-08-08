@@ -17,7 +17,10 @@ def test_history_bank_key_changes_with_checkpoint_and_config():
 def test_history_bank_rejects_future_gt():
     entry = {
         "TEMP_LONG": None, "TEMP_MID": None, "TEMP_SHORT": None,
-        "key": "x", "metadata": {"uses_gt_future": False},
+        "key": "x", "metadata": {
+            "uses_gt_future": False,
+            "warp_provenance": [{"causal": True, "uses_future_gt": False}],
+        },
     }
     assert validate_history_bank_entry(entry)
     with pytest.raises(ValueError, match="future GT"):

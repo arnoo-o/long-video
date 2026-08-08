@@ -23,13 +23,16 @@ def main():
     scenes = []
     for archive in args.archive:
         report, frame_ids, poses, runs = scan_holo360d_zip(archive, gap_factor=args.gap_factor)
-        windows = select_revisit_windows(poses, runs)
-        report["selected_phase_b_windows"] = windows
-        report["selected_phase_b_large_motion_windows"] = select_large_motion_windows(poses, runs)
-        report["available_phase_b_chunk_counts"] = [item["chunks"] for item in windows]
+        revisit_candidates = select_revisit_windows(poses, runs)
+        motion_candidates = select_large_motion_windows(poses, runs)
+        report["phase_b_revisit_pose_candidates"] = revisit_candidates
+        report["phase_b_large_motion_pose_candidates"] = motion_candidates
+        report["available_phase_b_chunk_counts"] = sorted({
+            int(item["chunks"]) for item in revisit_candidates
+        })
         report["usable_anchor_count"] = int(sum(item["anchor_count"] for item in report["continuous_runs"]))
         scenes.append(report)
-    payload = {"schema_version": 1, "gap_factor": args.gap_factor, "scenes": scenes}
+    payload = {"schema_version": 2, "gap_factor": args.gap_factor, "scenes": scenes}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")

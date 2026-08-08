@@ -99,6 +99,7 @@ def plucker_camera_rays(
     latent_frames: int,
     temporal_scale: int,
     scene_scale: float,
+    sequence_frame_start: int = 0,
 ):
     """Build target-patch-center Plucker rays in the frozen source frame."""
     import torch
@@ -109,17 +110,19 @@ def plucker_camera_rays(
         raise ValueError(f"camera/intrinsics mismatch: {tuple(c2w.shape)} vs {tuple(k.shape)}")
     if not np.isfinite(float(scene_scale)) or float(scene_scale) <= 0:
         raise ValueError("scene_scale must be finite and positive")
-    identity = torch.eye(4, dtype=c2w.dtype, device=c2w.device)
-    if not torch.allclose(c2w[:, 0], identity.expand_as(c2w[:, 0]), atol=1e-5, rtol=0):
-        raise ValueError("the first source-relative c2w must be identity")
+    sequence_frame_start = int(sequence_frame_start)
+    if sequence_frame_start < 0:
+        raise ValueError("sequence_frame_start must be non-negative")
+    if sequence_frame_start == 0:
+        identity = torch.eye(4, dtype=c2w.dtype, device=c2w.device)
+        if not torch.allclose(c2w[:, 0], identity.expand_as(c2w[:, 0]), atol=1e-5, rtol=0):
+            raise ValueError("the full sequence frame0 source-relative c2w must be identity")
 
     groups = _temporal_groups(c2w.shape[1], latent_frames, temporal_scale)
     representative_c2w, representative_k = _group_representative_cameras(c2w, k, groups)
-    if not torch.allclose(
-        representative_c2w[:, 0, :3, 3],
-        torch.zeros_like(representative_c2w[:, 0, :3, 3]),
-        atol=1e-6,
-        rtol=0,
+    if sequence_frame_start == 0 and not torch.allclose(
+        representative_c2w[:, 0, :3, 3], torch.zeros_like(representative_c2w[:, 0, :3, 3]),
+        atol=1e-6, rtol=0,
     ):
         raise RuntimeError("the first latent group must retain the source canonical origin")
 
@@ -333,6 +336,13 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
             self._context = next(iter(contexts.values())) if len(contexts) == 1 else None
             self.last_metrics = {}
 
+        def metrics_snapshot(self):
+            """Materialize detached GPU scalars only at an explicit log boundary."""
+            return {
+                key: float(value.detach().cpu()) if hasattr(value, "detach") else float(value)
+                for key, value in self.last_metrics.items()
+            }
+
         def clear_context(self):
             self._context = None
             self._contexts = {}
@@ -392,19 +402,16 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
                 if block_index == 0 and context.camera_enabled:
                     camera_delta = self.camera_adapter(context.plucker_tokens)
                     target = target + (self.camera_gate.float() * camera_delta).to(target.dtype)
-                    self.last_metrics["camera_ratio"] = float(
-                        ((self.camera_gate.float() * camera_delta).norm(dim=-1).mean() / base_norm).detach().cpu()
-                    )
+                    self.last_metrics["camera_ratio"] = (
+                        (self.camera_gate.float() * camera_delta).norm(dim=-1).mean() / base_norm
+                    ).detach()
                 if context.anchor_enabled:
                     anchor_delta = self.anchor_adapter(target, context.warp_tokens)
                     contribution = self.anchor_gates[gate_index].float() * context.visibility_tokens * anchor_delta
-                    if not bool(torch.equal(contribution[context.visibility_tokens.expand_as(contribution) == 0],
-                                            torch.zeros_like(contribution[context.visibility_tokens.expand_as(contribution) == 0]))):
-                        raise RuntimeError("invisible Spatial Anchor contribution must be exactly zero")
                     target = target + contribution.to(target.dtype)
-                    self.last_metrics[f"anchor_ratio_block{block_index}"] = float(
-                        (contribution.norm(dim=-1).mean() / base_norm).detach().cpu()
-                    )
+                    self.last_metrics[f"anchor_ratio_block{block_index}"] = (
+                        contribution.norm(dim=-1).mean() / base_norm
+                    ).detach()
                 updated = torch.cat((hidden[:, :-count], target), dim=1)
                 return (updated, *args[1:]), kwargs
             return hook

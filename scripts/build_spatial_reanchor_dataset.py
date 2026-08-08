@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from zipfile import ZipFile
@@ -76,6 +77,79 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _renderer_overlap_for_candidate(extracted, candidate):
+    import numpy as np
+    from long_video.data.erp_geometry import source_relative_c2w
+    from long_video.data.holo360d import Holo360DReader
+    from long_video.geometry.point_renderer import render
+    from long_video.oracle_training.dataset import _perspective, _resize_erp
+    from long_video.oracle_training.oracle_node import build_oracle_erp_node
+    from long_video.types import CameraBatch
+
+    reader = Holo360DReader(extracted, normalize_first_pose=False)
+    source = reader.read(0)
+    source_rgb, source_depth, source_mask = _resize_erp(
+        source.rgb, source.depth, source.mask, (512, 1024),
+    )
+    node = build_oracle_erp_node(
+        source_rgb, source_depth, source_mask,
+        source_c2w_local=np.eye(4, dtype=np.float32), voxel_size=0.02, pixel_center=0.5,
+        model_versions={"geometry": "Holo360D_mesh_depth", "builder": "selection_m0"},
+    )
+    offsets = [int(candidate["earlier_anchor_offset"]), int(candidate["later_anchor_offset"])]
+    frames = [reader.read(offset) for offset in offsets]
+    intrinsics = []
+    poses = []
+    for frame in frames:
+        _, _, _, _, intrinsic = _perspective(frame, fov_degrees=90.0, height=192, width=320)
+        intrinsics.append(intrinsic)
+        poses.append(source_relative_c2w(source.raw_c2w, frame.raw_c2w))
+    rendered = render(
+        node, CameraBatch(np.asarray(poses), np.asarray(intrinsics), 192, 320),
+        device="cpu", near=0.05, far=100.0, point_radius=1, chunk_points=1000000,
+    )
+    left, right = np.asarray(rendered.visibility[0], bool), np.asarray(rendered.visibility[1], bool)
+    union = left | right
+    return float((left & right).sum() / max(int(union.sum()), 1))
+
+
+def _finalize_scene_candidates(scene, archive, output):
+    from long_video.oracle_training.revisit import (
+        add_renderer_overlap, choose_independent_final_candidates,
+    )
+
+    pools = {
+        "revisit": scene.get("phase_b_revisit_pose_candidates", []),
+        "large_motion": scene.get("phase_b_large_motion_pose_candidates", []),
+    }
+    if not all(pools.values()):
+        raise ValueError("scan report must contain pose-prefiltered Phase B candidate pools")
+    evaluation_root = Path(output) / "_selection_eval" / scene["scene_id"]
+    evaluated = {"revisit": [], "large_motion": []}
+    for sample_type, candidates in pools.items():
+        for ordinal, candidate in enumerate(candidates):
+            destination = evaluation_root / f"{sample_type}_{ordinal:03d}"
+            extracted = _extract(
+                archive, destination, int(candidate["start"]), int(candidate["anchor_count"]),
+            )
+            try:
+                overlap = _renderer_overlap_for_candidate(extracted, candidate)
+            finally:
+                resolved = destination.resolve()
+                if evaluation_root.resolve() not in resolved.parents:
+                    raise RuntimeError("selection cleanup escaped its temporary root")
+                shutil.rmtree(resolved)
+            evaluated[sample_type].append(
+                add_renderer_overlap(candidate, overlap, sample_type=sample_type)
+            )
+    revisit, motion = choose_independent_final_candidates(
+        evaluated["revisit"], evaluated["large_motion"],
+    )
+    if not revisit or not motion:
+        raise ValueError("renderer scoring produced no independent Phase B selections")
+    return revisit, motion
+
+
 def main():
     args = _args()
     if args.physical_gpu != 1:
@@ -108,14 +182,19 @@ def main():
         for split, starts in phase_a.items():
             specs.extend({"phase": "A", "split": split, "start": start, "anchors": 5, "chunks": 1}
                          for start in starts)
-        for window in scene["selected_phase_b_windows"]:
+        selected_revisit, selected_motion = _finalize_scene_candidates(
+            scene, archive, args.output,
+        )
+        scene["selected_phase_b_windows"] = selected_revisit
+        scene["selected_phase_b_large_motion_windows"] = selected_motion
+        for window in selected_revisit:
             specs.append({
                 "phase": "B", "split": "train", "start": int(window["start"]),
                 "anchors": int(window["anchor_count"]), "chunks": int(window["chunks"]),
                 "revisit": window,
                 "sample_type": "revisit",
             })
-        for window in scene["selected_phase_b_large_motion_windows"]:
+        for window in selected_motion:
             specs.append({
                 "phase": "B", "split": "train", "start": int(window["start"]),
                 "anchors": int(window["anchor_count"]), "chunks": int(window["chunks"]),
@@ -157,9 +236,10 @@ def main():
                 "anchor_count": spec["anchors"], "chunk_count": spec["chunks"],
                 "metadata": metadata,
                 "sample_type": metadata["sample_type"],
+                "training_chunk_index": int(spec.get("revisit", {}).get("training_chunk_index", 0)),
             })
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "git_sha": git_sha,
         "scan_report": str(args.scan_report),
         "scan_report_sha256": _sha256(args.scan_report),

@@ -47,6 +47,26 @@ def test_plucker_rejects_noncanonical_first_pose():
         )
 
 
+def test_later_chunk_keeps_sequence_canonical_frame_without_identity_requirement():
+    poses, intrinsics = _cameras()
+    chunk = poses.copy()
+    chunk[:, 0, 3] += 3.0
+    rays = plucker_camera_rays(
+        chunk, intrinsics, image_height=384, image_width=640,
+        token_height=24, token_width=40, latent_frames=9,
+        temporal_scale=4, scene_scale=1.0, sequence_frame_start=32,
+    )
+    assert rays.shape == (1, 9, 24, 40, 6)
+    assert not torch.equal(rays[0, 0, ..., 3:], torch.zeros_like(rays[0, 0, ..., 3:]))
+    for _node_id in ("M0", "M1", "M2"):
+        current = plucker_camera_rays(
+            chunk, intrinsics, image_height=384, image_width=640,
+            token_height=24, token_width=40, latent_frames=9,
+            temporal_scale=4, scene_scale=1.0, sequence_frame_start=32,
+        )
+        torch.testing.assert_close(current, rays)
+
+
 def test_visibility_mapping_uses_exact_vae_temporal_groups():
     visibility = np.ones((33, 384, 640), np.float32)
     visibility[1:5] = 0

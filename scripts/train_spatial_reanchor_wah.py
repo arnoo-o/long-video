@@ -101,6 +101,7 @@ def main():
         save_spatial_training_checkpoint,
     )
     from long_video.oracle_training.history_bank import HistoryBankKey, validate_history_bank_entry
+    from long_video.oracle_training.causal_warp import CausalActiveNodeRenderer
     from long_video.wah.spatial_reanchor import (
         install_spatial_reanchor, plucker_camera_rays, resize_latents_spatial,
         visibility_to_target_tokens,
@@ -243,32 +244,34 @@ def main():
         )
         return prompt_embeds, histories
 
-    def sample_arrays(record, chunk_index=0):
+    def sample_arrays(record, chunk_index=0, *, causal_renderer=None):
         root = Path(record["path"])
         start = int(chunk_index) * int(config["chunk_stride"])
         target = _frames(root / "target" / "target_rgb_for_loss", start, exact.num_frames)
         poses = np.load(root / "target" / "target_c2w_local.npy")[start:start + exact.num_frames]
         intrinsics = np.load(root / "target" / "intrinsics.npy")[start:start + exact.num_frames]
         prompt = (root / "prompt.txt").read_text(encoding="utf-8")
-        if chunk_index == 0:
+        warp_provenance = None
+        if causal_renderer is not None:
+            cameras = CameraBatch(poses, intrinsics, exact.height, exact.width)
+            causal = causal_renderer.render(cameras, frame_start=start)
+            rendered = causal.warp
+            warp = [Image.fromarray(np.asarray(frame).astype(np.uint8)) for frame in rendered.rgb]
+            visibility = np.asarray(rendered.visibility, np.float32)
+            confidence = np.asarray(rendered.confidence, np.float32)
+            warp_provenance = causal.provenance
+        elif chunk_index == 0:
             warp = _frames(root / "single_chunk_warp" / "warp_rgb")
             visibility = np.load(root / "single_chunk_warp" / "warp_visibility.npy")
             confidence = np.load(root / "single_chunk_warp" / "warp_confidence.npy")
         else:
-            node = NodeStore(root / "session").load("node_000")
-            cameras = CameraBatch(poses, intrinsics, exact.height, exact.width)
-            rendered = render(
-                node, cameras, device="cuda:0", near=0.05, far=100.0,
-                point_radius=1, chunk_points=1000000,
-            )
-            warp = [Image.fromarray(np.asarray(frame).astype(np.uint8)) for frame in rendered.rgb]
-            visibility = np.asarray(rendered.visibility, np.float32)
-            confidence = np.asarray(rendered.confidence, np.float32)
+            raise RuntimeError("Phase B warp must be rendered by the causal active-node renderer")
         metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
         return {
             "root": root, "target": target, "poses": poses, "intrinsics": intrinsics,
             "prompt": prompt, "warp": warp, "visibility": visibility,
             "confidence": confidence, "metadata": metadata, "start": start,
+            "warp_provenance": warp_provenance,
         }
 
     spatial_geometry_cache = {}
@@ -312,6 +315,7 @@ def main():
                 latent_frames=stage_warp.shape[2],
                 temporal_scale=int(config["vae_temporal_scale"]),
                 scene_scale=scene_scale,
+                sequence_frame_start=int(sample["start"]),
             )
             geometry = (visibility, rays)
             spatial_geometry_cache[geometry_key] = geometry
@@ -381,7 +385,6 @@ def main():
                 "weights": weights,
             }
             del target_latents, prompt, histories, empty_histories, warp_latents
-            torch.cuda.empty_cache()
         item = encoded_a[key]
         return {
             **item,
@@ -419,7 +422,9 @@ def main():
             {
                 "sequence_id": item["sequence_id"], "scene_id": item["scene_id"],
                 "sample_type": item["sample_type"], "chunk_count": item["chunk_count"],
+                "training_chunk_index": item.get("training_chunk_index"),
                 "revisit": item["metadata"].get("revisit"),
+                "phase_b_selection": item["metadata"].get("phase_b_selection"),
             }
             for item in phase_b
         ],
@@ -428,6 +433,8 @@ def main():
             for count in sorted({int(item["chunk_count"]) for item in phase_b})
         },
         "available_phase_b_chunks_by_scene": available_phase_b_chunks,
+        "phase_b_node_mode": "M0-only",
+        "phase_b_uses_future_gt": False,
         "phase_b_mix": phase_b_mix,
         "scene_scale": {scene: {"value": 1.0, "source": "Holo360D_dataset_calibrated_metric"} for scene in scenes},
         "trainable_parameters": {
@@ -544,12 +551,31 @@ def main():
         pipe.transformer.train()
         values["anchor_gates"] = controller.anchor_gates.detach().cpu().tolist()
         values["camera_gate"] = float(controller.camera_gate.detach().cpu())
-        values["utilization"] = dict(controller.last_metrics)
+        values["utilization"] = controller.metrics_snapshot()
         return values
 
     history_bank = {}
     bank_step = -1
     bank_stats = []
+    memory_cleanup_stats = {"calls": 0, "reasons": [], "entries": 0}
+
+    def maybe_cleanup_after_bank_entry():
+        allocated = int(torch.cuda.memory_allocated(0))
+        reserved = int(torch.cuda.memory_reserved(0))
+        total = int(torch.cuda.get_device_properties(0).total_memory)
+        reason = None
+        if reserved > int(0.90 * total):
+            reason = "reserved>0.90*total"
+        elif reserved - allocated > 8 * 1024**3:
+            reason = "allocator_fragmentation_gap>8GiB"
+        memory_cleanup_stats["entries"] += 1
+        if reason is not None:
+            torch.cuda.empty_cache()
+            memory_cleanup_stats["calls"] += 1
+            memory_cleanup_stats["reasons"].append({
+                "global_step": global_step, "reason": reason,
+                "allocated": allocated, "reserved": reserved,
+            })
 
     def lora_snapshot():
         folder = run_dir / "history_bank_lora"
@@ -560,7 +586,11 @@ def main():
         return folder / "current_lora.pt"
 
     def build_bank_entry(record, snapshot, snapshot_sha, *, corrupt_generated_history=False):
-        current_chunk = int(record["chunk_count"]) - 1
+        if "training_chunk_index" not in record:
+            raise ValueError("Phase B record is missing selector training_chunk_index")
+        current_chunk = int(record["training_chunk_index"])
+        if not 0 <= current_chunk < int(record["chunk_count"]):
+            raise ValueError("training_chunk_index is outside the selected Phase B window")
         root = Path(record["path"])
         source = Image.open(root / "source" / "source_perspective.png").convert("RGB")
         prompt = (root / "prompt.txt").read_text(encoding="utf-8")
@@ -579,11 +609,18 @@ def main():
         if "temp_short_acceptance_scale" in signature.parameters:
             init_kwargs["temp_short_acceptance_scale"] = 1.0
         state = pipe.init_autoregressive_state(**init_kwargs)
+        causal_renderer = CausalActiveNodeRenderer(
+            NodeStore(root / "session"),
+            renderer_kwargs={"device": "cuda:0", "near": 0.05, "far": 100.0,
+                             "point_radius": 1, "chunk_points": 1000000},
+        )
+        warp_provenance = []
         corruption_generator = torch.Generator(device=device).manual_seed(
             exact.seed + global_step + 1009
         )
         for chunk in range(current_chunk):
-            sample = sample_arrays(record, chunk)
+            sample = sample_arrays(record, chunk, causal_renderer=causal_renderer)
+            warp_provenance.append(sample["warp_provenance"])
             if corrupt_generated_history:
                 generated_frames = max(0, int(state["total_generated_latent_frames"]) - 1)
                 generated_frames = min(generated_frames, int(state["num_history_latent_frames"]))
@@ -615,8 +652,8 @@ def main():
             finally:
                 controller.clear_context()
             del warp_latents
-            torch.cuda.empty_cache()
-        sample = sample_arrays(record, current_chunk)
+        sample = sample_arrays(record, current_chunk, causal_renderer=causal_renderer)
+        warp_provenance.append(sample["warp_provenance"])
         pipe._prepare_autoregressive_warp_chunk(
             state, np.stack([np.asarray(item) for item in sample["warp"]]),
             sample["visibility"][None, None],
@@ -671,6 +708,9 @@ def main():
                 "global_step": global_step, "history_chunk_index": current_chunk,
                 "self_augmentation": bool(corrupt_generated_history),
                 "restoration_steps_per_pyramid_stage": tuple(exact.pyramid_num_inference_steps_list),
+                "node_mode": causal_renderer.node_mode,
+                "warp_provenance": warp_provenance,
+                "training_chunk_index": current_chunk,
             },
         }
         validate_history_bank_entry({
@@ -699,6 +739,7 @@ def main():
                     record, snapshot, snapshot_sha, corrupt_generated_history=True,
                 )
                 history_bank[(record["scene_id"], "corruption")] = corruption
+            maybe_cleanup_after_bank_entry()
         expected_keys = {
             (scene, kind) for scene in scenes
             for kind in ("revisit", "large_motion", "corruption")
@@ -715,6 +756,7 @@ def main():
         stat = {
             "global_step": global_step, "chunk_plan": dict(chunk_plan),
             "entries": len(history_bank), "seconds": time.perf_counter() - refresh_started,
+            "memory_cleanup": dict(memory_cleanup_stats),
         }
         bank_stats.append(stat)
         _atomic_json(run_dir / "history_bank_stats.json", bank_stats)
@@ -794,6 +836,7 @@ def main():
     accumulation = 1 if args.mode == "smoke" else int(training["gradient_accumulation_steps"])
     rng = np.random.default_rng(exact.seed)
     ema_loss = None
+    logged_utilization = {}
     diagnostics = []
     scene_counts = {scene: 0 for scene in scenes}
     chunk_counts = {}
@@ -898,10 +941,10 @@ def main():
             "anchor_gates": controller.anchor_gates.detach().cpu().tolist(),
             "camera_gate": float(controller.camera_gate.detach().cpu()),
             "anchor_ratio": max(
-                [value for key, value in controller.last_metrics.items() if key.startswith("anchor_ratio")],
+                [value for key, value in logged_utilization.items() if key.startswith("anchor_ratio")],
                 default=0.0,
             ),
-            "camera_ratio": controller.last_metrics.get("camera_ratio", 0.0),
+            "camera_ratio": logged_utilization.get("camera_ratio", 0.0),
             "history_bank_age": None if bank_step < 0 else global_step - bank_step,
             "latest_checkpoint": str(checkpoint) if checkpoint.exists() else None,
             "gpu_memory": {
@@ -912,6 +955,12 @@ def main():
             "elapsed": elapsed, "eta": eta, "git_sha": git_sha,
         }
         if global_step % int(training["status_every"]) == 0 or global_step == 1 or global_step == max_steps:
+            logged_utilization = controller.metrics_snapshot()
+            status["anchor_ratio"] = max(
+                [value for key, value in logged_utilization.items() if key.startswith("anchor_ratio")],
+                default=0.0,
+            )
+            status["camera_ratio"] = logged_utilization.get("camera_ratio", 0.0)
             _atomic_json(status_path, status)
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(status) + "\n")
@@ -933,6 +982,7 @@ def main():
         "chunk_length_distribution": chunk_counts,
         "phase_b_mix_counts": mix_counts,
         "history_bank_stats": bank_stats,
+        "memory_cleanup": memory_cleanup_stats,
         "diagnostics": diagnostics,
         "source_checkpoint_info": source_info,
         "lora_setup": lora_stats,

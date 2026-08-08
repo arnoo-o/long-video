@@ -145,7 +145,17 @@ def scan_holo360d_zip(path, *, gap_factor=2.5):
     return report, frame_ids, poses, runs
 
 
+def _training_chunk_for_anchor(anchor_offset: int, chunks: int):
+    return min(max(int(anchor_offset) // 4, 0), int(chunks) - 1)
+
+
+def _chunk_anchor_bounds(chunk_index: int):
+    start = 4 * int(chunk_index)
+    return start, start + 4
+
+
 def score_revisit_window(poses, start: int, anchors: int):
+    """Pose-only revisit prefilter; renderer overlap is added in finalization."""
     window = np.asarray(poses[start:start + anchors], np.float64)
     if len(window) != anchors:
         raise ValueError("revisit window is truncated")
@@ -168,6 +178,11 @@ def score_revisit_window(poses, start: int, anchors: int):
             if best is None or candidate > best:
                 best = candidate
     score, separation, overlap, translation, rotation, earlier, later = best
+    chunks = (int(anchors) - 1) // 4
+    training_chunk_index = _training_chunk_for_anchor(later, chunks)
+    chunk_start, chunk_end = _chunk_anchor_bounds(training_chunk_index)
+    if not chunk_start <= later <= chunk_end:
+        raise RuntimeError("revisit later anchor is outside its selected training chunk")
     return {
         "start": int(start),
         "anchor_count": int(anchors),
@@ -179,41 +194,157 @@ def score_revisit_window(poses, start: int, anchors: int):
         "earlier_anchor_offset": int(earlier),
         "later_anchor_offset": int(later),
         "pose_overlap_proxy": float(overlap),
-        "revisit_score": float(score),
+        "pose_prefilter_score": float(score),
+        "revisit_score": None,
+        "renderer_overlap": None,
+        "renderer_overlap_metric": "projected_visibility_iou",
+        "training_chunk_index": int(training_chunk_index),
+        "selection_translation": float(translation),
+        "selection_rotation_degrees": float(rotation),
+        "selection_temporal_gap_anchors": int(separation),
     }
 
 
-def select_revisit_windows(poses, runs, *, chunk_counts=(8, 12, 16), candidate_stride=4):
+def score_large_motion_window(poses, start: int, anchors: int):
+    """Choose the current chunk where the window's strongest local motion occurs."""
+    window = np.asarray(poses[start:start + anchors], np.float64)
+    if len(window) != anchors:
+        raise ValueError("large-motion window is truncated")
+    chunks = (int(anchors) - 1) // 4
+    best = None
+    for chunk_index in range(chunks):
+        anchor_start, anchor_end = _chunk_anchor_bounds(chunk_index)
+        local = window[anchor_start:anchor_end + 1]
+        positions = local[:, :3, 3]
+        rotations = local[:, :3, :3]
+        for earlier in range(len(local) - 1):
+            for later in range(earlier + 1, len(local)):
+                translation = float(np.linalg.norm(positions[later] - positions[earlier]))
+                rotation = float(_rotation_angle_degrees(rotations[earlier], rotations[later]))
+                temporal_gap = later - earlier
+                score = translation + 0.01 * rotation
+                candidate = (score, translation, rotation, temporal_gap, chunk_index, earlier, later)
+                if best is None or candidate > best:
+                    best = candidate
+    score, translation, rotation, temporal_gap, chunk_index, earlier, later = best
+    earlier_offset = 4 * chunk_index + earlier
+    later_offset = 4 * chunk_index + later
+    max_translation = float(
+        np.linalg.norm(window[:, :3, 3] - window[:1, :3, 3], axis=1).max(initial=0)
+    )
+    max_rotation = float(
+        _rotation_angle_degrees(window[:1, :3, :3], window[:, :3, :3]).max(initial=0)
+    )
+    distance_scale = max(max_translation, 0.25)
+    orientation_overlap = max(0.0, (np.cos(np.deg2rad(rotation)) + 1.0) * 0.5)
+    pose_proxy = float(np.exp(-translation / distance_scale) * orientation_overlap)
+    return {
+        "start": int(start), "anchor_count": int(anchors),
+        "max_translation": max_translation, "max_rotation_degrees": max_rotation,
+        "earlier_anchor_offset": int(earlier_offset),
+        "later_anchor_offset": int(later_offset),
+        "pose_overlap_proxy": pose_proxy,
+        "pose_prefilter_score": float(score),
+        "large_motion_score": None,
+        "renderer_overlap": None,
+        "renderer_overlap_metric": "projected_visibility_iou",
+        "training_chunk_index": int(chunk_index),
+        "selection_translation": float(translation),
+        "selection_rotation_degrees": float(rotation),
+        "selection_temporal_gap_anchors": int(temporal_gap),
+    }
+
+
+def _candidate_windows(poses, runs, chunks, candidate_stride, scorer):
+    contract = MultiChunkContract(int(chunks)).validate()
+    candidates = []
+    for run_start, run_end in runs:
+        last_start = int(run_end) - contract.anchors
+        for start in range(int(run_start), last_start + 1, int(candidate_stride)):
+            item = scorer(poses, start, contract.anchors)
+            item.update({"chunks": int(chunks), "dense_frames": contract.dense_frames})
+            candidates.append(item)
+    return candidates
+
+
+def select_revisit_windows(
+    poses, runs, *, chunk_counts=(8, 12, 16), candidate_stride=4, prefilter_count=8,
+):
+    """Return pose-prefiltered candidates; these are not final until renderer scoring."""
     selected = []
     for chunks in chunk_counts:
-        contract = MultiChunkContract(int(chunks)).validate()
-        candidates = []
-        for run_start, run_end in runs:
-            last_start = int(run_end) - contract.anchors
-            for start in range(int(run_start), last_start + 1, int(candidate_stride)):
-                item = score_revisit_window(poses, start, contract.anchors)
-                item.update({"chunks": int(chunks), "dense_frames": contract.dense_frames})
-                candidates.append(item)
-        if candidates:
-            selected.append(max(candidates, key=lambda item: item["revisit_score"]))
+        candidates = _candidate_windows(poses, runs, chunks, candidate_stride, score_revisit_window)
+        selected.extend(sorted(
+            candidates, key=lambda item: item["pose_prefilter_score"], reverse=True,
+        )[:int(prefilter_count)])
     return selected
 
 
-def select_large_motion_windows(poses, runs, *, chunk_counts=(8, 12, 16), candidate_stride=4):
+def select_large_motion_windows(
+    poses, runs, *, chunk_counts=(8, 12, 16), candidate_stride=4, prefilter_count=8,
+):
     selected = []
     for chunks in chunk_counts:
-        contract = MultiChunkContract(int(chunks)).validate()
-        candidates = []
-        for run_start, run_end in runs:
-            last_start = int(run_end) - contract.anchors
-            for start in range(int(run_start), last_start + 1, int(candidate_stride)):
-                item = score_revisit_window(poses, start, contract.anchors)
-                item.update({"chunks": int(chunks), "dense_frames": contract.dense_frames})
-                item["large_motion_score"] = (
-                    item["max_translation"] + 0.01 * item["max_rotation_degrees"]
-                    + 0.25 * (1.0 - item["pose_overlap_proxy"])
-                )
-                candidates.append(item)
-        if candidates:
-            selected.append(max(candidates, key=lambda item: item["large_motion_score"]))
+        candidates = _candidate_windows(poses, runs, chunks, candidate_stride, score_large_motion_window)
+        selected.extend(sorted(
+            candidates, key=lambda item: item["pose_prefilter_score"], reverse=True,
+        )[:int(prefilter_count)])
     return selected
+
+
+def add_renderer_overlap(candidate, overlap: float, *, sample_type: str):
+    """Finalize one pose-prefiltered candidate with measured projected overlap."""
+    item = dict(candidate)
+    overlap = float(overlap)
+    if not np.isfinite(overlap) or not 0.0 <= overlap <= 1.0:
+        raise ValueError(f"renderer overlap must be finite in [0,1], got {overlap}")
+    item["renderer_overlap"] = overlap
+    if sample_type == "revisit":
+        item["revisit_score"] = (
+            overlap * np.log1p(item["selection_temporal_gap_anchors"])
+            + 0.05 * item["max_translation"]
+            + 0.002 * item["max_rotation_degrees"]
+        )
+    elif sample_type == "large_motion":
+        item["large_motion_score"] = (
+            item["selection_translation"]
+            + 0.01 * item["selection_rotation_degrees"]
+            + 0.1 * (1.0 - overlap)
+        )
+    else:
+        raise ValueError(f"unsupported Phase B sample type: {sample_type}")
+    item["selection_stage"] = "renderer_final"
+    return item
+
+
+def windows_highly_overlap(left, right, threshold=0.8):
+    left_start, left_end = int(left["start"]), int(left["start"] + left["anchor_count"])
+    right_start, right_end = int(right["start"]), int(right["start"] + right["anchor_count"])
+    intersection = max(0, min(left_end, right_end) - max(left_start, right_start))
+    union = max(left_end, right_end) - min(left_start, right_start)
+    return union > 0 and intersection / union >= float(threshold)
+
+
+def choose_independent_final_candidates(revisit_candidates, motion_candidates):
+    """Choose renderer-scored revisit/motion records, preferring independent windows."""
+    final_revisit, final_motion = [], []
+    chunk_counts = sorted({int(item["chunks"]) for item in revisit_candidates + motion_candidates})
+    for chunks in chunk_counts:
+        revisit = sorted(
+            [item for item in revisit_candidates if int(item["chunks"]) == chunks],
+            key=lambda item: item["revisit_score"], reverse=True,
+        )
+        motion = sorted(
+            [item for item in motion_candidates if int(item["chunks"]) == chunks],
+            key=lambda item: item["large_motion_score"], reverse=True,
+        )
+        if not revisit or not motion:
+            continue
+        chosen_revisit = revisit[0]
+        independent = [item for item in motion if not windows_highly_overlap(chosen_revisit, item)]
+        chosen_motion = independent[0] if independent else motion[0]
+        chosen_motion = dict(chosen_motion)
+        chosen_motion["independent_from_revisit"] = bool(independent)
+        final_revisit.append(chosen_revisit)
+        final_motion.append(chosen_motion)
+    return final_revisit, final_motion

@@ -358,8 +358,16 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
                 lengths = kwargs.get("original_context_length_list")
                 if lengths is not None:
                     target_count = sum(int(value) for value in lengths)
-            if target_count is None and len(args) > 6 and args[6] is not None:
-                target_count = int(args[6])
+            if target_count is None:
+                # The train_exact transformer places original_context_length at
+                # positional index 6, while the official inference transformer
+                # has a shorter block signature and places it at index 4.
+                # Select only a scalar integer that names one of our stage token
+                # counts so attention masks cannot be mistaken for the length.
+                for value in args[4:]:
+                    if isinstance(value, int) and int(value) in self._contexts:
+                        target_count = int(value)
+                        break
             if target_count is None:
                 raise RuntimeError(
                     "multiple spatial pyramid contexts require the transformer's target token count"
@@ -383,7 +391,10 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
             if output.ndim != 5 or output.shape[1] != self.hidden_size:
                 raise RuntimeError(f"unexpected patch_short output {tuple(output.shape)}")
             if output.shape[2] < frame_count:
-                raise RuntimeError("patch_short output is shorter than current SPATIAL_WARP")
+                # Official pyramid inference injects the current warp only in
+                # stage 0. Later stages call patch_short for the shorter normal
+                # history, so there is no SPATIAL_WARP suffix to tag there.
+                return output
             result = output.clone()
             role = self.spatial_warp_role.to(device=result.device, dtype=result.dtype).view(1, -1, 1, 1, 1)
             result[:, :, -frame_count:] = result[:, :, -frame_count:] + role

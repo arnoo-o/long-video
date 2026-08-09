@@ -19,8 +19,9 @@ def _args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/spatial_reanchor_training.yaml")
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--mode", choices=("smoke", "train"), required=True)
+    parser.add_argument("--mode", choices=("smoke", "phase-b-smoke", "train"), required=True)
     parser.add_argument("--resume", default="")
+    parser.add_argument("--phase-b-smoke-steps", type=int, default=3)
     parser.add_argument("--set", action="append", default=[], dest="overrides")
     return parser.parse_args()
 
@@ -144,6 +145,7 @@ def main():
 
     sys.path.insert(0, str(Path(config["wah_root"])))
     from warp_as_history.training import core as opt
+    from warp_as_history import WarpAsHistoryPipeline
 
     training = config["training"]
     phase_b_mix = {key: float(training["phase_b_mix"][key]) for key in ("revisit", "large_motion", "corruption")}
@@ -195,6 +197,19 @@ def main():
     started = time.perf_counter()
     git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     pipe = opt.load_pipeline(exact, device)
+    if not isinstance(pipe, WarpAsHistoryPipeline):
+        # Keep the exact training transformer/VAE/scheduler loaded by
+        # train_exact, but use the same autoregressive state implementation as
+        # formal inference. WarpAsHistoryPipeline is a state-compatible
+        # HeliosPipeline subclass and adds no model parameters.
+        pipe.__class__ = WarpAsHistoryPipeline
+    required_ar_methods = (
+        "init_autoregressive_state", "generate_next_chunk",
+        "_prepare_autoregressive_warp_chunk", "_build_pyramid_base_histories",
+    )
+    missing_ar_methods = [name for name in required_ar_methods if not callable(getattr(pipe, name, None))]
+    if missing_ar_methods:
+        raise TypeError(f"training pipeline is missing formal WAH AR methods: {missing_ar_methods}")
     mean, std = opt.latent_stats(pipe, device)
     adapter_name, lora_params, lora_stats = opt.setup_visible_lora(
         pipe.transformer, exact, "oracle_wah_24fps"
@@ -221,12 +236,36 @@ def main():
     )
     global_step = phase_step = 0
     phase = "A"
+    restored = None
+    restored_rng_state = None
     if args.resume:
         restored = load_spatial_training_checkpoint(
             args.resume, pipe.transformer, optimizer, scheduler
         )
         global_step = restored["global_step"]
         phase, phase_step = restored["phase"], restored["phase_step"]
+        restored_rng_state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all(),
+        }
+        restored_trainable = {
+            name for name, parameter in pipe.transformer.named_parameters()
+            if parameter.requires_grad
+        }
+        restored_lora = {name for name in restored_trainable if ".lora_" in name}
+        restored_spatial = {name for name in restored_trainable if name.startswith("spatial_reanchor.")}
+        if len(restored_lora) != 320 or len(restored_spatial) != 17:
+            raise RuntimeError(
+                "step600 resume must restore exactly 320 LoRA and 17 Spatial tensors; "
+                f"got LoRA={len(restored_lora)} Spatial={len(restored_spatial)}"
+            )
+    if args.mode == "phase-b-smoke":
+        if not args.resume or global_step != int(training["phase_a_steps"]):
+            raise ValueError("phase-b-smoke requires the completed step600 Phase A checkpoint")
+        if not 2 <= int(args.phase_b_smoke_steps) <= 5:
+            raise ValueError("phase-b-smoke must run 2 to 5 optimizer steps")
 
     def encode_warp(frames):
         with torch.no_grad():
@@ -397,7 +436,8 @@ def main():
         }
 
     fixed = phase_a_item(phase_a_diag[0])
-    opt.seed_global_rng(exact.seed)
+    if not args.resume:
+        opt.seed_global_rng(exact.seed)
     fixed_stage_items = opt.flow_matching_train_exact_items(pipe, fixed["target"], exact, device)
     if len(fixed_stage_items) != 1:
         raise ValueError("the restored formal WAH fixed-stage strategy must sample exactly one stage")
@@ -502,6 +542,14 @@ def main():
         raise ValueError("SPATIAL_WARP and target RoPE indices are not aligned")
     _atomic_json(run_dir / "startup_report.json", startup_report)
 
+    if restored_rng_state is not None:
+        # Startup diagnostics construct fixed tensors and may consume global
+        # randomness. Resume must begin Phase B from the checkpoint RNG state.
+        random.setstate(restored_rng_state["python"])
+        np.random.set_state(restored_rng_state["numpy"])
+        torch.set_rng_state(restored_rng_state["torch_cpu"])
+        torch.cuda.set_rng_state_all(restored_rng_state["torch_cuda"])
+
     def loss_for(item, *, histories=None, anchor=True, camera=True, spatial_warp=True, fixed_items=None):
         def condition(stage_item):
             return spatial_conditioning(
@@ -586,6 +634,14 @@ def main():
         )
         return folder / "current_lora.pt"
 
+    def reset_runtime_wah_adapter():
+        pipe._unfuse_wah_lora()
+        pipe._delete_wah_adapter()
+        pipe._wah_loaded_lora_path = None
+        pipe.transformer.set_adapter(adapter_name)
+        for name, parameter in pipe.transformer.named_parameters():
+            parameter.requires_grad_(id(parameter) in trainable_ids)
+
     def build_bank_entry(record, snapshot, snapshot_sha, *, corrupt_generated_history=False):
         if "training_chunk_index" not in record:
             raise ValueError("Phase B record is missing selector training_chunk_index")
@@ -610,6 +666,10 @@ def main():
         if "temp_short_acceptance_scale" in signature.parameters:
             init_kwargs["temp_short_acceptance_scale"] = 1.0
         state = pipe.init_autoregressive_state(**init_kwargs)
+        if tuple(int(value) for value in state["history_sizes"]) != (16, 2, 1):
+            raise RuntimeError(f"formal AR history sizes changed: {state['history_sizes']}")
+        if int(state["num_history_latent_frames"]) != 19:
+            raise RuntimeError("formal AR history must retain all 19 TEMP_LONG/MID/SHORT latents")
         causal_renderer = CausalActiveNodeRenderer(
             NodeStore(root / "session"),
             renderer_kwargs={"device": "cuda:0", "near": 0.05, "far": 100.0,
@@ -712,6 +772,13 @@ def main():
                 "node_mode": causal_renderer.node_mode,
                 "warp_provenance": warp_provenance,
                 "training_chunk_index": current_chunk,
+                "history_state_semantics": "formal_wah_autoregressive_v1",
+                "history_sizes": {
+                    "TEMP_LONG": int(state["history_sizes"][0]),
+                    "TEMP_MID": int(state["history_sizes"][1]),
+                    "TEMP_SHORT": int(state["history_sizes"][2]),
+                },
+                "rollout_prefix_chunks": current_chunk,
             },
         }
         validate_history_bank_entry({
@@ -725,6 +792,7 @@ def main():
     def refresh_history_bank(chunk_plan):
         nonlocal history_bank, bank_step
         refresh_started = time.perf_counter()
+        reset_runtime_wah_adapter()
         snapshot = lora_snapshot()
         snapshot_sha = _sha256(snapshot)
         selected = [
@@ -732,15 +800,18 @@ def main():
             if int(item["chunk_count"]) == int(chunk_plan[item["scene_id"]])
         ]
         history_bank = {}
-        for record in selected:
-            entry = build_bank_entry(record, snapshot, snapshot_sha)
-            history_bank[(record["scene_id"], record["sample_type"])] = entry
-            if record["sample_type"] == "revisit":
-                corruption = build_bank_entry(
-                    record, snapshot, snapshot_sha, corrupt_generated_history=True,
-                )
-                history_bank[(record["scene_id"], "corruption")] = corruption
-            maybe_cleanup_after_bank_entry()
+        try:
+            for record in selected:
+                entry = build_bank_entry(record, snapshot, snapshot_sha)
+                history_bank[(record["scene_id"], record["sample_type"])] = entry
+                if record["sample_type"] == "revisit":
+                    corruption = build_bank_entry(
+                        record, snapshot, snapshot_sha, corrupt_generated_history=True,
+                    )
+                    history_bank[(record["scene_id"], "corruption")] = corruption
+                maybe_cleanup_after_bank_entry()
+        finally:
+            reset_runtime_wah_adapter()
         expected_keys = {
             (scene, kind) for scene in scenes
             for kind in ("revisit", "large_motion", "corruption")
@@ -833,9 +904,27 @@ def main():
 
     phase_a_steps = int(training["phase_a_steps"])
     phase_b_steps = int(training["phase_b_steps"])
-    max_steps = 20 if args.mode == "smoke" else phase_a_steps + phase_b_steps
-    accumulation = 1 if args.mode == "smoke" else int(training["gradient_accumulation_steps"])
+    phase_b_smoke = args.mode == "phase-b-smoke"
+    max_steps = (
+        20 if args.mode == "smoke" else
+        global_step + int(args.phase_b_smoke_steps) if phase_b_smoke else
+        phase_a_steps + phase_b_steps
+    )
+    accumulation = 1 if args.mode in ("smoke", "phase-b-smoke") else int(training["gradient_accumulation_steps"])
     rng = np.random.default_rng(exact.seed)
+    restored_phase_rng = None if restored is None else restored["metadata"].get("phase_rng_state")
+    if restored_phase_rng is not None:
+        rng.bit_generator.state = restored_phase_rng
+    elif global_step:
+        # Schema-v2 step600 predates phase_rng_state. Replay only the custom
+        # NumPy generator calls made by Phase A so Phase B starts exactly where
+        # an uninterrupted run would have started.
+        for replay_step in range(min(global_step, phase_a_steps)):
+            for replay_micro in range(int(training["gradient_accumulation_steps"])):
+                replay_scene = scenes[(replay_step * int(training["gradient_accumulation_steps"]) + replay_micro) % len(scenes)]
+                replay_candidates = [item for item in phase_a if item["scene_id"] == replay_scene]
+                rng.integers(len(replay_candidates))
+                rng.random()
     ema_loss = None
     logged_utilization = {}
     diagnostics = []
@@ -845,6 +934,34 @@ def main():
     checkpoint = run_dir / "checkpoint_latest.pt"
     pipe.transformer.train()
     status = None
+    run_start_step = global_step
+    smoke_key = None
+    if phase_b_smoke:
+        smoke_record = next(
+            item for item in phase_b
+            if item["sample_type"] == "revisit" and int(item["chunk_count"]) == 8
+        )
+        reset_runtime_wah_adapter()
+        smoke_snapshot = lora_snapshot()
+        try:
+            smoke_entry = build_bank_entry(
+                smoke_record, smoke_snapshot, _sha256(smoke_snapshot),
+            )
+        finally:
+            reset_runtime_wah_adapter()
+        smoke_key = (smoke_record["scene_id"], "revisit")
+        history_bank[smoke_key] = smoke_entry
+        bank_step = global_step
+        _atomic_json(run_dir / "phase_b_smoke_history.json", {
+            "record": smoke_record,
+            "key": smoke_entry["key"],
+            "metadata": smoke_entry["metadata"],
+            "history_shapes": {
+                name: None if value is None else list(value.shape)
+                for name, value in smoke_entry["histories"].items()
+                if name.startswith("latents_history_")
+            },
+        })
     while global_step < max_steps:
         if args.mode == "smoke" or global_step < phase_a_steps:
             phase = "A"
@@ -861,10 +978,10 @@ def main():
                 int(training["history_bank_refresh_first"])
                 if phase_step <= 400 else int(training["history_bank_refresh_final"])
             )
-            if not history_bank or global_step - bank_step >= refresh_interval or any(
+            if not phase_b_smoke and (not history_bank or global_step - bank_step >= refresh_interval or any(
                 int(item["record"]["chunk_count"]) != chunk_plan[item["record"]["scene_id"]]
                 for item in history_bank.values()
-            ):
+            )):
                 refresh_history_bank(chunk_plan)
         optimizer.zero_grad(set_to_none=True)
         micro_losses = []
@@ -882,16 +999,21 @@ def main():
                 )
                 sample_type = "camera_only" if camera_only else "warp_anchor"
             else:
-                draw = float(rng.random())
-                revisit_boundary = phase_b_mix["revisit"]
-                motion_boundary = revisit_boundary + phase_b_mix["large_motion"]
-                if draw < revisit_boundary:
+                if phase_b_smoke:
+                    scene = smoke_key[0]
                     sample_type = "revisit"
-                elif draw < motion_boundary:
-                    sample_type = "large_motion"
+                    item = phase_b_item(*smoke_key)
                 else:
-                    sample_type = "corruption"
-                item = phase_b_item(scene, sample_type)
+                    draw = float(rng.random())
+                    revisit_boundary = phase_b_mix["revisit"]
+                    motion_boundary = revisit_boundary + phase_b_mix["large_motion"]
+                    if draw < revisit_boundary:
+                        sample_type = "revisit"
+                    elif draw < motion_boundary:
+                        sample_type = "large_motion"
+                    else:
+                        sample_type = "corruption"
+                    item = phase_b_item(scene, sample_type)
                 loss = loss_for(item)
                 mix_counts[sample_type] += 1
                 chunk_count = int(item["record"]["chunk_count"])
@@ -920,6 +1042,7 @@ def main():
                 "source_checkpoint": str(config["source_checkpoint"]),
                 "scene_scale": {scene: 1.0 for scene in scenes},
                 "config": config, "adapter_name": adapter_name,
+                "phase_rng_state": rng.bit_generator.state,
             }
             save_spatial_training_checkpoint(
                 checkpoint, pipe.transformer, optimizer, scheduler,
@@ -931,7 +1054,8 @@ def main():
             )
         elapsed = time.perf_counter() - started
         remaining = max_steps - global_step
-        eta = elapsed / max(global_step, 1) * remaining
+        completed_this_run = global_step - run_start_step
+        eta = elapsed / max(completed_this_run, 1) * remaining
         status = {
             "status": "running" if global_step < max_steps else "completed",
             "global_step": global_step, "phase": phase, "phase_step": phase_step,
@@ -995,6 +1119,18 @@ def main():
         "gpu_processes": _gpu_snapshot(),
     }
     _atomic_json(run_dir / "training_status_final.json", final)
+    if phase_b_smoke:
+        _atomic_json(run_dir / "phase_b_smoke_report.json", {
+            "passed": status["status"] == "completed",
+            "optimizer_steps": global_step - run_start_step,
+            "start_global_step": run_start_step,
+            "end_global_step": global_step,
+            "uses_future_gt": False,
+            "history_bank_key": history_bank[smoke_key]["key"],
+            "history_metadata": history_bank[smoke_key]["metadata"],
+            "finite_loss": bool(np.isfinite(status["loss"])),
+            "gpu_memory": status["gpu_memory"],
+        })
     print(json.dumps(final, indent=2))
 
 

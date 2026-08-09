@@ -228,6 +228,28 @@ def test_pyramid_context_selects_exact_target_token_count():
         )
 
 
+def test_pyramid_context_accepts_inference_positional_context_length():
+    transformer = _Transformer()
+    controller = install_spatial_reanchor(
+        transformer, rank=8, refresh_blocks=(0, 1, 2, 3), gate_init=0.05,
+    )
+    contexts = []
+    for latent_height, latent_width in ((12, 20), (24, 40), (48, 80)):
+        token_height, token_width = latent_height // 2, latent_width // 2
+        contexts.append({
+            "warp_latents": torch.randn(1, 16, 9, latent_height, latent_width),
+            "visibility_tokens": torch.ones(1, 9 * token_height * token_width, 1),
+            "plucker_tokens": torch.randn(1, 9, token_height, token_width, 6),
+        })
+    controller.prepare_context(stage_contexts=contexts)
+    for token_count in (540, 2160, 8640):
+        hidden = torch.randn(1, token_count + 20, 32)
+        context = controller._context_for_hidden(
+            hidden, (hidden, None, None, None, token_count), {},
+        )
+        assert context.target_token_count == token_count
+
+
 def test_hooks_use_frozen_target_patch_and_spatial_role_only_on_warp():
     transformer = _Transformer()
     controller = install_spatial_reanchor(
@@ -238,6 +260,11 @@ def test_hooks_use_frozen_target_patch_and_spatial_role_only_on_warp():
     visibility = torch.ones(1, 8640, 1)
     rays = torch.randn(1, 9, 24, 40, 6)
     controller.prepare_context(warp, visibility, rays)
+    later_stage_short = torch.randn(1, 16, 2, 48, 80)
+    later_stage_raw = transformer.patch_short._conv_forward(
+        later_stage_short, transformer.patch_short.weight, transformer.patch_short.bias,
+    )
+    torch.testing.assert_close(transformer.patch_short(later_stage_short), later_stage_raw)
     short = torch.randn(1, 16, 10, 48, 80)
     raw = transformer.patch_short._conv_forward(short, transformer.patch_short.weight, transformer.patch_short.bias)
     patched = transformer.patch_short(short)

@@ -101,7 +101,14 @@ def main():
         masked_flow_matching_loss,
         save_spatial_training_checkpoint,
     )
-    from long_video.oracle_training.history_bank import HistoryBankKey, validate_history_bank_entry
+    from long_video.oracle_training.history_bank import (
+        HistoryBankKey, history_bank_cache_key, validate_history_bank_entry,
+    )
+    from long_video.oracle_training.round_robin import RoundRobinChunkScheduler, eligible_current_chunks
+    from long_video.oracle_training.supervision import validate_current_chunk_supervision
+    from long_video.oracle_training.spatial_memory_prefix import (
+        SpatialMemoryPrefixBank, binary_support_confidence, choose_prefix,
+    )
     from long_video.oracle_training.causal_warp import CausalActiveNodeRenderer
     from long_video.wah.spatial_reanchor import (
         install_spatial_reanchor, plucker_camera_rays, resize_latents_spatial,
@@ -210,6 +217,35 @@ def main():
     missing_ar_methods = [name for name in required_ar_methods if not callable(getattr(pipe, name, None))]
     if missing_ar_methods:
         raise TypeError(f"training pipeline is missing formal WAH AR methods: {missing_ar_methods}")
+
+    # Keep the Spatial Memory Prefix mask semantics identical to formal
+    # inference: only the image-prefix slot is replaced; current warp masks
+    # and the model structure remain untouched.
+    if not getattr(pipe, "_spatial_memory_prefix_installed", False):
+        _build_pyramid_base_histories = pipe._build_pyramid_base_histories
+
+        def _with_spatial_memory_prefix(*method_args, **method_kwargs):
+            histories = _build_pyramid_base_histories(*method_args, **method_kwargs)
+            state = method_kwargs.get("state")
+            if state is None and method_args:
+                state = method_args[0]
+            visibility = None if state is None else state.get("spatial_prefix_visibility_latent")
+            confidence = None if state is None else state.get("spatial_prefix_confidence_latent")
+            if visibility is not None:
+                short_visible = histories.get("history_visible_mask_short")
+                if short_visible is not None:
+                    short_visible[:, :, :1] = visibility.to(
+                        device=short_visible.device, dtype=short_visible.dtype,
+                    )
+                short_confidence = histories.get("history_confidence_short")
+                if short_confidence is not None and confidence is not None:
+                    short_confidence[:, :, :1] = confidence.to(
+                        device=short_confidence.device, dtype=short_confidence.dtype,
+                    )
+            return histories
+
+        pipe._build_pyramid_base_histories = _with_spatial_memory_prefix
+        pipe._spatial_memory_prefix_installed = True
     mean, std = opt.latent_stats(pipe, device)
     adapter_name, lora_params, lora_stats = opt.setup_visible_lora(
         pipe.transformer, exact, "oracle_wah_24fps"
@@ -235,6 +271,7 @@ def main():
         optimizer, lambda step: min(1.0, (step + 1) / warmup)
     )
     global_step = phase_step = 0
+    round_robin = RoundRobinChunkScheduler()
     phase = "A"
     restored = None
     restored_rng_state = None
@@ -261,6 +298,10 @@ def main():
                 "step600 resume must restore exactly 320 LoRA and 17 Spatial tensors; "
                 f"got LoRA={len(restored_lora)} Spatial={len(restored_spatial)}"
             )
+        # New Phase B checkpoints carry the scheduler cursor/counts.  The
+        # original step-600 checkpoint predates this metadata and intentionally
+        # starts from all-zero counts.
+        round_robin.restore(restored.get("metadata", {}).get("round_robin"))
     if args.mode == "phase-b-smoke":
         if not args.resume or global_step != int(training["phase_a_steps"]):
             raise ValueError("phase-b-smoke requires the completed step600 Phase A checkpoint")
@@ -476,6 +517,18 @@ def main():
         "available_phase_b_chunks_by_scene": available_phase_b_chunks,
         "phase_b_node_mode": "M0-only",
         "phase_b_uses_future_gt": False,
+        "phase_b_current_chunk_policy": {
+            "eligible": "1..N-1",
+            "scheduler": "deterministic_round_robin_per_trajectory",
+            "shared_boundary_weight": 0.0,
+        },
+        "phase_b_spatial_memory_prefix": {
+            "translation_threshold": 3.0,
+            "rotation_threshold_degrees": 30.0,
+            "hit_requires": "translation<=3 AND full_rotation_angle<=30",
+            "source_chunk0": "raw_source_full_support",
+            "m0_priority": True,
+        },
         "phase_b_mix": phase_b_mix,
         "scene_scale": {scene: {"value": 1.0, "source": "Holo360D_dataset_calibrated_metric"} for scene in scenes},
         "trainable_parameters": {
@@ -551,6 +604,9 @@ def main():
         torch.cuda.set_rng_state_all(restored_rng_state["torch_cuda"])
 
     def loss_for(item, *, histories=None, anchor=True, camera=True, spatial_warp=True, fixed_items=None):
+        if "current_chunk_index" in item:
+            raw_weights = np.asarray(item["weights"])
+            validate_current_chunk_supervision(raw_weights, int(item["target"].shape[2]))
         def condition(stage_item):
             return spatial_conditioning(
                 item["sample"], item["warp_latents"], stage_item["noisy_latents"],
@@ -603,7 +659,11 @@ def main():
         values["utilization"] = controller.metrics_snapshot()
         return values
 
+    # Phase B cache entries are indexed by scene/sample/trajectory/current
+    # chunk.  The scheduler state is checkpointed so resume preserves exact
+    # round-robin coverage instead of silently starting at chunk one again.
     history_bank = {}
+    history_bank_cache = {}
     bank_step = -1
     bank_stats = []
     memory_cleanup_stats = {"calls": 0, "reasons": [], "entries": 0}
@@ -642,12 +702,16 @@ def main():
         for name, parameter in pipe.transformer.named_parameters():
             parameter.requires_grad_(id(parameter) in trainable_ids)
 
-    def build_bank_entry(record, snapshot, snapshot_sha, *, corrupt_generated_history=False):
-        if "training_chunk_index" not in record:
-            raise ValueError("Phase B record is missing selector training_chunk_index")
-        current_chunk = int(record["training_chunk_index"])
-        if not 0 <= current_chunk < int(record["chunk_count"]):
-            raise ValueError("training_chunk_index is outside the selected Phase B window")
+    def build_bank_entries(record, snapshot, snapshot_sha, *, corrupt_generated_history=False):
+        """Build every current-chunk entry from one causal AR rollout.
+
+        The old implementation restarted the model at chunk zero for every
+        selector, making a 16-chunk bank an O(N^2) rollout.  We now retain a
+        CPU snapshot at each current boundary while traversing the trajectory
+        once; each entry still contains only its own prefix history.
+        """
+        chunk_count = int(record["chunk_count"])
+        eligible = eligible_current_chunks(chunk_count)
         root = Path(record["path"])
         source = Image.open(root / "source" / "source_perspective.png").convert("RGB")
         prompt = (root / "prompt.txt").read_text(encoding="utf-8")
@@ -675,12 +739,102 @@ def main():
             renderer_kwargs={"device": "cuda:0", "near": 0.05, "far": 100.0,
                              "point_radius": 1, "chunk_points": 1000000},
         )
+        # Session-local Spatial Memory Prefix.  This stores canonical pose/K,
+        # clean latent, support and provenance for each prefix candidate; it
+        # is deliberately recreated per trajectory rollout.
+        memory_bank = SpatialMemoryPrefixBank(
+            translation_threshold=3.0, rotation_threshold=30.0,
+        )
+        sample_cache = {}
+
+        def _sample(chunk_index):
+            chunk_index = int(chunk_index)
+            if chunk_index not in sample_cache:
+                sample_cache[chunk_index] = sample_arrays(
+                    record, chunk_index, causal_renderer=causal_renderer,
+                )
+            return sample_cache[chunk_index]
+
+        def _prefix_support(sample, latent):
+            pixels = torch.as_tensor(
+                np.asarray(sample["visibility"][0], np.float32),
+                device=device, dtype=torch.float32,
+            ).reshape(1, 1, 1, int(exact.height), int(exact.width))
+            visible = pipe._visibility_mask_to_history_latents(
+                pixels,
+                latent_frames=1,
+                latent_height=int(latent.shape[-2]),
+                latent_width=int(latent.shape[-1]),
+                temporal_scale=int(config["vae_temporal_scale"]),
+            ).detach()
+            # Spatial Memory Prefix confidence is hard support (0/1), while
+            # visibility remains the renderer's pooled support fraction.
+            confidence = binary_support_confidence(visible).detach()
+            return visible, confidence
+
+        first_sample = _sample(0)
+        m0_latent = state["image_latents"][:, :, :1].detach().clone()
+        # The raw source image is the fully valid chunk-0 prefix in formal
+        # inference.  Renderer visibility is only used for chunk 1+ M0
+        # boundaries; do not weaken the source slot with a renderer mask.
+        m0_visibility = torch.ones_like(m0_latent[:, :1])
+        m0_confidence = torch.ones_like(m0_visibility)
+        memory_bank.add_if_novel(
+            pose=first_sample["poses"][0], intrinsics=first_sample["intrinsics"][0],
+            latent=m0_latent, visibility=m0_visibility, confidence=m0_confidence,
+            frame_id=0, chunk_id=0, source_type="M0",
+        )
+        state["spatial_prefix_visibility_latent"] = m0_visibility
+        state["spatial_prefix_confidence_latent"] = m0_confidence
+        memory_reports = []
         warp_provenance = []
+        boundary_snapshots = {}
         corruption_generator = torch.Generator(device=device).manual_seed(
             exact.seed + global_step + 1009
         )
-        for chunk in range(current_chunk):
-            sample = sample_arrays(record, chunk, causal_renderer=causal_renderer)
+        def _snapshot_state(value, key=None):
+            # Avoid retaining full encoded-warp/video caches at every boundary.
+            if key in {
+                "warp_latents_tensor", "online_warp_video_tensor", "online_visibility_mask",
+                "history_video", "real_history_latents", "last_output",
+            }:
+                return None
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().clone()
+            if isinstance(value, torch.Generator):
+                return {"__torch_generator_state__": value.get_state().cpu().clone()}
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            if isinstance(value, dict):
+                return {
+                    name: item for name, child in value.items()
+                    if (item := _snapshot_state(child, name)) is not None
+                }
+            if isinstance(value, list):
+                return [_snapshot_state(child) for child in value]
+            if isinstance(value, tuple):
+                return tuple(_snapshot_state(child) for child in value)
+            return value
+
+        def _restore_state(value):
+            if isinstance(value, dict) and set(value) == {"__torch_generator_state__"}:
+                generator = torch.Generator(device=device)
+                generator.set_state(value["__torch_generator_state__"].detach().cpu())
+                return generator
+            if isinstance(value, torch.Tensor):
+                return value.to(device=device)
+            if isinstance(value, dict):
+                return {name: _restore_state(child) for name, child in value.items()}
+            if isinstance(value, list):
+                return [_restore_state(child) for child in value]
+            if isinstance(value, tuple):
+                return tuple(_restore_state(child) for child in value)
+            if isinstance(value, np.ndarray):
+                return value.copy()
+            return value
+
+        for chunk in range(max(eligible)):
+            sample = _sample(chunk)
             warp_provenance.append(sample["warp_provenance"])
             if corrupt_generated_history:
                 generated_frames = max(0, int(state["total_generated_latent_frames"]) - 1)
@@ -696,6 +850,46 @@ def main():
                         (1.0 - sigma) * current + sigma * noise
                     )
             warp_latents = encode_warp(sample["warp"])
+            current_m0_latent = warp_latents[:, :, :1].detach().clone()
+            current_m0_visibility, current_m0_confidence = _prefix_support(sample, current_m0_latent)
+            if chunk == 0:
+                prefix_latent, prefix_visibility, prefix_confidence = (
+                    m0_latent, m0_visibility, m0_confidence,
+                )
+                prefix_report = {
+                    "hit": True, "entry_id": 0, "source_type": "M0",
+                    "translation": 0.0, "rotation_degrees": 0.0,
+                    "prefix_source": "raw_source",
+                }
+            else:
+                prefix_latent, prefix_visibility, prefix_confidence, prefix_report = choose_prefix(
+                    memory_bank,
+                    pose=sample["poses"][0],
+                    m0_latent=current_m0_latent,
+                    m0_visibility=current_m0_visibility,
+                    m0_confidence=current_m0_confidence,
+                    m0_has_support=bool(np.asarray(sample["visibility"][0]).any()),
+                )
+            state["image_latents"] = prefix_latent.detach().clone()
+            state["spatial_prefix_visibility_latent"] = prefix_visibility.detach().clone()
+            state["spatial_prefix_confidence_latent"] = prefix_confidence.detach().clone()
+            prefix_report.update({
+                "query_frame_id": int(sample["start"]), "query_chunk_id": int(chunk),
+                "m0_has_support": bool(np.asarray(sample["visibility"][0]).any()),
+                "uses_future_gt": False,
+            })
+            memory_reports.append(prefix_report)
+            # This state is the exact no-grad AR prefix for this boundary.
+            # Keep it before generating the current chunk and before adding a
+            # generated memory candidate.
+            boundary_snapshots[int(chunk)] = {
+                "state": _snapshot_state(state),
+                "sample": sample,
+                "warp_latents": warp_latents.detach().cpu().clone(),
+                "warp_provenance": list(warp_provenance),
+                "memory_reports": list(memory_reports),
+                "memory_summary": memory_bank.summary(),
+            }
             inference_pyramid = opt.training_exact_pyramid_latents(
                 warp_latents, len(exact.pyramid_num_inference_steps_list),
             )
@@ -712,85 +906,162 @@ def main():
                     )
             finally:
                 controller.clear_context()
+            # Add one clean boundary candidate after generation.  M0 entries
+            # remain authoritative; generated values only fill unsupported
+            # views and are never allowed to overwrite M0.
+            if bool(np.asarray(sample["visibility"][0]).any()):
+                candidate_latent = current_m0_latent
+                candidate_visibility = current_m0_visibility
+                candidate_confidence = current_m0_confidence
+                candidate_source = "M0"
+            else:
+                candidate_latent = state["last_latents"][:, :, :1].detach()
+                candidate_visibility = torch.ones_like(current_m0_visibility)
+                candidate_confidence = torch.ones_like(current_m0_confidence)
+                candidate_source = "generated"
+            memory_reports.append(memory_bank.add_if_novel(
+                pose=sample["poses"][0], intrinsics=sample["intrinsics"][0],
+                latent=candidate_latent, visibility=candidate_visibility,
+                confidence=candidate_confidence, frame_id=int(sample["start"]),
+                chunk_id=int(chunk), source_type=candidate_source,
+            ))
             del warp_latents
-        sample = sample_arrays(record, current_chunk, causal_renderer=causal_renderer)
+
+        # The final eligible boundary follows chunk N-2's rollout.  Select its
+        # Spatial Memory Prefix without generating the supervised chunk.
+        current_chunk = int(max(eligible))
+        sample = _sample(current_chunk)
         warp_provenance.append(sample["warp_provenance"])
-        pipe._prepare_autoregressive_warp_chunk(
-            state, np.stack([np.asarray(item) for item in sample["warp"]]),
-            sample["visibility"][None, None],
-            (sample["confidence"] * sample["visibility"])[None, None],
-        )
-        clean_history = state["history_latents"][:, :, -int(state["num_history_latent_frames"]):]
-        _, _, short_history = clean_history.split(state["history_sizes"], dim=2)
-        base_short = torch.cat([state["image_latents"], short_history], dim=2)
-        histories = pipe._build_pyramid_base_histories(
-            state, device, short_history.dtype, generator, base_short,
-        )
-        prompt_embeds = state.get("lora_prompt_embeds")
-        if prompt_embeds is None:
-            prompt_embeds = state["prompt_embeds"]
-        with torch.no_grad():
-            target_latents = opt.encode_video_latents(
-                pipe, sample["target"], exact, device, mean, std
-            ).detach()
         warp_latents = encode_warp(sample["warp"])
-        all_weights = np.load(root / "primary_loss_weight_latent.npy")
-        latent_start = current_chunk * (exact.num_latent_frames_per_chunk - 1)
-        weights = all_weights[latent_start:latent_start + exact.num_latent_frames_per_chunk]
-        if len(weights) != exact.num_latent_frames_per_chunk:
-            raise ValueError("current Phase B supervision weights are truncated")
-        weights = weights.copy()
-        weights[0] = 0.0
-        bank_key = HistoryBankKey(
-            checkpoint_sha=snapshot_sha, global_step=global_step,
-            scene_id=record["scene_id"], source_id=record["sequence_id"],
-            trajectory_id=record["sequence_id"], history_chunk_index=current_chunk,
-            generation_config=(
-                ("pyramid_steps", tuple(exact.pyramid_num_inference_steps_list)),
-                ("history_sizes", tuple(exact.history_sizes)),
-                ("visible_token_drop", bool(exact.history_visible_token_drop)),
-                ("warp_downsample", str(exact.warp_history_downsample_mode)),
-                ("spatial_reanchor", True),
-                ("history_corruption", bool(corrupt_generated_history)),
-                ("history_corruption_sigma", float(training["history_corruption_sigma"])),
-            ),
-            prompt=prompt, seed=exact.seed,
+        current_m0_latent = warp_latents[:, :, :1].detach().clone()
+        current_m0_visibility, current_m0_confidence = _prefix_support(sample, current_m0_latent)
+        prefix_latent, prefix_visibility, prefix_confidence, prefix_report = choose_prefix(
+            memory_bank,
+            pose=sample["poses"][0],
+            m0_latent=current_m0_latent,
+            m0_visibility=current_m0_visibility,
+            m0_confidence=current_m0_confidence,
+            m0_has_support=bool(np.asarray(sample["visibility"][0]).any()),
         )
-        key_payload = dict(bank_key.__dict__)
-        key = bank_key.digest()
-        entry = {
-            "key": key, "key_payload": key_payload, "record": record,
-            "sample": sample, "target": _tree_to(target_latents, "cpu"),
-            "prompt": _tree_to(prompt_embeds, "cpu"),
-            "histories": _tree_to(histories, "cpu"),
-            "warp_latents": _tree_to(warp_latents, "cpu"), "weights": weights,
-            "metadata": {
-                "uses_gt_future": False, "checkpoint_sha": snapshot_sha,
-                "global_step": global_step, "history_chunk_index": current_chunk,
-                "self_augmentation": bool(corrupt_generated_history),
-                "restoration_steps_per_pyramid_stage": tuple(exact.pyramid_num_inference_steps_list),
-                "node_mode": causal_renderer.node_mode,
-                "warp_provenance": warp_provenance,
-                "training_chunk_index": current_chunk,
-                "history_state_semantics": "formal_wah_autoregressive_v1",
-                "history_sizes": {
-                    "TEMP_LONG": int(state["history_sizes"][0]),
-                    "TEMP_MID": int(state["history_sizes"][1]),
-                    "TEMP_SHORT": int(state["history_sizes"][2]),
-                },
-                "rollout_prefix_chunks": current_chunk,
-            },
-        }
-        validate_history_bank_entry({
-            "TEMP_LONG": entry["histories"].get("latents_history_long"),
-            "TEMP_MID": entry["histories"].get("latents_history_mid"),
-            "TEMP_SHORT": entry["histories"].get("latents_history_short"),
-            "key": entry["key"], "metadata": entry["metadata"],
+        state["image_latents"] = prefix_latent.detach().clone()
+        state["spatial_prefix_visibility_latent"] = prefix_visibility.detach().clone()
+        state["spatial_prefix_confidence_latent"] = prefix_confidence.detach().clone()
+        prefix_report.update({
+            "query_frame_id": int(sample["start"]), "query_chunk_id": int(current_chunk),
+            "m0_has_support": bool(np.asarray(sample["visibility"][0]).any()),
+            "uses_future_gt": False,
         })
-        return entry
+        memory_reports.append(prefix_report)
+        boundary_snapshots[current_chunk] = {
+            "state": _snapshot_state(state), "sample": sample,
+            "warp_latents": warp_latents.detach().cpu().clone(),
+            "warp_provenance": list(warp_provenance),
+            "memory_reports": list(memory_reports),
+            "memory_summary": memory_bank.summary(),
+        }
+
+        entries = {}
+        all_weights = np.load(root / "primary_loss_weight_latent.npy")
+        for current_chunk in eligible:
+            snap = boundary_snapshots[int(current_chunk)]
+            sample = snap["sample"]
+            state = _restore_state(snap["state"])
+            generator = state.get("generator", generator)
+            warp_latents = _tree_to(snap["warp_latents"], device)
+            pipe._prepare_autoregressive_warp_chunk(
+                state, np.stack([np.asarray(item) for item in sample["warp"]]),
+                sample["visibility"][None, None],
+                (sample["confidence"] * sample["visibility"])[None, None],
+            )
+            clean_history = state["history_latents"][:, :, -int(state["num_history_latent_frames"]):]
+            _, _, short_history = clean_history.split(state["history_sizes"], dim=2)
+            base_short = torch.cat([state["image_latents"], short_history], dim=2)
+            histories = pipe._build_pyramid_base_histories(
+                state, device, short_history.dtype, generator, base_short,
+            )
+            prompt_embeds = state.get("lora_prompt_embeds")
+            if prompt_embeds is None:
+                prompt_embeds = state["prompt_embeds"]
+            with torch.no_grad():
+                target_latents = opt.encode_video_latents(
+                    pipe, sample["target"], exact, device, mean, std,
+                ).detach()
+            latent_start = int(current_chunk) * (exact.num_latent_frames_per_chunk - 1)
+            weights = all_weights[latent_start:latent_start + exact.num_latent_frames_per_chunk]
+            if len(weights) != exact.num_latent_frames_per_chunk:
+                raise ValueError("current Phase B supervision weights are truncated")
+            weights = weights.copy()
+            weights[0] = 0.0
+            supervised_latent_indices = validate_current_chunk_supervision(
+                weights, int(target_latents.shape[2]),
+            )
+            bank_key = HistoryBankKey(
+                checkpoint_sha=snapshot_sha, global_step=global_step,
+                scene_id=record["scene_id"], source_id=record["sequence_id"],
+                trajectory_id=record["sequence_id"], history_chunk_index=int(current_chunk),
+                generation_config=(
+                    ("pyramid_steps", tuple(exact.pyramid_num_inference_steps_list)),
+                    ("history_sizes", tuple(exact.history_sizes)),
+                    ("visible_token_drop", bool(exact.history_visible_token_drop)),
+                    ("warp_downsample", str(exact.warp_history_downsample_mode)),
+                    ("spatial_reanchor", True),
+                    ("spatial_memory_prefix", True),
+                    ("memory_translation_threshold", 3.0),
+                    ("memory_rotation_threshold_degrees", 30.0),
+                    ("chunk0_raw_source_full_support", True),
+                    ("history_corruption", bool(corrupt_generated_history)),
+                    ("history_corruption_sigma", float(training["history_corruption_sigma"])),
+                ),
+                prompt=prompt, seed=exact.seed,
+            )
+            key_payload = dict(bank_key.__dict__)
+            key = bank_key.digest()
+            entry = {
+                "key": key, "key_payload": key_payload, "record": {
+                    **record, "training_chunk_index": int(current_chunk),
+                },
+                "sample": sample, "target": _tree_to(target_latents, "cpu"),
+                "prompt": _tree_to(prompt_embeds, "cpu"),
+                "histories": _tree_to(histories, "cpu"),
+                "warp_latents": _tree_to(warp_latents, "cpu"), "weights": weights,
+                "supervised_latent_indices": supervised_latent_indices,
+                "metadata": {
+                    "uses_gt_future": False, "checkpoint_sha": snapshot_sha,
+                    "global_step": global_step, "history_chunk_index": int(current_chunk),
+                    "self_augmentation": bool(corrupt_generated_history),
+                    "restoration_steps_per_pyramid_stage": tuple(exact.pyramid_num_inference_steps_list),
+                    "node_mode": causal_renderer.node_mode,
+                    "warp_provenance": snap["warp_provenance"],
+                    "training_chunk_index": int(current_chunk),
+                    "history_state_semantics": "formal_wah_autoregressive_v1",
+                    "history_sizes": {
+                        "TEMP_LONG": int(state["history_sizes"][0]),
+                        "TEMP_MID": int(state["history_sizes"][1]),
+                        "TEMP_SHORT": int(state["history_sizes"][2]),
+                    },
+                    "rollout_prefix_chunks": int(current_chunk),
+                    "supervised_latent_indices": supervised_latent_indices,
+                    "supervised_latent_count": len(supervised_latent_indices),
+                    "spatial_memory": {
+                        "session_local": True, "translation_threshold": 3.0,
+                        "rotation_threshold_degrees": 30.0,
+                        "hit_requires": "translation<=3 AND full_rotation_angle<=30",
+                        "entries": snap["memory_summary"], "reports": snap["memory_reports"],
+                    },
+                },
+            }
+            validate_history_bank_entry({
+                "TEMP_LONG": entry["histories"].get("latents_history_long"),
+                "TEMP_MID": entry["histories"].get("latents_history_mid"),
+                "TEMP_SHORT": entry["histories"].get("latents_history_short"),
+                "key": entry["key"], "metadata": entry["metadata"],
+            })
+            entries[int(current_chunk)] = entry
+            del target_latents, histories, warp_latents
+        return entries
 
     def refresh_history_bank(chunk_plan):
-        nonlocal history_bank, bank_step
+        nonlocal history_bank, history_bank_cache, bank_step
         refresh_started = time.perf_counter()
         reset_runtime_wah_adapter()
         snapshot = lora_snapshot()
@@ -800,21 +1071,39 @@ def main():
             if int(item["chunk_count"]) == int(chunk_plan[item["scene_id"]])
         ]
         history_bank = {}
+        history_bank_cache = {}
         try:
             for record in selected:
-                entry = build_bank_entry(record, snapshot, snapshot_sha)
-                history_bank[(record["scene_id"], record["sample_type"])] = entry
-                if record["sample_type"] == "revisit":
-                    corruption = build_bank_entry(
-                        record, snapshot, snapshot_sha, corrupt_generated_history=True,
+                trajectory = record["sequence_id"]
+                entries = build_bank_entries(record, snapshot, snapshot_sha)
+                corruption_entries = (
+                    build_bank_entries(record, snapshot, snapshot_sha, corrupt_generated_history=True)
+                    if record["sample_type"] == "revisit" else {}
+                )
+                for current_chunk, entry in entries.items():
+                    cache_key = history_bank_cache_key(
+                        trajectory, current_chunk, record["scene_id"], record["sample_type"],
                     )
-                    history_bank[(record["scene_id"], "corruption")] = corruption
+                    history_bank_cache[cache_key] = entry
+                    history_bank[(str(trajectory), int(current_chunk), record["scene_id"], record["sample_type"])] = entry
+                    if record["sample_type"] == "revisit":
+                        corruption = corruption_entries[int(current_chunk)]
+                        corruption_key = history_bank_cache_key(
+                            trajectory, current_chunk, record["scene_id"], "corruption",
+                        )
+                        history_bank_cache[corruption_key] = corruption
+                        history_bank[(str(trajectory), int(current_chunk), record["scene_id"], "corruption")] = corruption
                 maybe_cleanup_after_bank_entry()
         finally:
             reset_runtime_wah_adapter()
         expected_keys = {
-            (scene, kind) for scene in scenes
-            for kind in ("revisit", "large_motion", "corruption")
+            (str(record["sequence_id"]), int(current_chunk), record["scene_id"], kind)
+            for record in selected
+            for kind in (
+                (record["sample_type"], "corruption")
+                if record["sample_type"] == "revisit" else (record["sample_type"],)
+            )
+            for current_chunk in eligible_current_chunks(int(record["chunk_count"]))
         }
         if set(history_bank) != expected_keys:
             raise ValueError(
@@ -827,7 +1116,11 @@ def main():
         bank_step = global_step
         stat = {
             "global_step": global_step, "chunk_plan": dict(chunk_plan),
-            "entries": len(history_bank), "seconds": time.perf_counter() - refresh_started,
+            "entries": len(history_bank),
+            "eligible_current_chunks": {
+                scene: list(eligible_current_chunks(int(chunk_plan[scene]))) for scene in scenes
+            },
+            "seconds": time.perf_counter() - refresh_started,
             "memory_cleanup": dict(memory_cleanup_stats),
         }
         bank_stats.append(stat)
@@ -837,6 +1130,7 @@ def main():
             "entries": [
                 {
                     "scene_id": scene, "sample_type": sample_type,
+                    "current_chunk_index": int(current_chunk),
                     "key": entry["key"], "key_payload": entry["key_payload"],
                     "metadata": entry["metadata"],
                     "history_shapes": {
@@ -845,18 +1139,32 @@ def main():
                         if key.startswith("latents_history_")
                     },
                 }
-                for (scene, sample_type), entry in sorted(history_bank.items())
+                for (trajectory, current_chunk, scene, sample_type), entry in sorted(history_bank.items())
             ],
         })
 
-    def phase_b_item(scene, sample_type):
-        entry = history_bank[(scene, sample_type)]
+    def phase_b_item(scene, sample_type, current_chunk, trajectory=None):
+        if trajectory is None:
+            candidates = [
+                key for key in history_bank
+                if key[1] == int(current_chunk) and key[2] == scene and key[3] == sample_type
+            ]
+            if len(candidates) != 1:
+                raise KeyError(f"ambiguous Phase B trajectory/current chunk entry: {scene, sample_type, current_chunk}")
+            trajectory = candidates[0][0]
+        key = (str(trajectory), int(current_chunk), scene, sample_type)
+        if key not in history_bank:
+            raise KeyError(f"Phase B history bank has no trajectory/current chunk entry: {key}")
+        entry = history_bank[key]
         histories = _tree_to(entry["histories"], device)
         return {
             "sample": entry["sample"], "target": _tree_to(entry["target"], device),
             "prompt": _tree_to(entry["prompt"], device), "histories": histories,
             "warp_latents": _tree_to(entry["warp_latents"], device),
             "weights": entry["weights"], "record": entry["record"],
+            "trajectory": str(entry["record"]["sequence_id"]),
+            "current_chunk_index": int(entry["record"]["training_chunk_index"]),
+            "supervised_latent_indices": list(entry.get("supervised_latent_indices", [])),
         }
 
     def benchmark_checkpointing():
@@ -931,11 +1239,34 @@ def main():
     scene_counts = {scene: 0 for scene in scenes}
     chunk_counts = {}
     mix_counts = {"revisit": 0, "large_motion": 0, "corruption": 0}
+    metrics_history_path = run_dir / "metrics_history.json"
+    metrics_history = []
+    if metrics_history_path.exists():
+        try:
+            loaded_metrics = json.loads(metrics_history_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_metrics, list):
+                metrics_history = loaded_metrics
+        except (OSError, ValueError):
+            # A truncated metrics file must not make a valid checkpoint
+            # unloadable; the next status interval atomically replaces it.
+            metrics_history = []
+
+    def supervision_counts_report():
+        """Include zeroes for not-yet-selected chunks in every diagnostic."""
+
+        return {
+            str(record["sequence_id"]): round_robin.counts_for(
+                record["sequence_id"], int(record["chunk_count"]),
+            )
+            for record in phase_b
+        }
     checkpoint = run_dir / "checkpoint_latest.pt"
     pipe.transformer.train()
     status = None
     run_start_step = global_step
     smoke_key = None
+    last_trajectory = None
+    last_current_chunk = None
     if phase_b_smoke:
         smoke_record = next(
             item for item in phase_b
@@ -944,12 +1275,17 @@ def main():
         reset_runtime_wah_adapter()
         smoke_snapshot = lora_snapshot()
         try:
-            smoke_entry = build_bank_entry(
+            smoke_entries = build_bank_entries(
                 smoke_record, smoke_snapshot, _sha256(smoke_snapshot),
             )
+            smoke_chunk = int(smoke_record.get("training_chunk_index", 1))
+            smoke_entry = smoke_entries[smoke_chunk]
         finally:
             reset_runtime_wah_adapter()
-        smoke_key = (smoke_record["scene_id"], "revisit")
+        smoke_key = (
+            str(smoke_record["sequence_id"]), int(smoke_record["training_chunk_index"]),
+            smoke_record["scene_id"], "revisit",
+        )
         history_bank[smoke_key] = smoke_entry
         bank_step = global_step
         _atomic_json(run_dir / "phase_b_smoke_history.json", {
@@ -1000,9 +1336,13 @@ def main():
                 sample_type = "camera_only" if camera_only else "warp_anchor"
             else:
                 if phase_b_smoke:
-                    scene = smoke_key[0]
+                    scene = smoke_key[2]
                     sample_type = "revisit"
-                    item = phase_b_item(*smoke_key)
+                    item = phase_b_item(scene, sample_type, smoke_key[1], smoke_key[0])
+                    round_robin.record(
+                        item["trajectory"], item["current_chunk_index"],
+                        int(item["record"]["chunk_count"]),
+                    )
                 else:
                     draw = float(rng.random())
                     revisit_boundary = phase_b_mix["revisit"]
@@ -1013,7 +1353,19 @@ def main():
                         sample_type = "large_motion"
                     else:
                         sample_type = "corruption"
-                    item = phase_b_item(scene, sample_type)
+                    trajectory = next(
+                        record["sequence_id"] for record in phase_b
+                        if record["scene_id"] == scene
+                        and int(record["chunk_count"]) == int(chunk_plan[scene])
+                        and (
+                            record["sample_type"] == sample_type
+                            or sample_type == "corruption" and record["sample_type"] == "revisit"
+                        )
+                    )
+                    current_chunk = round_robin.next_chunk(
+                        trajectory, int(chunk_plan[scene]),
+                    )
+                    item = phase_b_item(scene, sample_type, current_chunk, trajectory)
                 loss = loss_for(item)
                 mix_counts[sample_type] += 1
                 chunk_count = int(item["record"]["chunk_count"])
@@ -1023,6 +1375,8 @@ def main():
             controller.clear_context()
             micro_losses.append(float(loss.detach().cpu()))
             last_scene, last_type = scene, sample_type
+            last_trajectory = None if phase == "A" else item.get("trajectory")
+            last_current_chunk = None if phase == "A" else int(item.get("current_chunk_index"))
             scene_counts[scene] += 1
             chunk_counts[str(chunk_count)] = chunk_counts.get(str(chunk_count), 0) + 1
         assert_only_lora_gradients(pipe.transformer, trainable)
@@ -1037,21 +1391,29 @@ def main():
             diagnostics.append(entry)
             _atomic_json(run_dir / "diagnostic_history.json", diagnostics)
         if global_step % int(training["checkpoint_every"]) == 0 or global_step == max_steps:
+            checkpoint_path = (
+                run_dir / f"checkpoint_step{global_step}_phaseB.pt"
+                if phase == "B" else checkpoint
+            )
             metadata = {
                 "git_sha": git_sha, "manifest_sha": _sha256(manifest_path),
                 "source_checkpoint": str(config["source_checkpoint"]),
                 "scene_scale": {scene: 1.0 for scene in scenes},
                 "config": config, "adapter_name": adapter_name,
                 "phase_rng_state": rng.bit_generator.state,
+                "round_robin": round_robin.snapshot(),
+                "supervision_counts": supervision_counts_report(),
+                "metrics_history_path": str(metrics_history_path),
             }
             save_spatial_training_checkpoint(
-                checkpoint, pipe.transformer, optimizer, scheduler,
+                checkpoint_path, pipe.transformer, optimizer, scheduler,
                 global_step=global_step, phase=phase, phase_step=phase_step,
                 metadata=metadata,
             )
             opt.save_visible_lora_state(
                 pipe.transformer, run_dir, adapter_name, "spatial_reanchor_lora.pt"
             )
+            checkpoint = checkpoint_path
         elapsed = time.perf_counter() - started
         remaining = max_steps - global_step
         completed_this_run = global_step - run_start_step
@@ -1060,7 +1422,15 @@ def main():
             "status": "running" if global_step < max_steps else "completed",
             "global_step": global_step, "phase": phase, "phase_step": phase_step,
             "max_steps": max_steps, "scene": last_scene, "chunk_count": chunk_count,
-            "sample_type": last_type, "loss": value, "ema_loss": ema_loss,
+            "sample_type": last_type, "trajectory": last_trajectory,
+            "current_chunk_index": last_current_chunk,
+            "supervised_latent_indices": (
+                None if phase == "A" else list(item.get("supervised_latent_indices", []))
+            ),
+            "supervised_latent_count": (
+                None if phase == "A" else len(item.get("supervised_latent_indices", []))
+            ),
+            "loss": value, "ema_loss": ema_loss,
             "lr_lora": optimizer.param_groups[0]["lr"],
             "lr_new": optimizer.param_groups[1]["lr"], "grad_norm": float(grad),
             "anchor_gates": controller.anchor_gates.detach().cpu().tolist(),
@@ -1072,6 +1442,8 @@ def main():
             "camera_ratio": logged_utilization.get("camera_ratio", 0.0),
             "history_bank_age": None if bank_step < 0 else global_step - bank_step,
             "latest_checkpoint": str(checkpoint) if checkpoint.exists() else None,
+            "round_robin": round_robin.snapshot(),
+            "supervision_counts": supervision_counts_report(),
             "gpu_memory": {
                 "allocated": int(torch.cuda.memory_allocated(0)),
                 "reserved": int(torch.cuda.memory_reserved(0)),
@@ -1086,6 +1458,22 @@ def main():
                 default=0.0,
             )
             status["camera_ratio"] = logged_utilization.get("camera_ratio", 0.0)
+            metrics_history.append({
+                "global_step": int(global_step), "phase": phase,
+                "phase_step": int(phase_step), "scene": last_scene,
+                "sample_type": last_type, "trajectory": last_trajectory,
+                "current_chunk_index": last_current_chunk, "loss": float(value),
+                "ema_loss": None if ema_loss is None else float(ema_loss),
+                "diagnostic": diagnostics[-1] if diagnostics and diagnostics[-1]["global_step"] == global_step else None,
+                "supervision_counts": supervision_counts_report(),
+                "eligible_current_chunks": {
+                    str(record["sequence_id"]): list(eligible_current_chunks(int(record["chunk_count"])))
+                    for record in phase_b
+                },
+                "supervised_latent_indices": status["supervised_latent_indices"],
+                "supervised_latent_count": status["supervised_latent_count"],
+            })
+            _atomic_json(run_dir / "metrics_history.json", metrics_history)
             _atomic_json(status_path, status)
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(status) + "\n")
@@ -1106,6 +1494,10 @@ def main():
         "scene_sample_counts": scene_counts,
         "chunk_length_distribution": chunk_counts,
         "phase_b_mix_counts": mix_counts,
+        "round_robin": round_robin.snapshot(),
+        "supervision_counts": supervision_counts_report(),
+        "metrics_history": metrics_history,
+        "history_bank_cache_keys": [list(key) for key in sorted(history_bank_cache)],
         "history_bank_stats": bank_stats,
         "memory_cleanup": memory_cleanup_stats,
         "diagnostics": diagnostics,

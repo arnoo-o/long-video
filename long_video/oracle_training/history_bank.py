@@ -17,11 +17,40 @@ class HistoryBankKey:
     generation_config: tuple
     prompt: str
     seed: int
-    history_schema_version: int = 1
+    # Version 2 includes the trajectory/current-chunk Spatial Memory Prefix
+    # semantics and therefore must not collide with old generated-history
+    # entries.
+    history_schema_version: int = 2
+
+    @property
+    def current_chunk_index(self) -> int:
+        """Explicit alias used by Phase B cache maps and diagnostics."""
+
+        return int(self.history_chunk_index)
+
+    @property
+    def trajectory_chunk(self) -> tuple[str, int]:
+        """Stable map key preventing history reuse across chunks."""
+
+        return str(self.trajectory_id), int(self.history_chunk_index)
 
     def digest(self):
         payload = asdict(self)
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def history_bank_cache_key(trajectory_id: object, current_chunk_index: int, *parts) -> tuple:
+    """Build a map key that always carries trajectory and current chunk.
+
+    ``parts`` may contain scene/sample/checkpoint identifiers.  The first two
+    fields are intentionally fixed and make accidental cross-chunk reuse
+    visible in both tests and serialized indexes.
+    """
+
+    chunk = int(current_chunk_index)
+    if chunk < 1:
+        raise ValueError("history bank current_chunk_index must be >= 1")
+    return (str(trajectory_id), chunk, *parts)
 
 
 def validate_history_bank_entry(entry):

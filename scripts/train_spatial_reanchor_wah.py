@@ -875,6 +875,12 @@ def main():
         for name, parameter in pipe.transformer.named_parameters():
             parameter.requires_grad_(id(parameter) in trainable_ids)
 
+    min_temporal_gap_frames = (19 - 1) * int(config["vae_temporal_scale"])
+    if min_temporal_gap_frames != 72:
+        raise RuntimeError(
+            f"formal spatial-memory temporal gap must be 72 frames, got {min_temporal_gap_frames}"
+        )
+
     def build_bank_entries(record, snapshot, snapshot_sha, *, corrupt_generated_history=False):
         """Build every current-chunk entry from one causal AR rollout.
 
@@ -907,13 +913,14 @@ def main():
             raise RuntimeError(f"formal AR history sizes changed: {state['history_sizes']}")
         if int(state["num_history_latent_frames"]) != 19:
             raise RuntimeError("formal AR history must retain all 19 TEMP_LONG/MID/SHORT latents")
-        min_temporal_gap_frames = (
+        state_min_temporal_gap_frames = (
             (int(state["num_history_latent_frames"]) - 1)
             * int(config["vae_temporal_scale"])
         )
-        if min_temporal_gap_frames != 72:
+        if state_min_temporal_gap_frames != min_temporal_gap_frames:
             raise RuntimeError(
-                f"formal spatial-memory temporal gap must be 72 frames, got {min_temporal_gap_frames}"
+                "formal spatial-memory temporal gap does not match the actual AR state: "
+                f"expected {min_temporal_gap_frames}, got {state_min_temporal_gap_frames}"
             )
         causal_renderer = CausalActiveNodeRenderer(
             NodeStore(root / "session"),

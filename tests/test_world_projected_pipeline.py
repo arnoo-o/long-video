@@ -6,6 +6,9 @@ from long_video.wah.world_projected_pipeline import (
     build_canonical_world_pyramid,
     build_world_projection_context,
     build_world_state_at_sigma,
+    fill_invalid_warp_for_vae,
+    smooth_latent_visibility,
+    world_projection_weight,
 )
 
 
@@ -18,7 +21,7 @@ def test_world_projection_is_exact_identity_in_unknown_region_and_bounded():
     projected, metrics = apply_world_projection(
         raw, world, visibility, confidence,
         sigma=0.25, lambda_max=0.5, gamma=1.0,
-        confidence_power=1.0, confidence_threshold=0.3,
+        confidence_ramp_min=0.2, confidence_ramp_max=0.5,
     )
     unknown = (visibility == 0).expand_as(raw)
     assert torch.equal(projected[unknown], raw[unknown])
@@ -31,19 +34,36 @@ def test_world_projection_is_exact_identity_in_unknown_region_and_bounded():
     assert 0.0 <= float(metrics["projection_mask_ratio"]) <= 1.0
 
 
-def test_confidence_threshold_and_sigma_schedule_disable_projection():
+def test_soft_confidence_ramp_and_sigma_schedule_disable_projection():
     raw = torch.randn(1, 2, 1, 2, 2)
     world = torch.randn_like(raw)
     visible = torch.ones(1, 1, 1, 2, 2)
-    low_confidence = torch.full_like(visible, 0.29)
-    thresholded, _ = apply_world_projection(
-        raw, world, visible, low_confidence, sigma=0.0, confidence_threshold=0.3,
+    minimum_confidence = torch.full_like(visible, 0.2)
+    ramped_out, _ = apply_world_projection(
+        raw, world, visible, minimum_confidence, sigma=0.0,
+        confidence_ramp_min=0.2, confidence_ramp_max=0.5,
     )
     early, _ = apply_world_projection(
         raw, world, visible, torch.ones_like(visible), sigma=1.0,
     )
-    assert torch.equal(thresholded, raw)
+    assert torch.equal(ramped_out, raw)
     assert torch.equal(early, raw)
+
+
+def test_soft_confidence_ramp_is_linear_and_stage_lambda_can_be_zero():
+    visible = torch.ones(1, 1, 1, 1, 3)
+    confidence = torch.tensor([[[[[0.2, 0.35, 0.5]]]]])
+    weight, schedule = world_projection_weight(
+        visible, confidence, sigma=0.0, lambda_max=0.3, gamma=1.0,
+        confidence_ramp_min=0.2, confidence_ramp_max=0.5,
+    )
+    torch.testing.assert_close(weight, torch.tensor([[[[[0.0, 0.15, 0.3]]]]]))
+    assert float(schedule) == 0.3
+    disabled, _ = world_projection_weight(
+        visible, confidence, sigma=0.0, lambda_max=0.0, gamma=1.0,
+        confidence_ramp_min=0.2, confidence_ramp_max=0.5,
+    )
+    assert torch.count_nonzero(disabled) == 0
 
 
 def test_world_state_uses_real_stage_start_not_generic_noise():
@@ -68,7 +88,7 @@ def test_three_stage_world_pyramid_and_support_shapes_match():
     confidence = torch.full_like(visibility, 0.75)
     context = build_world_projection_context(
         clean, visibility, confidence,
-        config=WorldProjectionConfig(lambda_max=0.5),
+        config=WorldProjectionConfig(lambda_max_by_stage=(0.0, 0.15, 0.30)),
     )
     for latent, visible, conf in zip(
         context.canonical_latents, context.visibility, context.confidence,
@@ -78,3 +98,24 @@ def test_three_stage_world_pyramid_and_support_shapes_match():
         assert torch.isfinite(latent).all()
         assert torch.isfinite(visible).all()
         assert torch.isfinite(conf).all()
+
+
+def test_visibility_smoothing_erodes_edges_and_never_expands_unknown_region():
+    value = torch.zeros(1, 1, 1, 7, 7)
+    value[..., 1:6, 1:6] = 1.0
+    softened = smooth_latent_visibility(value)
+    assert softened.min() >= 0 and softened.max() <= 1
+    assert torch.equal(softened[value == 0], torch.zeros_like(softened[value == 0]))
+    assert float(softened[..., 3, 3]) > float(softened[..., 1, 1])
+
+
+def test_invalid_warp_fill_uses_nearest_visible_without_enabling_support():
+    import numpy as np
+
+    rgb = np.zeros((1, 3, 3, 3), np.float32)
+    visibility = np.zeros((1, 3, 3), bool)
+    visibility[0, 1, 1] = True
+    rgb[0, 1, 1] = (0.2, 0.4, 0.6)
+    filled = fill_invalid_warp_for_vae(rgb, visibility)
+    np.testing.assert_allclose(filled, np.broadcast_to((0.2, 0.4, 0.6), filled.shape))
+    assert not visibility[0, 0, 0]

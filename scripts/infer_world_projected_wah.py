@@ -38,10 +38,16 @@ def parse_args():
     parser.add_argument("--chunks", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=int, default=24)
-    parser.add_argument("--lambda-max", type=float, default=0.5)
+    parser.add_argument("--lambda-max-stage0", type=float, default=0.0)
+    parser.add_argument("--lambda-max-stage1", type=float, default=0.15)
+    parser.add_argument("--lambda-max-stage2", type=float, default=0.30)
     parser.add_argument("--gamma", type=float, default=1.0)
-    parser.add_argument("--confidence-power", type=float, default=1.0)
-    parser.add_argument("--confidence-threshold", type=float, default=0.3)
+    parser.add_argument("--confidence-ramp-min", type=float, default=0.2)
+    parser.add_argument("--confidence-ramp-max", type=float, default=0.5)
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=None,
+        help="Deprecated compatibility argument; WPF soft-ramp mode ignores it.",
+    )
     parser.add_argument("--coverage-threshold", type=float)
     parser.add_argument(
         "--memory-set", action="append", default=[], metavar="KEY=VALUE",
@@ -82,6 +88,7 @@ from long_video.wah.world_projected_pipeline import (
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
     build_world_projection_context,
+    fill_invalid_warp_for_vae,
 )
 from warp_as_history.training.core import training_exact_pyramid_latents
 
@@ -89,7 +96,7 @@ from warp_as_history.training.core import training_exact_pyramid_latents
 HEIGHT, WIDTH = 384, 640
 CHUNK_FRAMES, CHUNK_STRIDE = 33, 32
 LATENT_FRAMES, VAE_TEMPORAL_SCALE = 9, 4
-PYRAMID_STEPS = (1, 1, 1)
+PYRAMID_STEPS = (2, 2, 2)
 
 
 def write_json(path: Path, value):
@@ -240,9 +247,10 @@ def load_phase_a_zero(transformer, checkpoint):
 def clean_warp_latents(pipe, state, warp):
     generator = state["generator"]
     saved_rng = generator.get_state()
+    filled_rgb = fill_invalid_warp_for_vae(warp.rgb, warp.visibility)
     pipe._prepare_autoregressive_warp_chunk(
         state,
-        warp.rgb,
+        filled_rgb,
         np.asarray(warp.visibility, np.float32)[None, None],
         np.asarray(warp.confidence * warp.visibility, np.float32)[None, None],
     )
@@ -444,10 +452,14 @@ def main():
         raise RuntimeError("training-free inference left trainable transformer parameters")
     fixed_prefix = state["image_latents"].detach().clone()
     projection_config = WorldProjectionConfig(
-        lambda_max=ARGS.lambda_max,
+        lambda_max_by_stage=(
+            ARGS.lambda_max_stage0,
+            ARGS.lambda_max_stage1,
+            ARGS.lambda_max_stage2,
+        ),
         gamma=ARGS.gamma,
-        confidence_power=ARGS.confidence_power,
-        confidence_threshold=ARGS.confidence_threshold,
+        confidence_ramp_min=ARGS.confidence_ramp_min,
+        confidence_ramp_max=ARGS.confidence_ramp_max,
     )
     startup = {
         "state": "running",
@@ -463,6 +475,9 @@ def main():
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
         "projection": vars(projection_config),
+        "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
+        "canonical_warp_vae_fill": "per_frame_nearest_visible_with_chunk_mean_fallback",
+        "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
         "memory_config": memory_config,
         "uses_future_gt": False,
         "chunks_total": ARGS.chunks,
@@ -475,9 +490,10 @@ def main():
     )
     records = []
     started = time.perf_counter()
-    previous_generated = previous_warp = None
+    previous_generated = previous_warp = previous_projection_boundary = None
     generated_motion, warp_motion, rotation_motion = [], [], []
     visible_l1 = []
+    boundary_generated_l1, boundary_warp_l1, boundary_projection_l1 = [], [], []
     try:
         with torch.no_grad():
             for chunk_index in range(ARGS.chunks):
@@ -548,6 +564,46 @@ def main():
                     verified_ratio = float(next_active.quality_metrics.get("verified_point_ratio", 0.0))
 
                 warp_u8 = u8(warp.rgb)
+                stage_diagnostics = projection.diagnostics
+                if len(stage_diagnostics) != sum(PYRAMID_STEPS):
+                    raise RuntimeError(
+                        f"expected {sum(PYRAMID_STEPS)} scheduler projections, got {len(stage_diagnostics)}"
+                    )
+                for stage_id, expected_steps in enumerate(PYRAMID_STEPS):
+                    stage_items = [item for item in stage_diagnostics if item["stage_id"] == stage_id]
+                    if [item["step_id"] for item in stage_items] != list(range(expected_steps)):
+                        raise RuntimeError(f"stage {stage_id} did not execute {expected_steps} ordered updates")
+                    if stage_id == 0 and any(item["projection_delta_ratio"] != 0.0 for item in stage_items):
+                        raise RuntimeError("stage0 World Projection must remain exactly disabled")
+                    if stage_id > 0:
+                        next_sigmas = [item["next_sigma"] for item in stage_items]
+                        if len(set(next_sigmas)) != expected_steps:
+                            raise RuntimeError(f"stage {stage_id} did not expose distinct next_sigma values")
+                        strengths = [item["projection_strength_mean"] for item in stage_items]
+                        if any(right < left for left, right in zip(strengths, strengths[1:])):
+                            raise RuntimeError(f"stage {stage_id} projection strength did not increase")
+                projection_weight = projection.final_projection_weight
+                if projection_weight is None or tuple(projection_weight.shape[2:]) != (9, 48, 80):
+                    raise RuntimeError("final stage projection weight must be [B,1,9,48,80]")
+                projection_weight = projection_weight.detach().float().cpu()
+                chunk_boundary = None
+                if chunk_index > 0:
+                    chunk_boundary = {
+                        "global_previous_frame": int(start),
+                        "global_current_frame": int(start + 1),
+                        "generation_l1": float(np.abs(
+                            generated[1].astype(np.float32) - previous_generated.astype(np.float32)
+                        ).mean() / 255.0),
+                        "warp_l1": float(np.abs(
+                            warp_u8[1].astype(np.float32) - previous_warp.astype(np.float32)
+                        ).mean() / 255.0),
+                        "projection_mask_l1": float(
+                            (projection_weight[0, 0, 1] - previous_projection_boundary).abs().mean()
+                        ),
+                    }
+                    boundary_generated_l1.append(chunk_boundary["generation_l1"])
+                    boundary_warp_l1.append(chunk_boundary["warp_l1"])
+                    boundary_projection_l1.append(chunk_boundary["projection_mask_l1"])
                 for local in range(first, CHUNK_FRAMES):
                     global_index = start + local
                     generated_frame, warp_frame = generated[local], warp_u8[local]
@@ -573,6 +629,7 @@ def main():
                         cosine = np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0)
                         rotation_motion.append(float(np.degrees(np.arccos(cosine))))
                     previous_generated, previous_warp = generated_frame, warp_frame
+                previous_projection_boundary = projection_weight[0, 0, -1].clone()
 
                 visible = np.asarray(warp.visibility, bool)
                 confidence = np.asarray(warp.confidence, np.float32)
@@ -593,7 +650,8 @@ def main():
                         "view_diversity": manager.buffer.view_diversity,
                         "mean_new_area_ratio": manager.buffer.mean_new_area_ratio,
                     },
-                    "projection_stages": projection.diagnostics,
+                    "projection_stages": stage_diagnostics,
+                    "chunk_boundary": chunk_boundary,
                     "stage_shapes": stage_shapes,
                     "unknown_projection_exact_zero": all(
                         item["unknown_projection_delta_max"] == 0.0 for item in projection.diagnostics
@@ -638,6 +696,12 @@ def main():
         "generation_warp_motion_correlation": correlation(generated_motion, warp_motion),
         "generation_rotation_motion_correlation": correlation(generated_motion, rotation_motion),
         "warp_rotation_motion_correlation": correlation(warp_motion, rotation_motion),
+        "chunk_boundary_generation_l1_mean": float(np.mean(boundary_generated_l1)) if boundary_generated_l1 else 0.0,
+        "chunk_boundary_warp_l1_mean": float(np.mean(boundary_warp_l1)) if boundary_warp_l1 else 0.0,
+        "chunk_boundary_projection_mask_l1_mean": (
+            float(np.mean(boundary_projection_l1)) if boundary_projection_l1 else 0.0
+        ),
+        "chunk_boundaries": [item["chunk_boundary"] for item in records if item["chunk_boundary"]],
         "elapsed_seconds": time.perf_counter() - started,
         "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(0)),
         "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(0)),

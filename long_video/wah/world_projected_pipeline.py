@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -21,20 +22,25 @@ except ImportError:  # Keep CPU helper tests importable without the submodule.
 
 @dataclass(frozen=True)
 class WorldProjectionConfig:
-    lambda_max: float = 0.5
+    lambda_max_by_stage: tuple[float, ...] = (0.0, 0.15, 0.30)
     gamma: float = 1.0
-    confidence_power: float = 1.0
-    confidence_threshold: float = 0.3
+    confidence_ramp_min: float = 0.2
+    confidence_ramp_max: float = 0.5
 
     def __post_init__(self):
-        if not 0.0 <= self.lambda_max <= 1.0:
-            raise ValueError("lambda_max must be in [0, 1]")
+        if not self.lambda_max_by_stage:
+            raise ValueError("lambda_max_by_stage must not be empty")
+        if any(not 0.0 <= value <= 1.0 for value in self.lambda_max_by_stage):
+            raise ValueError("every stage lambda_max must be in [0, 1]")
         if self.gamma < 0.0:
             raise ValueError("gamma must be non-negative")
-        if self.confidence_power < 0.0:
-            raise ValueError("confidence_power must be non-negative")
-        if not 0.0 <= self.confidence_threshold <= 1.0:
-            raise ValueError("confidence_threshold must be in [0, 1]")
+        if not 0.0 <= self.confidence_ramp_min < self.confidence_ramp_max <= 1.0:
+            raise ValueError("confidence ramp must satisfy 0 <= min < max <= 1")
+
+    def lambda_max(self, stage_id: int) -> float:
+        if not 0 <= int(stage_id) < len(self.lambda_max_by_stage):
+            raise ValueError(f"no projection lambda configured for stage {stage_id}")
+        return float(self.lambda_max_by_stage[int(stage_id)])
 
 
 @dataclass
@@ -44,6 +50,7 @@ class WorldProjectionContext:
     confidence: list[torch.Tensor]
     config: WorldProjectionConfig = field(default_factory=WorldProjectionConfig)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    final_projection_weight: torch.Tensor | None = None
 
     def __post_init__(self):
         count = len(self.canonical_latents)
@@ -72,6 +79,35 @@ def _resize_video_latents(value: torch.Tensor, height: int, width: int, *, mode:
         kwargs["align_corners"] = False
     resized = F.interpolate(flat.float(), **kwargs).to(value.dtype)
     return resized.reshape(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
+
+
+def fill_invalid_warp_for_vae(rgb: Any, visibility: Any) -> np.ndarray:
+    """Nearest-fill invalid renderer pixels only for canonical VAE encoding."""
+    from scipy.ndimage import distance_transform_edt
+
+    value = np.asarray(rgb)
+    visible = np.asarray(visibility, bool)
+    if value.ndim != 4 or value.shape[-1] != 3 or visible.shape != value.shape[:3]:
+        raise ValueError(f"expected RGB [T,H,W,3] and visibility [T,H,W], got {value.shape}/{visible.shape}")
+    result = value.copy()
+    if visible.any():
+        fallback = value[visible].reshape(-1, 3).mean(axis=0)
+    else:
+        fallback = np.full((3,), 0.5 if np.issubdtype(value.dtype, np.floating) else 128.0)
+    for frame_index, mask in enumerate(visible):
+        if mask.all():
+            continue
+        if not mask.any():
+            result[frame_index] = fallback
+            continue
+        indices = distance_transform_edt(
+            ~mask, return_distances=False, return_indices=True,
+        )
+        filled = result[frame_index]
+        filled[~mask] = value[frame_index][indices[0, ~mask], indices[1, ~mask]]
+    if np.issubdtype(value.dtype, np.integer):
+        result = np.rint(result).astype(value.dtype)
+    return result
 
 
 def build_canonical_world_pyramid(clean_latent: torch.Tensor, stage_count: int = 3) -> list[torch.Tensor]:
@@ -123,6 +159,23 @@ def pixel_support_to_latent(
     return _resize_video_latents(grouped, latent_height, latent_width, mode="area").clamp(0.0, 1.0)
 
 
+def smooth_latent_visibility(value: torch.Tensor) -> torch.Tensor:
+    """Erode and soften spatial support without leaking into true unknowns."""
+    if value.ndim != 5 or value.shape[1] != 1:
+        raise ValueError(f"visibility must be [B,1,T,H,W], got {tuple(value.shape)}")
+    batch, _, frames, height, width = value.shape
+    flat = value.float().permute(0, 2, 1, 3, 4).reshape(batch * frames, 1, height, width)
+    original = flat.clamp(0.0, 1.0)
+    binary = (original > 0.0).float()
+    inverse = F.pad(1.0 - binary, (1, 1, 1, 1), mode="constant", value=1.0)
+    eroded = 1.0 - F.max_pool2d(inverse, kernel_size=3, stride=1)
+    softened = F.avg_pool2d(eroded, kernel_size=3, stride=1, padding=1)
+    # Multiplying by original support makes exact unknowns stay exact zero and
+    # retains fractional temporal/spatial coverage produced by VAE grouping.
+    softened = (softened * original).clamp(0.0, 1.0)
+    return softened.reshape(batch, frames, 1, height, width).permute(0, 2, 1, 3, 4)
+
+
 def build_world_projection_context(
     clean_latent: torch.Tensor,
     visibility: Any,
@@ -149,9 +202,10 @@ def build_world_projection_context(
     )
     visible_pyramid, confidence_pyramid = [], []
     for endpoint in canonical:
-        visible_pyramid.append(_resize_video_latents(
+        stage_visibility = _resize_video_latents(
             full_visibility, endpoint.shape[-2], endpoint.shape[-1], mode="area",
-        ).clamp(0.0, 1.0))
+        ).clamp(0.0, 1.0)
+        visible_pyramid.append(smooth_latent_visibility(stage_visibility))
         confidence_pyramid.append(_resize_video_latents(
             full_confidence, endpoint.shape[-2], endpoint.shape[-1], mode="area",
         ).clamp(0.0, 1.0))
@@ -201,8 +255,8 @@ def apply_world_projection(
     sigma: float | torch.Tensor,
     lambda_max: float = 0.5,
     gamma: float = 1.0,
-    confidence_power: float = 1.0,
-    confidence_threshold: float = 0.3,
+    confidence_ramp_min: float = 0.2,
+    confidence_ramp_max: float = 0.5,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Blend a scheduler result toward verified world evidence."""
     if tuple(z_world.shape) != tuple(z_raw.shape):
@@ -212,20 +266,16 @@ def apply_world_projection(
         raise ValueError(
             f"support must be {support_shape}, got {tuple(visibility.shape)}/{tuple(confidence.shape)}"
         )
-    sigma_value = torch.as_tensor(sigma, device=z_raw.device, dtype=torch.float32).clamp(0.0, 1.0)
-    schedule = float(lambda_max) * (1.0 - sigma_value).pow(float(gamma))
-    visible = visibility.to(device=z_raw.device, dtype=torch.float32).clamp(0.0, 1.0)
-    confidence_value = confidence.to(device=z_raw.device, dtype=torch.float32).clamp(0.0, 1.0)
-    confidence_weight = torch.where(
-        confidence_value >= float(confidence_threshold),
-        confidence_value.pow(float(confidence_power)),
-        torch.zeros_like(confidence_value),
+    strength, schedule = world_projection_weight(
+        visibility, confidence, sigma=sigma, lambda_max=lambda_max, gamma=gamma,
+        confidence_ramp_min=confidence_ramp_min,
+        confidence_ramp_max=confidence_ramp_max,
+        device=z_raw.device,
     )
-    strength = visible * confidence_weight * schedule
     projected = z_raw.float() + strength * (z_world.float() - z_raw.float())
     projected = projected.to(z_raw.dtype)
     delta = projected.float() - z_raw.float()
-    unknown = visible == 0
+    unknown = visibility.to(device=z_raw.device) == 0
     unknown_delta_max = (
         delta.masked_select(unknown.expand_as(delta)).abs().max()
         if bool(unknown.any()) else torch.zeros((), device=z_raw.device)
@@ -242,6 +292,32 @@ def apply_world_projection(
         "unknown_projection_delta_max": unknown_delta_max.detach(),
     }
     return projected, diagnostics
+
+
+def world_projection_weight(
+    visibility: torch.Tensor,
+    confidence: torch.Tensor,
+    *,
+    sigma: float | torch.Tensor,
+    lambda_max: float,
+    gamma: float,
+    confidence_ramp_min: float,
+    confidence_ramp_max: float,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the exact soft projection weight and its scalar sigma schedule."""
+    if confidence_ramp_max <= confidence_ramp_min:
+        raise ValueError("confidence_ramp_max must be greater than confidence_ramp_min")
+    device = device or visibility.device
+    sigma_value = torch.as_tensor(sigma, device=device, dtype=torch.float32).clamp(0.0, 1.0)
+    schedule = float(lambda_max) * (1.0 - sigma_value).pow(float(gamma))
+    visible = visibility.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+    confidence_value = confidence.to(device=device, dtype=torch.float32).clamp(0.0, 1.0)
+    confidence_weight = (
+        (confidence_value - float(confidence_ramp_min))
+        / (float(confidence_ramp_max) - float(confidence_ramp_min))
+    ).clamp(0.0, 1.0)
+    return visible * confidence_weight * schedule, schedule
 
 
 class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
@@ -289,17 +365,29 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 stage_start_state=stage_start,
             )
             config = context.config
+            stage_lambda_max = config.lambda_max(stage_id)
             projected, diagnostic = apply_world_projection(
                 z_raw, z_world, visible, confidence,
                 sigma=next_sigma,
-                lambda_max=config.lambda_max,
+                lambda_max=stage_lambda_max,
                 gamma=config.gamma,
-                confidence_power=config.confidence_power,
-                confidence_threshold=config.confidence_threshold,
+                confidence_ramp_min=config.confidence_ramp_min,
+                confidence_ramp_max=config.confidence_ramp_max,
             )
+            context.final_projection_weight = world_projection_weight(
+                visible, confidence,
+                sigma=next_sigma,
+                lambda_max=stage_lambda_max,
+                gamma=config.gamma,
+                confidence_ramp_min=config.confidence_ramp_min,
+                confidence_ramp_max=config.confidence_ramp_max,
+                device=z_raw.device,
+            )[0].detach()
             context.diagnostics.append({
                 "stage_id": int(stage_id),
-                "sigma": float(torch.as_tensor(next_sigma).detach().cpu()),
+                "step_id": int(step_index),
+                "sigma": float(torch.as_tensor(current_sigma).detach().cpu()),
+                "next_sigma": float(torch.as_tensor(next_sigma).detach().cpu()),
                 **{key: float(value.detach().cpu()) for key, value in diagnostic.items()},
             })
             return (projected, *result[1:])

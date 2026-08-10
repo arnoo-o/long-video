@@ -297,6 +297,9 @@ def build_spatial_reanchor_controller(
             self._handles = []
             self.last_metrics = {}
             self.collect_spatial_metrics = False
+            # Inference-only kill switch.  The default remains enabled so the
+            # Phase-B v2 training/resume path is numerically unchanged.
+            self.enable_spatial_memory_attention = True
             self._suspend_patch_short_hook = False
             self._verified_history_modulation_blocks = set()
 
@@ -467,7 +470,8 @@ def build_spatial_reanchor_controller(
             count = int(original_context_length)
             context = self._contexts.get(count) if self._context is None else self._context
             if (
-                context is None or not context.spatial_attention_enabled
+                context is None or not self.enable_spatial_memory_attention
+                or not context.spatial_attention_enabled
                 or context.memory_tokens is None
             ):
                 return hidden

@@ -346,6 +346,12 @@ def test_second_spatial_attention_has_fixed_slots_hard_memory_mask_and_zero_gate
     assert tuple(changed.shape) == tuple(hidden.shape)
     torch.testing.assert_close(changed[:, :-540], hidden[:, :-540])
     assert not torch.equal(changed[:, -540:], hidden[:, -540:])
+    controller.enable_spatial_memory_attention = False
+    bypassed = controller.spatial_attention(
+        transformer.blocks[0], hidden, rotary, 540, scale_msa, shift_msa,
+    )
+    assert torch.equal(bypassed, hidden)
+    controller.enable_spatial_memory_attention = True
     changed[:, -540:].sum().backward()
     assert controller.spatial_k_lora[0].up.weight.grad is not None
     assert controller.spatial_v_lora[0].up.weight.grad is not None

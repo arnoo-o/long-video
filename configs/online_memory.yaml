@@ -6,6 +6,7 @@ min_translation_baseline: 0.15
 min_view_diversity: 0.15
 min_new_area_ratio: 0.2
 min_overlap_coverage: 0.03
+transition_readiness_mode: all
 min_confidence_weighted_coverage: 0.5
 max_overlap_depth_error: 0.5
 min_new_point_ratio: 0.1

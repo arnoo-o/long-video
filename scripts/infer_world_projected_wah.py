@@ -411,6 +411,8 @@ def main():
             memory_config[key] = int(raw_value)
         elif isinstance(original, float):
             memory_config[key] = float(raw_value)
+        elif isinstance(original, str):
+            memory_config[key] = raw_value.strip()
         else:
             raise TypeError(f"unsupported memory override type for {key}: {type(original).__name__}")
     geometry = Pi3GeometryBackend(
@@ -670,6 +672,7 @@ def main():
                         "view_diversity": manager.buffer.view_diversity,
                         "mean_new_area_ratio": manager.buffer.mean_new_area_ratio,
                     },
+                    "candidate_readiness": manager.readiness_report(),
                     "projection_stages": stage_diagnostics,
                     "chunk_boundary": chunk_boundary,
                     "stage_shapes": stage_shapes,

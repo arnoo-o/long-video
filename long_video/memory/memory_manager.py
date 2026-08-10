@@ -49,6 +49,7 @@ class MemoryManager:
         min_verified_baseline=0.03,
         max_verified_rgb_error=0.15,
         max_verified_depth_error=0.1,
+        transition_readiness_mode="all",
     ):
         self.geometry_backend = geometry_backend
         self.node_store = node_store
@@ -82,6 +83,9 @@ class MemoryManager:
         self.min_verified_baseline=float(min_verified_baseline)
         self.max_verified_rgb_error=float(max_verified_rgb_error)
         self.max_verified_depth_error=float(max_verified_depth_error)
+        self.transition_readiness_mode = str(transition_readiness_mode)
+        if self.transition_readiness_mode not in {"all", "any"}:
+            raise ValueError("transition_readiness_mode must be 'all' or 'any'")
         self.nodes = {}
         self.events = []
 
@@ -93,14 +97,47 @@ class MemoryManager:
         return self.low_count
 
     def _ready(self):
-        overlap = float(np.mean([frame.coverage for frame in self.buffer.frames]))
-        return (
-            len(self.buffer) >= self.min_transition_frames
-            and self.buffer.translation_baseline >= self.min_translation_baseline
-            and self.buffer.view_diversity >= self.min_view_diversity
-            and self.buffer.mean_new_area_ratio >= self.min_new_area_ratio
-            and overlap >= self.min_overlap_coverage
+        return bool(self.readiness_report()["ready"])
+
+    def readiness_report(self):
+        overlap = (
+            float(np.mean([frame.coverage for frame in self.buffer.frames]))
+            if self.buffer.frames else 0.0
         )
+        conditions = {
+            "translation": self.buffer.translation_baseline >= self.min_translation_baseline,
+            "view_change": self.buffer.view_diversity >= self.min_view_diversity,
+            "new_area": self.buffer.mean_new_area_ratio >= self.min_new_area_ratio,
+            "world_overlap": overlap >= self.min_overlap_coverage,
+        }
+        enough_frames = len(self.buffer) >= self.min_transition_frames
+        condition_ready = (
+            any(conditions.values())
+            if self.transition_readiness_mode == "any"
+            else all(conditions.values())
+        )
+        return {
+            "ready": bool(enough_frames and condition_ready),
+            "enough_frames": bool(enough_frames),
+            "frame_count": int(len(self.buffer)),
+            "mode": self.transition_readiness_mode,
+            "conditions": conditions,
+            "values": {
+                "translation": float(self.buffer.translation_baseline),
+                "view_change_radians": float(self.buffer.view_diversity),
+                "view_change_degrees": float(np.rad2deg(self.buffer.view_diversity)),
+                "new_area": float(self.buffer.mean_new_area_ratio),
+                "world_overlap": overlap,
+            },
+            "thresholds": {
+                "translation": float(self.min_translation_baseline),
+                "view_change_radians": float(self.min_view_diversity),
+                "view_change_degrees": float(np.rad2deg(self.min_view_diversity)),
+                "new_area": float(self.min_new_area_ratio),
+                "world_overlap": float(self.min_overlap_coverage),
+                "minimum_frames": int(self.min_transition_frames),
+            },
+        }
 
     def _append_chunk(self, generated_rgb_for_memory, cameras, warp, frame_start):
         from ..oracle_training.contracts import assert_no_supervision_content

@@ -58,7 +58,7 @@ def test_soft_confidence_ramp_is_linear_and_stage_lambda_can_be_zero():
         confidence_ramp_min=0.2, confidence_ramp_max=0.5,
     )
     torch.testing.assert_close(weight, torch.tensor([[[[[0.0, 0.15, 0.3]]]]]))
-    assert float(schedule) == 0.3
+    torch.testing.assert_close(schedule, torch.tensor(0.3))
     disabled, _ = world_projection_weight(
         visible, confidence, sigma=0.0, lambda_max=0.0, gamma=1.0,
         confidence_ramp_min=0.2, confidence_ramp_max=0.5,

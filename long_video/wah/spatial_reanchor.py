@@ -492,7 +492,8 @@ def build_spatial_reanchor_controller(
             key_bias = key_bias.masked_fill(~valid[:, None, None, :], -1.0e4)
             has_support = valid.any(dim=-1).view(-1, 1, 1, 1)
             delta = torch.nn.functional.scaled_dot_product_attention(
-                query, key, value, attn_mask=key_bias, dropout_p=0.0, is_causal=False,
+                query, key, value, attn_mask=key_bias.to(query.dtype),
+                dropout_p=0.0, is_causal=False,
             ) * has_support
             delta = delta.transpose(1, 2).flatten(2)
             delta = attn.to_out[1](attn.to_out[0](delta))

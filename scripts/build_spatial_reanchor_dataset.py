@@ -21,6 +21,14 @@ def _args():
     parser.add_argument("--rife-checkpoint", type=Path, required=True)
     parser.add_argument("--rife-python", type=Path, required=True)
     parser.add_argument("--physical-gpu", type=int, default=1)
+    parser.add_argument(
+        "--scene", action="append", dest="scenes",
+        help="Build only the named scene; may be repeated. Defaults to every scanned scene.",
+    )
+    parser.add_argument(
+        "--base-manifest", type=Path,
+        help="Preserve records from this manifest and append the newly built scenes.",
+    )
     return parser.parse_args()
 
 
@@ -163,6 +171,13 @@ def main():
     from long_video.oracle_training.dense_dataset import build_dense_oracle_sequence
 
     report = json.loads(args.scan_report.read_text(encoding="utf-8"))
+    requested_scenes = None if args.scenes is None else set(args.scenes)
+    scanned_scene_ids = {scene["scene_id"] for scene in report["scenes"]}
+    if requested_scenes is not None:
+        missing = requested_scenes - scanned_scene_ids
+        if missing:
+            raise ValueError(f"requested scenes are absent from scan report: {sorted(missing)}")
+    selected_scene_ids = scanned_scene_ids if requested_scenes is None else requested_scenes
     args.output.mkdir(parents=True, exist_ok=True)
     rife = PracticalRIFE425(args.rife_root, args.rife_checkpoint, args.rife_python)
     rife_revision = subprocess.check_output(
@@ -170,16 +185,23 @@ def main():
     ).strip()
     git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     records = []
+    base_manifest = None
+    if args.base_manifest is not None:
+        base_manifest = json.loads(args.base_manifest.read_text(encoding="utf-8"))
+        records.extend(base_manifest["sequences"])
+    existing_sequence_ids = {record["sequence_id"] for record in records}
     for scene in report["scenes"]:
         archive = Path(scene["archive"])
         scene_id = scene["scene_id"]
+        if scene_id not in selected_scene_ids:
+            continue
         prompt = (
             "A stable outdoor environment viewed by a smoothly moving camera."
             if scene_id.lower().startswith("outdoor")
             else "A stable indoor environment viewed by a smoothly moving camera."
         )
-        phase_a = _phase_a_starts(scene["continuous_runs"])
         specs = []
+        phase_a = _phase_a_starts(scene["continuous_runs"])
         for split, starts in phase_a.items():
             specs.extend({"phase": "A", "split": split, "start": start, "anchors": 5, "chunks": 1}
                          for start in starts)
@@ -206,6 +228,8 @@ def main():
                 f"{scene_id}_phase{spec['phase']}_{spec['split']}_{ordinal:03d}_"
                 f"{spec['chunks']}chunk_24fps"
             )
+            if sequence_id in existing_sequence_ids:
+                raise ValueError(f"sequence already exists in base manifest: {sequence_id}")
             extracted = _extract(
                 archive, args.output / "_extracted" / sequence_id,
                 spec["start"], spec["anchors"],
@@ -239,6 +263,7 @@ def main():
                 "sample_type": metadata["sample_type"],
                 "training_chunk_index": int(spec.get("revisit", {}).get("training_chunk_index", 0)),
             })
+            existing_sequence_ids.add(sequence_id)
     manifest = {
         "schema_version": 3,
         "git_sha": git_sha,
@@ -246,6 +271,9 @@ def main():
         "scan_report_sha256": _sha256(args.scan_report),
         "rife_revision": rife_revision,
         "rife_checkpoint_sha256": _sha256(args.rife_checkpoint / "flownet.pkl"),
+        "base_manifest": None if args.base_manifest is None else str(args.base_manifest),
+        "base_manifest_sha256": None if args.base_manifest is None else _sha256(args.base_manifest),
+        "newly_built_scenes": sorted(selected_scene_ids),
         "sequences": records,
     }
     target = args.output / "spatial_reanchor_manifest.json"

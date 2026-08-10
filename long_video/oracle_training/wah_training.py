@@ -264,3 +264,97 @@ def load_spatial_training_checkpoint(path, transformer, optimizer, scheduler):
         "phase_step": int(payload["phase_step"]),
         "metadata": dict(payload.get("metadata") or {}),
     }
+
+
+def load_phase_b_v2_base_checkpoint(path, transformer):
+    """Load step600 model tensors only; deliberately ignore optimizer/scheduler/RNG."""
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("global_step", -1)) != 600:
+        raise ValueError("Phase-B v2 must initialize from the step600 checkpoint")
+    state = payload.get("trainable_state") or {}
+    named = dict(transformer.named_parameters())
+    matched = {name: value for name, value in state.items() if name in named}
+    lora = sorted(name for name in matched if ".lora_" in name)
+    spatial = sorted(name for name in matched if name.startswith("spatial_reanchor."))
+    if len(lora) != 320 or len(spatial) != 17:
+        raise RuntimeError(
+            f"step600 must contain 320 WAH LoRA and 17 Anchor/Camera tensors; "
+            f"got {len(lora)} and {len(spatial)}"
+        )
+    with torch.no_grad():
+        for name, value in matched.items():
+            named[name].copy_(value.to(device=named[name].device, dtype=named[name].dtype))
+    return {
+        "global_step": 600, "loaded_lora_names": lora,
+        "loaded_spatial_camera_names": spatial,
+        "metadata": dict(payload.get("metadata") or {}),
+    }
+
+
+def save_phase_b_v2_checkpoint(
+    path, transformer, optimizer, scheduler, *, global_step, phase_step, metadata,
+):
+    import random
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        name: parameter.detach().cpu()
+        for name, parameter in transformer.named_parameters()
+        if parameter.requires_grad
+    }
+    if not state or any(
+        not name.startswith("spatial_reanchor.spatial_") for name in state
+    ):
+        raise RuntimeError("Phase-B v2 checkpoint contains an unexpected trainable parameter")
+    payload = {
+        "schema_version": 3, "training_semantics": "phase_b_spatial_memory_warp_v2",
+        "global_step": int(global_step), "phase": "B", "phase_step": int(phase_step),
+        "trainable_state": state, "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(), "metadata": dict(metadata),
+        "rng_state": {
+            "python": random.getstate(), "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        },
+    }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+    return path
+
+
+def load_phase_b_v2_checkpoint(path, transformer, optimizer, scheduler):
+    import random
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if int(payload.get("schema_version", 0)) != 3:
+        raise ValueError("Phase-B v2 resume requires checkpoint schema version 3")
+    named = dict(transformer.named_parameters())
+    expected = {name for name, parameter in named.items() if parameter.requires_grad}
+    state = payload.get("trainable_state") or {}
+    if set(state) != expected:
+        raise ValueError(
+            f"Phase-B v2 trainable state mismatch: missing={sorted(expected-set(state))[:5]} "
+            f"unexpected={sorted(set(state)-expected)[:5]}"
+        )
+    with torch.no_grad():
+        for name, value in state.items():
+            named[name].copy_(value.to(device=named[name].device, dtype=named[name].dtype))
+    optimizer.load_state_dict(payload["optimizer"])
+    scheduler.load_state_dict(payload["scheduler"])
+    rng = payload.get("rng_state") or {}
+    if rng:
+        random.setstate(rng["python"]); np.random.set_state(rng["numpy"])
+        torch.set_rng_state(rng["torch_cpu"])
+        if torch.cuda.is_available() and rng.get("torch_cuda"):
+            torch.cuda.set_rng_state_all(rng["torch_cuda"])
+    return {
+        "global_step": int(payload["global_step"]), "phase": "B",
+        "phase_step": int(payload["phase_step"]),
+        "metadata": dict(payload.get("metadata") or {}),
+    }

@@ -10,6 +10,7 @@ from .revisit import (
 from .history_bank import HistoryBankKey, history_bank_cache_key, validate_history_bank_entry
 from .round_robin import RoundRobinChunkScheduler, eligible_current_chunks
 from .spatial_memory_prefix import SpatialMemoryBank, SpatialMemoryPrefixBank, choose_prefix
+from .spatial_memory_warp import SpatialMemoryWarpBank
 from .supervision import validate_current_chunk_supervision
 from .causal_warp import CausalActiveNodeRenderer, CausalWarpResult
 
@@ -20,6 +21,7 @@ __all__ = [
     "HistoryBankKey", "history_bank_cache_key", "validate_history_bank_entry",
     "RoundRobinChunkScheduler", "eligible_current_chunks",
     "SpatialMemoryPrefixBank", "choose_prefix",
+    "SpatialMemoryWarpBank",
     "SpatialMemoryBank",
     "validate_current_chunk_supervision",
     "CausalActiveNodeRenderer", "CausalWarpResult",

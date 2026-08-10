@@ -356,6 +356,7 @@ def add_renderer_overlap(candidate, overlap: float, *, sample_type: str):
     if not np.isfinite(overlap) or not 0.0 <= overlap <= 1.0:
         raise ValueError(f"renderer overlap must be finite in [0,1], got {overlap}")
     item["renderer_overlap"] = overlap
+    item["renderer_overlap_metric"] = "bidirectional_depth_reprojection_overlap"
     if sample_type == "revisit":
         item["revisit_score"] = (
             overlap * np.log1p(item["selection_temporal_gap_anchors"])

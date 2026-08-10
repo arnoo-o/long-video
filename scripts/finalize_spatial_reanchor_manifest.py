@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 
 
 def _args():
@@ -42,6 +43,8 @@ def _renderer_overlap(record, candidate):
 
 def main():
     args = _args()
+    repo = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo))
     from long_video.oracle_training.revisit import (
         add_renderer_overlap, choose_independent_final_candidates,
         score_large_motion_window, score_revisit_window,
@@ -60,7 +63,10 @@ def main():
             raw_candidates = [score_revisit_window(poses[:anchors], 0, anchors)]
         else:
             raw_candidates = []
-            for chunk_index in range(int(record["chunk_count"])):
+            # Chunk zero is the source/prefix chunk and is never a trainable
+            # Phase B current chunk.  Large-motion selection must therefore
+            # point at one of the round-robin eligible chunks 1..N-1.
+            for chunk_index in range(1, int(record["chunk_count"])):
                 local = score_large_motion_window(poses[4 * chunk_index:4 * chunk_index + 5], 0, 5)
                 local["training_chunk_index"] = chunk_index
                 local["earlier_anchor_offset"] += 4 * chunk_index

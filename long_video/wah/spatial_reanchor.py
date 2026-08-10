@@ -229,7 +229,18 @@ def _module_classes():
         def forward(self, rays):
             return self.up(torch.nn.functional.silu(self.down(rays.float())))
 
-    return nn, Adapter, Camera
+    class LowRankDelta(nn.Module):
+        def __init__(self, hidden_size: int, output_size: int, rank: int):
+            super().__init__()
+            self.down = nn.Linear(hidden_size, rank, bias=False)
+            self.up = nn.Linear(rank, output_size, bias=False)
+            nn.init.kaiming_uniform_(self.down.weight, a=5 ** 0.5)
+            nn.init.zeros_(self.up.weight)
+
+        def forward(self, hidden):
+            return self.up(self.down(hidden))
+
+    return nn, Adapter, Camera, LowRankDelta
 
 
 @dataclass
@@ -242,12 +253,20 @@ class ReanchorContext:
     anchor_enabled: bool
     camera_enabled: bool
     spatial_warp_enabled: bool
+    warp_confidence_tokens: object = None
+    memory_tokens: object = None
+    memory_visibility_tokens: object = None
+    memory_confidence_tokens: object = None
+    spatial_attention_enabled: bool = False
 
 
-def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refresh_blocks=(0, 10, 20, 30), gate_init=0.05):
+def build_spatial_reanchor_controller(
+    hidden_size: int, *, rank: int = 64, refresh_blocks=(0, 10, 20, 30),
+    gate_init=0.05, spatial_rank: int = 8, block_count: int = 40,
+):
     """Create the torch module lazily so importing geometry helpers stays CPU-light."""
     import torch
-    nn, Adapter, Camera = _module_classes()
+    nn, Adapter, Camera, LowRankDelta = _module_classes()
 
     class Controller(nn.Module):
         def __init__(self):
@@ -260,16 +279,31 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
             self.anchor_gates = nn.Parameter(torch.full((len(self.refresh_blocks),), float(gate_init)))
             self.camera_gate = nn.Parameter(torch.tensor(float(gate_init)))
             self.spatial_warp_role = nn.Parameter(torch.zeros(self.hidden_size))
+            self.spatial_memory_role = nn.Parameter(torch.zeros(self.hidden_size))
+            self.spatial_k_lora = nn.ModuleList([
+                LowRankDelta(self.hidden_size, self.hidden_size, int(spatial_rank))
+                for _ in range(int(block_count))
+            ])
+            self.spatial_v_lora = nn.ModuleList([
+                LowRankDelta(self.hidden_size, self.hidden_size, int(spatial_rank))
+                for _ in range(int(block_count))
+            ])
+            self.spatial_gate = nn.Parameter(torch.zeros(int(block_count)))
             self._context = None
             self._contexts = {}
             self._handles = []
             self.last_metrics = {}
+            self.collect_spatial_metrics = False
 
         def install(self, transformer):
             if self._handles:
                 raise RuntimeError("spatial re-anchor hooks are already installed")
             if len(transformer.blocks) <= max(self.refresh_blocks):
                 raise ValueError("refresh block exceeds transformer depth")
+            if len(transformer.blocks) != len(self.spatial_gate):
+                raise ValueError(
+                    f"spatial attention expects {len(self.spatial_gate)} blocks, got {len(transformer.blocks)}"
+                )
             object.__setattr__(self, "_transformer_ref", weakref.ref(transformer))
             self._handles.append(transformer.patch_short.register_forward_hook(self._patch_short_hook))
             for gate_index, block_index in enumerate(self.refresh_blocks):
@@ -277,6 +311,9 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
                     self._block_hook(gate_index, block_index), with_kwargs=True
                 )
                 self._handles.append(handle)
+            for block_index, block in enumerate(transformer.blocks):
+                object.__setattr__(block, "_spatial_controller_ref", weakref.ref(self))
+                block._spatial_block_index = int(block_index)
             return self
 
         def prepare_context(
@@ -323,6 +360,36 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
                 count = int(warp_tokens.shape[1])
                 if count in contexts:
                     raise ValueError(f"duplicate spatial stage token count: {count}")
+                warp_confidence = raw.get("warp_confidence_tokens", stage_visibility).to(
+                    device=warp_tokens.device, dtype=torch.float32,
+                )
+                memory_latents = raw.get("memory_warp_latents")
+                memory_tokens = None
+                memory_visibility = None
+                memory_confidence = None
+                if memory_latents is not None:
+                    memory = memory_latents.to(device=patch.weight.device, dtype=patch.weight.dtype)
+                    memory_tokens = patch(memory).flatten(2).transpose(1, 2).detach()
+                    memory_visibility = raw["memory_visibility_tokens"].to(
+                        device=memory_tokens.device, dtype=torch.float32,
+                    )
+                    memory_confidence = raw.get(
+                        "memory_confidence_tokens", memory_visibility,
+                    ).to(device=memory_tokens.device, dtype=torch.float32)
+                    expected_memory = (warp_tokens.shape[0], 540, warp_tokens.shape[2])
+                    if tuple(memory_tokens.shape) != expected_memory:
+                        raise ValueError(
+                            f"memory warp must provide fixed 540 stage0 tokens, got {tuple(memory_tokens.shape)}"
+                        )
+                    if warp_tokens.shape[1] != 540:
+                        raise ValueError("W/R spatial attention is restricted to stage0 target count 540")
+                    for label, value in (
+                        ("warp confidence", warp_confidence),
+                        ("memory visibility", memory_visibility),
+                        ("memory confidence", memory_confidence),
+                    ):
+                        if value.shape[:2] != warp_tokens.shape[:2] or value.shape[-1] != 1:
+                            raise ValueError(f"{label} token mismatch: {tuple(value.shape)}")
                 contexts[count] = ReanchorContext(
                     warp_tokens=warp_tokens,
                     visibility_tokens=stage_visibility,
@@ -332,6 +399,11 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
                     anchor_enabled=bool(anchor_enabled),
                     camera_enabled=bool(camera_enabled),
                     spatial_warp_enabled=bool(spatial_warp_enabled),
+                    warp_confidence_tokens=warp_confidence,
+                    memory_tokens=memory_tokens,
+                    memory_visibility_tokens=memory_visibility,
+                    memory_confidence_tokens=memory_confidence,
+                    spatial_attention_enabled=bool(raw.get("spatial_attention_enabled", memory_tokens is not None)),
                 )
             self._contexts = contexts
             self._context = next(iter(contexts.values())) if len(contexts) == 1 else None
@@ -347,6 +419,92 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
         def clear_context(self):
             self._context = None
             self._contexts = {}
+
+        @staticmethod
+        def _apply_rotary(hidden, frequencies):
+            first, second = hidden.unflatten(-1, (-1, 2)).unbind(-1)
+            cosine, sine = frequencies.unsqueeze(-2).chunk(2, dim=-1)
+            output = torch.empty_like(hidden)
+            output[..., 0::2] = first * cosine[..., 0::2] - second * sine[..., 1::2]
+            output[..., 1::2] = first * sine[..., 1::2] + second * cosine[..., 0::2]
+            return output
+
+        def spatial_attention(self, block, hidden, rotary_emb, original_context_length):
+            """Second attention pass over fixed [current-W | retrieved-R] temporary K/V."""
+            block_index = int(block._spatial_block_index)
+            count = int(original_context_length)
+            context = self._contexts.get(count) if self._context is None else self._context
+            if (
+                context is None or not context.spatial_attention_enabled
+                or context.memory_tokens is None
+            ):
+                return hidden
+            if count != 540 or hidden.shape[1] < count:
+                raise RuntimeError(f"spatial target must be the final 540 tokens, got {count}")
+            target = hidden[:, -count:]
+            warp = context.warp_tokens + self.spatial_warp_role.to(
+                device=target.device, dtype=target.dtype,
+            ).view(1, 1, -1)
+            memory = context.memory_tokens + self.spatial_memory_role.to(
+                device=target.device, dtype=target.dtype,
+            ).view(1, 1, -1)
+            spatial = torch.cat((warp, memory), dim=1).to(dtype=target.dtype)
+            if spatial.shape[1] != 1080:
+                raise RuntimeError(f"fixed spatial K/V must contain 1080 tokens, got {spatial.shape[1]}")
+            attn = block.attn1
+            query = attn.norm_q(attn.to_q(target))
+            key = attn.norm_k(
+                attn.to_k(spatial) + self.spatial_k_lora[block_index](spatial).to(spatial.dtype)
+            )
+            value = attn.to_v(spatial) + self.spatial_v_lora[block_index](spatial).to(spatial.dtype)
+            query = query.unflatten(2, (attn.heads, -1))
+            key = key.unflatten(2, (attn.heads, -1))
+            value = value.unflatten(2, (attn.heads, -1))
+            if rotary_emb is not None:
+                target_rotary = rotary_emb[:, -count:]
+                query = self._apply_rotary(query, target_rotary)
+                key = self._apply_rotary(key, torch.cat((target_rotary, target_rotary), dim=1))
+            query = query.transpose(1, 2)
+            key = key.transpose(1, 2)
+            value = value.transpose(1, 2)
+            visibility = torch.cat(
+                (context.visibility_tokens, context.memory_visibility_tokens), dim=1,
+            ).to(device=target.device, dtype=torch.float32)
+            confidence = torch.cat(
+                (context.warp_confidence_tokens, context.memory_confidence_tokens), dim=1,
+            ).to(device=target.device, dtype=torch.float32).clamp(0, 1)
+            valid = visibility.squeeze(-1) > 0
+            key_bias = torch.log(confidence.squeeze(-1).clamp_min(1e-6))[:, None, None, :]
+            key_bias = key_bias.masked_fill(~valid[:, None, None, :], -1.0e4)
+            has_support = valid.any(dim=-1).view(-1, 1, 1, 1)
+            delta = torch.nn.functional.scaled_dot_product_attention(
+                query, key, value, attn_mask=key_bias, dropout_p=0.0, is_causal=False,
+            ) * has_support
+            delta = delta.transpose(1, 2).flatten(2)
+            delta = attn.to_out[1](attn.to_out[0](delta))
+            gate = self.spatial_gate[block_index].float()
+            updated_target = target + (gate * delta.float()).to(target.dtype)
+            self.last_metrics[f"spatial_gate_block{block_index}"] = gate.detach()
+            self.last_metrics[f"spatial_delta_ratio_block{block_index}"] = (
+                delta.float().norm(dim=-1).mean()
+                / target.float().norm(dim=-1).mean().clamp_min(1e-8)
+            ).detach()
+            if self.collect_spatial_metrics:
+                with torch.no_grad():
+                    scores = torch.matmul(query.float(), key.float().transpose(-1, -2)) * (
+                        query.shape[-1] ** -0.5
+                    ) + key_bias
+                    weights = torch.softmax(scores, dim=-1) * valid[:, None, None, :]
+                    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+                    self.last_metrics[f"warp_attention_mass_block{block_index}"] = (
+                        weights[..., :540].sum(dim=-1).mean().detach()
+                    )
+                    self.last_metrics[f"memory_attention_mass_block{block_index}"] = (
+                        weights[..., 540:].sum(dim=-1).mean().detach()
+                    )
+            self.last_metrics["warp_valid_token_count"] = valid[:, :540].sum().detach()
+            self.last_metrics["memory_valid_token_count"] = valid[:, 540:].sum().detach()
+            return torch.cat((hidden[:, :-count], updated_target), dim=1)
 
         def _context_for_hidden(self, hidden, args, kwargs):
             if self._context is not None:
@@ -431,12 +589,16 @@ def build_spatial_reanchor_controller(hidden_size: int, *, rank: int = 64, refre
     return Controller()
 
 
-def install_spatial_reanchor(transformer, *, rank=64, refresh_blocks=(0, 10, 20, 30), gate_init=0.05):
+def install_spatial_reanchor(
+    transformer, *, rank=64, refresh_blocks=(0, 10, 20, 30), gate_init=0.05,
+    spatial_rank=8,
+):
     hidden_size = int(transformer.patch_embedding.out_channels)
     for parameter in transformer.patch_embedding.parameters():
         parameter.requires_grad_(False)
     controller = build_spatial_reanchor_controller(
-        hidden_size, rank=rank, refresh_blocks=refresh_blocks, gate_init=gate_init
+        hidden_size, rank=rank, refresh_blocks=refresh_blocks, gate_init=gate_init,
+        spatial_rank=spatial_rank, block_count=len(transformer.blocks),
     )
     transformer.add_module("spatial_reanchor", controller)
     controller.install(transformer)

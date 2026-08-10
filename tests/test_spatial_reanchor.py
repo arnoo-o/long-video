@@ -138,6 +138,10 @@ def test_adapter_invisible_contribution_is_exactly_zero():
 
 
 class _Block(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn1 = _Attention()
+
     def forward(
         self, hidden_states, encoder_hidden_states, temb, rotary_emb,
         navit_hidden_attention_mask=None, navit_encoder_attention_mask=None,
@@ -145,6 +149,18 @@ class _Block(torch.nn.Module):
         is_first_denoising_step=False, attention_kwargs=None,
     ):
         return hidden_states
+
+
+class _Attention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.heads = 4
+        self.to_q = torch.nn.Linear(32, 32)
+        self.to_k = torch.nn.Linear(32, 32)
+        self.to_v = torch.nn.Linear(32, 32)
+        self.norm_q = torch.nn.RMSNorm(32)
+        self.norm_k = torch.nn.RMSNorm(32)
+        self.to_out = torch.nn.ModuleList([torch.nn.Linear(32, 32), torch.nn.Dropout(0.0)])
 
 
 class _Transformer(torch.nn.Module):
@@ -278,6 +294,48 @@ def test_hooks_use_frozen_target_patch_and_spatial_role_only_on_warp():
     assert controller.camera_gate.grad is not None
     assert controller.anchor_gates.grad is not None
     assert controller.spatial_warp_role.grad is not None
+
+
+def test_second_spatial_attention_has_fixed_slots_hard_memory_mask_and_zero_gate_identity():
+    transformer = _Transformer()
+    controller = install_spatial_reanchor(
+        transformer, rank=8, refresh_blocks=(0, 1, 2, 3), gate_init=0.05,
+        spatial_rank=8,
+    )
+    controller.collect_spatial_metrics = True
+    warp = torch.randn(1, 16, 9, 12, 20)
+    memory = torch.randn_like(warp)
+    visibility = torch.ones(1, 540, 1)
+    memory_visibility = torch.zeros(1, 540, 1)
+    rays = torch.randn(1, 9, 6, 10, 6)
+    controller.prepare_context(
+        warp, visibility, rays,
+        stage_contexts=[{
+            "warp_latents": warp, "visibility_tokens": visibility,
+            "warp_confidence_tokens": visibility, "plucker_tokens": rays,
+            "memory_warp_latents": memory,
+            "memory_visibility_tokens": memory_visibility,
+            "memory_confidence_tokens": memory_visibility,
+            "spatial_attention_enabled": True,
+        }],
+    )
+    hidden = torch.randn(1, 560, 32)
+    rotary = torch.randn(1, 560, 16)
+    output = controller.spatial_attention(transformer.blocks[0], hidden, rotary, 540)
+    assert torch.equal(output, hidden)
+    assert int(controller.last_metrics["warp_valid_token_count"]) == 540
+    assert int(controller.last_metrics["memory_valid_token_count"]) == 0
+    torch.testing.assert_close(
+        controller.last_metrics["memory_attention_mass_block0"], torch.tensor(0.0),
+    )
+    controller.spatial_gate.data[0] = 0.1
+    changed = controller.spatial_attention(transformer.blocks[0], hidden, rotary, 540)
+    assert tuple(changed.shape) == tuple(hidden.shape)
+    torch.testing.assert_close(changed[:, :-540], hidden[:, :-540])
+    assert not torch.equal(changed[:, -540:], hidden[:, -540:])
+    changed[:, -540:].sum().backward()
+    assert controller.spatial_k_lora[0].up.weight.grad is not None
+    assert controller.spatial_v_lora[0].up.weight.grad is not None
 
 
 def test_canonical_plucker_is_independent_of_memory_node_switch():

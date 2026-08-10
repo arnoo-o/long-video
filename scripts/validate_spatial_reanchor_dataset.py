@@ -55,6 +55,20 @@ def main():
             for run in scene["continuous_runs"]
         ):
             raise ValueError(f"{record['sequence_id']}: selected window crosses an acquisition gap")
+        if record["phase"] == "B" and record["split"] == "train":
+            training_chunk = int(record.get("training_chunk_index", -1))
+            if not 1 <= training_chunk < chunks:
+                raise ValueError(
+                    f"{record['sequence_id']}: Phase B training chunk must be in 1..N-1, "
+                    f"got {training_chunk} for N={chunks}"
+                )
+            selection = record.get("metadata", {}).get("phase_b_selection", {})
+            if selection.get("renderer_overlap_metric") != "bidirectional_depth_reprojection_overlap":
+                raise ValueError(
+                    f"{record['sequence_id']}: renderer overlap metric is not depth reprojection"
+                )
+            if record.get("metadata", {}).get("uses_gt_future") is not False:
+                raise ValueError(f"{record['sequence_id']}: uses_gt_future must be false")
         counts[record["scene_id"]] = counts.get(record["scene_id"], 0) + 1
         validated.append({
             "sequence_id": record["sequence_id"], "scene_id": record["scene_id"],
@@ -62,13 +76,40 @@ def main():
             "anchors": anchors,
         })
     phase_a_train = [item for item in manifest["sequences"] if item["phase"] == "A" and item["split"] == "train"]
-    phase_a_by_scene = {scene: sum(item["scene_id"] == scene for item in phase_a_train) for scene in counts}
-    if len(counts) != 2 or len(set(phase_a_by_scene.values())) != 1:
+    phase_a_diag = [
+        item for item in manifest["sequences"]
+        if item["phase"] == "A" and item["split"] == "diagnostic"
+    ]
+    phase_b_train = [
+        item for item in manifest["sequences"]
+        if item["phase"] == "B" and item["split"] == "train"
+    ]
+    phase_a_scenes = sorted({item["scene_id"] for item in phase_a_train})
+    phase_b_scenes = sorted({item["scene_id"] for item in phase_b_train})
+    phase_a_by_scene = {
+        scene: sum(item["scene_id"] == scene for item in phase_a_train)
+        for scene in phase_a_scenes
+    }
+    phase_a_diag_by_scene = {
+        scene: sum(item["scene_id"] == scene for item in phase_a_diag)
+        for scene in phase_a_scenes
+    }
+    if (
+        len(phase_a_scenes) < 2
+        or len(set(phase_a_by_scene.values())) != 1
+        or min(phase_a_by_scene.values()) < 4
+        or any(phase_a_diag_by_scene.get(scene, 0) < 1 for scene in phase_a_scenes)
+        or not phase_b_scenes
+        or set(phase_a_scenes) != set(phase_b_scenes)
+    ):
         raise ValueError(f"Phase A scene balance changed: {phase_a_by_scene}")
     payload = {
         "status": "passed", "manifest": str(args.manifest),
         "sequence_count": len(validated), "scene_counts": counts,
-        "phase_a_train_by_scene": phase_a_by_scene, "sequences": validated,
+        "phase_a_train_by_scene": phase_a_by_scene,
+        "phase_a_diagnostic_by_scene": phase_a_diag_by_scene,
+        "phase_b_scenes": phase_b_scenes,
+        "sequences": validated,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")

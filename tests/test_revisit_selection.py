@@ -95,6 +95,9 @@ def test_renderer_overlap_controls_final_score_and_independent_choice():
         [revisit], [overlapping_motion, independent_motion],
     )
     assert selected_revisit[0]["renderer_overlap"] == 0.7
+    assert selected_revisit[0]["renderer_overlap_metric"] == (
+        "bidirectional_depth_reprojection_overlap"
+    )
     assert selected_motion[0]["start"] == 100
     assert selected_motion[0]["independent_from_revisit"] is True
 

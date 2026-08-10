@@ -38,6 +38,16 @@ def _atomic_json(path, payload):
     temporary.replace(path)
 
 
+def _atomic_torch_save(path, payload):
+    import torch
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with Path(path).open("rb") as handle:
@@ -816,6 +826,20 @@ def main():
     bank_step = -1
     bank_stats = []
     memory_cleanup_stats = {"calls": 0, "reasons": [], "entries": 0}
+    persistent_bank_dir = Path(
+        config.get("history_bank_cache_dir") or (run_dir / "persistent_history_bank")
+    )
+    persistent_bank_dir.mkdir(parents=True, exist_ok=True)
+
+    def controller_state_sha():
+        digest = hashlib.sha256()
+        for name, value in sorted(controller.state_dict().items()):
+            tensor = value.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
 
     def maybe_cleanup_after_bank_entry():
         allocated = int(torch.cuda.memory_allocated(0))
@@ -1141,6 +1165,7 @@ def main():
                     ("spatial_memory_warp_attention", True),
                     ("memory_translation_threshold", 3.0),
                     ("memory_rotation_threshold_degrees", 30.0),
+                    ("memory_min_temporal_gap_frames", int(min_temporal_gap_frames)),
                     ("fixed_spatial_kv_tokens", (540, 540)),
                     ("history_corruption", bool(corrupt_generated_history)),
                     ("history_corruption_sigma", float(training["history_corruption_sigma"])),
@@ -1209,32 +1234,64 @@ def main():
             item for item in phase_b
             if int(item["chunk_count"]) == int(chunk_plan[item["scene_id"]])
         ]
-        history_bank = {}
-        history_bank_cache = {}
-        try:
-            for record in selected:
-                trajectory = record["sequence_id"]
-                entries = build_bank_entries(record, snapshot, snapshot_sha)
-                corruption_entries = (
-                    build_bank_entries(record, snapshot, snapshot_sha, corrupt_generated_history=True)
-                    if record["sample_type"] == "revisit" else {}
-                )
-                for current_chunk, entry in entries.items():
-                    cache_key = history_bank_cache_key(
-                        trajectory, current_chunk, record["scene_id"], record["sample_type"],
-                    )
-                    history_bank_cache[cache_key] = entry
-                    history_bank[(str(trajectory), int(current_chunk), record["scene_id"], record["sample_type"])] = entry
-                    if record["sample_type"] == "revisit":
-                        corruption = corruption_entries[int(current_chunk)]
-                        corruption_key = history_bank_cache_key(
-                            trajectory, current_chunk, record["scene_id"], "corruption",
-                        )
-                        history_bank_cache[corruption_key] = corruption
-                        history_bank[(str(trajectory), int(current_chunk), record["scene_id"], "corruption")] = corruption
-                maybe_cleanup_after_bank_entry()
-        finally:
+        cache_descriptor = {
+            "schema_version": 1,
+            "git_sha": git_sha,
+            "global_step": int(global_step),
+            "wah_lora_snapshot_sha": snapshot_sha,
+            "controller_state_sha": controller_state_sha(),
+            "wah_model": str(config["wah_model"]),
+            "source_checkpoint": str(config["source_checkpoint"]),
+            "seed": int(exact.seed),
+            "pyramid_steps": list(exact.pyramid_num_inference_steps_list),
+            "history_sizes": list(exact.history_sizes),
+            "memory_min_temporal_gap_frames": int(min_temporal_gap_frames),
+            "history_corruption_sigma": float(training["history_corruption_sigma"]),
+            "chunk_plan": {str(key): int(value) for key, value in sorted(chunk_plan.items())},
+            "records": [
+                [record["scene_id"], record["sequence_id"], int(record["chunk_count"]), record["sample_type"]]
+                for record in selected
+            ],
+        }
+        cache_digest = hashlib.sha256(
+            json.dumps(cache_descriptor, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        persistent_cache_path = persistent_bank_dir / f"history_bank_{cache_digest}.pt"
+        cache_hit = persistent_cache_path.exists()
+        if cache_hit:
+            payload = torch.load(persistent_cache_path, map_location="cpu", weights_only=False)
+            if payload.get("descriptor") != cache_descriptor:
+                raise RuntimeError("persistent History Bank descriptor mismatch")
+            history_bank = payload["history_bank"]
+            history_bank_cache = payload["history_bank_cache"]
             reset_runtime_wah_adapter()
+        else:
+            history_bank = {}
+            history_bank_cache = {}
+            try:
+                for record in selected:
+                    trajectory = record["sequence_id"]
+                    entries = build_bank_entries(record, snapshot, snapshot_sha)
+                    corruption_entries = (
+                        build_bank_entries(record, snapshot, snapshot_sha, corrupt_generated_history=True)
+                        if record["sample_type"] == "revisit" else {}
+                    )
+                    for current_chunk, entry in entries.items():
+                        cache_key = history_bank_cache_key(
+                            trajectory, current_chunk, record["scene_id"], record["sample_type"],
+                        )
+                        history_bank_cache[cache_key] = entry
+                        history_bank[(str(trajectory), int(current_chunk), record["scene_id"], record["sample_type"])] = entry
+                        if record["sample_type"] == "revisit":
+                            corruption = corruption_entries[int(current_chunk)]
+                            corruption_key = history_bank_cache_key(
+                                trajectory, current_chunk, record["scene_id"], "corruption",
+                            )
+                            history_bank_cache[corruption_key] = corruption
+                            history_bank[(str(trajectory), int(current_chunk), record["scene_id"], "corruption")] = corruption
+                    maybe_cleanup_after_bank_entry()
+            finally:
+                reset_runtime_wah_adapter()
         expected_keys = {
             (str(record["sequence_id"]), int(current_chunk), record["scene_id"], kind)
             for record in selected
@@ -1249,6 +1306,12 @@ def main():
                 f"History Bank selection is incomplete: expected {sorted(expected_keys)}, "
                 f"got {sorted(history_bank)}"
             )
+        if not cache_hit:
+            _atomic_torch_save(persistent_cache_path, {
+                "descriptor": cache_descriptor,
+                "history_bank": history_bank,
+                "history_bank_cache": history_bank_cache,
+            })
         pipe.transformer.set_adapter(adapter_name)
         for name, parameter in pipe.transformer.named_parameters():
             parameter.requires_grad_(id(parameter) in trainable_ids)
@@ -1260,6 +1323,11 @@ def main():
                 scene: list(eligible_current_chunks(int(chunk_plan[scene]))) for scene in scenes
             },
             "seconds": time.perf_counter() - refresh_started,
+            "persistent_cache": {
+                "hit": bool(cache_hit), "digest": cache_digest,
+                "path": str(persistent_cache_path),
+                "bytes": int(persistent_cache_path.stat().st_size),
+            },
             "memory_cleanup": dict(memory_cleanup_stats),
         }
         bank_stats.append(stat)

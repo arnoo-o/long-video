@@ -17,10 +17,9 @@ class HistoryBankKey:
     generation_config: tuple
     prompt: str
     seed: int
-    # Version 2 includes the trajectory/current-chunk Spatial Memory Prefix
-    # semantics and therefore must not collide with old generated-history
-    # entries.
-    history_schema_version: int = 2
+    # Version 3 includes the temporally gap-filtered Spatial Memory Warp and
+    # stage0 patch_short spatial-attention input semantics.
+    history_schema_version: int = 3
 
     @property
     def current_chunk_index(self) -> int:

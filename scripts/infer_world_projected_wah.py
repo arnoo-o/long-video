@@ -18,7 +18,18 @@ def parse_args():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wah-root", type=Path, required=True)
     parser.add_argument("--wah-model", type=Path, required=True)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    initialization = parser.add_mutually_exclusive_group(required=True)
+    initialization.add_argument(
+        "--checkpoint", type=Path,
+        help="Schema-v2 step600 Phase-A checkpoint.",
+    )
+    initialization.add_argument(
+        "--phase-a-zero-source-checkpoint", type=Path,
+        help=(
+            "The source WAH LoRA checkpoint used before Phase-A step 1. "
+            "Spatial Anchor/Camera stay at their untrained initialization."
+        ),
+    )
     parser.add_argument("--lora", type=Path, required=True)
     parser.add_argument("--pi3-repo", type=Path, required=True)
     parser.add_argument("--pi3-checkpoint", type=Path, required=True)
@@ -36,7 +47,7 @@ def parse_args():
         "--memory-set", action="append", default=[], metavar="KEY=VALUE",
         help="Override an existing MemoryManager threshold for this experiment.",
     )
-    parser.add_argument("--video-name", default="school_world_projected_step600.mp4")
+    parser.add_argument("--video-name", default="school_world_projected.mp4")
     return parser.parse_args()
 
 
@@ -137,13 +148,7 @@ def state_fingerprint(state):
     return digest.hexdigest()
 
 
-def load_step600(transformer, checkpoint):
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if int(payload.get("schema_version", 0)) != 2:
-        raise ValueError("World-Projected Flow requires the schema-v2 step600 Phase-A checkpoint")
-    if int(payload.get("global_step", -1)) != 600 or str(payload.get("phase")) != "A":
-        raise ValueError("checkpoint must be step600 Phase A")
-    source = payload.get("trainable_state") or {}
+def _map_trainable_state(transformer, source):
     named = dict(transformer.named_parameters())
     runtime_lora = {}
     for name in named:
@@ -169,6 +174,17 @@ def load_step600(transformer, checkpoint):
             if tuple(parameter.shape) != tuple(value.shape):
                 raise ValueError(f"shape mismatch for {source_name}: {value.shape} vs {parameter.shape}")
             parameter.copy_(value.to(parameter.device, parameter.dtype))
+    return mapping
+
+
+def load_step600(transformer, checkpoint):
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if int(payload.get("schema_version", 0)) != 2:
+        raise ValueError("World-Projected Flow requires the schema-v2 step600 Phase-A checkpoint")
+    if int(payload.get("global_step", -1)) != 600 or str(payload.get("phase")) != "A":
+        raise ValueError("checkpoint must be step600 Phase A")
+    source = payload.get("trainable_state") or {}
+    mapping = _map_trainable_state(transformer, source)
     lora_count = sum(canonical_lora_name(name) is not None for name in source)
     spatial_count = sum(name.startswith("spatial_reanchor.") for name in source)
     if len(mapping) != 337 or lora_count != 320 or spatial_count != 17:
@@ -182,6 +198,41 @@ def load_step600(transformer, checkpoint):
         "lora_tensor_count": lora_count,
         "spatial_tensor_count": spatial_count,
         "fingerprint_sha256": state_fingerprint(source),
+    }
+
+
+def load_phase_a_zero(transformer, checkpoint):
+    """Reproduce the trainable state immediately before Phase-A optimizer step 1."""
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    source = payload.get("trainable_state") or payload.get("lora_state") or {}
+    if not source:
+        raise ValueError("Phase-A zero-step source checkpoint contains no WAH LoRA state")
+    mapping = _map_trainable_state(transformer, source)
+    lora_count = sum(canonical_lora_name(name) is not None for name in source)
+    spatial_count = sum(name.startswith("spatial_reanchor.") for name in source)
+    if len(mapping) != 320 or lora_count != 320 or spatial_count != 0:
+        raise RuntimeError(
+            "Phase-A zero-step source must contain exactly 320 WAH LoRA tensors "
+            f"and no Spatial Anchor/Camera tensors; got {len(mapping)}/{lora_count}/{spatial_count}"
+        )
+    initialized_spatial = {
+        name: parameter
+        for name, parameter in transformer.named_parameters()
+        if name.startswith("spatial_reanchor.")
+    }
+    if len(initialized_spatial) != 17:
+        raise RuntimeError(
+            f"expected 17 freshly initialized Spatial Anchor/Camera tensors, got {len(initialized_spatial)}"
+        )
+    return {
+        "project_global_step": 0,
+        "source_checkpoint_global_step": int(payload.get("global_step", -1)),
+        "tensor_count": len(mapping),
+        "lora_tensor_count": lora_count,
+        "loaded_spatial_tensor_count": spatial_count,
+        "initialized_spatial_tensor_count": len(initialized_spatial),
+        "source_fingerprint_sha256": state_fingerprint(source),
+        "initialized_spatial_fingerprint_sha256": state_fingerprint(initialized_spatial),
     }
 
 
@@ -376,7 +427,14 @@ def main():
     )
     if int(state["indices_latents_history_short"][0, 0]) != 0:
         raise RuntimeError("permanent source prefix temporal RoPE must be zero")
-    checkpoint_report = load_step600(pipe.transformer, ARGS.checkpoint)
+    if ARGS.phase_a_zero_source_checkpoint is not None:
+        initialization_mode = "phase_a_zero_step"
+        initialization_path = ARGS.phase_a_zero_source_checkpoint
+        checkpoint_report = load_phase_a_zero(pipe.transformer, initialization_path)
+    else:
+        initialization_mode = "phase_a_step600"
+        initialization_path = ARGS.checkpoint
+        checkpoint_report = load_step600(pipe.transformer, initialization_path)
     for parameter in pipe.transformer.parameters():
         parameter.requires_grad_(False)
     for parameter in pipe.vae.parameters():
@@ -392,7 +450,9 @@ def main():
     )
     startup = {
         "state": "running",
-        "checkpoint": str(ARGS.checkpoint),
+        "initialization_mode": initialization_mode,
+        "project_global_step": int(checkpoint_report.get("project_global_step", 600)),
+        "checkpoint": str(initialization_path),
         "checkpoint_report": checkpoint_report,
         "training_free": True,
         "optimizer_created": False,

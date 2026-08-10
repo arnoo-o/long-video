@@ -238,7 +238,7 @@ def _module_classes():
             nn.init.zeros_(self.up.weight)
 
         def forward(self, hidden):
-            return self.up(self.down(hidden))
+            return self.up(self.down(hidden.float()))
 
     return nn, Adapter, Camera, LowRankDelta
 

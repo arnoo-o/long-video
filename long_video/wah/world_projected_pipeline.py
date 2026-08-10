@@ -309,4 +309,3 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             return super().stage2_sample(*args, **kwargs)
         finally:
             scheduler.step = original_step
-

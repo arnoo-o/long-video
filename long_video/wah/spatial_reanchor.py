@@ -321,6 +321,11 @@ def build_spatial_reanchor_controller(
             warp_latents=None,
             visibility_tokens=None,
             plucker_tokens=None,
+            warp_confidence_tokens=None,
+            memory_warp_latents=None,
+            memory_visibility_tokens=None,
+            memory_confidence_tokens=None,
+            spatial_attention_enabled=False,
             *,
             anchor_enabled=True,
             camera_enabled=True,
@@ -337,6 +342,11 @@ def build_spatial_reanchor_controller(
                 "warp_latents": warp_latents,
                 "visibility_tokens": visibility_tokens,
                 "plucker_tokens": plucker_tokens,
+                "warp_confidence_tokens": warp_confidence_tokens,
+                "memory_warp_latents": memory_warp_latents,
+                "memory_visibility_tokens": memory_visibility_tokens,
+                "memory_confidence_tokens": memory_confidence_tokens,
+                "spatial_attention_enabled": spatial_attention_enabled,
             }]
             contexts = {}
             for raw in raw_contexts:
@@ -360,7 +370,10 @@ def build_spatial_reanchor_controller(
                 count = int(warp_tokens.shape[1])
                 if count in contexts:
                     raise ValueError(f"duplicate spatial stage token count: {count}")
-                warp_confidence = raw.get("warp_confidence_tokens", stage_visibility).to(
+                raw_warp_confidence = raw.get("warp_confidence_tokens")
+                warp_confidence = (
+                    stage_visibility if raw_warp_confidence is None else raw_warp_confidence
+                ).to(
                     device=warp_tokens.device, dtype=torch.float32,
                 )
                 memory_latents = raw.get("memory_warp_latents")
@@ -373,8 +386,9 @@ def build_spatial_reanchor_controller(
                     memory_visibility = raw["memory_visibility_tokens"].to(
                         device=memory_tokens.device, dtype=torch.float32,
                     )
-                    memory_confidence = raw.get(
-                        "memory_confidence_tokens", memory_visibility,
+                    raw_memory_confidence = raw.get("memory_confidence_tokens")
+                    memory_confidence = (
+                        memory_visibility if raw_memory_confidence is None else raw_memory_confidence
                     ).to(device=memory_tokens.device, dtype=torch.float32)
                     expected_memory = (warp_tokens.shape[0], 540, warp_tokens.shape[2])
                     if tuple(memory_tokens.shape) != expected_memory:

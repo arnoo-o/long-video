@@ -74,13 +74,10 @@ def main():
     manager=MemoryManager(
         geometry_backend=backend,coverage_threshold=min(0.99,mean_coverage+0.05),
         low_coverage_chunks=1,min_transition_frames=12,keyframe_count=8,heldout_count=4,
-        min_translation_baseline=0.1,min_view_diversity=0.05,
-        min_new_area_ratio=max(0.01,1.0-mean_coverage-0.05),min_overlap_coverage=0.005,
-        min_confidence_weighted_coverage=0.001,max_overlap_rgb_error=0.5,
-        max_overlap_depth_error=1.0,max_heldout_rgb_error=0.5,max_heldout_depth_error=1.0,
-        min_new_point_ratio=0.01,max_scale_dispersion=0.3,max_pose_error=0.3,
-        min_verified_views=2,min_verified_baseline=0.03,max_verified_rgb_error=0.25,
-        max_verified_depth_error=0.2,reactivation_hysteresis=0.0,
+        min_translation_baseline=2.5,min_view_diversity=float(np.deg2rad(25.0)),
+        min_new_area_ratio=0.05,max_world_overlap=0.20,
+        max_overlap_rgb_error=0.5,max_overlap_depth_error=1.0,
+        reactivation_hysteresis=0.0,
     )
     active,event=manager.process_chunk(m0,transition_rgb,cameras,warp,8)
     promoted=bool(event.get("accepted")) and active.node_id=="node_001"

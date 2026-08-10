@@ -49,6 +49,8 @@ class WorldProjectionContext:
     visibility: list[torch.Tensor]
     confidence: list[torch.Tensor]
     config: WorldProjectionConfig = field(default_factory=WorldProjectionConfig)
+    previous_boundary_latents: list[torch.Tensor] | None = None
+    boundary_beta: tuple[float, ...] = (0.6, 0.3, 0.1)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     final_projection_weight: torch.Tensor | None = None
 
@@ -67,6 +69,22 @@ class WorldProjectionContext:
                     f"stage {stage_id} support shape mismatch: latent={tuple(latent.shape)} "
                     f"visibility={tuple(visible.shape)} confidence={tuple(confidence.shape)}"
                 )
+        if any(not 0.0 <= value <= 1.0 for value in self.boundary_beta):
+            raise ValueError("boundary beta values must be in [0, 1]")
+        if self.previous_boundary_latents is not None:
+            if len(self.previous_boundary_latents) != count:
+                raise ValueError("boundary pyramid must match world stage count")
+            for stage_id, (world, boundary) in enumerate(zip(
+                self.canonical_latents, self.previous_boundary_latents,
+            )):
+                expected = (
+                    world.shape[0], world.shape[1], len(self.boundary_beta),
+                    world.shape[3], world.shape[4],
+                )
+                if tuple(boundary.shape) != expected:
+                    raise ValueError(
+                        f"stage {stage_id} boundary shape {tuple(boundary.shape)} != {expected}"
+                    )
 
 
 def _resize_video_latents(value: torch.Tensor, height: int, width: int, *, mode: str) -> torch.Tensor:
@@ -184,6 +202,8 @@ def build_world_projection_context(
     stage_count: int = 3,
     temporal_scale: int = 4,
     config: WorldProjectionConfig | None = None,
+    previous_clean_boundary_latent: torch.Tensor | None = None,
+    boundary_beta: tuple[float, ...] = (0.6, 0.3, 0.1),
 ) -> WorldProjectionContext:
     canonical = build_canonical_world_pyramid(clean_latent, stage_count)
     full_visibility = pixel_support_to_latent(
@@ -209,11 +229,22 @@ def build_world_projection_context(
         confidence_pyramid.append(_resize_video_latents(
             full_confidence, endpoint.shape[-2], endpoint.shape[-1], mode="area",
         ).clamp(0.0, 1.0))
+    boundary = None
+    if previous_clean_boundary_latent is not None:
+        previous = previous_clean_boundary_latent.detach()
+        if previous.ndim != 5 or previous.shape[2] != len(boundary_beta):
+            raise ValueError(
+                "previous clean boundary latent must be [B,C,len(beta),H,W], "
+                f"got {tuple(previous.shape)} for beta={boundary_beta}"
+            )
+        boundary = build_canonical_world_pyramid(previous, stage_count)
     return WorldProjectionContext(
         canonical_latents=canonical,
         visibility=visible_pyramid,
         confidence=confidence_pyramid,
         config=config or WorldProjectionConfig(),
+        previous_boundary_latents=boundary,
+        boundary_beta=tuple(float(value) for value in boundary_beta),
     )
 
 
@@ -294,6 +325,83 @@ def apply_world_projection(
     return projected, diagnostics
 
 
+def apply_world_and_boundary_projection(
+    z_raw: torch.Tensor,
+    z_world: torch.Tensor,
+    visibility: torch.Tensor,
+    confidence: torch.Tensor,
+    *,
+    previous_boundary: torch.Tensor | None,
+    boundary_beta: tuple[float, ...] = (0.6, 0.3, 0.1),
+    sigma: float | torch.Tensor,
+    lambda_max: float = 0.5,
+    gamma: float = 1.0,
+    confidence_ramp_min: float = 0.2,
+    confidence_ramp_max: float = 0.5,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply Boundary Projection and WPF from the same scheduler output."""
+    if tuple(z_world.shape) != tuple(z_raw.shape):
+        raise ValueError("world/raw shape mismatch")
+    world_strength, schedule = world_projection_weight(
+        visibility, confidence,
+        sigma=sigma, lambda_max=lambda_max, gamma=gamma,
+        confidence_ramp_min=confidence_ramp_min,
+        confidence_ramp_max=confidence_ramp_max,
+        device=z_raw.device,
+    )
+    raw = z_raw.float()
+    world_delta = world_strength * (z_world.float() - raw)
+    boundary_delta = torch.zeros_like(raw)
+    beta_tensor = torch.zeros(
+        (1, 1, z_raw.shape[2], 1, 1), device=z_raw.device, dtype=torch.float32,
+    )
+    if previous_boundary is not None:
+        frame_count = len(boundary_beta)
+        expected = (
+            z_raw.shape[0], z_raw.shape[1], frame_count,
+            z_raw.shape[3], z_raw.shape[4],
+        )
+        if tuple(previous_boundary.shape) != expected:
+            raise ValueError(
+                f"previous boundary shape {tuple(previous_boundary.shape)} != {expected}"
+            )
+        beta_tensor[:, :, :frame_count] = torch.as_tensor(
+            boundary_beta, device=z_raw.device, dtype=torch.float32,
+        ).view(1, 1, frame_count, 1, 1)
+        previous_aligned = raw.clone()
+        previous_aligned[:, :, :frame_count] = previous_boundary.to(
+            device=z_raw.device, dtype=torch.float32,
+        )
+        boundary_delta = beta_tensor * (previous_aligned - raw)
+    combined = (raw + boundary_delta + world_delta).to(z_raw.dtype)
+    unknown = visibility.to(device=z_raw.device) == 0
+    unknown_world_delta_max = (
+        world_delta.masked_select(unknown.expand_as(world_delta)).abs().max()
+        if bool(unknown.any()) else torch.zeros((), device=z_raw.device)
+    )
+    if float(unknown_world_delta_max.detach().cpu()) != 0.0:
+        raise RuntimeError("world projection changed a V=0 latent element")
+    return combined, {
+        "lambda": schedule.detach(),
+        "projection_mask_ratio": (world_strength > 0).float().mean().detach(),
+        "projection_strength_mean": world_strength.mean().detach(),
+        "projection_delta_ratio": (
+            world_delta.norm() / raw.norm().clamp_min(1e-8)
+        ).detach(),
+        "unknown_projection_delta_max": unknown_world_delta_max.detach(),
+        "boundary_active": torch.as_tensor(
+            previous_boundary is not None, device=z_raw.device, dtype=torch.float32,
+        ),
+        "boundary_strength_mean": beta_tensor.mean().detach(),
+        "boundary_delta_ratio": (
+            boundary_delta.norm() / raw.norm().clamp_min(1e-8)
+        ).detach(),
+        "combined_delta_ratio": (
+            (boundary_delta + world_delta).norm() / raw.norm().clamp_min(1e-8)
+        ).detach(),
+    }
+
+
 def world_projection_weight(
     visibility: torch.Tensor,
     confidence: torch.Tensor,
@@ -366,8 +474,16 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             )
             config = context.config
             stage_lambda_max = config.lambda_max(stage_id)
-            projected, diagnostic = apply_world_projection(
+            boundary = (
+                None if context.previous_boundary_latents is None
+                else context.previous_boundary_latents[stage_id].to(
+                    device=z_raw.device, dtype=z_raw.dtype,
+                )
+            )
+            projected, diagnostic = apply_world_and_boundary_projection(
                 z_raw, z_world, visible, confidence,
+                previous_boundary=boundary,
+                boundary_beta=context.boundary_beta,
                 sigma=next_sigma,
                 lambda_max=stage_lambda_max,
                 gamma=config.gamma,

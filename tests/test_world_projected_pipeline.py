@@ -2,6 +2,7 @@ import torch
 
 from long_video.wah.world_projected_pipeline import (
     WorldProjectionConfig,
+    apply_world_and_boundary_projection,
     apply_world_projection,
     build_canonical_world_pyramid,
     build_world_projection_context,
@@ -119,3 +120,36 @@ def test_invalid_warp_fill_uses_nearest_visible_without_enabling_support():
     filled = fill_invalid_warp_for_vae(rgb, visibility)
     np.testing.assert_allclose(filled, np.broadcast_to((0.2, 0.4, 0.6), filled.shape))
     assert not visibility[0, 0, 0]
+
+
+def test_boundary_and_world_projection_share_raw_origin_and_decay_over_three_latents():
+    raw = torch.zeros(1, 2, 5, 1, 1)
+    world = torch.full_like(raw, 2.0)
+    previous = torch.full((1, 2, 3, 1, 1), 4.0)
+    visible = torch.ones(1, 1, 5, 1, 1)
+    confidence = torch.ones_like(visible)
+    projected, metrics = apply_world_and_boundary_projection(
+        raw, world, visible, confidence,
+        previous_boundary=previous,
+        boundary_beta=(0.6, 0.3, 0.1),
+        sigma=0.0, lambda_max=0.25, gamma=1.0,
+        confidence_ramp_min=0.2, confidence_ramp_max=0.5,
+    )
+    # z = raw + beta*(prev-raw) + lambda*(world-raw)
+    expected = torch.tensor([2.9, 1.7, 0.9, 0.5, 0.5]).view(1, 1, 5, 1, 1)
+    torch.testing.assert_close(projected, expected.expand_as(projected))
+    assert float(metrics["boundary_active"]) == 1.0
+    assert float(metrics["unknown_projection_delta_max"]) == 0.0
+
+
+def test_boundary_projection_does_not_change_later_temporal_latents_without_world_support():
+    raw = torch.randn(1, 2, 5, 2, 2)
+    previous = torch.randn(1, 2, 3, 2, 2)
+    projected, _ = apply_world_and_boundary_projection(
+        raw, torch.randn_like(raw),
+        torch.zeros(1, 1, 5, 2, 2),
+        torch.ones(1, 1, 5, 2, 2),
+        previous_boundary=previous,
+        boundary_beta=(0.6, 0.3, 0.1), sigma=0.0,
+    )
+    torch.testing.assert_close(projected[:, :, 3:], raw[:, :, 3:])

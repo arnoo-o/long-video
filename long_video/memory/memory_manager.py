@@ -5,12 +5,17 @@ import numpy as np
 
 from ..geometry.point_renderer import render
 from ..data.camera import rgb_to_float01
-from ..types import CameraBatch, ScaleMetadata, ViewSet, Z_DEPTH
+from ..types import ScaleMetadata, ViewSet, Z_DEPTH
 from .node_builder import build_from_views
 from ..online.transition_buffer import TransitionBuffer
 
 
 class MemoryManager:
+    REQUIRED_HISTORY_FRAMES = 12
+    REQUIRED_TRANSLATION = 2.5
+    REQUIRED_VIEW_CHANGE_RADIANS = float(np.deg2rad(25.0))
+    REQUIRED_NEW_AREA_RATIO = 0.05
+    REQUIRED_MAX_WORLD_OVERLAP = 0.20
     ACTIVE = "ACTIVE"
     TRANSITION = "TRANSITION"
     CANDIDATE = "CANDIDATE"
@@ -25,67 +30,66 @@ class MemoryManager:
         high_confidence_threshold=0.5,
         low_coverage_chunks=2,
         min_transition_frames=12,
-        min_translation_baseline=0.15,
-        min_view_diversity=0.15,
-        min_new_area_ratio=0.2,
-        min_overlap_coverage=0.03,
-        min_confidence_weighted_coverage=0.5,
+        min_translation_baseline=2.5,
+        min_view_diversity=float(np.deg2rad(25.0)),
+        min_new_area_ratio=0.05,
+        max_world_overlap=0.20,
         max_overlap_rgb_error=0.25,
         max_overlap_depth_error=0.5,
-        max_heldout_rgb_error=0.25,
-        max_heldout_depth_error=0.5,
-        min_new_point_ratio=0.1,
         generated_confidence=0.25,
         keyframe_count=8,
         voxel_size=0.02,
         heldout_count=4,
-        max_scale_dispersion=0.25,
-        max_pose_error=0.25,
         max_buffer_length=96,
         max_age_frames=240,
         failure_cooldown_frames=32,
         reactivation_hysteresis=0.1,
-        min_verified_views=2,
-        min_verified_baseline=0.03,
-        max_verified_rgb_error=0.15,
-        max_verified_depth_error=0.1,
-        transition_readiness_mode="all",
+        transition_readiness_mode="any",
+        ignore_candidate_depth_rejection=False,
     ):
         self.geometry_backend = geometry_backend
         self.node_store = node_store
         self.coverage_threshold = float(coverage_threshold)
         self.high_confidence_threshold = float(high_confidence_threshold)
         self.low_coverage_chunks = int(low_coverage_chunks)
-        self.min_transition_frames = int(min_transition_frames)
-        self.min_translation_baseline = float(min_translation_baseline)
-        self.min_view_diversity = float(min_view_diversity)
-        self.min_new_area_ratio = float(min_new_area_ratio)
-        self.min_overlap_coverage = float(min_overlap_coverage)
-        self.min_confidence_weighted_coverage=float(min_confidence_weighted_coverage)
+        required = {
+            "min_transition_frames": (int(min_transition_frames), self.REQUIRED_HISTORY_FRAMES),
+            "min_translation_baseline": (float(min_translation_baseline), self.REQUIRED_TRANSLATION),
+            "min_view_diversity": (float(min_view_diversity), self.REQUIRED_VIEW_CHANGE_RADIANS),
+            "min_new_area_ratio": (float(min_new_area_ratio), self.REQUIRED_NEW_AREA_RATIO),
+            "max_world_overlap": (float(max_world_overlap), self.REQUIRED_MAX_WORLD_OVERLAP),
+        }
+        conflicting = {
+            name: {"requested": requested, "required": mandated}
+            for name, (requested, mandated) in required.items()
+            if not np.isclose(requested, mandated, rtol=0.0, atol=1e-9)
+        }
+        if conflicting:
+            raise ValueError(
+                "Validated Causal World readiness thresholds are permanent: "
+                f"{conflicting}"
+            )
+        if str(transition_readiness_mode) != "any":
+            raise ValueError("Validated Causal World readiness mode is permanently 'any'")
+        self.min_transition_frames = self.REQUIRED_HISTORY_FRAMES
+        self.min_translation_baseline = self.REQUIRED_TRANSLATION
+        self.min_view_diversity = self.REQUIRED_VIEW_CHANGE_RADIANS
+        self.min_new_area_ratio = self.REQUIRED_NEW_AREA_RATIO
+        self.max_world_overlap = self.REQUIRED_MAX_WORLD_OVERLAP
         self.max_overlap_rgb_error=float(max_overlap_rgb_error)
         self.max_overlap_depth_error = float(max_overlap_depth_error)
-        self.max_heldout_rgb_error=float(max_heldout_rgb_error)
-        self.max_heldout_depth_error=float(max_heldout_depth_error)
-        self.min_new_point_ratio = float(min_new_point_ratio)
         self.generated_confidence = float(generated_confidence)
         self.keyframe_count = int(keyframe_count)
         self.voxel_size = float(voxel_size)
         self.heldout_count = int(heldout_count)
         self.low_count = 0
-        self.max_scale_dispersion=float(max_scale_dispersion)
-        self.max_pose_error=float(max_pose_error)
         self.state = self.ACTIVE
         self.buffer=TransitionBuffer(
             max_length=max_buffer_length,max_age_frames=max_age_frames,
             cooldown_frames=failure_cooldown_frames)
         self.reactivation_hysteresis=float(reactivation_hysteresis)
-        self.min_verified_views=int(min_verified_views)
-        self.min_verified_baseline=float(min_verified_baseline)
-        self.max_verified_rgb_error=float(max_verified_rgb_error)
-        self.max_verified_depth_error=float(max_verified_depth_error)
-        self.transition_readiness_mode = str(transition_readiness_mode)
-        if self.transition_readiness_mode not in {"all", "any"}:
-            raise ValueError("transition_readiness_mode must be 'all' or 'any'")
+        self.ignore_candidate_depth_rejection = bool(ignore_candidate_depth_rejection)
+        self.transition_readiness_mode = "any"
         self.nodes = {}
         self.events = []
 
@@ -108,17 +112,14 @@ class MemoryManager:
             "translation": self.buffer.translation_baseline >= self.min_translation_baseline,
             "view_change": self.buffer.view_diversity >= self.min_view_diversity,
             "new_area": self.buffer.mean_new_area_ratio >= self.min_new_area_ratio,
-            "world_overlap": overlap >= self.min_overlap_coverage,
         }
         enough_frames = len(self.buffer) >= self.min_transition_frames
-        condition_ready = (
-            any(conditions.values())
-            if self.transition_readiness_mode == "any"
-            else all(conditions.values())
-        )
+        world_overlap_below_max = overlap < self.max_world_overlap
+        condition_ready = any(conditions.values())
         return {
-            "ready": bool(enough_frames and condition_ready),
+            "ready": bool(enough_frames and world_overlap_below_max and condition_ready),
             "enough_frames": bool(enough_frames),
+            "world_overlap_below_max": bool(world_overlap_below_max),
             "frame_count": int(len(self.buffer)),
             "mode": self.transition_readiness_mode,
             "conditions": conditions,
@@ -134,7 +135,7 @@ class MemoryManager:
                 "view_change_radians": float(self.min_view_diversity),
                 "view_change_degrees": float(np.rad2deg(self.min_view_diversity)),
                 "new_area": float(self.min_new_area_ratio),
-                "world_overlap": float(self.min_overlap_coverage),
+                "maximum_world_overlap_exclusive": float(self.max_world_overlap),
                 "minimum_frames": int(self.min_transition_frames),
             },
         }
@@ -194,6 +195,32 @@ class MemoryManager:
         proximity = np.exp(-distance / max(0.25 * np.hypot(height, width), 1.0))
         confidence = float(base_confidence) * (0.4 + 0.3 * texture + 0.3 * proximity)
         return np.clip(confidence, 0.0, 1.0).astype(np.float32)
+
+    def _predict_geometry(self, rgb, c2w, intrinsics, *, known_depth, known_mask,
+                          known_scale):
+        try:
+            return self.geometry_backend.predict(
+                rgb, c2w, intrinsics,
+                known_depth=known_depth,
+                known_mask=known_mask,
+                known_depth_convention=Z_DEPTH,
+                known_scale=known_scale,
+            )
+        except ValueError as error:
+            if not str(error).startswith("Scale anchor rejected:"):
+                raise
+            prediction = self.geometry_backend.predict(
+                rgb, c2w, intrinsics,
+                known_depth=None,
+                known_mask=None,
+                known_depth_convention=None,
+                known_scale=known_scale,
+            )
+            prediction.diagnostics["depth_anchor_fallback"] = True
+            prediction.diagnostics["depth_anchor_failure"] = str(error)
+            prediction.scale_info["anchor_source"] = "unanchored_pi3_mandatory_promotion"
+            return prediction
+
     def build_candidate(self, active_node, created_frame):
         if self.geometry_backend is None:
             raise RuntimeError("MemoryManager requires a geometry backend to construct M1")
@@ -207,9 +234,10 @@ class MemoryManager:
         c2w = np.stack([frame.camera_c2w for frame in frames]).astype(np.float32)
         intrinsics = np.stack([frame.intrinsics for frame in frames]).astype(np.float32)
         known_depth=np.stack([frame.old_node_warp_depth for frame in frames])
-        prediction = self.geometry_backend.predict(
-            rgb,c2w,intrinsics,known_depth=known_depth,known_mask=known_mask,
-            known_depth_convention=Z_DEPTH,known_scale=active_node.scale,
+        prediction = self._predict_geometry(
+            rgb, c2w, intrinsics,
+            known_depth=known_depth, known_mask=known_mask,
+            known_scale=active_node.scale,
         )
         source=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_source,2)
@@ -318,167 +346,172 @@ class MemoryManager:
         self.state = self.CANDIDATE
         return candidate, frames, heldout
 
-    def _verified_point_mask(self, candidate):
-        """Require distinct translated views plus RGB/depth/occlusion agreement per point."""
-        points=np.asarray(candidate.points_xyz,np.float32)
-        colors=np.asarray(candidate.points_rgb,np.float32)/255.0
-        supports=[]; camera_centers=[]
-        for view_index in range(len(candidate.view_rgb)):
-            c2w=np.asarray(candidate.view_c2w[view_index],np.float32)
-            camera=(points-c2w[:3,3])@c2w[:3,:3]
-            z=camera[:,2]
-            projected=camera@np.asarray(candidate.view_intrinsics[view_index],np.float32).T
-            u=np.rint(projected[:,0]/np.maximum(z,1e-8)).astype(np.int64)
-            v=np.rint(projected[:,1]/np.maximum(z,1e-8)).astype(np.int64)
-            height,width=candidate.view_depth[view_index].shape
-            inside=(z>0)&(u>=0)&(u<width)&(v>=0)&(v<height)
-            sampled_depth=np.full(len(points),np.nan,np.float32)
-            sampled_rgb=np.zeros((len(points),3),np.float32)
+    @staticmethod
+    def _outside_parent_projection_mask(candidate, frames):
+        """Keep generated points only if no parent point projects at that pixel in any view."""
+        points = np.asarray(candidate.points_xyz, np.float32)
+        overlaps_parent = np.zeros(len(points), bool)
+        for frame in frames:
+            c2w = np.asarray(frame.camera_c2w, np.float32)
+            camera = (points - c2w[:3, 3]) @ c2w[:3, :3]
+            z = camera[:, 2]
+            projected = camera @ np.asarray(frame.intrinsics, np.float32).T
+            u = np.rint(projected[:, 0] / np.maximum(z, 1e-8)).astype(np.int64)
+            v = np.rint(projected[:, 1] / np.maximum(z, 1e-8)).astype(np.int64)
+            parent_visible = np.asarray(frame.warp_visibility, bool)
+            height, width = parent_visible.shape
+            inside = (z > 0) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
             if inside.any():
-                sampled_depth[inside]=candidate.view_depth[view_index,v[inside],u[inside]]
-                value=np.asarray(candidate.view_rgb[view_index],np.float32)
-                if value.size and value.max()>1:
-                    value=value/255.0
-                sampled_rgb[inside]=value[v[inside],u[inside]]
-            tolerance=np.maximum(self.max_verified_depth_error,0.05*np.nan_to_num(sampled_depth,nan=0.0))
-            depth_error=np.abs(z-sampled_depth)
-            rgb_error=np.abs(colors-sampled_rgb).mean(axis=1)
-            depth_consistent=np.isfinite(sampled_depth)&(depth_error<=tolerance)
-            occlusion_consistent=np.isfinite(sampled_depth)&(z<=sampled_depth+tolerance)
-            supports.append(inside&depth_consistent&occlusion_consistent&(rgb_error<=self.max_verified_rgb_error))
-            camera_centers.append(c2w[:3,3])
-        support=np.stack(supports); distinct=support.sum(axis=0)
-        baseline=np.zeros(len(points),np.float32); centers=np.asarray(camera_centers,np.float32)
-        for left in range(len(centers)):
-            for right in range(left+1,len(centers)):
-                pair=support[left]&support[right]
-                baseline[pair]=np.maximum(baseline[pair],float(np.linalg.norm(centers[left]-centers[right])))
-        candidate.quality_metrics["verified_support_mean"]=float(distinct.mean())
-        candidate.quality_metrics["verified_baseline_mean"]=float(
-            baseline[distinct>=self.min_verified_views].mean()
-            if np.any(distinct>=self.min_verified_views) else 0.0)
-        return ((candidate.points_source==2)&(distinct>=self.min_verified_views)&
-                (baseline>=self.min_verified_baseline))
+                indices = np.flatnonzero(inside)
+                overlaps_parent[indices] |= parent_visible[v[indices], u[indices]]
+        return (np.asarray(candidate.points_source) == 2) & ~overlaps_parent
+
     def validate_candidate(self, candidate, frames, heldout):
+        """Commit every finite, parent-nonoverlapping generated point.
+
+        Candidate admission already happened in ``readiness_report``.  No RGB,
+        depth, pose, confidence, support-view, occlusion, or camera-baseline
+        metric is allowed to veto either the node or its otherwise valid novel
+        points.
+        """
         self.state = self.VALIDATING
-        all_frames=list(frames)+list(heldout)
-        height, width = all_frames[0].generated_rgb.shape[:2]
-        cameras = CameraBatch(
-            np.stack([frame.camera_c2w for frame in all_frames]),
-            np.stack([frame.intrinsics for frame in all_frames]),
-            height,
-            width,
+        del heldout
+        generated = np.asarray(candidate.points_source) == 2
+        finite = np.isfinite(np.asarray(candidate.points_xyz)).all(axis=1)
+        nonoverlap = self._outside_parent_projection_mask(candidate, frames)
+        eligible = generated & finite & nonoverlap
+        candidate.points_source[eligible] = 3
+        candidate.points_confidence[eligible] = np.maximum(
+            candidate.points_confidence[eligible], 0.9
         )
-        validation_frames=list(heldout[:4])+list(frames[:4])
-        if len(validation_frames)!=8:
-            raise RuntimeError("held-out Pi3 validation requires four held-out and four mapping references")
-        validation_generated=rgb_to_float01(np.stack([
-            frame.generated_rgb for frame in validation_frames]))
-        validation_parent=rgb_to_float01(np.stack([
-            frame.old_node_warp for frame in validation_frames]))
-        validation_known_mask=np.stack([
-            frame.warp_visibility for frame in validation_frames])
-        validation_rgb=np.where(
-            validation_known_mask[...,None],validation_parent,validation_generated)
-        validation_prediction=self.geometry_backend.predict(
-            validation_rgb,
-            np.stack([frame.camera_c2w for frame in validation_frames]).astype(np.float32),
-            np.stack([frame.intrinsics for frame in validation_frames]).astype(np.float32),
-            known_depth=np.stack([
-                frame.old_node_warp_depth for frame in validation_frames]).astype(np.float32),
-            known_mask=validation_known_mask,
-            known_depth_convention=Z_DEPTH,
-            known_scale=candidate.scale,
-        )
-        rendered = render(candidate, cameras, point_radius=0, device="cpu")
-        def rgb01(value):
-            value=np.asarray(value,np.float32)
-            return value/255.0 if value.size and value.max()>1 else value
-        overlap_rgb=[]; overlap_depth=[]; held_rgb=[]; held_depth=[]; held_depth_pixels=[]
-        for index,frame in enumerate(all_frames):
-            overlap=(rendered.visibility[index] & frame.warp_visibility &
-                     np.isfinite(rendered.depth[index]) &
-                     np.isfinite(frame.old_node_warp_depth))
-            if overlap.any():
-                overlap_rgb.append(float(np.abs(rendered.rgb[index][overlap]-
-                                                  rgb01(frame.old_node_warp)[overlap]).mean()))
-                overlap_depth.append(float(np.median(np.abs(rendered.depth[index][overlap]-
-                                                              frame.old_node_warp_depth[overlap]))))
-            if index>=len(frames):
-                valid=rendered.visibility[index]
-                if valid.any():
-                    held_rgb.append(float(np.abs(rendered.rgb[index][valid]-
-                                               rgb01(frame.generated_rgb)[valid]).mean()))
-                heldout_index=index-len(frames)
-                predicted_depth=np.asarray(
-                    validation_prediction.depth[heldout_index],np.float32)
-                depth_valid=(rendered.visibility[index] & ~frame.warp_visibility &
-                             np.isfinite(rendered.depth[index]) &
-                             np.isfinite(predicted_depth) & (predicted_depth>0))
-                held_depth_pixels.append(int(depth_valid.sum()))
-                if depth_valid.any():
-                    held_depth.append(float(np.median(np.abs(
-                        rendered.depth[index][depth_valid]-predicted_depth[depth_valid]))))
+        candidate._verified_new_point_mask = eligible.copy()
         metrics = {
-            "overlap_rgb_error": float(np.mean(overlap_rgb)) if overlap_rgb else float("inf"),
-            "overlap_depth_error": float(np.mean(overlap_depth)) if overlap_depth else float("inf"),
-            "heldout_rgb_error": float(np.mean(held_rgb)) if held_rgb else float("inf"),
-            "heldout_depth_error": float(np.mean(held_depth)) if held_depth else float("inf"),
-            "heldout_depth_valid_pixels": int(sum(held_depth_pixels)),
             "scale_dispersion": float(candidate.scale.uncertainty),
             "pose_error": float(candidate.quality_metrics["geometry_diagnostics"].get("pose_error",0.0)),
             "valid_depth_ratio": float(np.isfinite(candidate.view_depth).mean()),
             "new_point_ratio": float(candidate.quality_metrics.get("new_point_ratio",0.0)),
-            "pixel_coverage": float(rendered.visibility.mean()),
-            "confidence_weighted_coverage": float((rendered.visibility*rendered.confidence).mean()),
             "distinct_view_count": int(candidate.observation_count.max(initial=0)),
-            "confidence_source": candidate.quality_metrics["geometry_diagnostics"].get(
-                "confidence_source","unknown"),
-            "confidence_type": candidate.quality_metrics["geometry_diagnostics"].get(
-                "confidence_type","unknown"),
-            "heldout_confidence_source": validation_prediction.diagnostics.get(
-                "confidence_source","unknown"),
-            "heldout_confidence_type": validation_prediction.diagnostics.get(
-                "confidence_type","unknown"),
-            "known_rgb_content_origins": sorted(np.unique(
-                candidate.view_rgb_content_origin[
-                    candidate.view_rgb_evidence_role=="parent_warp"]).tolist()),
-            "known_depth_content_origins": sorted(np.unique(
-                candidate.view_depth_content_origin[
-                    candidate.view_depth_evidence_role=="parent_warp"]).tolist()),
-            "known_evidence_role": "parent_warp",
-            "new_rgb_content_origin": "model_generated",
-            "new_rgb_evidence_role": "current_generation",
-            "new_depth_content_origin": "pi3_prediction",
-            "new_depth_evidence_role": "geometry_prediction",
-            "generated_image_confidence_min": candidate.quality_metrics[
-                "generated_image_confidence_min"],
-            "generated_image_confidence_max": candidate.quality_metrics[
-                "generated_image_confidence_max"],
-            "generated_image_confidence_std": candidate.quality_metrics[
-                "generated_image_confidence_std"],
+            "mandatory_acceptance_by_readiness": True,
+            "legacy_rgb_pose_depth_confidence_gates_used": False,
+            "legacy_point_verification_gates_used": False,
+            "eligible_nonoverlap_point_count": int(eligible.sum()),
+            "parent_projection_overlap_rejected_point_count": int(
+                (generated & ~nonoverlap).sum()
+            ),
+            "nonfinite_generated_point_count": int((generated & ~finite).sum()),
         }
+        candidate.quality_metrics.update({
+            "verified_point_ratio": float(eligible.mean()),
+            "generated_point_count_before_parent_overlap_filter": int(generated.sum()),
+            "generated_point_count_outside_parent_projection": int(nonoverlap.sum()),
+            "generated_point_count_rejected_parent_projection_overlap": int(
+                (generated & ~nonoverlap).sum()
+            ),
+            "eligible_nonoverlap_point_count": int(eligible.sum()),
+        })
         candidate.quality_metrics.update(metrics)
-        accepted = (
-            metrics["confidence_weighted_coverage"]>=self.min_confidence_weighted_coverage
-            and metrics["heldout_rgb_error"]<=self.max_heldout_rgb_error
-            and metrics["overlap_rgb_error"]<=self.max_overlap_rgb_error
-            and metrics["overlap_depth_error"] <= self.max_overlap_depth_error
-            and metrics["heldout_depth_error"]<=self.max_heldout_depth_error
-            and metrics["new_point_ratio"] >= self.min_new_point_ratio
-            and metrics["scale_dispersion"]<=self.max_scale_dispersion
-            and metrics["pose_error"]<=self.max_pose_error
+        return True, metrics
+
+    @staticmethod
+    def _point_field(node, name, count, *, dtype=None, fill=0):
+        value = getattr(node, name, None)
+        if value is not None:
+            return np.asarray(value)
+        if dtype is None:
+            raise ValueError(f"missing required point field {name}")
+        return np.full((count,), fill, dtype=dtype)
+
+    def _merge_verified_points(self, active, candidate):
+        """Preserve every committed parent point and append verified novel voxels only."""
+        parent_count = len(active.points_xyz)
+        verified = getattr(candidate, "_verified_new_point_mask", None)
+        if verified is None:
+            verified = np.asarray(candidate.points_source) == 3
+        else:
+            verified = np.asarray(verified, bool).copy()
+            if verified.shape != (len(candidate.points_xyz),):
+                raise ValueError("verified new-point mask shape mismatch")
+        verified &= np.isfinite(np.asarray(candidate.points_xyz)).all(axis=1)
+        verified_indices = np.flatnonzero(verified)
+
+        if len(verified_indices):
+            candidate_xyz = np.asarray(candidate.points_xyz)[verified_indices]
+            candidate_keys = np.floor(candidate_xyz / self.voxel_size).astype(np.int64)
+            unique_keys, inverse = np.unique(candidate_keys, axis=0, return_inverse=True)
+            confidence = np.asarray(candidate.points_confidence)[verified_indices]
+            best = np.full(len(unique_keys), -1, np.int64)
+            for local_index, group in enumerate(inverse):
+                previous = best[group]
+                if previous < 0 or confidence[local_index] > confidence[previous]:
+                    best[group] = local_index
+
+            parent_keys = np.floor(
+                np.asarray(active.points_xyz) / self.voxel_size
+            ).astype(np.int64)
+            key_dtype = np.dtype((np.void, unique_keys.dtype.itemsize * unique_keys.shape[1]))
+            unique_key_view = np.ascontiguousarray(unique_keys).view(key_dtype).ravel()
+            parent_key_view = np.ascontiguousarray(parent_keys).view(key_dtype).ravel()
+            novel_groups = ~np.isin(unique_key_view, parent_key_view)
+            append_indices = verified_indices[best[novel_groups]]
+        else:
+            append_indices = np.empty((0,), np.int64)
+
+        point_fields = (
+            "points_xyz", "points_rgb", "points_confidence", "points_source",
+            "observation_count",
         )
-        if accepted:
-            verified=self._verified_point_mask(candidate)
-            candidate.points_source[verified]=3
-            candidate.points_confidence[verified]=np.maximum(candidate.points_confidence[verified],0.9)
-            candidate.quality_metrics["verified_point_ratio"]=float(verified.mean())
-        return accepted, metrics
+        for name in point_fields:
+            parent = np.asarray(getattr(active, name))
+            child = np.asarray(getattr(candidate, name))[append_indices]
+            setattr(candidate, name, np.concatenate([parent, child], axis=0))
+            if not np.array_equal(np.asarray(getattr(candidate, name))[:parent_count], parent):
+                raise RuntimeError(f"cumulative promotion modified parent field {name}")
+
+        optional_fields = {
+            "points_normal": (np.float32, 0.0, (3,)),
+            "point_view_mask": (np.uint64, 0, ()),
+            "points_rgb_content_origin": ("U24", "unknown", ()),
+            "points_depth_content_origin": ("U24", "unknown", ()),
+            "points_evidence_role": ("U24", "unknown", ()),
+            "points_rgb_evidence_role": ("U24", "unknown", ()),
+            "points_depth_evidence_role": ("U24", "unknown", ()),
+        }
+        for name, (dtype, fill, tail_shape) in optional_fields.items():
+            parent_value = getattr(active, name, None)
+            child_value = getattr(candidate, name, None)
+            if parent_value is None and child_value is None:
+                continue
+            parent = (np.asarray(parent_value) if parent_value is not None else
+                      np.full((parent_count, *tail_shape), fill, dtype=dtype))
+            child = (np.asarray(child_value)[append_indices] if child_value is not None else
+                     np.full((len(append_indices), *tail_shape), fill, dtype=dtype))
+            setattr(candidate, name, np.concatenate([parent, child], axis=0))
+
+        points = np.asarray(candidate.points_xyz)
+        candidate.bbox_min = points.min(axis=0).astype(np.float32)
+        candidate.bbox_max = points.max(axis=0).astype(np.float32)
+        candidate.coverage_radius = float(
+            np.linalg.norm(candidate.bbox_max - candidate.bbox_min) * 0.5
+        )
+        candidate.quality_metrics.update({
+            "parent_points_preserved": True,
+            "parent_point_count": int(parent_count),
+            "eligible_candidate_point_count": int(len(verified_indices)),
+            "appended_eligible_point_count": int(len(append_indices)),
+            "discarded_ineligible_candidate_point_count": int(len(verified) - len(verified_indices)),
+            "discarded_duplicate_eligible_point_count": int(
+                len(verified_indices) - len(append_indices)
+            ),
+            "cumulative_point_count": int(len(candidate.points_xyz)),
+        })
+        if hasattr(candidate, "_verified_new_point_mask"):
+            del candidate._verified_new_point_mask
+        return candidate
 
     def promote(self, active, candidate, offline_gt_metrics=None):
         if offline_gt_metrics is not None:
             raise ValueError("promotion cannot consume offline ground-truth metrics")
+        candidate = self._merge_verified_points(active, candidate)
         active.status = "archived"
         candidate.status = "active"
         candidate.parent_id = active.node_id
@@ -506,36 +539,25 @@ class MemoryManager:
         mean_coverage = float(np.mean(warp.coverage_per_frame))
         self.observe(mean_coverage)
         event = {"state": self.state, "coverage": mean_coverage}
-        if self.low_count >= self.low_coverage_chunks:
-            self.state = self.TRANSITION
-            self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
+        # Permanent policy: every causal generated frame contributes to readiness.
+        # Low coverage is diagnostic only and never gates candidate construction.
+        self.state = self.TRANSITION
+        self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
         if (self.state==self.TRANSITION and self._ready() and
                 self.buffer.can_attempt(candidate_created_frame)):
             candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)
+            if not accepted:
+                raise RuntimeError("readiness-qualified candidate must be accepted")
             event.update(candidate_id=candidate.node_id, accepted=accepted, metrics=metrics)
-            if accepted:
-                active_node = self.promote(active_node, candidate)
-            else:
-                rejection_reasons=[
-                    key for key, failed in {
-                        "confidence_weighted_coverage":metrics["confidence_weighted_coverage"]<self.min_confidence_weighted_coverage,
-                        "heldout_rgb_error":metrics["heldout_rgb_error"]>self.max_heldout_rgb_error,
-                        "overlap_rgb_error":metrics["overlap_rgb_error"]>self.max_overlap_rgb_error,
-                        "overlap_depth_error":metrics["overlap_depth_error"]>self.max_overlap_depth_error,
-                        "heldout_depth_error":metrics["heldout_depth_error"]>self.max_heldout_depth_error,
-                        "new_point_ratio":metrics["new_point_ratio"]<self.min_new_point_ratio,
-                        "scale_dispersion":metrics["scale_dispersion"]>self.max_scale_dispersion,
-                        "pose_error":metrics["pose_error"]>self.max_pose_error,
-                    }.items() if failed]
-                self.buffer.reject(candidate_created_frame, rejection_reasons)
-                event["rejection_reason"] = rejection_reasons
-                self.state = self.TRANSITION
+            active_node = self.promote(active_node, candidate)
         event["state"] = self.state
         self.events.append(event)
         return active_node, event
 
     def maybe_reactivate(self,active_node,cameras,improvement=None):
+        if active_node.quality_metrics.get("parent_points_preserved", False):
+            return active_node, None
         hysteresis=(self.reactivation_hysteresis if improvement is None else float(improvement))
         active_warp=render(active_node,cameras,point_radius=0,device="cpu")
         active_score=float((active_warp.visibility*active_warp.confidence).mean())

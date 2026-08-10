@@ -45,7 +45,7 @@ def main():
     )
     m0 = build_from_views(views, voxel_size=0.04)
     visibility = np.zeros((frames, height, width), bool)
-    visibility[:, :, : width // 4] = True
+    visibility[:, :, : width // 8] = True
     warp = WarpBatch(
         rgb.astype(np.float32) / 255,
         np.where(visibility, 2.0, np.nan).astype(np.float32),
@@ -59,15 +59,10 @@ def main():
         coverage_threshold=0.5,
         low_coverage_chunks=1,
         min_transition_frames=12,
-        min_translation_baseline=0.1,
-        min_view_diversity=0.1,
-        min_new_area_ratio=0.5,
-        min_overlap_coverage=0.1,
-        min_confidence_weighted_coverage=0.01,
-        max_overlap_rgb_error=1.0,max_heldout_rgb_error=1.0,
-        max_overlap_depth_error=1.0,
-        max_heldout_depth_error=1.0,
-        min_new_point_ratio=0.01,
+        min_translation_baseline=2.5,
+        min_view_diversity=float(np.deg2rad(25.0)),
+        min_new_area_ratio=0.05,
+        max_world_overlap=0.20,
         keyframe_count=8,
         heldout_count=4,
     )
@@ -81,8 +76,8 @@ def main():
     assert active.quality_metrics["verified_point_ratio"] > 0
     print("memory transition passed", event["metrics"], {
         "verified_point_ratio": active.quality_metrics["verified_point_ratio"],
-        "verified_support_mean": active.quality_metrics["verified_support_mean"],
-        "verified_baseline_mean": active.quality_metrics["verified_baseline_mean"],
+        "appended_eligible_point_count": active.quality_metrics["appended_eligible_point_count"],
+        "parent_points_preserved": active.quality_metrics["parent_points_preserved"],
     })
 
 

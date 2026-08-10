@@ -183,10 +183,12 @@ def test_m1_parent_rgb_and_generated_new_region_provenance(tmp_path):
     assert np.all(candidate.view_depth_evidence_role[:, :, :4] == "parent_warp")
     assert np.ptp(candidate.view_image_confidence[:, :, 4:]) > 0
     assert candidate.quality_metrics["geometry_diagnostics"]["confidence_type"] == "heuristic"
-    _, metrics = manager.validate_candidate(candidate, mapping, heldout)
-    assert metrics["heldout_depth_valid_pixels"] > 0
-    assert np.isfinite(metrics["heldout_depth_error"])
-    assert metrics["heldout_confidence_source"] == "local_depth_continuity"
+    accepted, metrics = manager.validate_candidate(candidate, mapping, heldout)
+    assert accepted
+    assert metrics["mandatory_acceptance_by_readiness"] is True
+    assert metrics["legacy_rgb_pose_depth_confidence_gates_used"] is False
+    assert metrics["legacy_point_verification_gates_used"] is False
+    assert metrics["eligible_nonoverlap_point_count"] >= 0
     store = NodeStore(tmp_path / "session")
     store.save(candidate)
     restored = store.load(candidate.node_id)

@@ -15,6 +15,10 @@ import time
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequence", type=Path, required=True)
+    parser.add_argument(
+        "--source-image", type=Path,
+        help="Optional source-prefix image; does not modify the sequence directory.",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--wah-root", type=Path, required=True)
     parser.add_argument("--wah-model", type=Path, required=True)
@@ -61,6 +65,13 @@ def parse_args():
         help=(
             "Experiment only: set the MemoryManager candidate-promotion "
             "confidence-weighted coverage threshold to zero. WPF confidence is unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--ignore-candidate-depth-rejection", action="store_true",
+        help=(
+            "Experiment only: record depth errors but do not use them to reject "
+            "a candidate. Per-point verification remains unchanged."
         ),
     )
     parser.add_argument(
@@ -387,7 +398,8 @@ def main():
     required_frames = ARGS.chunks * CHUNK_STRIDE + 1
     if len(poses) < required_frames or len(intrinsics) < required_frames:
         raise ValueError(f"sequence has {len(poses)} frames, needs {required_frames}")
-    source = Image.open(ARGS.sequence / "source" / "source_perspective.png").convert("RGB").resize((WIDTH, HEIGHT))
+    source_path = ARGS.source_image or (ARGS.sequence / "source" / "source_perspective.png")
+    source = Image.open(source_path).convert("RGB").resize((WIDTH, HEIGHT))
     prompt = (ARGS.sequence / "prompt.txt").read_text(encoding="utf-8").strip()
 
     rollout_store = NodeStore(ARGS.output / "validated_world_session")
@@ -422,11 +434,10 @@ def main():
             memory_config[key] = raw_value.strip()
         else:
             raise TypeError(f"unsupported memory override type for {key}: {type(original).__name__}")
-    configured_candidate_confidence_threshold = float(
-        memory_config["min_confidence_weighted_coverage"]
+    configured_candidate_confidence_threshold = None
+    memory_config["ignore_candidate_depth_rejection"] = bool(
+        ARGS.ignore_candidate_depth_rejection
     )
-    if ARGS.ignore_candidate_confidence:
-        memory_config["min_confidence_weighted_coverage"] = 0.0
     geometry = Pi3GeometryBackend(
         ARGS.pi3_checkpoint, ARGS.pi3_repo, device="cuda:0", input_size=518,
     )
@@ -505,6 +516,7 @@ def main():
         "requires_grad_parameter_count": 0,
         "source_prefix_fixed": True,
         "source_prefix_rope": 0,
+        "source_image": str(source_path),
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
         "projection": vars(projection_config),
@@ -514,10 +526,30 @@ def main():
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
         "memory_config": memory_config,
         "candidate_confidence_gate": {
-            "ignored": bool(ARGS.ignore_candidate_confidence),
+            "ignored": True,
             "configured_threshold": configured_candidate_confidence_threshold,
-            "effective_threshold": float(memory_config["min_confidence_weighted_coverage"]),
+            "effective_threshold": None,
             "wpf_confidence_ramp_unchanged": True,
+        },
+        "candidate_depth_rejection_ignored": True,
+        "candidate_acceptance_policy": {
+            "permanent": True,
+            "minimum_history_frames": 12,
+            "mode": "any",
+            "translation": 2.5,
+            "view_change_degrees": 25.0,
+            "mean_new_area_ratio": 0.05,
+            "maximum_mean_world_overlap_exclusive": 0.20,
+            "secondary_rejection_gates": [],
+        },
+        "world_promotion_mode": "preserve_parent_append_verified_novel_points",
+        "parent_points_always_rendered": True,
+        "generated_points_must_avoid_parent_projection": True,
+        "new_node_render_delay_chunks": 1,
+        "boundary_projection": {
+            "source": "previous_chunk_last_3_clean_temporal_latents",
+            "beta": [0.6, 0.3, 0.1],
+            "combined_with_wpf_from_same_z_raw": True,
         },
         "uses_future_gt": False,
         "chunks_total": ARGS.chunks,
@@ -534,11 +566,17 @@ def main():
     generated_motion, warp_motion, rotation_motion = [], [], []
     visible_l1 = []
     boundary_generated_l1, boundary_warp_l1, boundary_projection_l1 = [], [], []
+    pending_active_node = None
     try:
         with torch.no_grad():
             for chunk_index in range(ARGS.chunks):
                 chunk_started = time.perf_counter()
                 start = chunk_index * CHUNK_STRIDE
+                activated_node_id = None
+                if pending_active_node is not None:
+                    renderer.active_node = pending_active_node
+                    activated_node_id = pending_active_node.node_id
+                    pending_active_node = None
                 cameras = CameraBatch(
                     poses[start:start + CHUNK_FRAMES],
                     intrinsics[start:start + CHUNK_FRAMES],
@@ -560,6 +598,10 @@ def main():
                     stage_count=len(PYRAMID_STEPS),
                     temporal_scale=VAE_TEMPORAL_SCALE,
                     config=projection_config,
+                    previous_clean_boundary_latent=state.get(
+                        "previous_chunk_clean_boundary_latents"
+                    ),
+                    boundary_beta=(0.6, 0.3, 0.1),
                 )
                 pipe.set_world_projection_context(projection)
                 try:
@@ -580,6 +622,12 @@ def main():
                     raise RuntimeError(f"chunk returned {len(generated)} frames, expected {CHUNK_FRAMES}")
                 if not torch.equal(state["image_latents"], fixed_prefix):
                     raise RuntimeError("AR generation replaced the permanent source prefix")
+                last_clean_latents = state.get("last_latents")
+                if not isinstance(last_clean_latents, torch.Tensor) or last_clean_latents.shape[2] < 3:
+                    raise RuntimeError("AR state did not expose three clean boundary latents")
+                state["previous_chunk_clean_boundary_latents"] = (
+                    last_clean_latents[:, :, -3:].detach().clone()
+                )
 
                 first = 0 if chunk_index == 0 else 1
                 memory_generated = generated[first:]
@@ -597,11 +645,24 @@ def main():
                     warp=memory_warp,
                     frame_start=start + first,
                 )
-                renderer.active_node = next_active
+                pending_active_node = next_active
                 metrics = event.get("metrics") or {}
                 verified_ratio = None
+                promotion_metrics = {}
                 if event.get("accepted"):
                     verified_ratio = float(next_active.quality_metrics.get("verified_point_ratio", 0.0))
+                    promotion_metrics = {
+                        key: next_active.quality_metrics.get(key)
+                        for key in (
+                            "parent_points_preserved",
+                            "parent_point_count",
+                            "eligible_candidate_point_count",
+                            "appended_eligible_point_count",
+                            "discarded_ineligible_candidate_point_count",
+                            "discarded_duplicate_eligible_point_count",
+                            "cumulative_point_count",
+                        )
+                    }
 
                 warp_u8 = u8(warp.rgb)
                 stage_diagnostics = projection.diagnostics
@@ -677,6 +738,11 @@ def main():
                     "chunk_index": chunk_index,
                     "active_node_id": node_at_start.node_id,
                     "active_node_for_next_chunk": next_active.node_id,
+                    "node_activated_at_chunk_start": activated_node_id,
+                    "candidate_renderable_from_chunk": (
+                        chunk_index + 1 if event.get("accepted") else None
+                    ),
+                    "candidate_rendered_in_creation_chunk": False,
                     "world_coverage": float(np.asarray(warp.coverage_per_frame).mean()),
                     "world_confidence_mean": float(confidence[visible].mean() if visible.any() else 0.0),
                     "candidate_created": "candidate_id" in event,
@@ -684,6 +750,7 @@ def main():
                     "candidate_id": event.get("candidate_id"),
                     "candidate_rejection_reasons": event.get("rejection_reason", []),
                     "verified_point_ratio": verified_ratio,
+                    "promotion_metrics": promotion_metrics,
                     "candidate_metrics": metrics,
                     "transition_buffer": {
                         "frame_count": len(manager.buffer),
@@ -693,6 +760,12 @@ def main():
                     },
                     "candidate_readiness": manager.readiness_report(),
                     "projection_stages": stage_diagnostics,
+                    "boundary_projection_active": bool(
+                        projection.previous_boundary_latents is not None
+                    ),
+                    "saved_clean_boundary_latent_shape": list(
+                        state["previous_chunk_clean_boundary_latents"].shape
+                    ),
                     "chunk_boundary": chunk_boundary,
                     "stage_shapes": stage_shapes,
                     "unknown_projection_exact_zero": all(
@@ -713,6 +786,8 @@ def main():
                 print(json.dumps({"event": "chunk_complete", **record}), flush=True)
                 clear_decoded_history(state)
                 del generated, clean, projection, output
+            if pending_active_node is not None:
+                renderer.active_node = pending_active_node
     except Exception as error:
         startup.update({"state": "failed", "error": repr(error)})
         write_json(ARGS.output / "status.json", startup)

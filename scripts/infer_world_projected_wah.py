@@ -57,6 +57,13 @@ def parse_args():
     )
     parser.add_argument("--coverage-threshold", type=float)
     parser.add_argument(
+        "--ignore-candidate-confidence", action="store_true",
+        help=(
+            "Experiment only: set the MemoryManager candidate-promotion "
+            "confidence-weighted coverage threshold to zero. WPF confidence is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--memory-set", action="append", default=[], metavar="KEY=VALUE",
         help="Override an existing MemoryManager threshold for this experiment.",
     )
@@ -415,6 +422,11 @@ def main():
             memory_config[key] = raw_value.strip()
         else:
             raise TypeError(f"unsupported memory override type for {key}: {type(original).__name__}")
+    configured_candidate_confidence_threshold = float(
+        memory_config["min_confidence_weighted_coverage"]
+    )
+    if ARGS.ignore_candidate_confidence:
+        memory_config["min_confidence_weighted_coverage"] = 0.0
     geometry = Pi3GeometryBackend(
         ARGS.pi3_checkpoint, ARGS.pi3_repo, device="cuda:0", input_size=518,
     )
@@ -501,6 +513,12 @@ def main():
         "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
         "memory_config": memory_config,
+        "candidate_confidence_gate": {
+            "ignored": bool(ARGS.ignore_candidate_confidence),
+            "configured_threshold": configured_candidate_confidence_threshold,
+            "effective_threshold": float(memory_config["min_confidence_weighted_coverage"]),
+            "wpf_confidence_ramp_unchanged": True,
+        },
         "uses_future_gt": False,
         "chunks_total": ARGS.chunks,
         "chunks_complete": 0,
@@ -664,6 +682,7 @@ def main():
                     "candidate_created": "candidate_id" in event,
                     "candidate_accepted": bool(event.get("accepted", False)),
                     "candidate_id": event.get("candidate_id"),
+                    "candidate_rejection_reasons": event.get("rejection_reason", []),
                     "verified_point_ratio": verified_ratio,
                     "candidate_metrics": metrics,
                     "transition_buffer": {

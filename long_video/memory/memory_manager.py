@@ -45,7 +45,6 @@ class MemoryManager:
         failure_cooldown_frames=32,
         reactivation_hysteresis=0.1,
         transition_readiness_mode="any",
-        ignore_candidate_depth_rejection=False,
     ):
         self.geometry_backend = geometry_backend
         self.node_store = node_store
@@ -88,7 +87,6 @@ class MemoryManager:
             max_length=max_buffer_length,max_age_frames=max_age_frames,
             cooldown_frames=failure_cooldown_frames)
         self.reactivation_hysteresis=float(reactivation_hysteresis)
-        self.ignore_candidate_depth_rejection = bool(ignore_candidate_depth_rejection)
         self.transition_readiness_mode = "any"
         self.nodes = {}
         self.events = []

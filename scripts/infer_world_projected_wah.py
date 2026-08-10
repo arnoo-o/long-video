@@ -61,20 +61,6 @@ def parse_args():
     )
     parser.add_argument("--coverage-threshold", type=float)
     parser.add_argument(
-        "--ignore-candidate-confidence", action="store_true",
-        help=(
-            "Experiment only: set the MemoryManager candidate-promotion "
-            "confidence-weighted coverage threshold to zero. WPF confidence is unchanged."
-        ),
-    )
-    parser.add_argument(
-        "--ignore-candidate-depth-rejection", action="store_true",
-        help=(
-            "Experiment only: record depth errors but do not use them to reject "
-            "a candidate. Per-point verification remains unchanged."
-        ),
-    )
-    parser.add_argument(
         "--memory-set", action="append", default=[], metavar="KEY=VALUE",
         help="Override an existing MemoryManager threshold for this experiment.",
     )
@@ -434,10 +420,6 @@ def main():
             memory_config[key] = raw_value.strip()
         else:
             raise TypeError(f"unsupported memory override type for {key}: {type(original).__name__}")
-    configured_candidate_confidence_threshold = None
-    memory_config["ignore_candidate_depth_rejection"] = bool(
-        ARGS.ignore_candidate_depth_rejection
-    )
     geometry = Pi3GeometryBackend(
         ARGS.pi3_checkpoint, ARGS.pi3_repo, device="cuda:0", input_size=518,
     )
@@ -525,13 +507,6 @@ def main():
         "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
         "memory_config": memory_config,
-        "candidate_confidence_gate": {
-            "ignored": True,
-            "configured_threshold": configured_candidate_confidence_threshold,
-            "effective_threshold": None,
-            "wpf_confidence_ramp_unchanged": True,
-        },
-        "candidate_depth_rejection_ignored": True,
         "candidate_acceptance_policy": {
             "permanent": True,
             "minimum_history_frames": 12,
@@ -542,7 +517,7 @@ def main():
             "maximum_mean_world_overlap_exclusive": 0.20,
             "secondary_rejection_gates": [],
         },
-        "world_promotion_mode": "preserve_parent_append_verified_novel_points",
+        "world_promotion_mode": "preserve_parent_append_eligible_novel_points",
         "parent_points_always_rendered": True,
         "generated_points_must_avoid_parent_projection": True,
         "new_node_render_delay_chunks": 1,

@@ -216,9 +216,10 @@ def load_phase_a_zero(transformer, checkpoint):
             f"and no Spatial Anchor/Camera tensors; got {len(mapping)}/{lora_count}/{spatial_count}"
         )
     initialized_spatial = {
-        name: parameter
-        for name, parameter in transformer.named_parameters()
-        if name.startswith("spatial_reanchor.") and parameter.requires_grad
+        f"spatial_reanchor.{name}": parameter
+        for name, parameter in transformer.spatial_reanchor.named_parameters()
+        if not name.startswith(("spatial_k_lora.", "spatial_v_lora."))
+        and name not in {"spatial_memory_role", "spatial_gate"}
     }
     if len(initialized_spatial) != 17:
         raise RuntimeError(

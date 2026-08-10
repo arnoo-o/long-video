@@ -80,7 +80,7 @@ def test_depth_anchor_failure_retries_unanchored_only_when_depth_rejection_is_ig
 
     backend = Backend()
     manager = MemoryManager(
-        geometry_backend=backend, ignore_candidate_depth_rejection=True,
+        geometry_backend=backend,
     )
     prediction = manager._predict_geometry(
         np.zeros((8, 2, 2, 3), np.float32),

@@ -218,7 +218,7 @@ def load_phase_a_zero(transformer, checkpoint):
     initialized_spatial = {
         name: parameter
         for name, parameter in transformer.named_parameters()
-        if name.startswith("spatial_reanchor.")
+        if name.startswith("spatial_reanchor.") and parameter.requires_grad
     }
     if len(initialized_spatial) != 17:
         raise RuntimeError(

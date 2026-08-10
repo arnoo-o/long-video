@@ -63,7 +63,7 @@ index 92a976b..df6f986 100644
 +        controller = None if controller_ref is None else controller_ref()
 +        if controller is not None:
 +            hidden_states = controller.spatial_attention(
-+                self, hidden_states, rotary_emb, original_context_length,
++                self, hidden_states, rotary_emb, original_context_length, scale_msa, shift_msa,
 +            )
 +
          # 2. Cross-attention
@@ -414,7 +414,7 @@ index d69fe15..a64d387 100644
 +        controller = None if controller_ref is None else controller_ref()
 +        if controller is not None:
 +            hidden_states = controller.spatial_attention(
-+                self, hidden_states, rotary_emb, original_context_length,
++                self, hidden_states, rotary_emb, original_context_length, scale_msa, shift_msa,
 +            )
 +
          # 2. Cross-attention

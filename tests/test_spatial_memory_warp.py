@@ -26,6 +26,7 @@ def test_generated_boundary_uses_causal_depth_and_renders_fixed_query():
     assert len(entry.points_xyz) == height * width
     result = bank.render_query(
         poses=np.stack([pose] * 33), intrinsics=np.stack([intrinsics] * 33),
+        query_frame_id=128, min_temporal_gap_frames=72,
         height=height, width=width, device="cpu", point_radius=0,
     )
     assert result["report"]["memory_hit"]
@@ -48,6 +49,7 @@ def test_memory_miss_keeps_full_invalid_slots_and_does_not_mutate_query_inputs()
     poses = np.stack([query_pose] * 33)
     result = bank.render_query(
         poses=poses, intrinsics=np.stack([intrinsics] * 33),
+        query_frame_id=128, min_temporal_gap_frames=72,
         height=12, width=16, device="cpu",
     )
     assert result["report"]["memory_hit"] is False
@@ -55,3 +57,34 @@ def test_memory_miss_keeps_full_invalid_slots_and_does_not_mutate_query_inputs()
     assert not result["visibility"].any()
     assert not result["confidence"].any()
     np.testing.assert_array_equal(poses, np.stack([query_pose] * 33))
+
+
+def test_recent_boundaries_are_excluded_from_spatial_memory_retrieval():
+    height, width = 12, 16
+    pose, intrinsics = _camera()
+    bank = SpatialMemoryWarpBank(translation_threshold=3.0, rotation_threshold_degrees=30.0)
+    bank.add_generated_boundary(
+        rgb=np.zeros((height, width, 3), np.uint8),
+        depth=np.ones((height, width), np.float32),
+        visibility=np.ones((height, width), bool),
+        confidence=np.ones((height, width), np.float32),
+        pose=pose, intrinsics=intrinsics, frame_id=32, chunk_id=0,
+        provenance={"uses_future_gt": False},
+    )
+    for query_frame_id in (64, 96):
+        entry, report = bank.query(
+            pose, query_frame_id=query_frame_id, min_temporal_gap_frames=72,
+        )
+        assert entry is None
+        assert report["excluded_recent_entry_count"] == 1
+        assert report["eligible_entry_count"] == 0
+        assert report["memory_temporal_gap_frames"] is None
+
+    entry, report = bank.query(
+        pose, query_frame_id=128, min_temporal_gap_frames=72,
+    )
+    assert entry is not None
+    assert report["memory_hit"]
+    assert report["memory_temporal_gap_frames"] == 96
+    assert report["excluded_recent_entry_count"] == 0
+    assert report["eligible_entry_count"] == 1

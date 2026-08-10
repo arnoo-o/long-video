@@ -140,6 +140,7 @@ def test_adapter_invisible_contribution_is_exactly_zero():
 class _Block(torch.nn.Module):
     def __init__(self):
         super().__init__()
+        self.norm1 = torch.nn.RMSNorm(32)
         self.attn1 = _Attention()
 
     def forward(
@@ -321,15 +322,24 @@ def test_second_spatial_attention_has_fixed_slots_hard_memory_mask_and_zero_gate
     )
     hidden = torch.randn(1, 560, 32)
     rotary = torch.randn(1, 560, 16)
-    output = controller.spatial_attention(transformer.blocks[0], hidden, rotary, 540)
+    transformer.patch_short(warp)
+    scale_msa = torch.zeros_like(hidden)
+    shift_msa = torch.zeros_like(hidden)
+    output = controller.spatial_attention(
+        transformer.blocks[0], hidden, rotary, 540, scale_msa, shift_msa,
+    )
     assert torch.equal(output, hidden)
+    assert tuple(controller._context.spatial_warp_tokens.shape) == (1, 540, 32)
+    assert tuple(controller._context.memory_tokens.shape) == (1, 540, 32)
     assert int(controller.last_metrics["warp_valid_token_count"]) == 540
     assert int(controller.last_metrics["memory_valid_token_count"]) == 0
     torch.testing.assert_close(
         controller.last_metrics["memory_attention_mass_block0"], torch.tensor(0.0),
     )
     controller.spatial_gate.data[0] = 0.1
-    changed = controller.spatial_attention(transformer.blocks[0], hidden, rotary, 540)
+    changed = controller.spatial_attention(
+        transformer.blocks[0], hidden, rotary, 540, scale_msa, shift_msa,
+    )
     assert tuple(changed.shape) == tuple(hidden.shape)
     torch.testing.assert_close(changed[:, :-540], hidden[:, :-540])
     assert not torch.equal(changed[:, -540:], hidden[:, -540:])

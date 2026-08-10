@@ -258,6 +258,7 @@ class ReanchorContext:
     memory_visibility_tokens: object = None
     memory_confidence_tokens: object = None
     spatial_attention_enabled: bool = False
+    spatial_warp_tokens: object = None
 
 
 def build_spatial_reanchor_controller(
@@ -294,6 +295,8 @@ def build_spatial_reanchor_controller(
             self._handles = []
             self.last_metrics = {}
             self.collect_spatial_metrics = False
+            self._suspend_patch_short_hook = False
+            self._verified_history_modulation_blocks = set()
 
         def install(self, transformer):
             if self._handles:
@@ -381,8 +384,16 @@ def build_spatial_reanchor_controller(
                 memory_visibility = None
                 memory_confidence = None
                 if memory_latents is not None:
-                    memory = memory_latents.to(device=patch.weight.device, dtype=patch.weight.dtype)
-                    memory_tokens = patch(memory).flatten(2).transpose(1, 2).detach()
+                    patch_short = transformer.patch_short
+                    memory = memory_latents.to(
+                        device=patch_short.weight.device, dtype=patch_short.weight.dtype,
+                    )
+                    self._suspend_patch_short_hook = True
+                    try:
+                        with torch.no_grad():
+                            memory_tokens = patch_short(memory).flatten(2).transpose(1, 2).detach()
+                    finally:
+                        self._suspend_patch_short_hook = False
                     memory_visibility = raw["memory_visibility_tokens"].to(
                         device=memory_tokens.device, dtype=torch.float32,
                     )
@@ -443,7 +454,10 @@ def build_spatial_reanchor_controller(
             output[..., 1::2] = first * sine[..., 1::2] + second * cosine[..., 0::2]
             return output
 
-        def spatial_attention(self, block, hidden, rotary_emb, original_context_length):
+        def spatial_attention(
+            self, block, hidden, rotary_emb, original_context_length,
+            scale_msa, shift_msa,
+        ):
             """Second attention pass over fixed [current-W | retrieved-R] temporary K/V."""
             block_index = int(block._spatial_block_index)
             count = int(original_context_length)
@@ -456,17 +470,58 @@ def build_spatial_reanchor_controller(
             if count != 540 or hidden.shape[1] < count:
                 raise RuntimeError(f"spatial target must be the final 540 tokens, got {count}")
             target = hidden[:, -count:]
-            warp = context.warp_tokens + self.spatial_warp_role.to(
-                device=target.device, dtype=target.dtype,
-            ).view(1, 1, -1)
+            warp = context.spatial_warp_tokens
+            if warp is None:
+                raise RuntimeError("stage0 CURRENT_WARP tokens were not captured before spatial attention")
+            warp = warp.to(device=target.device, dtype=target.dtype)
             memory = context.memory_tokens + self.spatial_memory_role.to(
                 device=target.device, dtype=target.dtype,
             ).view(1, 1, -1)
-            spatial = torch.cat((warp, memory), dim=1).to(dtype=target.dtype)
+            if warp.shape[1] != 540 or memory.shape[1] != 540:
+                raise RuntimeError(
+                    f"fixed spatial inputs must be W=540/R=540, got {warp.shape[1]}/{memory.shape[1]}"
+                )
+
+            def split_modulation(value, label):
+                value = value.float()
+                if value.ndim == 2:
+                    reference = value[:, None, :]
+                    return reference.expand(-1, count, -1), reference.expand(-1, count, -1)
+                if value.ndim != 3:
+                    raise RuntimeError(f"{label} must be [B,D] or [B,S,D], got {tuple(value.shape)}")
+                if value.shape[1] == 1:
+                    reference = value
+                    return reference.expand(-1, count, -1), reference.expand(-1, count, -1)
+                if value.shape[1] != hidden.shape[1]:
+                    raise RuntimeError(
+                        f"tokenwise {label} does not match hidden sequence: {tuple(value.shape)} vs {tuple(hidden.shape)}"
+                    )
+                history = value[:, :-count]
+                if history.shape[1] == 0:
+                    raise RuntimeError("zero-timestep history modulation requires at least one history token")
+                reference = history[:, :1]
+                if block_index not in self._verified_history_modulation_blocks:
+                    if not torch.allclose(history, reference.expand_as(history), atol=0.0, rtol=0.0):
+                        raise RuntimeError("zero-timestep history modulation is not identical across history tokens")
+                return value[:, -count:], reference.expand(-1, count, -1)
+
+            target_scale, history_scale = split_modulation(scale_msa, "scale_msa")
+            target_shift, history_shift = split_modulation(shift_msa, "shift_msa")
+            self._verified_history_modulation_blocks.add(block_index)
+            target_input = (
+                block.norm1(target.float()) * (1.0 + target_scale) + target_shift
+            ).to(dtype=target.dtype)
+            warp_input = (
+                block.norm1(warp.float()) * (1.0 + history_scale) + history_shift
+            ).to(dtype=target.dtype)
+            memory_input = (
+                block.norm1(memory.float()) * (1.0 + history_scale) + history_shift
+            ).to(dtype=target.dtype)
+            spatial = torch.cat((warp_input, memory_input), dim=1)
             if spatial.shape[1] != 1080:
                 raise RuntimeError(f"fixed spatial K/V must contain 1080 tokens, got {spatial.shape[1]}")
             attn = block.attn1
-            query = attn.norm_q(attn.to_q(target))
+            query = attn.norm_q(attn.to_q(target_input))
             key = attn.norm_k(
                 attn.to_k(spatial) + self.spatial_k_lora[block_index](spatial).to(spatial.dtype)
             )
@@ -554,6 +609,8 @@ def build_spatial_reanchor_controller(
             return context
 
         def _patch_short_hook(self, _module, _args, output):
+            if self._suspend_patch_short_hook:
+                return output
             contexts = list(self._contexts.values())
             if not contexts or not any(context.spatial_warp_enabled for context in contexts):
                 return output
@@ -571,6 +628,15 @@ def build_spatial_reanchor_controller(
             result = output.clone()
             role = self.spatial_warp_role.to(device=result.device, dtype=result.dtype).view(1, -1, 1, 1, 1)
             result[:, :, -frame_count:] = result[:, :, -frame_count:] + role
+            spatial_contexts = [
+                context for context in contexts
+                if context.spatial_attention_enabled and context.target_token_count == 540
+            ]
+            captured = result[:, :, -frame_count:].flatten(2).transpose(1, 2)
+            if spatial_contexts and captured.shape[1] == 540:
+                if len(spatial_contexts) != 1:
+                    raise RuntimeError("expected exactly one stage0 spatial-attention context")
+                spatial_contexts[0].spatial_warp_tokens = captured.detach()
             return result
 
         def _block_hook(self, gate_index, block_index):

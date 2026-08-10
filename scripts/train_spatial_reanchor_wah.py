@@ -883,6 +883,14 @@ def main():
             raise RuntimeError(f"formal AR history sizes changed: {state['history_sizes']}")
         if int(state["num_history_latent_frames"]) != 19:
             raise RuntimeError("formal AR history must retain all 19 TEMP_LONG/MID/SHORT latents")
+        min_temporal_gap_frames = (
+            (int(state["num_history_latent_frames"]) - 1)
+            * int(config["vae_temporal_scale"])
+        )
+        if min_temporal_gap_frames != 72:
+            raise RuntimeError(
+                f"formal spatial-memory temporal gap must be 72 frames, got {min_temporal_gap_frames}"
+            )
         causal_renderer = CausalActiveNodeRenderer(
             NodeStore(root / "session"),
             renderer_kwargs={"device": "cuda:0", "near": 0.05, "far": 100.0,
@@ -954,6 +962,8 @@ def main():
         def _memory_for_sample(sample):
             rendered = memory_bank.render_query(
                 poses=sample["poses"], intrinsics=sample["intrinsics"],
+                query_frame_id=int(sample["start"]),
+                min_temporal_gap_frames=min_temporal_gap_frames,
                 height=exact.height, width=exact.width, device="cuda:0",
                 near=0.05, far=100.0, point_radius=1, chunk_points=1000000,
             )
@@ -1600,6 +1610,9 @@ def main():
             "memory_entry_id": None if phase == "A" else item.get("memory_report", {}).get("memory_entry_id"),
             "memory_translation_distance": None if phase == "A" else item.get("memory_report", {}).get("memory_translation_distance"),
             "memory_rotation_distance_degrees": None if phase == "A" else item.get("memory_report", {}).get("memory_rotation_distance_degrees"),
+            "memory_temporal_gap_frames": None if phase == "A" else item.get("memory_report", {}).get("memory_temporal_gap_frames"),
+            "excluded_recent_entry_count": None if phase == "A" else item.get("memory_report", {}).get("excluded_recent_entry_count"),
+            "eligible_entry_count": None if phase == "A" else item.get("memory_report", {}).get("eligible_entry_count"),
             "W_visibility": None if phase == "A" else int(np.asarray(item["sample"]["visibility"]).sum()),
             "R_visibility": None if phase == "A" else int(np.asarray(item["memory_visibility"]).sum()),
             "W_token_slots": 540 if phase == "B" else None,

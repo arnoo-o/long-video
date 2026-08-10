@@ -62,26 +62,41 @@ class SpatialMemoryWarpBank:
         self.rotation_threshold_degrees = float(rotation_threshold_degrees)
         self.entries: list[SpatialMemoryWarpEntry] = []
 
-    def query(self, pose):
+    def query(self, pose, *, query_frame_id, min_temporal_gap_frames):
         pose = np.asarray(pose, np.float32)
         candidates = []
+        excluded_recent_entry_count = 0
+        eligible_entry_count = 0
         for entry in self.entries:
             if not len(entry.points_xyz):
+                continue
+            temporal_gap = int(query_frame_id) - int(entry.frame_id)
+            if temporal_gap <= int(min_temporal_gap_frames):
+                excluded_recent_entry_count += 1
                 continue
             translation = float(np.linalg.norm(entry.pose[:3, 3] - pose[:3, 3]))
             rotation = full_rotation_angle_degrees(entry.pose, pose)
             if translation <= self.translation_threshold and rotation <= self.rotation_threshold_degrees:
-                candidates.append((translation + rotation / 30.0, translation, rotation, entry))
+                eligible_entry_count += 1
+                candidates.append(
+                    (translation + rotation / 30.0, translation, rotation, temporal_gap, entry)
+                )
         if not candidates:
             return None, {
                 "memory_hit": False, "memory_entry_id": None,
                 "memory_translation_distance": None, "memory_rotation_distance_degrees": None,
+                "memory_temporal_gap_frames": None,
+                "excluded_recent_entry_count": excluded_recent_entry_count,
+                "eligible_entry_count": eligible_entry_count,
             }
-        _, translation, rotation, entry = min(candidates, key=lambda item: item[0])
+        _, translation, rotation, temporal_gap, entry = min(candidates, key=lambda item: item[0])
         return entry, {
             "memory_hit": True, "memory_entry_id": int(entry.entry_id),
             "memory_translation_distance": translation,
             "memory_rotation_distance_degrees": rotation,
+            "memory_temporal_gap_frames": temporal_gap,
+            "excluded_recent_entry_count": excluded_recent_entry_count,
+            "eligible_entry_count": eligible_entry_count,
         }
 
     def add_generated_boundary(
@@ -114,8 +129,14 @@ class SpatialMemoryWarpBank:
         self.entries.append(entry)
         return entry
 
-    def render_query(self, *, poses, intrinsics, height, width, device="cpu", **renderer_kwargs):
-        entry, report = self.query(np.asarray(poses)[0])
+    def render_query(
+        self, *, poses, intrinsics, height, width, query_frame_id,
+        min_temporal_gap_frames, device="cpu", **renderer_kwargs,
+    ):
+        entry, report = self.query(
+            np.asarray(poses)[0], query_frame_id=query_frame_id,
+            min_temporal_gap_frames=min_temporal_gap_frames,
+        )
         shape = (len(poses), int(height), int(width))
         if entry is None or not len(entry.points_xyz):
             return {

@@ -322,7 +322,10 @@ def test_second_spatial_attention_has_fixed_slots_hard_memory_mask_and_zero_gate
     )
     hidden = torch.randn(1, 560, 32)
     rotary = torch.randn(1, 560, 16)
-    transformer.patch_short(warp)
+    # Formal train_exact keeps short history at full latent resolution even
+    # while the supervised target is stage0; the hook must still capture a
+    # complete 540-token stage0 CURRENT_WARP before visible-token dropping.
+    transformer.patch_short(torch.randn(1, 16, 9, 48, 80))
     scale_msa = torch.zeros_like(hidden)
     shift_msa = torch.zeros_like(hidden)
     output = controller.spatial_attention(

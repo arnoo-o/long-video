@@ -259,6 +259,8 @@ class ReanchorContext:
     memory_confidence_tokens: object = None
     spatial_attention_enabled: bool = False
     spatial_warp_tokens: object = None
+    spatial_latent_height: int = 0
+    spatial_latent_width: int = 0
 
 
 def build_spatial_reanchor_controller(
@@ -429,6 +431,8 @@ def build_spatial_reanchor_controller(
                     memory_visibility_tokens=memory_visibility,
                     memory_confidence_tokens=memory_confidence,
                     spatial_attention_enabled=bool(raw.get("spatial_attention_enabled", memory_tokens is not None)),
+                    spatial_latent_height=int(stage_warp.shape[-2]),
+                    spatial_latent_width=int(stage_warp.shape[-1]),
                 )
             self._contexts = contexts
             self._context = next(iter(contexts.values())) if len(contexts) == 1 else None
@@ -632,11 +636,29 @@ def build_spatial_reanchor_controller(
                 context for context in contexts
                 if context.spatial_attention_enabled and context.target_token_count == 540
             ]
-            captured = result[:, :, -frame_count:].flatten(2).transpose(1, 2)
-            if spatial_contexts and captured.shape[1] == 540:
+            if spatial_contexts:
                 if len(spatial_contexts) != 1:
                     raise RuntimeError("expected exactly one stage0 spatial-attention context")
-                spatial_contexts[0].spatial_warp_tokens = captured.detach()
+                context = spatial_contexts[0]
+                current_warp_latents = _args[0][:, :, -frame_count:]
+                stage0_warp_latents = resize_latents_spatial(
+                    current_warp_latents,
+                    height=context.spatial_latent_height,
+                    width=context.spatial_latent_width,
+                )
+                self._suspend_patch_short_hook = True
+                try:
+                    with torch.no_grad():
+                        stage0_warp = _module(stage0_warp_latents)
+                finally:
+                    self._suspend_patch_short_hook = False
+                stage0_warp = stage0_warp + role
+                captured = stage0_warp.flatten(2).transpose(1, 2)
+                if captured.shape[1] != 540:
+                    raise RuntimeError(
+                        f"stage0 CURRENT_WARP capture must contain 540 tokens, got {captured.shape[1]}"
+                    )
+                context.spatial_warp_tokens = captured.detach()
             return result
 
         def _block_hook(self, gate_index, block_index):

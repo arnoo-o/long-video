@@ -34,6 +34,13 @@ def parse_args():
     parser.add_argument("--pi3-repo", type=Path, required=True)
     parser.add_argument("--pi3-checkpoint", type=Path, required=True)
     parser.add_argument("--memory-config", type=Path, default=Path("configs/online_memory.yaml"))
+    parser.add_argument(
+        "--source-world-observed-erp-mask", type=Path,
+        help=(
+            "Inference-only filter: copy M0 with only points whose rays fall in "
+            "the original perspective observation mask. The stored M0 is not modified."
+        ),
+    )
     parser.add_argument("--physical-gpu", type=int, default=1)
     parser.add_argument("--chunks", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
@@ -74,6 +81,7 @@ sys.path.insert(0, str(ARGS.wah_root))
 from long_video.config import load_yaml
 from long_video.initialization.geometry_backend import Pi3GeometryBackend
 from long_video.memory.memory_manager import MemoryManager
+from long_video.memory.node_filter import filter_node_to_observed_erp
 from long_video.memory.node_store import NodeStore
 from long_video.oracle_training.causal_warp import CausalActiveNodeRenderer
 from long_video.oracle_training.contracts import GeneratedMemoryBatch
@@ -377,6 +385,17 @@ def main():
 
     rollout_store = NodeStore(ARGS.output / "validated_world_session")
     source_node = NodeStore(ARGS.sequence / "session").load("node_000")
+    if ARGS.source_world_observed_erp_mask is not None:
+        observed_mask = np.load(ARGS.source_world_observed_erp_mask)
+        source_node, source_world_filter = filter_node_to_observed_erp(source_node, observed_mask)
+        source_world_filter["observed_erp_mask"] = str(ARGS.source_world_observed_erp_mask)
+    else:
+        source_world_filter = {
+            "mode": "full_completed_panorama_points",
+            "original_point_count": int(len(source_node.points_xyz)),
+            "kept_point_count": int(len(source_node.points_xyz)),
+            "input_node_unchanged": True,
+        }
     rollout_store.save(source_node)
     memory_config = load_yaml(ARGS.memory_config)
     if ARGS.coverage_threshold is not None:
@@ -477,6 +496,7 @@ def main():
         "projection": vars(projection_config),
         "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
         "canonical_warp_vae_fill": "per_frame_nearest_visible_with_chunk_mean_fallback",
+        "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
         "memory_config": memory_config,
         "uses_future_gt": False,

@@ -32,6 +32,10 @@ def parse_args():
     parser.add_argument("--confidence-power", type=float, default=1.0)
     parser.add_argument("--confidence-threshold", type=float, default=0.3)
     parser.add_argument("--coverage-threshold", type=float)
+    parser.add_argument(
+        "--memory-set", action="append", default=[], metavar="KEY=VALUE",
+        help="Override an existing MemoryManager threshold for this experiment.",
+    )
     parser.add_argument("--video-name", default="school_world_projected_step600.mp4")
     return parser.parse_args()
 
@@ -317,6 +321,19 @@ def main():
     memory_config = load_yaml(ARGS.memory_config)
     if ARGS.coverage_threshold is not None:
         memory_config["coverage_threshold"] = float(ARGS.coverage_threshold)
+    for override in ARGS.memory_set:
+        key, separator, raw_value = override.partition("=")
+        if not separator or key not in memory_config:
+            raise ValueError(f"memory override must name an existing key, got {override!r}")
+        original = memory_config[key]
+        if isinstance(original, bool):
+            memory_config[key] = raw_value.strip().lower() in {"1", "true", "yes", "on"}
+        elif isinstance(original, int):
+            memory_config[key] = int(raw_value)
+        elif isinstance(original, float):
+            memory_config[key] = float(raw_value)
+        else:
+            raise TypeError(f"unsupported memory override type for {key}: {type(original).__name__}")
     geometry = Pi3GeometryBackend(
         ARGS.pi3_checkpoint, ARGS.pi3_repo, device="cuda:0", input_size=518,
     )
@@ -385,6 +402,7 @@ def main():
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
         "projection": vars(projection_config),
+        "memory_config": memory_config,
         "uses_future_gt": False,
         "chunks_total": ARGS.chunks,
         "chunks_complete": 0,
@@ -508,6 +526,12 @@ def main():
                     "candidate_id": event.get("candidate_id"),
                     "verified_point_ratio": verified_ratio,
                     "candidate_metrics": metrics,
+                    "transition_buffer": {
+                        "frame_count": len(manager.buffer),
+                        "translation_baseline": manager.buffer.translation_baseline,
+                        "view_diversity": manager.buffer.view_diversity,
+                        "mean_new_area_ratio": manager.buffer.mean_new_area_ratio,
+                    },
                     "projection_stages": projection.diagnostics,
                     "stage_shapes": stage_shapes,
                     "unknown_projection_exact_zero": all(

@@ -495,6 +495,13 @@ class MemoryManager:
     def process_chunk(self, active_node, generated_rgb_for_memory, cameras, warp, frame_start, **forbidden):
         from ..oracle_training.contracts import assert_no_supervision_content
         assert_no_supervision_content(forbidden, "MemoryManager")
+        generated_frame_count = len(generated_rgb_for_memory)
+        if generated_frame_count < 1:
+            raise ValueError("MemoryManager cannot process an empty generated chunk")
+        # ``frame_start`` is inclusive.  A candidate built after this chunk is
+        # causally available at its final generated frame, not at the following
+        # frame (the right-open range endpoint).
+        candidate_created_frame = int(frame_start) + generated_frame_count - 1
         self.register(active_node)
         mean_coverage = float(np.mean(warp.coverage_per_frame))
         self.observe(mean_coverage)
@@ -503,8 +510,8 @@ class MemoryManager:
             self.state = self.TRANSITION
             self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
         if (self.state==self.TRANSITION and self._ready() and
-                self.buffer.can_attempt(frame_start+len(generated_rgb_for_memory))):
-            candidate, frames, heldout = self.build_candidate(active_node, frame_start + len(generated_rgb_for_memory))
+                self.buffer.can_attempt(candidate_created_frame)):
+            candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)
             event.update(candidate_id=candidate.node_id, accepted=accepted, metrics=metrics)
             if accepted:
@@ -521,7 +528,7 @@ class MemoryManager:
                         "scale_dispersion":metrics["scale_dispersion"]>self.max_scale_dispersion,
                         "pose_error":metrics["pose_error"]>self.max_pose_error,
                     }.items() if failed]
-                self.buffer.reject(frame_start+len(generated_rgb_for_memory), rejection_reasons)
+                self.buffer.reject(candidate_created_frame, rejection_reasons)
                 event["rejection_reason"] = rejection_reasons
                 self.state = self.TRANSITION
         event["state"] = self.state

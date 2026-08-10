@@ -27,9 +27,9 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
         max_world_overlap=0.20,
     )
     manager.buffer = _ReadinessBuffer(11, translation=3.0, view_change=0.0, new_area=0.0)
-    assert not manager._ready()
+    assert not manager._ready(0.01)
     manager.buffer = _ReadinessBuffer(12, translation=0.0, view_change=0.5, new_area=0.0)
-    report = manager.readiness_report()
+    report = manager.readiness_report(0.01)
     assert report["ready"]
     assert report["conditions"] == {
         "translation": False,
@@ -44,11 +44,21 @@ def test_world_overlap_must_be_strictly_below_twenty_percent():
     manager.buffer = _ReadinessBuffer(
         12, translation=3.0, view_change=1.0, new_area=0.5, coverage=0.20,
     )
-    assert not manager._ready()
+    assert not manager._ready(0.20)
     manager.buffer = _ReadinessBuffer(
         12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.199,
     )
-    assert manager._ready()
+    assert manager._ready(0.199)
+
+
+def test_readiness_uses_current_chunk_overlap_not_history_mean():
+    manager = MemoryManager()
+    manager.buffer = _ReadinessBuffer(
+        12, translation=0.0, view_change=0.5, new_area=0.5, coverage=0.95,
+    )
+    report = manager.readiness_report(0.10)
+    assert report["ready"]
+    assert report["values"]["current_chunk_world_overlap"] == 0.10
 
 
 def test_readiness_policy_rejects_conflicting_mode_or_thresholds():
@@ -63,7 +73,7 @@ def test_candidate_created_frame_is_last_inclusive_generated_frame():
     captured = {}
     manager.buffer = SimpleNamespace(can_attempt=lambda frame: True)
     manager._append_chunk = lambda *args, **kwargs: None
-    manager._ready = lambda: True
+    manager.readiness_report = lambda _overlap=None: {"ready": True}
 
     def build_candidate(_active, created_frame):
         captured["created_frame"] = created_frame

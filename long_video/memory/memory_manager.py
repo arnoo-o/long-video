@@ -88,6 +88,7 @@ class MemoryManager:
             cooldown_frames=failure_cooldown_frames)
         self.reactivation_hysteresis=float(reactivation_hysteresis)
         self.transition_readiness_mode = "any"
+        self.current_world_overlap = 1.0
         self.nodes = {}
         self.events = []
 
@@ -98,14 +99,16 @@ class MemoryManager:
         self.low_count = self.low_count + 1 if coverage < self.coverage_threshold else 0
         return self.low_count
 
-    def _ready(self):
-        return bool(self.readiness_report()["ready"])
+    def _ready(self, current_world_overlap=None):
+        return bool(self.readiness_report(current_world_overlap)["ready"])
 
-    def readiness_report(self):
-        overlap = (
-            float(np.mean([frame.coverage for frame in self.buffer.frames]))
-            if self.buffer.frames else 0.0
+    def readiness_report(self, current_world_overlap=None):
+        overlap = float(
+            self.current_world_overlap
+            if current_world_overlap is None else current_world_overlap
         )
+        if not np.isfinite(overlap) or not 0.0 <= overlap <= 1.0:
+            raise ValueError(f"current world overlap must be finite in [0,1], got {overlap}")
         conditions = {
             "translation": self.buffer.translation_baseline >= self.min_translation_baseline,
             "view_change": self.buffer.view_diversity >= self.min_view_diversity,
@@ -126,7 +129,7 @@ class MemoryManager:
                 "view_change_radians": float(self.buffer.view_diversity),
                 "view_change_degrees": float(np.rad2deg(self.buffer.view_diversity)),
                 "new_area": float(self.buffer.mean_new_area_ratio),
-                "world_overlap": overlap,
+                "current_chunk_world_overlap": overlap,
             },
             "thresholds": {
                 "translation": float(self.min_translation_baseline),
@@ -535,13 +538,16 @@ class MemoryManager:
         candidate_created_frame = int(frame_start) + generated_frame_count - 1
         self.register(active_node)
         mean_coverage = float(np.mean(warp.coverage_per_frame))
+        self.current_world_overlap = mean_coverage
         self.observe(mean_coverage)
         event = {"state": self.state, "coverage": mean_coverage}
         # Permanent policy: every causal generated frame contributes to readiness.
         # Low coverage is diagnostic only and never gates candidate construction.
         self.state = self.TRANSITION
         self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
-        if (self.state==self.TRANSITION and self._ready() and
+        readiness = self.readiness_report(mean_coverage)
+        event["readiness"] = readiness
+        if (self.state==self.TRANSITION and readiness["ready"] and
                 self.buffer.can_attempt(candidate_created_frame)):
             candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)

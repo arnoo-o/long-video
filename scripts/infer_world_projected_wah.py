@@ -733,7 +733,7 @@ def main():
                         "view_diversity": manager.buffer.view_diversity,
                         "mean_new_area_ratio": manager.buffer.mean_new_area_ratio,
                     },
-                    "candidate_readiness": manager.readiness_report(),
+                    "candidate_readiness": event["readiness"],
                     "projection_stages": stage_diagnostics,
                     "boundary_projection_active": bool(
                         projection.previous_boundary_latents is not None

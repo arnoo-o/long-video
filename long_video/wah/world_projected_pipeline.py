@@ -7,7 +7,7 @@ therefore leaves training and ordinary inference unchanged.
 from __future__ import annotations
 
 from collections import deque
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -1072,7 +1072,7 @@ def sparse_pixel_constraint(
     lr: float,
     lambda_z: float,
     max_grad_norm: float,
-    activation_offload_budget_bytes: int = 32 * 1024**3,
+    activation_offload_budget_bytes: int = 4 * 1024**3,
     activation_offload_min_tensor_bytes: int = 8 * 1024**2,
     activation_offload_min_spatial_area: int = 96 * 160,
     epsilon: float = 1e-8,
@@ -1181,6 +1181,32 @@ def sparse_pixel_constraint(
             / base.float().norm().clamp_min(float(epsilon))
         ).detach(),
     }
+
+
+@contextmanager
+def temporarily_offload_frozen_transformer_blocks(
+    transformer: Any,
+    *,
+    restore_device: torch.device,
+    block_count: int = 16,
+):
+    """Free deterministic inference memory while VAE input gradients run."""
+    blocks = getattr(transformer, "blocks", None)
+    if blocks is None or len(blocks) < int(block_count):
+        raise RuntimeError("Helios transformer does not expose enough frozen blocks to offload")
+    selected = list(blocks[-int(block_count):])
+    if any(parameter.requires_grad for block in selected for parameter in block.parameters()):
+        raise RuntimeError("sparse inference attempted to offload a trainable Transformer block")
+    for block in selected:
+        block.to(device="cpu")
+    torch.cuda.empty_cache()
+    try:
+        yield len(selected)
+    finally:
+        # The VAE autograd graph has already been consumed and detached.
+        torch.cuda.empty_cache()
+        for block in selected:
+            block.to(device=restore_device)
 
 
 def sparse_pixel_constraint_enabled(stage_id: int, stage_count: int) -> bool:
@@ -1513,15 +1539,21 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                     vae_latents = value.to(dtype=vae_dtype) / latents_std + latents_mean
                     return self.vae.decode(vae_latents, return_dict=False)[0]
 
-                optimized_clean, sparse_metrics = sparse_pixel_constraint(
-                    clean_candidate,
-                    decode_fn=decode_clean,
-                    warp_rgb=warp_rgb,
-                    visibility=pixel_visibility,
-                    steps=sparse_steps,
-                    lr=sparse_lr,
-                    lambda_z=sparse_lambda_z,
-                    max_grad_norm=1.0,
+                with temporarily_offload_frozen_transformer_blocks(
+                    self.transformer, restore_device=z_raw.device, block_count=16,
+                ) as offloaded_block_count:
+                    optimized_clean, sparse_metrics = sparse_pixel_constraint(
+                        clean_candidate,
+                        decode_fn=decode_clean,
+                        warp_rgb=warp_rgb,
+                        visibility=pixel_visibility,
+                        steps=sparse_steps,
+                        lr=sparse_lr,
+                        lambda_z=sparse_lambda_z,
+                        max_grad_norm=1.0,
+                    )
+                sparse_metrics["sparse_offloaded_transformer_block_count"] = torch.as_tensor(
+                    offloaded_block_count, device=z_raw.device, dtype=torch.float32,
                 )
                 if is_final_step:
                     z_next = optimized_clean

@@ -27,6 +27,7 @@ from long_video.wah.world_projected_pipeline import (
     scheduler_align_clean_prediction,
     scheduler_clean_prediction,
     sparse_pixel_constraint,
+    temporarily_offload_frozen_transformer_blocks,
     mask_canonical_latent,
     smooth_latent_visibility,
     world_projection_weight,
@@ -104,6 +105,26 @@ def test_sparse_pixel_constraint_rejects_soft_visibility():
             visibility=torch.full((1, 1, 1, 1, 1), 0.5),
             steps=1, lr=0.005, lambda_z=1.0, max_grad_norm=1.0,
         )
+
+
+def test_sparse_constraint_block_offload_requires_frozen_and_restores():
+    transformer = torch.nn.Module()
+    transformer.blocks = torch.nn.ModuleList([torch.nn.Linear(2, 2) for _ in range(3)])
+    for parameter in transformer.parameters():
+        parameter.requires_grad_(False)
+    with temporarily_offload_frozen_transformer_blocks(
+        transformer, restore_device=torch.device("cpu"), block_count=2,
+    ) as count:
+        assert count == 2
+        assert all(parameter.device.type == "cpu" for parameter in transformer.parameters())
+    assert all(parameter.device.type == "cpu" for parameter in transformer.parameters())
+
+    next(transformer.blocks[-1].parameters()).requires_grad_(True)
+    with pytest.raises(RuntimeError):
+        with temporarily_offload_frozen_transformer_blocks(
+            transformer, restore_device=torch.device("cpu"), block_count=1,
+        ):
+            pass
 
 
 def test_canonical_residual_composition_gives_world_exclusive_known_pixels():

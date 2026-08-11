@@ -1072,8 +1072,9 @@ def sparse_pixel_constraint(
     lr: float,
     lambda_z: float,
     max_grad_norm: float,
-    activation_offload_budget_bytes: int = 12 * 1024**3,
-    activation_offload_min_tensor_bytes: int = 32 * 1024**2,
+    activation_offload_budget_bytes: int = 32 * 1024**3,
+    activation_offload_min_tensor_bytes: int = 8 * 1024**2,
+    activation_offload_min_spatial_area: int = 96 * 160,
     epsilon: float = 1e-8,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Jointly optimize one clean 33-frame latent against sparse renderer pixels.
@@ -1112,6 +1113,8 @@ def sparse_pixel_constraint(
         should_offload = (
             tensor.is_cuda
             and not tensor.is_leaf
+            and tensor.ndim >= 4
+            and int(tensor.shape[-2] * tensor.shape[-1]) >= int(activation_offload_min_spatial_area)
             and tensor_bytes >= int(activation_offload_min_tensor_bytes)
             and offloaded_bytes + tensor_bytes <= int(activation_offload_budget_bytes)
         )

@@ -1072,6 +1072,8 @@ def sparse_pixel_constraint(
     lr: float,
     lambda_z: float,
     max_grad_norm: float,
+    activation_offload_budget_bytes: int = 12 * 1024**3,
+    activation_offload_min_tensor_bytes: int = 32 * 1024**2,
     epsilon: float = 1e-8,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Jointly optimize one clean 33-frame latent against sparse renderer pixels.
@@ -1102,15 +1104,39 @@ def sparse_pixel_constraint(
     last_grad_norm = torch.zeros((), device=base.device)
     last_clipped_norm = torch.zeros((), device=base.device)
     visible_count = visible.sum().detach()
+    offloaded_bytes = 0
+
+    def pack_saved_tensor(tensor: torch.Tensor):
+        nonlocal offloaded_bytes
+        tensor_bytes = int(tensor.numel() * tensor.element_size())
+        should_offload = (
+            tensor.is_cuda
+            and not tensor.is_leaf
+            and tensor_bytes >= int(activation_offload_min_tensor_bytes)
+            and offloaded_bytes + tensor_bytes <= int(activation_offload_budget_bytes)
+        )
+        if not should_offload:
+            return False, tensor
+        offloaded_bytes += tensor_bytes
+        return True, tensor.detach().to(device="cpu", non_blocking=False)
+
+    def unpack_saved_tensor(packed):
+        was_offloaded, tensor = packed
+        if not was_offloaded:
+            return tensor
+        return tensor.to(device=base.device, non_blocking=False)
+
     with torch.enable_grad():
         for _ in range(int(steps)):
             variable = x0_opt.detach().requires_grad_(True)
             # Wan's decoder does not implement gradient checkpointing.  Save
-            # its backward activations on CPU so the joint 33-frame graph does
-            # not coexist with ~48 GiB of resident Helios state on H100.
+            # a bounded subset of its largest non-parameter activations on CPU
+            # so the joint 33-frame graph fits beside resident Helios state.
             # This changes storage only: decode, loss, and gradient are exact.
             saved_tensor_context = (
-                torch.autograd.graph.save_on_cpu(pin_memory=True)
+                torch.autograd.graph.saved_tensors_hooks(
+                    pack_saved_tensor, unpack_saved_tensor,
+                )
                 if variable.is_cuda else nullcontext()
             )
             with saved_tensor_context:
@@ -1144,8 +1170,8 @@ def sparse_pixel_constraint(
         "sparse_grad_norm": last_grad_norm,
         "sparse_clipped_grad_norm": last_clipped_norm,
         "sparse_visible_pixel_count": visible_count,
-        "sparse_activation_offload": torch.as_tensor(
-            float(base.is_cuda), device=base.device,
+        "sparse_activation_offload_bytes": torch.as_tensor(
+            offloaded_bytes, device=base.device, dtype=torch.float64,
         ),
         "sparse_latent_delta_ratio": (
             (x0_opt.float() - base.float()).norm()

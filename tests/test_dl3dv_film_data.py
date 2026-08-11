@@ -21,7 +21,8 @@ def test_official_metadata_is_joined_and_balanced(tmp_path):
     scene_hashes = [f"{i:064x}" for i in range(4)]
     csv_path = tmp_path / "valid.csv"
     csv_path.write_text("hash,sensibility label,batch,duration\n" + "\n".join(
-        f"{h},Without any sensitivity information,1K,60" for h in scene_hashes))
+        f"{h},Without any sensitivity information,1K,{'' if h == scene_hashes[0] else '60'}"
+        for h in scene_hashes))
     rows = []
     for index, scene_hash in enumerate(scene_hashes):
         poi, category = (("Living-Room", "Indoor") if index % 2 == 0 else
@@ -33,6 +34,7 @@ def test_official_metadata_is_joined_and_balanced(tmp_path):
     records = read_official_metadata(csv_path, html)
     ranked = ranked_candidates(records, seed=1)
     assert len(ranked) == 4
+    assert any(x["duration"] == 0 for x in ranked)
     assert [x["environment"] for x in ranked] == ["indoor", "outdoor", "indoor", "outdoor"]
 
 

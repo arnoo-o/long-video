@@ -58,7 +58,7 @@ def read_official_metadata(csv_path, preview_html_path):
         for row in csv.DictReader(handle):
             valid[row["hash"]] = {
                 "scene_hash": row["hash"], "batch": row["batch"],
-                "duration": float(row["duration"]),
+                "duration": float(row.get("duration") or 0.0),
                 "sensibility_label": row.get("sensibility label", ""),
             }
     parser = _PreviewParser()

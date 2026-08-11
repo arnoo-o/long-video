@@ -205,14 +205,14 @@ class WorldProjectionContext:
                         f"stage {stage_id} boundary shape {tuple(boundary.shape)} != {expected}"
                     )
         if (self.pixel_warp_rgb is None) != (self.pixel_visibility is None):
-            raise ValueError("pixel RGB clamp requires both warp RGB and visibility")
+            raise ValueError("sparse pixel constraint requires both warp RGB and visibility")
         if self.pixel_warp_rgb is not None:
             expected = (
                 self.pixel_warp_rgb.shape[0], 1, self.pixel_warp_rgb.shape[2],
                 self.pixel_warp_rgb.shape[3], self.pixel_warp_rgb.shape[4],
             )
             if self.pixel_warp_rgb.ndim != 5 or tuple(self.pixel_visibility.shape) != expected:
-                raise ValueError("pixel RGB clamp tensors must be aligned [B,C/T,H,W]")
+                raise ValueError("sparse constraint tensors must be aligned [B,C/T,H,W]")
             if not bool(torch.isfinite(self.pixel_warp_rgb).all()):
                 raise ValueError("pixel warp RGB must be finite")
             if not bool(((self.pixel_visibility == 0) | (self.pixel_visibility == 1)).all()):
@@ -1006,57 +1006,6 @@ def apply_boundary_then_world_clamp(
     }
 
 
-def composite_renderer_rgb(
-    model_rgb: torch.Tensor,
-    warp_rgb: torch.Tensor,
-    renderer_visibility: torch.Tensor,
-) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Composite raw renderer RGB over a decoded clean prediction per pixel.
-
-    This path deliberately accepts no latent support or coverage threshold.
-    Renderer-visible pixels belong to the point cloud; every pixel gap remains
-    exactly the model prediction.
-    """
-    if model_rgb.ndim != 5 or tuple(warp_rgb.shape) != tuple(model_rgb.shape):
-        raise ValueError("model/warp RGB must have the same [B,3,T,H,W] shape")
-    expected_visibility = (
-        model_rgb.shape[0], 1, model_rgb.shape[2],
-        model_rgb.shape[3], model_rgb.shape[4],
-    )
-    if tuple(renderer_visibility.shape) != expected_visibility:
-        raise ValueError(
-            f"renderer visibility must be {expected_visibility}, got {tuple(renderer_visibility.shape)}"
-        )
-    visibility = renderer_visibility.to(device=model_rgb.device, dtype=torch.float32)
-    if not bool(((visibility == 0) | (visibility == 1)).all()):
-        raise ValueError("RGB clamp visibility must be raw binary renderer visibility")
-    model = model_rgb.float()
-    warp = warp_rgb.to(device=model_rgb.device, dtype=torch.float32)
-    mixed = visibility * warp + (1.0 - visibility) * model
-    visible = (visibility == 1).expand_as(mixed)
-    unknown = (visibility == 0).expand_as(mixed)
-    visible_error = (
-        (mixed - warp).masked_select(visible).abs().max()
-        if bool(visible.any()) else torch.zeros((), device=mixed.device)
-    )
-    unknown_error = (
-        (mixed - model).masked_select(unknown).abs().max()
-        if bool(unknown.any()) else torch.zeros((), device=mixed.device)
-    )
-    if float(visible_error.detach().cpu()) != 0.0:
-        raise RuntimeError("RGB clamp changed a renderer-visible pixel")
-    if float(unknown_error.detach().cpu()) != 0.0:
-        raise RuntimeError("RGB clamp changed a point-cloud gap")
-    return mixed.to(model_rgb.dtype), {
-        "rgb_visibility_mean": visibility.mean().detach(),
-        "rgb_visible_exact_warp_max_error": visible_error.detach(),
-        "rgb_unknown_exact_model_max_error": unknown_error.detach(),
-        "rgb_composite_formula_max_error": (
-            mixed - (visibility * warp + (1.0 - visibility) * model)
-        ).abs().max().detach(),
-    }
-
-
 def scheduler_clean_prediction(
     scheduler: Any,
     model_output: torch.Tensor,
@@ -1086,12 +1035,17 @@ def scheduler_align_clean_prediction(
     clean_prediction: torch.Tensor,
     *,
     step_index: int,
-    stage_start_state: torch.Tensor,
+    dmd_noisy_tensor: torch.Tensor,
     dmd_sigmas: torch.Tensor,
     dmd_timesteps: torch.Tensor,
     all_timesteps: torch.Tensor,
 ) -> torch.Tensor:
-    """Return an RGB-composited clean endpoint to Helios' native next coordinate."""
+    """Return a clean endpoint to Helios' native next coordinate.
+
+    ``dmd_noisy_tensor`` is the exact tensor passed by the pinned Helios
+    pipeline to the current scheduler call.  It must not be replaced by an
+    inferred stage start or newly sampled noise.
+    """
     if int(step_index) >= len(all_timesteps) - 1:
         return clean_prediction
     next_timestep = torch.full(
@@ -1100,15 +1054,93 @@ def scheduler_align_clean_prediction(
     )
     return scheduler.add_noise(
         clean_prediction,
-        stage_start_state.to(clean_prediction.device, clean_prediction.dtype),
+        dmd_noisy_tensor.to(clean_prediction.device, clean_prediction.dtype),
         next_timestep,
         sigmas=dmd_sigmas,
         timesteps=dmd_timesteps,
     )
 
 
-def rgb_pixel_clamp_enabled(stage_id: int, stage_count: int) -> bool:
-    """RGB consistency is intentionally restricted to the final pyramid stage."""
+def sparse_pixel_constraint(
+    x0_base: torch.Tensor,
+    *,
+    decode_fn: Any,
+    warp_rgb: torch.Tensor,
+    visibility: torch.Tensor,
+    steps: int,
+    lr: float,
+    lambda_z: float,
+    max_grad_norm: float,
+    epsilon: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Jointly optimize one clean 33-frame latent against sparse renderer pixels.
+
+    Only ``x0_opt`` receives gradients.  The renderer visibility is used
+    exactly as supplied: it is neither dilated nor converted to latent-cell
+    ownership, and invisible RGB pixels contribute no pixel loss.
+    """
+    if int(steps) < 0:
+        raise ValueError("sparse constraint steps must be non-negative")
+    if float(lr) < 0 or float(lambda_z) < 0 or float(max_grad_norm) <= 0:
+        raise ValueError("invalid sparse constraint optimization hyperparameters")
+    if x0_base.ndim != 5:
+        raise ValueError(f"x0_base must be [B,C,T,H,W], got {tuple(x0_base.shape)}")
+    warp = warp_rgb.detach().to(device=x0_base.device)
+    visible = visibility.detach().to(device=x0_base.device, dtype=torch.float32)
+    if warp.ndim != 5 or visible.ndim != 5:
+        raise ValueError("sparse renderer tensors must be five-dimensional")
+    if tuple(visible.shape) != (warp.shape[0], 1, warp.shape[2], warp.shape[3], warp.shape[4]):
+        raise ValueError("sparse visibility must align exactly with renderer RGB")
+    if not bool(((visible == 0) | (visible == 1)).all()):
+        raise ValueError("sparse constraint requires raw binary renderer visibility")
+
+    base = x0_base.detach()
+    x0_opt = base
+    last_pixel = torch.zeros((), device=base.device)
+    last_latent = torch.zeros((), device=base.device)
+    last_grad_norm = torch.zeros((), device=base.device)
+    last_clipped_norm = torch.zeros((), device=base.device)
+    visible_count = visible.sum().detach()
+    with torch.enable_grad():
+        for _ in range(int(steps)):
+            variable = x0_opt.detach().requires_grad_(True)
+            decoded = decode_fn(variable)
+            if tuple(decoded.shape) != tuple(warp.shape):
+                raise RuntimeError(
+                    f"decoded 33-frame RGB {tuple(decoded.shape)} != renderer {tuple(warp.shape)}"
+                )
+            warp_value = warp.to(device=decoded.device, dtype=decoded.dtype)
+            visible_value = visible.to(device=decoded.device, dtype=decoded.dtype)
+            pixel_loss = (
+                visible_value * (decoded - warp_value).abs()
+            ).sum() / (3.0 * visible_value.sum() + float(epsilon))
+            latent_loss = (variable.float() - base.float()).square().mean()
+            loss = pixel_loss.float() + float(lambda_z) * latent_loss
+            gradient, = torch.autograd.grad(loss, variable, create_graph=False, retain_graph=False)
+            grad_float = gradient.float()
+            grad_norm = grad_float.norm()
+            clip_scale = (float(max_grad_norm) / grad_norm.clamp_min(float(epsilon))).clamp(max=1.0)
+            clipped = gradient * clip_scale.to(dtype=gradient.dtype)
+            x0_opt = (variable - float(lr) * clipped).detach()
+            last_pixel = pixel_loss.detach()
+            last_latent = latent_loss.detach()
+            last_grad_norm = grad_norm.detach()
+            last_clipped_norm = clipped.float().norm().detach()
+    return x0_opt.detach(), {
+        "sparse_pixel_loss": last_pixel,
+        "sparse_latent_loss": last_latent,
+        "sparse_grad_norm": last_grad_norm,
+        "sparse_clipped_grad_norm": last_clipped_norm,
+        "sparse_visible_pixel_count": visible_count,
+        "sparse_latent_delta_ratio": (
+            (x0_opt.float() - base.float()).norm()
+            / base.float().norm().clamp_min(float(epsilon))
+        ).detach(),
+    }
+
+
+def sparse_pixel_constraint_enabled(stage_id: int, stage_count: int) -> bool:
+    """Sparse pixel optimization is restricted to the final pyramid stage."""
     if int(stage_count) <= 0:
         raise ValueError("stage_count must be positive")
     return int(stage_id) == int(stage_count) - 1
@@ -1189,7 +1221,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
     def set_world_projection_context(self, context: WorldProjectionContext | None) -> None:
         self._world_projection_context = context
 
-    def set_rgb_pixel_clamp_context(
+    def set_sparse_pixel_constraint_context(
         self,
         raw_warp_rgb: Any,
         raw_renderer_visibility: Any,
@@ -1197,10 +1229,10 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         height: int,
         width: int,
     ) -> None:
-        """Attach the unfilled renderer evidence used only by stage-2 RGB clamp."""
+        """Attach raw renderer evidence used only by the stage-2 sparse loss."""
         context = getattr(self, "_world_projection_context", None)
         if context is None:
-            raise RuntimeError("set world projection context before RGB clamp pixels")
+            raise RuntimeError("set world projection context before sparse constraint pixels")
         device = self._wah_execution_device()
         rgb = self._coerce_warp_video_tensor(
             raw_warp_rgb, height=int(height), width=int(width), device=device,
@@ -1387,7 +1419,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 )
             )
             boundary_beta_max = config.boundary_beta_max(stage_id)
-            if not rgb_pixel_clamp_enabled(stage_id, len(context.canonical_latents)):
+            if not sparse_pixel_constraint_enabled(stage_id, len(context.canonical_latents)):
                 # Stage 0/1 retain only the existing Boundary Bridge.  They do
                 # not decode, composite, encode, or apply any world clamp.
                 z_next, diagnostic = apply_residual_boundary_bridge(
@@ -1399,18 +1431,19 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                     "projection_strength_mean": torch.zeros((), device=z_raw.device),
                     "per_step_world_clamp": torch.zeros((), device=z_raw.device),
                     "world_clamp_formula_max_error": torch.zeros((), device=z_raw.device),
-                    "rgb_pixel_clamp": torch.zeros((), device=z_raw.device),
+                    "sparse_pixel_constraint": torch.zeros((), device=z_raw.device),
                     "rgb_visibility_mean": torch.zeros((), device=z_raw.device),
                     "rgb_visible_exact_warp_max_error": torch.zeros((), device=z_raw.device),
                     "rgb_unknown_exact_model_max_error": torch.zeros((), device=z_raw.device),
                     "rgb_composite_formula_max_error": torch.zeros((), device=z_raw.device),
-                    "rgb_clamp_clean_delta_ratio": torch.zeros((), device=z_raw.device),
+                    "sparse_clean_delta_ratio": torch.zeros((), device=z_raw.device),
                 })
             else:
                 if context.pixel_warp_rgb is None or context.pixel_visibility is None:
-                    raise RuntimeError("stage-2 RGB clamp is missing raw renderer pixels")
+                    raise RuntimeError("stage-2 sparse constraint is missing raw renderer pixels")
                 # Obtain the true clean/x0 prediction from the scheduler's
-                # native flow coordinate.  No noisy latent is ever decoded.
+                # native flow coordinate.  Optimize all 33 decoded frames as
+                # one latent variable; never composite/re-encode RGB.
                 clean_model = scheduler_clean_prediction(
                     scheduler, model_output, timestep, sample,
                     dmd_sigmas=sigmas, dmd_timesteps=dmd_timesteps,
@@ -1423,55 +1456,69 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 )
                 latents_mean, latents_std = self._latent_stats(z_raw.device)
                 vae_dtype = self.vae.dtype
-                vae_latents = (
-                    clean_candidate.to(dtype=vae_dtype) / latents_std + latents_mean
-                )
-                model_rgb = self.vae.decode(vae_latents, return_dict=False)[0]
                 warp_rgb = context.pixel_warp_rgb.to(
-                    device=model_rgb.device, dtype=model_rgb.dtype,
+                    device=z_raw.device, dtype=vae_dtype,
                 )
-                pixel_visibility = context.pixel_visibility.to(model_rgb.device)
-                mixed_rgb, rgb_metrics = composite_renderer_rgb(
-                    model_rgb, warp_rgb, pixel_visibility,
+                pixel_visibility = context.pixel_visibility.to(z_raw.device)
+                is_final_step = int(step_index) >= len(all_timesteps) - 1
+                sparse_steps = 1
+                sparse_lr = 0.002 if is_final_step else 0.005
+                sparse_lambda_z = 2.0 if is_final_step else 1.0
+
+                def decode_clean(value: torch.Tensor) -> torch.Tensor:
+                    vae_latents = value.to(dtype=vae_dtype) / latents_std + latents_mean
+                    return self.vae.decode(vae_latents, return_dict=False)[0]
+
+                optimized_clean, sparse_metrics = sparse_pixel_constraint(
+                    clean_candidate,
+                    decode_fn=decode_clean,
+                    warp_rgb=warp_rgb,
+                    visibility=pixel_visibility,
+                    steps=sparse_steps,
+                    lr=sparse_lr,
+                    lambda_z=sparse_lambda_z,
+                    max_grad_norm=1.0,
                 )
-                mixed_clean = _encode_vae_deterministic(
-                    self, mixed_rgb.to(dtype=vae_dtype),
-                    latents_mean=latents_mean, latents_std=latents_std,
-                ).to(device=z_raw.device, dtype=z_raw.dtype)
-                if tuple(mixed_clean.shape) != tuple(z_raw.shape):
-                    raise RuntimeError(
-                        f"RGB clamp re-encode {tuple(mixed_clean.shape)} != scheduler {tuple(z_raw.shape)}"
+                if is_final_step:
+                    z_next = optimized_clean
+                else:
+                    dmd_noisy_tensor = step_kwargs.get("dmd_noisy_tensor")
+                    if dmd_noisy_tensor is None:
+                        raise RuntimeError("Helios scheduler call omitted native dmd_noisy_tensor")
+                    z_next = scheduler_align_clean_prediction(
+                        scheduler, optimized_clean,
+                        step_index=step_index,
+                        dmd_noisy_tensor=dmd_noisy_tensor,
+                        dmd_sigmas=sigmas,
+                        dmd_timesteps=dmd_timesteps,
+                        all_timesteps=all_timesteps,
                     )
-                z_next = scheduler_align_clean_prediction(
-                    scheduler, mixed_clean,
-                    step_index=step_index,
-                    stage_start_state=stage_start,
-                    dmd_sigmas=sigmas,
-                    dmd_timesteps=dmd_timesteps,
-                    all_timesteps=all_timesteps,
-                )
-                diagnostic.update(rgb_metrics)
+                diagnostic.update(sparse_metrics)
                 diagnostic.update({
-                    "projection_mask_ratio": rgb_metrics["rgb_visibility_mean"],
-                    "projection_strength_mean": rgb_metrics["rgb_visibility_mean"],
+                    "projection_mask_ratio": pixel_visibility.mean().detach(),
+                    "projection_strength_mean": pixel_visibility.mean().detach(),
                     "projection_delta_ratio": (
                         (z_next.float() - z_raw.float()).norm()
                         / z_raw.float().norm().clamp_min(1e-8)
                     ).detach(),
-                    "unknown_projection_delta_max": rgb_metrics[
-                        "rgb_unknown_exact_model_max_error"
-                    ],
+                    "unknown_projection_delta_max": torch.zeros((), device=z_raw.device),
                     "combined_delta_ratio": (
                         (z_next.float() - z_raw.float()).norm()
                         / z_raw.float().norm().clamp_min(1e-8)
                     ).detach(),
                     "per_step_world_clamp": torch.ones((), device=z_raw.device),
-                    "world_clamp_formula_max_error": rgb_metrics[
-                        "rgb_composite_formula_max_error"
-                    ],
-                    "rgb_pixel_clamp": torch.ones((), device=z_raw.device),
-                    "rgb_clamp_clean_delta_ratio": (
-                        (mixed_clean.float() - clean_model.float()).norm()
+                    "world_clamp_formula_max_error": torch.zeros((), device=z_raw.device),
+                    "sparse_pixel_constraint": torch.ones((), device=z_raw.device),
+                    "sparse_optimizer_created": torch.zeros((), device=z_raw.device),
+                    "sparse_vae_encode_used": torch.zeros((), device=z_raw.device),
+                    "sparse_new_noise_sampled": torch.zeros((), device=z_raw.device),
+                    "sparse_final_sigma_zero": torch.as_tensor(
+                        float(is_final_step), device=z_raw.device,
+                    ),
+                    "sparse_lr": torch.as_tensor(sparse_lr, device=z_raw.device),
+                    "sparse_lambda_z": torch.as_tensor(sparse_lambda_z, device=z_raw.device),
+                    "sparse_clean_delta_ratio": (
+                        (optimized_clean.float() - clean_model.float()).norm()
                         / clean_model.float().norm().clamp_min(1e-8)
                     ).detach(),
                 })
@@ -1488,29 +1535,34 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         try:
             sampled = super().stage2_sample(*args, **kwargs)
             if context.pixel_visibility is None:
-                raise RuntimeError("stage-2 RGB clamp did not retain renderer visibility")
+                raise RuntimeError("stage-2 sparse constraint did not retain renderer visibility")
             context.final_projection_weight = context.pixel_visibility.detach()
             final_step = context.diagnostics[-1] if context.diagnostics else None
             if final_step is None or final_step["stage_id"] != len(context.canonical_latents) - 1:
-                raise RuntimeError("final scheduler step did not record the RGB clamp")
+                raise RuntimeError("final scheduler step did not record the sparse constraint")
             if (
                 final_step["next_sigma"] != 0.0
-                or final_step["rgb_pixel_clamp"] != 1.0
-                or final_step["rgb_composite_formula_max_error"] != 0.0
+                or final_step["sparse_pixel_constraint"] != 1.0
+                or final_step["sparse_final_sigma_zero"] != 1.0
             ):
-                raise RuntimeError("final scheduler output is not a verified sigma-zero RGB clamp")
+                raise RuntimeError("final scheduler output is not a verified sigma-zero sparse constraint")
             context.final_residual_diagnostics = {
                 "sampled_norm": float(sampled.float().norm().detach().cpu()),
                 "composed_norm": float(sampled.float().norm().detach().cpu()),
-                "stage2_rgb_clamp_step_count": int(sum(
-                    item["rgb_pixel_clamp"] == 1.0 for item in context.diagnostics
+                "stage2_sparse_constraint_step_count": int(sum(
+                    item.get("sparse_pixel_constraint", 0.0) == 1.0
+                    for item in context.diagnostics
                 )),
                 "final_step_next_sigma": float(final_step["next_sigma"]),
-                "final_rgb_composite_formula_max_error": float(
-                    final_step["rgb_composite_formula_max_error"]
-                ),
+                "final_sparse_pixel_loss": float(final_step["sparse_pixel_loss"]),
+                "final_sparse_latent_loss": float(final_step["sparse_latent_loss"]),
+                "final_sparse_grad_norm": float(final_step["sparse_grad_norm"]),
                 "final_output_posthoc_clamp_applied": False,
                 "noisy_latent_decoded": False,
+                "rgb_hard_composite_used": False,
+                "composite_rgb_vae_encode_used": False,
+                "optimizer_created": False,
+                "dmd_noisy_tensor_reused": True,
                 "clamp_coverage_threshold_used": False,
                 "clamp_nearest_fill_used": False,
                 "soft_wpf_used": False,

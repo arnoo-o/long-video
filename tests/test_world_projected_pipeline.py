@@ -19,43 +19,24 @@ from long_video.wah.world_projected_pipeline import (
     build_boundary_state_at_sigma,
     build_world_state_at_sigma,
     canonical_support_to_tokens,
-    composite_renderer_rgb,
     compose_canonical_residual,
     fill_invalid_warp_for_vae,
     encode_canonical_video_latents,
     posterior_mode_or_mean,
-    rgb_pixel_clamp_enabled,
+    sparse_pixel_constraint_enabled,
     scheduler_align_clean_prediction,
     scheduler_clean_prediction,
+    sparse_pixel_constraint,
     mask_canonical_latent,
     smooth_latent_visibility,
     world_projection_weight,
 )
 
 
-def test_rgb_pixel_clamp_uses_raw_visibility_without_gap_fill():
-    model = torch.tensor([[[[[0.1, 0.2, 0.3]]]]]).expand(1, 3, 1, 1, 3).clone()
-    warp = torch.tensor([[[[[0.8, 0.9, 1.0]]]]]).expand_as(model).clone()
-    visibility = torch.tensor([[[[[1.0, 0.0, 1.0]]]]])
-    mixed, metrics = composite_renderer_rgb(model, warp, visibility)
-    torch.testing.assert_close(mixed[..., 0], warp[..., 0])
-    torch.testing.assert_close(mixed[..., 1], model[..., 1])
-    torch.testing.assert_close(mixed[..., 2], warp[..., 2])
-    assert float(metrics["rgb_visible_exact_warp_max_error"]) == 0.0
-    assert float(metrics["rgb_unknown_exact_model_max_error"]) == 0.0
-    assert float(metrics["rgb_composite_formula_max_error"]) == 0.0
-
-
-def test_rgb_pixel_clamp_is_stage2_only():
-    assert not rgb_pixel_clamp_enabled(0, 3)
-    assert not rgb_pixel_clamp_enabled(1, 3)
-    assert rgb_pixel_clamp_enabled(2, 3)
-
-
-def test_rgb_pixel_clamp_rejects_soft_or_thresholded_visibility():
-    rgb = torch.zeros(1, 3, 1, 1, 1)
-    with pytest.raises(ValueError):
-        composite_renderer_rgb(rgb, rgb, torch.full((1, 1, 1, 1, 1), 0.9))
+def test_sparse_pixel_constraint_is_stage2_only():
+    assert not sparse_pixel_constraint_enabled(0, 3)
+    assert not sparse_pixel_constraint_enabled(1, 3)
+    assert sparse_pixel_constraint_enabled(2, 3)
 
 
 def test_clean_prediction_and_native_scheduler_alignment_are_used():
@@ -83,12 +64,46 @@ def test_clean_prediction_and_native_scheduler_alignment_are_used():
     )
     torch.testing.assert_close(clean, torch.full_like(clean, 3.0))
     aligned = scheduler_align_clean_prediction(
-        scheduler, clean, step_index=0, stage_start_state=torch.full_like(clean, 8.0),
+        scheduler, clean, step_index=0, dmd_noisy_tensor=torch.full_like(clean, 8.0),
         dmd_sigmas=sigmas, dmd_timesteps=timesteps, all_timesteps=timesteps[:2],
     )
     torch.testing.assert_close(aligned, torch.full_like(clean, 5.0))
     assert scheduler.convert_calls == 1
     assert scheduler.noise_calls == 1
+
+
+def test_sparse_pixel_constraint_is_joint_and_only_updates_latent():
+    base = torch.zeros(1, 1, 2, 1, 2)
+    warp = torch.tensor([[[[[1.0, 5.0]], [[3.0, 7.0]]]]]).expand(1, 3, 2, 1, 2)
+    visibility = torch.tensor([[[[[1.0, 0.0]], [[1.0, 0.0]]]]])
+    decode_calls = []
+
+    def decode(value):
+        decode_calls.append(tuple(value.shape))
+        return value.expand(1, 3, 2, 1, 2)
+
+    optimized, metrics = sparse_pixel_constraint(
+        base, decode_fn=decode, warp_rgb=warp, visibility=visibility,
+        steps=1, lr=0.005, lambda_z=1.0, max_grad_norm=1.0,
+    )
+    assert decode_calls == [tuple(base.shape)]
+    assert optimized.grad_fn is None
+    assert not optimized.requires_grad
+    assert float(optimized[..., 0].abs().sum()) > 0.0
+    assert float(optimized[..., 1].abs().sum()) == 0.0
+    assert float(metrics["sparse_clipped_grad_norm"]) <= 1.0 + 1e-6
+
+
+def test_sparse_pixel_constraint_rejects_soft_visibility():
+    base = torch.zeros(1, 1, 1, 1, 1)
+    with pytest.raises(ValueError):
+        sparse_pixel_constraint(
+            base,
+            decode_fn=lambda value: value.expand(1, 3, 1, 1, 1),
+            warp_rgb=torch.zeros(1, 3, 1, 1, 1),
+            visibility=torch.full((1, 1, 1, 1, 1), 0.5),
+            steps=1, lr=0.005, lambda_z=1.0, max_grad_norm=1.0,
+        )
 
 
 def test_canonical_residual_composition_gives_world_exclusive_known_pixels():

@@ -529,15 +529,20 @@ def main():
         "source_image": str(source_path),
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
-        "generation_mode": "stage2_rgb_pixel_consistency_clamp",
+        "generation_mode": "stage2_sparse_pixel_constraint",
         "canonical_residual_formula": None,
         "soft_wpf_enabled": False,
         "projection": {
-            "mode": "stage2_clean_x0_rgb_pixel_clamp",
+            "mode": "stage2_clean_x0_sparse_pixel_constraint",
             "soft_wpf_enabled": False,
-            "formula": "I_mix=V_renderer*I_warp+(1-V_renderer)*I_model",
+            "formula": "L_pixel=sum(V*abs(D(x0_opt)-I_warp))/(3*sum(V)+eps) + lambda_z*mean((x0_opt-x0_base)^2)",
             "stages": [2],
             "decodes_noisy_latent": False,
+            "joint_33_frame_optimization": True,
+            "optimizer_created": False,
+            "vae_encode_used": False,
+            "step0": {"steps": 1, "lr": 0.005, "lambda_z": 1.0, "max_grad_norm": 1.0},
+            "final": {"steps": 1, "lr": 0.002, "lambda_z": 2.0, "max_grad_norm": 1.0},
             "coverage_threshold_used": False,
             "nearest_fill_used": False,
         },
@@ -557,8 +562,8 @@ def main():
         "wah_warp_rgb_fill": True,
         "wah_safe_support_override": False,
         "wah_world_ownership_override": False,
-        "rgb_clamp_visibility_source": "raw renderer visibility",
-        "rgb_clamp_coverage_threshold": None,
+        "sparse_constraint_visibility_source": "raw renderer visibility",
+        "sparse_constraint_coverage_threshold": None,
         "shared_world_boundary_slot": 0,
         "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
@@ -720,7 +725,7 @@ def main():
                 )
                 boundary_source_global_frame = state.get("boundary_source_global_frame")
                 pipe.set_world_projection_context(projection)
-                pipe.set_rgb_pixel_clamp_context(
+                pipe.set_sparse_pixel_constraint_context(
                     warp.rgb, warp.visibility, height=HEIGHT, width=WIDTH,
                 )
                 try:
@@ -819,22 +824,23 @@ def main():
                         raise RuntimeError(f"stage {stage_id} did not execute {expected_steps} ordered updates")
                     if stage_id == 0 and any(item["boundary_delta_ratio"] != 0.0 for item in stage_items):
                         raise RuntimeError("stage0 Boundary Bridge must remain exactly disabled")
-                    expected_rgb_clamp = 1.0 if stage_id == 2 else 0.0
-                    if any(item["rgb_pixel_clamp"] != expected_rgb_clamp for item in stage_items):
+                    expected_sparse = 1.0 if stage_id == 2 else 0.0
+                    if any(item.get("sparse_pixel_constraint", 0.0) != expected_sparse for item in stage_items):
                         raise RuntimeError(
-                            f"stage {stage_id} RGB clamp activation does not match stage-2-only policy"
+                            f"stage {stage_id} sparse constraint activation does not match stage-2-only policy"
                         )
                     if stage_id < 2 and any(
                         item["projection_strength_mean"] != 0.0 for item in stage_items
                     ):
-                        raise RuntimeError(f"stage {stage_id} unexpectedly applied RGB clamp")
+                        raise RuntimeError(f"stage {stage_id} unexpectedly applied sparse constraint")
                     if stage_id == 2 and any(
-                        item["rgb_visible_exact_warp_max_error"] != 0.0
-                        or item["rgb_unknown_exact_model_max_error"] != 0.0
-                        or item["rgb_composite_formula_max_error"] != 0.0
+                        item["sparse_optimizer_created"] != 0.0
+                        or item["sparse_vae_encode_used"] != 0.0
+                        or item["sparse_new_noise_sampled"] != 0.0
+                        or item["sparse_clipped_grad_norm"] > 1.000001
                         for item in stage_items
                     ):
-                        raise RuntimeError("stage2 RGB pixel composition is not exact")
+                        raise RuntimeError("stage2 sparse pixel constraint invariants failed")
                     if stage_id > 0:
                         next_sigmas = [item["next_sigma"] for item in stage_items]
                         if len(set(next_sigmas)) != expected_steps:
@@ -862,7 +868,7 @@ def main():
                 }
                 projection_weight = projection.final_projection_weight
                 if projection_weight is None or tuple(projection_weight.shape[2:]) != (33, HEIGHT, WIDTH):
-                    raise RuntimeError("RGB clamp visibility must be raw [B,1,33,H,W] pixels")
+                    raise RuntimeError("sparse constraint visibility must be raw [B,1,33,H,W] pixels")
                 projection_weight = projection_weight.detach().float().cpu()
                 chunk_boundary = None
                 if chunk_index > 0:
@@ -1000,9 +1006,9 @@ def main():
                     "world_ownership_binary": True,
                     "world_ownership_coverage_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
                     "world_ownership_applies_to": "Spatial Anchor / Boundary Bridge only",
-                    "rgb_clamp_visibility_source": "raw renderer pixels",
-                    "rgb_clamp_coverage_threshold": None,
-                    "rgb_clamp_nearest_fill_used": False,
+                    "sparse_constraint_visibility_source": "raw renderer pixels",
+                    "sparse_constraint_coverage_threshold": None,
+                    "sparse_constraint_nearest_fill_used": False,
                     "fill_owned_latent_count": fill_owned_latent_count,
                     "world_owned_latent_ratio": world_owned_latent_ratio,
                     "fill_only_latent_abs_max": fill_only_latent_abs_max,
@@ -1052,7 +1058,7 @@ def main():
                     "candidate_readiness": event["readiness"],
                     "projection_stages": stage_diagnostics,
                     "canonical_residual": projection.final_residual_diagnostics,
-                    "rgb_pixel_clamp": projection.final_residual_diagnostics,
+                    "sparse_pixel_constraint": projection.final_residual_diagnostics,
                     "boundary_projection_active": bool(
                         projection.previous_boundary_latents is not None
                     ),

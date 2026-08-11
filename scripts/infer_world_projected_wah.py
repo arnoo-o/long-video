@@ -97,6 +97,7 @@ from long_video.wah.spatial_reanchor import (
     visibility_to_target_tokens,
 )
 from long_video.wah.world_projected_pipeline import (
+    DelayedNodeActivationQueue,
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
     build_world_projection_context,
@@ -282,6 +283,25 @@ def clean_warp_latents(pipe, state, warp):
     finally:
         generator.set_state(saved_rng)
     return clean.detach()
+
+
+def clean_boundary_frame_latent(pipe, state, frame):
+    """Encode the one true stride-32 shared RGB frame with WAH VAE statistics."""
+    generator = state["generator"]
+    saved_rng = generator.get_state()
+    device = pipe._wah_execution_device()
+    tensor = pipe._coerce_warp_video_tensor(
+        np.asarray(frame)[None], height=HEIGHT, width=WIDTH, device=device,
+    ).to(device=device, dtype=pipe.vae.dtype)
+    mean, std = pipe._latent_stats(device)
+    try:
+        latent = pipe.vae.encode(tensor).latent_dist.sample(generator=generator)
+        latent = (latent - mean) * std
+    finally:
+        generator.set_state(saved_rng)
+    if tuple(latent.shape[2:]) != (1, 48, 80):
+        raise RuntimeError(f"single-frame boundary VAE latent shape mismatch: {tuple(latent.shape)}")
+    return latent.detach().to(dtype=torch.float32)
 
 
 def prepare_spatial_context(controller, transformer, clean, warp, poses, intrinsics, start):
@@ -520,10 +540,14 @@ def main():
         "world_promotion_mode": "preserve_parent_append_eligible_novel_points",
         "parent_points_always_rendered": True,
         "generated_points_must_avoid_parent_projection": True,
-        "new_node_render_delay_chunks": 1,
+        "new_node_render_delay_chunks": 2,
+        "maximum_pending_accepted_nodes": 1,
         "boundary_projection": {
-            "source": "previous_chunk_last_3_clean_temporal_latents",
-            "beta": [0.6, 0.3, 0.1],
+            "source": "previous_chunk_true_shared_generated_rgb_frame",
+            "temporal_slots": [0],
+            "beta_max_by_stage": list(projection_config.boundary_beta_max_by_stage),
+            "scheduler_aligned": True,
+            "wpf_uses_remaining_slot0_weight": True,
             "combined_with_wpf_from_same_z_raw": True,
         },
         "uses_future_gt": False,
@@ -541,23 +565,31 @@ def main():
     generated_motion, warp_motion, rotation_motion = [], [], []
     visible_l1 = []
     boundary_generated_l1, boundary_warp_l1, boundary_projection_l1 = [], [], []
-    pending_active_node = None
+    activation_queue = DelayedNodeActivationQueue(delay_chunks=2, max_pending=1)
     try:
         with torch.no_grad():
             for chunk_index in range(ARGS.chunks):
                 chunk_started = time.perf_counter()
                 start = chunk_index * CHUNK_STRIDE
+                scheduled_at_start = activation_queue.pending
+                activated = activation_queue.activate_due(chunk_index)
                 activated_node_id = None
-                if pending_active_node is not None:
-                    renderer.active_node = pending_active_node
-                    activated_node_id = pending_active_node.node_id
-                    pending_active_node = None
+                if activated is not None:
+                    renderer.active_node = activated.node
+                    activated_node_id = activated.node_id
+                scheduled_node_id = (
+                    scheduled_at_start.node_id
+                    if scheduled_at_start is not None else renderer.active_node.node_id
+                )
+                promotion_blocked_by_pending = activation_queue.pending is not None
                 cameras = CameraBatch(
                     poses[start:start + CHUNK_FRAMES],
                     intrinsics[start:start + CHUNK_FRAMES],
                     HEIGHT, WIDTH,
                 )
-                rendered = renderer.render(cameras, frame_start=start)
+                rendered = renderer.render(
+                    cameras, frame_start=start, allow_reactivation=False,
+                )
                 warp = rendered.warp
                 node_at_start = renderer.active_node
                 clean = clean_warp_latents(pipe, state, warp)
@@ -574,10 +606,10 @@ def main():
                     temporal_scale=VAE_TEMPORAL_SCALE,
                     config=projection_config,
                     previous_clean_boundary_latent=state.get(
-                        "previous_chunk_clean_boundary_latents"
+                        "previous_shared_frame_clean_latent"
                     ),
-                    boundary_beta=(0.6, 0.3, 0.1),
                 )
+                boundary_source_global_frame = state.get("boundary_source_global_frame")
                 pipe.set_world_projection_context(projection)
                 try:
                     output, state = pipe.generate_next_chunk(
@@ -597,12 +629,10 @@ def main():
                     raise RuntimeError(f"chunk returned {len(generated)} frames, expected {CHUNK_FRAMES}")
                 if not torch.equal(state["image_latents"], fixed_prefix):
                     raise RuntimeError("AR generation replaced the permanent source prefix")
-                last_clean_latents = state.get("last_latents")
-                if not isinstance(last_clean_latents, torch.Tensor) or last_clean_latents.shape[2] < 3:
-                    raise RuntimeError("AR state did not expose three clean boundary latents")
-                state["previous_chunk_clean_boundary_latents"] = (
-                    last_clean_latents[:, :, -3:].detach().clone()
+                state["previous_shared_frame_clean_latent"] = clean_boundary_frame_latent(
+                    pipe, state, generated[-1],
                 )
+                state["boundary_source_global_frame"] = int(start + CHUNK_STRIDE)
 
                 first = 0 if chunk_index == 0 else 1
                 memory_generated = generated[first:]
@@ -619,8 +649,19 @@ def main():
                     cameras=memory_cameras,
                     warp=memory_warp,
                     frame_start=start + first,
+                    allow_candidate_promotion=not promotion_blocked_by_pending,
                 )
-                pending_active_node = next_active
+                candidate_schedule = None
+                if event.get("accepted"):
+                    candidate_schedule = activation_queue.schedule(
+                        next_active, created_after_chunk=chunk_index,
+                    )
+                scheduled_node_id = (
+                    activation_queue.pending.node_id
+                    if activation_queue.pending is not None
+                    else (activated.node_id if activated is not None else renderer.active_node.node_id)
+                )
+                activation_plan_for_record = activation_queue.pending or activated
                 metrics = event.get("metrics") or {}
                 verified_ratio = None
                 promotion_metrics = {}
@@ -651,6 +692,8 @@ def main():
                         raise RuntimeError(f"stage {stage_id} did not execute {expected_steps} ordered updates")
                     if stage_id == 0 and any(item["projection_delta_ratio"] != 0.0 for item in stage_items):
                         raise RuntimeError("stage0 World Projection must remain exactly disabled")
+                    if stage_id == 0 and any(item["boundary_delta_ratio"] != 0.0 for item in stage_items):
+                        raise RuntimeError("stage0 Boundary Bridge must remain exactly disabled")
                     if stage_id > 0:
                         next_sigmas = [item["next_sigma"] for item in stage_items]
                         if len(set(next_sigmas)) != expected_steps:
@@ -658,6 +701,27 @@ def main():
                         strengths = [item["projection_strength_mean"] for item in stage_items]
                         if any(right < left for left, right in zip(strengths, strengths[1:])):
                             raise RuntimeError(f"stage {stage_id} projection strength did not increase")
+                        boundary_strengths = [item["boundary_strength"] for item in stage_items]
+                        if projection.previous_boundary_latents is not None and any(
+                            right < left for left, right in zip(
+                                boundary_strengths, boundary_strengths[1:],
+                            )
+                        ):
+                            raise RuntimeError(
+                                f"stage {stage_id} Boundary Bridge strength did not increase"
+                            )
+                boundary_non_slot0_delta_max = max(
+                    item["boundary_non_slot0_delta_max"] for item in stage_diagnostics
+                )
+                if boundary_non_slot0_delta_max != 0.0:
+                    raise RuntimeError("Boundary Bridge changed temporal slots 1..8")
+                boundary_delta_ratio_by_stage = {
+                    str(stage_id): [
+                        item["boundary_delta_ratio"] for item in stage_diagnostics
+                        if item["stage_id"] == stage_id
+                    ]
+                    for stage_id in range(len(PYRAMID_STEPS))
+                }
                 projection_weight = projection.final_projection_weight
                 if projection_weight is None or tuple(projection_weight.shape[2:]) != (9, 48, 80):
                     raise RuntimeError("final stage projection weight must be [B,1,9,48,80]")
@@ -712,12 +776,32 @@ def main():
                 record = {
                     "chunk_index": chunk_index,
                     "active_node_id": node_at_start.node_id,
-                    "active_node_for_next_chunk": next_active.node_id,
+                    "active_node_for_next_chunk": renderer.active_node.node_id,
                     "node_activated_at_chunk_start": activated_node_id,
+                    "scheduled_node_id": scheduled_node_id,
+                    "render_node_id": node_at_start.node_id,
+                    "pending_node_id": (
+                        activation_queue.pending.node_id if activation_queue.pending else None
+                    ),
+                    "created_after_chunk": (
+                        activation_plan_for_record.created_after_chunk
+                        if activation_plan_for_record else None
+                    ),
+                    "activate_at_chunk": (
+                        activation_plan_for_record.activate_at_chunk
+                        if activation_plan_for_record else None
+                    ),
+                    "candidate_created_after_chunk": (
+                        candidate_schedule.created_after_chunk if candidate_schedule else None
+                    ),
+                    "candidate_activate_at_chunk": (
+                        candidate_schedule.activate_at_chunk if candidate_schedule else None
+                    ),
                     "candidate_renderable_from_chunk": (
-                        chunk_index + 1 if event.get("accepted") else None
+                        candidate_schedule.activate_at_chunk if candidate_schedule else None
                     ),
                     "candidate_rendered_in_creation_chunk": False,
+                    "candidate_promotion_blocked_by_pending": promotion_blocked_by_pending,
                     "world_coverage": float(np.asarray(warp.coverage_per_frame).mean()),
                     "world_confidence_mean": float(confidence[visible].mean() if visible.any() else 0.0),
                     "candidate_created": "candidate_id" in event,
@@ -738,8 +822,11 @@ def main():
                     "boundary_projection_active": bool(
                         projection.previous_boundary_latents is not None
                     ),
+                    "boundary_source_global_frame": boundary_source_global_frame,
+                    "boundary_delta_ratio_by_stage": boundary_delta_ratio_by_stage,
+                    "boundary_non_slot0_delta_max": boundary_non_slot0_delta_max,
                     "saved_clean_boundary_latent_shape": list(
-                        state["previous_chunk_clean_boundary_latents"].shape
+                        state["previous_shared_frame_clean_latent"].shape
                     ),
                     "chunk_boundary": chunk_boundary,
                     "stage_shapes": stage_shapes,
@@ -761,8 +848,6 @@ def main():
                 print(json.dumps({"event": "chunk_complete", **record}), flush=True)
                 clear_decoded_history(state)
                 del generated, clean, projection, output
-            if pending_active_node is not None:
-                renderer.active_node = pending_active_node
     except Exception as error:
         startup.update({"state": "failed", "error": repr(error)})
         write_json(ARGS.output / "status.json", startup)

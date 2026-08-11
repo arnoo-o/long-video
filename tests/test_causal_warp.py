@@ -19,11 +19,13 @@ class _Store:
 class _Manager:
     def __init__(self):
         self.nodes = {}
+        self.reactivation_calls = 0
 
     def register(self, node):
         self.nodes[node.node_id] = node
 
     def maybe_reactivate(self, node, cameras):
+        self.reactivation_calls += 1
         assert len(cameras.c2w) == 2
         return node, None
 
@@ -49,3 +51,23 @@ def test_causal_warp_provenance_is_m0_only_and_no_future_gt(monkeypatch):
     assert result.provenance["node_mode"] == "M0-only"
     assert result.provenance["available_node_ids"] == ["node_000"]
     assert result.warp.rgb_content_origin[0, 0, 0] == "oracle_source"
+
+
+def test_explicit_scheduled_render_node_disables_reactivation(monkeypatch):
+    monkeypatch.setattr(causal_warp, "render", lambda node, cameras, **kwargs: WarpBatch(
+        rgb=np.zeros((1, 2, 2, 3), np.float32),
+        depth=np.ones((1, 2, 2), np.float32),
+        visibility=np.ones((1, 2, 2), bool),
+        confidence=np.ones((1, 2, 2), np.float32),
+        source=np.zeros((1, 2, 2), np.int8),
+        coverage_per_frame=np.ones(1, np.float32),
+    ))
+    manager = _Manager()
+    renderer = causal_warp.CausalActiveNodeRenderer(_Store(), manager=manager)
+    result = renderer.render(
+        CameraBatch(np.eye(4, dtype=np.float32)[None], np.eye(3, dtype=np.float32)[None], 2, 2),
+        frame_start=32,
+        allow_reactivation=False,
+    )
+    assert manager.reactivation_calls == 0
+    assert result.provenance["selection"] == "explicit_scheduled_render_node"

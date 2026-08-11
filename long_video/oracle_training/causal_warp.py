@@ -35,13 +35,15 @@ class CausalActiveNodeRenderer:
         self.node_mode = "M0-only"
         self.events = []
 
-    def render(self, cameras: CameraBatch, *, frame_start: int):
+    def render(self, cameras: CameraBatch, *, frame_start: int, allow_reactivation: bool = True):
         if int(frame_start) < int(self.active_node.created_frame):
             raise ValueError("causal renderer cannot render before the active node was created")
         active_before = self.active_node.node_id
-        self.active_node, reactivation = self.manager.maybe_reactivate(
-            self.active_node, cameras,
-        )
+        reactivation = None
+        if allow_reactivation:
+            self.active_node, reactivation = self.manager.maybe_reactivate(
+                self.active_node, cameras,
+            )
         warp = attach_warp_provenance(render(
             self.active_node, cameras, **self.renderer_kwargs,
         ), self.active_node)
@@ -51,7 +53,10 @@ class CausalActiveNodeRenderer:
             "active_node_at_start": active_before,
             "active_node_id": self.active_node.node_id,
             "available_node_ids": sorted(self.manager.nodes),
-            "selection": "MemoryManager.maybe_reactivate",
+            "selection": (
+                "MemoryManager.maybe_reactivate" if allow_reactivation
+                else "explicit_scheduled_render_node"
+            ),
             "renderer": "long_video.geometry.point_renderer.render",
             "node_mode": self.node_mode,
             "frame_start": int(frame_start),

@@ -526,7 +526,8 @@ class MemoryManager:
         self.state = self.ACTIVE_NEW_NODE
         return candidate
 
-    def process_chunk(self, active_node, generated_rgb_for_memory, cameras, warp, frame_start, **forbidden):
+    def process_chunk(self, active_node, generated_rgb_for_memory, cameras, warp, frame_start,
+                      *, allow_candidate_promotion=True, **forbidden):
         from ..oracle_training.contracts import assert_no_supervision_content
         assert_no_supervision_content(forbidden, "MemoryManager")
         generated_frame_count = len(generated_rgb_for_memory)
@@ -547,7 +548,8 @@ class MemoryManager:
         self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
         readiness = self.readiness_report(mean_coverage)
         event["readiness"] = readiness
-        if (self.state==self.TRANSITION and readiness["ready"] and
+        event["candidate_promotion_blocked"] = not bool(allow_candidate_promotion)
+        if (allow_candidate_promotion and self.state==self.TRANSITION and readiness["ready"] and
                 self.buffer.can_attempt(candidate_created_frame)):
             candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)

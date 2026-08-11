@@ -89,3 +89,23 @@ def test_candidate_created_frame_is_last_inclusive_generated_frame():
     manager.process_chunk(active, generated, None, warp, frame_start=33)
 
     assert captured["created_frame"] == 64
+
+
+def test_pending_activation_blocks_candidate_without_replacing_history_path():
+    manager = MemoryManager(low_coverage_chunks=0)
+    manager.buffer = SimpleNamespace(can_attempt=lambda frame: True)
+    manager._append_chunk = lambda *args, **kwargs: None
+    manager.readiness_report = lambda _overlap=None: {"ready": True}
+    manager.build_candidate = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("pending activation must prevent candidate construction")
+    )
+    active = SimpleNamespace(node_id="node_000")
+    generated = np.zeros((32, 1, 1, 3), np.uint8)
+    warp = SimpleNamespace(coverage_per_frame=np.zeros(32, np.float32))
+    returned, event = manager.process_chunk(
+        active, generated, None, warp, frame_start=65,
+        allow_candidate_promotion=False,
+    )
+    assert returned is active
+    assert event["candidate_promotion_blocked"] is True
+    assert "candidate_id" not in event

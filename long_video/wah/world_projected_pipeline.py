@@ -6,6 +6,7 @@ therefore leaves training and ordinary inference unchanged.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,7 @@ except ImportError:  # Keep CPU helper tests importable without the submodule.
 @dataclass(frozen=True)
 class WorldProjectionConfig:
     lambda_max_by_stage: tuple[float, ...] = (0.0, 0.15, 0.30)
+    boundary_beta_max_by_stage: tuple[float, ...] = (0.0, 0.10, 0.20)
     gamma: float = 1.0
     confidence_ramp_min: float = 0.2
     confidence_ramp_max: float = 0.5
@@ -32,6 +34,10 @@ class WorldProjectionConfig:
             raise ValueError("lambda_max_by_stage must not be empty")
         if any(not 0.0 <= value <= 1.0 for value in self.lambda_max_by_stage):
             raise ValueError("every stage lambda_max must be in [0, 1]")
+        if len(self.boundary_beta_max_by_stage) != len(self.lambda_max_by_stage):
+            raise ValueError("boundary beta stages must match world projection stages")
+        if any(not 0.0 <= value <= 1.0 for value in self.boundary_beta_max_by_stage):
+            raise ValueError("every stage boundary beta_max must be in [0, 1]")
         if self.gamma < 0.0:
             raise ValueError("gamma must be non-negative")
         if not 0.0 <= self.confidence_ramp_min < self.confidence_ramp_max <= 1.0:
@@ -42,6 +48,67 @@ class WorldProjectionConfig:
             raise ValueError(f"no projection lambda configured for stage {stage_id}")
         return float(self.lambda_max_by_stage[int(stage_id)])
 
+    def boundary_beta_max(self, stage_id: int) -> float:
+        if not 0 <= int(stage_id) < len(self.boundary_beta_max_by_stage):
+            raise ValueError(f"no boundary beta configured for stage {stage_id}")
+        return float(self.boundary_beta_max_by_stage[int(stage_id)])
+
+
+@dataclass(frozen=True)
+class ScheduledNodeActivation:
+    node: Any
+    created_after_chunk: int
+    activate_at_chunk: int
+
+    @property
+    def node_id(self) -> str:
+        return str(self.node.node_id)
+
+
+class DelayedNodeActivationQueue:
+    """A one-entry FIFO whose schedule cannot be overwritten by newer nodes."""
+
+    def __init__(self, delay_chunks: int = 2, max_pending: int = 1):
+        if int(delay_chunks) != 2:
+            raise ValueError("Validated Causal World activation delay is fixed at two chunks")
+        if int(max_pending) != 1:
+            raise ValueError("this experiment permits exactly one pending accepted node")
+        self.delay_chunks = int(delay_chunks)
+        self.max_pending = int(max_pending)
+        self._queue: deque[ScheduledNodeActivation] = deque()
+
+    def __len__(self) -> int:
+        return len(self._queue)
+
+    @property
+    def pending(self) -> ScheduledNodeActivation | None:
+        return self._queue[0] if self._queue else None
+
+    def schedule(self, node: Any, *, created_after_chunk: int) -> ScheduledNodeActivation:
+        if self._queue:
+            raise RuntimeError(
+                f"cannot replace pending activation {self._queue[0].node_id} with {node.node_id}"
+            )
+        entry = ScheduledNodeActivation(
+            node=node,
+            created_after_chunk=int(created_after_chunk),
+            activate_at_chunk=int(created_after_chunk) + self.delay_chunks,
+        )
+        self._queue.append(entry)
+        return entry
+
+    def activate_due(self, chunk_index: int) -> ScheduledNodeActivation | None:
+        if not self._queue:
+            return None
+        entry = self._queue[0]
+        if int(chunk_index) < entry.activate_at_chunk:
+            return None
+        if int(chunk_index) > entry.activate_at_chunk:
+            raise RuntimeError(
+                f"missed activation of {entry.node_id} at chunk {entry.activate_at_chunk}"
+            )
+        return self._queue.popleft()
+
 
 @dataclass
 class WorldProjectionContext:
@@ -50,7 +117,6 @@ class WorldProjectionContext:
     confidence: list[torch.Tensor]
     config: WorldProjectionConfig = field(default_factory=WorldProjectionConfig)
     previous_boundary_latents: list[torch.Tensor] | None = None
-    boundary_beta: tuple[float, ...] = (0.6, 0.3, 0.1)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     final_projection_weight: torch.Tensor | None = None
 
@@ -69,8 +135,6 @@ class WorldProjectionContext:
                     f"stage {stage_id} support shape mismatch: latent={tuple(latent.shape)} "
                     f"visibility={tuple(visible.shape)} confidence={tuple(confidence.shape)}"
                 )
-        if any(not 0.0 <= value <= 1.0 for value in self.boundary_beta):
-            raise ValueError("boundary beta values must be in [0, 1]")
         if self.previous_boundary_latents is not None:
             if len(self.previous_boundary_latents) != count:
                 raise ValueError("boundary pyramid must match world stage count")
@@ -78,7 +142,7 @@ class WorldProjectionContext:
                 self.canonical_latents, self.previous_boundary_latents,
             )):
                 expected = (
-                    world.shape[0], world.shape[1], len(self.boundary_beta),
+                    world.shape[0], world.shape[1], 1,
                     world.shape[3], world.shape[4],
                 )
                 if tuple(boundary.shape) != expected:
@@ -203,7 +267,6 @@ def build_world_projection_context(
     temporal_scale: int = 4,
     config: WorldProjectionConfig | None = None,
     previous_clean_boundary_latent: torch.Tensor | None = None,
-    boundary_beta: tuple[float, ...] = (0.6, 0.3, 0.1),
 ) -> WorldProjectionContext:
     canonical = build_canonical_world_pyramid(clean_latent, stage_count)
     full_visibility = pixel_support_to_latent(
@@ -232,10 +295,10 @@ def build_world_projection_context(
     boundary = None
     if previous_clean_boundary_latent is not None:
         previous = previous_clean_boundary_latent.detach()
-        if previous.ndim != 5 or previous.shape[2] != len(boundary_beta):
+        if previous.ndim != 5 or previous.shape[2] != 1:
             raise ValueError(
-                "previous clean boundary latent must be [B,C,len(beta),H,W], "
-                f"got {tuple(previous.shape)} for beta={boundary_beta}"
+                "previous clean boundary latent must be [B,C,1,H,W], "
+                f"got {tuple(previous.shape)}"
             )
         boundary = build_canonical_world_pyramid(previous, stage_count)
     return WorldProjectionContext(
@@ -244,7 +307,6 @@ def build_world_projection_context(
         confidence=confidence_pyramid,
         config=config or WorldProjectionConfig(),
         previous_boundary_latents=boundary,
-        boundary_beta=tuple(float(value) for value in boundary_beta),
     )
 
 
@@ -275,6 +337,31 @@ def build_world_state_at_sigma(
         sigma * stage_start_state.float()
         + (1.0 - sigma) * canonical_endpoint.to(stage_start_state.device).float()
     ).to(stage_start_state.dtype)
+
+
+def build_boundary_state_at_sigma(
+    *,
+    next_sigma: float | torch.Tensor,
+    clean_boundary_endpoint: torch.Tensor,
+    stage_start_state: torch.Tensor,
+) -> torch.Tensor:
+    """Put the shared-frame endpoint in the active stage scheduler coordinate."""
+    expected = (
+        stage_start_state.shape[0], stage_start_state.shape[1], 1,
+        stage_start_state.shape[3], stage_start_state.shape[4],
+    )
+    if tuple(clean_boundary_endpoint.shape) != expected:
+        raise ValueError(
+            f"boundary endpoint {tuple(clean_boundary_endpoint.shape)} != {expected}"
+        )
+    sigma = torch.as_tensor(
+        next_sigma, device=stage_start_state.device, dtype=torch.float32,
+    ).clamp(0.0, 1.0)
+    while sigma.ndim < stage_start_state.ndim:
+        sigma = sigma.unsqueeze(-1)
+    start_slot = stage_start_state[:, :, 0:1].float()
+    endpoint = clean_boundary_endpoint.to(stage_start_state.device).float()
+    return (sigma * start_slot + (1.0 - sigma) * endpoint).to(stage_start_state.dtype)
 
 
 def apply_world_projection(
@@ -331,8 +418,8 @@ def apply_world_and_boundary_projection(
     visibility: torch.Tensor,
     confidence: torch.Tensor,
     *,
-    previous_boundary: torch.Tensor | None,
-    boundary_beta: tuple[float, ...] = (0.6, 0.3, 0.1),
+    boundary_state: torch.Tensor | None,
+    boundary_beta_max: float = 0.0,
     sigma: float | torch.Tensor,
     lambda_max: float = 0.5,
     gamma: float = 1.0,
@@ -350,29 +437,29 @@ def apply_world_and_boundary_projection(
         device=z_raw.device,
     )
     raw = z_raw.float()
-    world_delta = world_strength * (z_world.float() - raw)
+    effective_world_strength = world_strength.clone()
     boundary_delta = torch.zeros_like(raw)
-    beta_tensor = torch.zeros(
-        (1, 1, z_raw.shape[2], 1, 1), device=z_raw.device, dtype=torch.float32,
-    )
-    if previous_boundary is not None:
-        frame_count = len(boundary_beta)
+    boundary_schedule = torch.zeros((), device=z_raw.device, dtype=torch.float32)
+    if boundary_state is not None:
         expected = (
-            z_raw.shape[0], z_raw.shape[1], frame_count,
+            z_raw.shape[0], z_raw.shape[1], 1,
             z_raw.shape[3], z_raw.shape[4],
         )
-        if tuple(previous_boundary.shape) != expected:
+        if tuple(boundary_state.shape) != expected:
             raise ValueError(
-                f"previous boundary shape {tuple(previous_boundary.shape)} != {expected}"
+                f"boundary state shape {tuple(boundary_state.shape)} != {expected}"
             )
-        beta_tensor[:, :, :frame_count] = torch.as_tensor(
-            boundary_beta, device=z_raw.device, dtype=torch.float32,
-        ).view(1, 1, frame_count, 1, 1)
-        previous_aligned = raw.clone()
-        previous_aligned[:, :, :frame_count] = previous_boundary.to(
-            device=z_raw.device, dtype=torch.float32,
+        sigma_value = torch.as_tensor(
+            sigma, device=z_raw.device, dtype=torch.float32,
+        ).clamp(0.0, 1.0)
+        boundary_schedule = float(boundary_beta_max) * (1.0 - sigma_value)
+        boundary_delta[:, :, 0:1] = boundary_schedule * (
+            boundary_state.to(device=z_raw.device, dtype=torch.float32)
+            - raw[:, :, 0:1]
         )
-        boundary_delta = beta_tensor * (previous_aligned - raw)
+        # Boundary owns beta of slot0; WPF receives only its remaining convex weight.
+        effective_world_strength[:, :, 0:1] *= 1.0 - boundary_schedule
+    world_delta = effective_world_strength * (z_world.float() - raw)
     combined = (raw + boundary_delta + world_delta).to(z_raw.dtype)
     unknown = visibility.to(device=z_raw.device) == 0
     unknown_world_delta_max = (
@@ -381,21 +468,28 @@ def apply_world_and_boundary_projection(
     )
     if float(unknown_world_delta_max.detach().cpu()) != 0.0:
         raise RuntimeError("world projection changed a V=0 latent element")
+    non_slot0_delta_max = (
+        boundary_delta[:, :, 1:].abs().max()
+        if z_raw.shape[2] > 1 else torch.zeros((), device=z_raw.device)
+    )
+    if float(non_slot0_delta_max.detach().cpu()) != 0.0:
+        raise RuntimeError("Boundary Bridge changed a non-slot0 temporal latent")
     return combined, {
         "lambda": schedule.detach(),
-        "projection_mask_ratio": (world_strength > 0).float().mean().detach(),
-        "projection_strength_mean": world_strength.mean().detach(),
+        "projection_mask_ratio": (effective_world_strength > 0).float().mean().detach(),
+        "projection_strength_mean": effective_world_strength.mean().detach(),
         "projection_delta_ratio": (
             world_delta.norm() / raw.norm().clamp_min(1e-8)
         ).detach(),
         "unknown_projection_delta_max": unknown_world_delta_max.detach(),
         "boundary_active": torch.as_tensor(
-            previous_boundary is not None, device=z_raw.device, dtype=torch.float32,
+            boundary_state is not None, device=z_raw.device, dtype=torch.float32,
         ),
-        "boundary_strength_mean": beta_tensor.mean().detach(),
+        "boundary_strength": boundary_schedule.detach(),
         "boundary_delta_ratio": (
             boundary_delta.norm() / raw.norm().clamp_min(1e-8)
         ).detach(),
+        "boundary_non_slot0_delta_max": non_slot0_delta_max.detach(),
         "combined_delta_ratio": (
             (boundary_delta + world_delta).norm() / raw.norm().clamp_min(1e-8)
         ).detach(),
@@ -474,16 +568,24 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             )
             config = context.config
             stage_lambda_max = config.lambda_max(stage_id)
-            boundary = (
+            boundary_endpoint = (
                 None if context.previous_boundary_latents is None
                 else context.previous_boundary_latents[stage_id].to(
                     device=z_raw.device, dtype=z_raw.dtype,
                 )
             )
+            boundary_state = (
+                None if boundary_endpoint is None else build_boundary_state_at_sigma(
+                    next_sigma=next_sigma,
+                    clean_boundary_endpoint=boundary_endpoint,
+                    stage_start_state=stage_start,
+                )
+            )
+            boundary_beta_max = config.boundary_beta_max(stage_id)
             projected, diagnostic = apply_world_and_boundary_projection(
                 z_raw, z_world, visible, confidence,
-                previous_boundary=boundary,
-                boundary_beta=context.boundary_beta,
+                boundary_state=boundary_state,
+                boundary_beta_max=boundary_beta_max,
                 sigma=next_sigma,
                 lambda_max=stage_lambda_max,
                 gamma=config.gamma,
@@ -499,6 +601,13 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 confidence_ramp_max=config.confidence_ramp_max,
                 device=z_raw.device,
             )[0].detach()
+            if boundary_state is not None:
+                beta = float(boundary_beta_max) * (
+                    1.0 - torch.as_tensor(
+                        next_sigma, device=z_raw.device, dtype=torch.float32,
+                    ).clamp(0.0, 1.0)
+                )
+                context.final_projection_weight[:, :, 0:1] *= 1.0 - beta
             context.diagnostics.append({
                 "stage_id": int(stage_id),
                 "step_id": int(step_index),

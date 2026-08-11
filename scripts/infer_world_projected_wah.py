@@ -271,17 +271,14 @@ def load_phase_a_zero(transformer, checkpoint):
 def clean_warp_latents(
     pipe, state, warp, *, canonical_warp_rgb=None, return_first_frame=False,
 ):
-    """Encode the chunk's already-filled canonical warp deterministically."""
+    """Encode world-only latents without touching WAH state or generator RNG."""
     if canonical_warp_rgb is None:
         canonical_warp_rgb = fill_invalid_warp_for_vae(warp.rgb, warp.visibility)
-    pipe._prepare_autoregressive_warp_chunk(
-        state,
-        canonical_warp_rgb,
-        np.asarray(warp.visibility, np.float32)[None, None],
-        np.asarray(warp.confidence * warp.visibility, np.float32)[None, None],
-    )
-    raw = state["online_warp_video_tensor"]
     device = pipe._wah_execution_device()
+    raw = pipe._coerce_warp_video_tensor(
+        canonical_warp_rgb,
+        height=int(state["height"]), width=int(state["width"]), device=device,
+    )
     mean, std = pipe._latent_stats(device)
     first_frame_latent, clean = encode_canonical_video_latents(
         pipe,
@@ -552,10 +549,14 @@ def main():
             [13, 14, 15, 16], [17, 18, 19, 20], [21, 22, 23, 24],
             [25, 26, 27, 28], [29, 30, 31, 32],
         ],
-        "canonical_support_shared_by": ["WAH"],
+        "canonical_support_shared_by": ["Spatial Anchor", "Boundary Bridge"],
         "canonical_safe_support_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
         "world_ownership_binary": True,
-        "world_ownership_applies_to": ["WAH conditioning only"],
+        "world_ownership_applies_to": ["Spatial Anchor", "Boundary Bridge"],
+        "wah_conditioning_path": "pinned_original",
+        "wah_warp_rgb_fill": True,
+        "wah_safe_support_override": False,
+        "wah_world_ownership_override": False,
         "rgb_clamp_visibility_source": "raw renderer visibility",
         "rgb_clamp_coverage_threshold": None,
         "shared_world_boundary_slot": 0,
@@ -722,16 +723,6 @@ def main():
                 pipe.set_rgb_pixel_clamp_context(
                     warp.rgb, warp.visibility, height=HEIGHT, width=WIDTH,
                 )
-                pipe.set_canonical_warp_conditioning(
-                    canonical_warp_rgb, clean,
-                    first_frame_latent=canonical_first_frame_latent,
-                    canonical_support=canonical_support,
-                    pixel_visibility=np.asarray(warp.visibility, np.float32)[None, None],
-                    pixel_confidence=np.asarray(
-                        warp.confidence * warp.visibility, np.float32,
-                    )[None, None],
-                    height=HEIGHT, width=WIDTH,
-                )
                 try:
                     output, state = pipe.generate_next_chunk(
                         state,
@@ -744,13 +735,8 @@ def main():
                     )
                 finally:
                     pipe.clear_world_projection_context()
-                    pipe.clear_canonical_warp_conditioning()
                     controller.clear_context()
-                canonical_conditioning_cache_hit = bool(
-                    getattr(pipe, "_canonical_conditioning_cache_hit", False)
-                )
-                if not canonical_conditioning_cache_hit:
-                    raise RuntimeError("WAH discarded the cached canonical first-frame/warp latents")
+                canonical_conditioning_cache_hit = None
                 generated = video_array(output)
                 if len(generated) != CHUNK_FRAMES:
                     raise RuntimeError(f"chunk returned {len(generated)} frames, expected {CHUNK_FRAMES}")
@@ -1006,12 +992,14 @@ def main():
                     "world_confidence_mean": float(confidence[visible].mean() if visible.any() else 0.0),
                     "canonical_support_shape": list(canonical_support.safe_support.shape),
                     "canonical_conditioning_cache_hit": canonical_conditioning_cache_hit,
+                    "wah_conditioning_path": "pinned_original",
+                    "wah_safe_support_override": False,
                     "canonical_visibility_mean": float(canonical_support.visibility.mean()),
                     "canonical_safe_support_mean": float(canonical_support.safe_support.mean()),
                     "canonical_confidence_mean": float(canonical_support.confidence.mean()),
                     "world_ownership_binary": True,
                     "world_ownership_coverage_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
-                    "world_ownership_applies_to": "WAH conditioning only",
+                    "world_ownership_applies_to": "Spatial Anchor / Boundary Bridge only",
                     "rgb_clamp_visibility_source": "raw renderer pixels",
                     "rgb_clamp_coverage_threshold": None,
                     "rgb_clamp_nearest_fill_used": False,

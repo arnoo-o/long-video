@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument("--chunks", type=int, default=16)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--disable-anchor-adapter", action="store_true")
+    parser.add_argument("--disable-camera-adapter", action="store_true")
+    parser.add_argument("--disable-spatial-warp", action="store_true")
+    parser.add_argument("--node-activation-delay-chunks", type=int, choices=(1, 2), default=2)
     parser.add_argument("--lambda-max-stage0", type=float, default=0.0)
     parser.add_argument("--lambda-max-stage1", type=float, default=0.15)
     parser.add_argument("--lambda-max-stage2", type=float, default=0.30)
@@ -314,6 +318,7 @@ def clean_boundary_frame_latent(pipe, state, frame):
 
 def prepare_spatial_context(
     controller, transformer, clean, canonical_support, poses, intrinsics, start,
+    *, anchor_enabled=True, camera_enabled=True, spatial_warp_enabled=True,
 ):
     patch = tuple(int(value) for value in transformer.config.patch_size)
     stage_contexts, shapes = [], []
@@ -362,9 +367,9 @@ def prepare_spatial_context(
         })
     controller.prepare_context(
         stage_contexts=stage_contexts,
-        anchor_enabled=True,
-        camera_enabled=True,
-        spatial_warp_enabled=True,
+        anchor_enabled=bool(anchor_enabled),
+        camera_enabled=bool(camera_enabled),
+        spatial_warp_enabled=bool(spatial_warp_enabled),
     )
     return shapes
 
@@ -527,8 +532,15 @@ def main():
         "source_image": str(source_path),
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
-        "projection": vars(projection_config),
-        "wpf_temporal_warmup": list(projection_config.temporal_warmup),
+        "generation_mode": "canonical_residual",
+        "canonical_residual_formula": "L=B+(1-M)*R; B=M*E(W)",
+        "soft_wpf_enabled": False,
+        "projection": {
+            "mode": "canonical_residual",
+            "soft_wpf_enabled": False,
+            "formula": "L=B+(1-M)*R; B=M*E(W)",
+        },
+        "legacy_soft_wpf_parameters_ignored": vars(projection_config),
         "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
         "canonical_warp_vae_fill": "per_frame_nearest_visible_with_chunk_mean_fallback",
         "canonical_support_temporal_groups": [
@@ -536,7 +548,7 @@ def main():
             [13, 14, 15, 16], [17, 18, 19, 20], [21, 22, 23, 24],
             [25, 26, 27, 28], [29, 30, 31, 32],
         ],
-        "canonical_support_shared_by": ["WAH", "Spatial Anchor", "WPF"],
+        "canonical_support_shared_by": ["WAH", "Canonical Residual Base"],
         "canonical_safe_support_threshold": WAH_VISIBLE_TOKEN_THRESHOLD,
         "shared_world_boundary_slot": 0,
         "source_world_filter": source_world_filter,
@@ -549,13 +561,16 @@ def main():
             "translation": 2.5,
             "view_change_degrees": 25.0,
             "mean_new_area_ratio": 0.05,
-            "maximum_mean_world_overlap_exclusive": 0.20,
+            "maximum_mean_world_overlap_inclusive": 0.50,
             "secondary_rejection_gates": [],
         },
         "world_promotion_mode": "preserve_parent_append_eligible_novel_points",
         "parent_points_always_rendered": True,
         "generated_points_must_avoid_parent_projection": True,
-        "new_node_render_delay_chunks": 2,
+        "anchor_adapter_enabled": not ARGS.disable_anchor_adapter,
+        "camera_adapter_enabled": not ARGS.disable_camera_adapter,
+        "spatial_warp_enabled": not ARGS.disable_spatial_warp,
+        "new_node_render_delay_chunks": ARGS.node_activation_delay_chunks,
         "maximum_pending_accepted_nodes": 1,
         "boundary_projection": {
             "source": "previous_chunk_true_shared_generated_rgb_frame",
@@ -563,7 +578,8 @@ def main():
             "beta_max_by_stage": list(projection_config.boundary_beta_max_by_stage),
             "scheduler_aligned": True,
             "wpf_uses_remaining_slot0_weight": False,
-            "combined_with_wpf_from_same_z_raw": True,
+            "combined_with_wpf_from_same_z_raw": False,
+            "combined_with_residual_scheduler_output": True,
         },
         "uses_future_gt": False,
         "chunks_total": ARGS.chunks,
@@ -580,7 +596,9 @@ def main():
     generated_motion, warp_motion, rotation_motion = [], [], []
     visible_l1 = []
     boundary_generated_l1, boundary_warp_l1, boundary_projection_l1 = [], [], []
-    activation_queue = DelayedNodeActivationQueue(delay_chunks=2, max_pending=1)
+    activation_queue = DelayedNodeActivationQueue(
+        delay_chunks=ARGS.node_activation_delay_chunks, max_pending=1,
+    )
     try:
         with torch.no_grad():
             for chunk_index in range(ARGS.chunks):
@@ -675,6 +693,9 @@ def main():
                     controller, pipe.transformer, clean, canonical_support,
                     poses[start:start + CHUNK_FRAMES],
                     intrinsics[start:start + CHUNK_FRAMES], start,
+                    anchor_enabled=not ARGS.disable_anchor_adapter,
+                    camera_enabled=not ARGS.disable_camera_adapter,
+                    spatial_warp_enabled=not ARGS.disable_spatial_warp,
                 )
                 projection = build_world_projection_context(
                     clean,
@@ -1008,6 +1029,7 @@ def main():
                     },
                     "candidate_readiness": event["readiness"],
                     "projection_stages": stage_diagnostics,
+                    "canonical_residual": projection.final_residual_diagnostics,
                     "boundary_projection_active": bool(
                         projection.previous_boundary_latents is not None
                     ),

@@ -9,6 +9,7 @@ from long_video.wah.world_projected_pipeline import (
     WorldProjectionConfig,
     apply_world_and_boundary_projection,
     apply_world_projection,
+    apply_residual_boundary_bridge,
     apply_previous_world_boundary,
     build_canonical_world_support,
     build_canonical_world_pyramid,
@@ -16,6 +17,7 @@ from long_video.wah.world_projected_pipeline import (
     build_boundary_state_at_sigma,
     build_world_state_at_sigma,
     canonical_support_to_tokens,
+    compose_canonical_residual,
     fill_invalid_warp_for_vae,
     encode_canonical_video_latents,
     posterior_mode_or_mean,
@@ -23,6 +25,31 @@ from long_video.wah.world_projected_pipeline import (
     smooth_latent_visibility,
     world_projection_weight,
 )
+
+
+def test_canonical_residual_composition_gives_world_exclusive_known_pixels():
+    endpoint = torch.full((1, 2, 2, 1, 3), 4.0)
+    residual = torch.full_like(endpoint, 10.0)
+    support = torch.tensor([[[[[1.0, 0.0, 0.25]], [[1.0, 0.0, 0.25]]]]])
+    composed, base = compose_canonical_residual(endpoint, support, residual)
+    torch.testing.assert_close(base[..., 0], torch.full_like(base[..., 0], 4.0))
+    torch.testing.assert_close(composed[..., 0], torch.full_like(composed[..., 0], 4.0))
+    torch.testing.assert_close(composed[..., 1], torch.full_like(composed[..., 1], 10.0))
+    torch.testing.assert_close(composed[..., 2], torch.full_like(composed[..., 2], 8.5))
+
+
+def test_residual_boundary_only_changes_unknown_slot0():
+    raw = torch.zeros(1, 2, 9, 1, 2)
+    boundary = torch.ones(1, 2, 1, 1, 2)
+    support = torch.zeros(1, 1, 9, 1, 2)
+    support[:, :, 0, :, 0] = 1.0
+    result, metrics = apply_residual_boundary_bridge(
+        raw, boundary, support, sigma=0.0, boundary_beta_max=0.2,
+    )
+    assert float(result[:, :, 0, :, 0].abs().max()) == 0.0
+    torch.testing.assert_close(result[:, :, 0, :, 1], torch.full_like(result[:, :, 0, :, 1], 0.2))
+    assert float(result[:, :, 1:].abs().max()) == 0.0
+    assert float(metrics["projection_delta_ratio"]) == 0.0
 
 
 def test_world_projection_is_exact_identity_in_unknown_region_and_bounded():
@@ -230,6 +257,15 @@ def test_delayed_node_activation_waits_full_chunk_and_schedule_cannot_be_replace
     activated = queue.activate_due(7)
     render_node = activated.node
     assert render_node.node_id == "node_001"
+
+
+def test_one_chunk_node_activation_delay_is_supported_for_inference_ablation():
+    node = SimpleNamespace(node_id="node_001")
+    queue = DelayedNodeActivationQueue(delay_chunks=1)
+    entry = queue.schedule(node, created_after_chunk=5)
+    assert entry.activate_at_chunk == 6
+    assert queue.activate_due(5) is None
+    assert queue.activate_due(6).node is node
 
 
 def test_temporal_warmup_only_scales_final_wpf_strength():

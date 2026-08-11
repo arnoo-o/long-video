@@ -112,8 +112,8 @@ class DelayedNodeActivationQueue:
     """A one-entry FIFO whose schedule cannot be overwritten by newer nodes."""
 
     def __init__(self, delay_chunks: int = 2, max_pending: int = 1):
-        if int(delay_chunks) != 2:
-            raise ValueError("Validated Causal World activation delay is fixed at two chunks")
+        if int(delay_chunks) not in (1, 2):
+            raise ValueError("Validated Causal World activation delay must be one or two chunks")
         if int(max_pending) != 1:
             raise ValueError("this experiment permits exactly one pending accepted node")
         self.delay_chunks = int(delay_chunks)
@@ -162,6 +162,7 @@ class WorldProjectionContext:
     previous_boundary_latents: list[torch.Tensor] | None = None
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     final_projection_weight: torch.Tensor | None = None
+    final_residual_diagnostics: dict[str, Any] | None = None
 
     def __post_init__(self):
         count = len(self.canonical_latents)
@@ -835,6 +836,80 @@ def apply_world_and_boundary_projection(
     }
 
 
+def compose_canonical_residual(
+    canonical_endpoint: torch.Tensor,
+    support: torch.Tensor,
+    residual: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose ``L = B + (1-M)R`` with ``B = M E(W)`` exactly once."""
+    if tuple(canonical_endpoint.shape) != tuple(residual.shape):
+        raise ValueError("canonical endpoint/residual shape mismatch")
+    expected = (
+        residual.shape[0], 1, residual.shape[2], residual.shape[3], residual.shape[4],
+    )
+    if tuple(support.shape) != expected:
+        raise ValueError(f"canonical residual support must be {expected}, got {tuple(support.shape)}")
+    mask = support.to(device=residual.device, dtype=torch.float32).clamp(0.0, 1.0)
+    endpoint = canonical_endpoint.to(device=residual.device, dtype=torch.float32)
+    residual_float = residual.float()
+    base = mask * endpoint
+    composed = base + (1.0 - mask) * residual_float
+    return composed.to(residual.dtype), base.to(residual.dtype)
+
+
+def apply_residual_boundary_bridge(
+    residual_raw: torch.Tensor,
+    boundary_state: torch.Tensor | None,
+    support: torch.Tensor,
+    *,
+    sigma: float | torch.Tensor,
+    boundary_beta_max: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply the existing slot0 Boundary Bridge only in residual/unknown space."""
+    expected_support = (
+        residual_raw.shape[0], 1, residual_raw.shape[2],
+        residual_raw.shape[3], residual_raw.shape[4],
+    )
+    if tuple(support.shape) != expected_support:
+        raise ValueError("residual boundary support shape mismatch")
+    raw = residual_raw.float()
+    delta = torch.zeros_like(raw)
+    schedule = torch.zeros((), device=raw.device, dtype=torch.float32)
+    if boundary_state is not None:
+        expected_boundary = (
+            raw.shape[0], raw.shape[1], 1, raw.shape[3], raw.shape[4],
+        )
+        if tuple(boundary_state.shape) != expected_boundary:
+            raise ValueError("residual boundary state shape mismatch")
+        sigma_value = torch.as_tensor(sigma, device=raw.device, dtype=torch.float32).clamp(0.0, 1.0)
+        schedule = float(boundary_beta_max) * (1.0 - sigma_value)
+        unknown_slot0 = 1.0 - support[:, :, 0:1].to(device=raw.device, dtype=torch.float32).clamp(0.0, 1.0)
+        delta[:, :, 0:1] = schedule * unknown_slot0 * (
+            boundary_state.to(device=raw.device, dtype=torch.float32) - raw[:, :, 0:1]
+        )
+    result = (raw + delta).to(residual_raw.dtype)
+    non_slot0 = (
+        delta[:, :, 1:].abs().max()
+        if raw.shape[2] > 1 else torch.zeros((), device=raw.device)
+    )
+    if float(non_slot0.detach().cpu()) != 0.0:
+        raise RuntimeError("Residual Boundary Bridge changed temporal slots 1..8")
+    return result, {
+        "lambda": torch.zeros((), device=raw.device),
+        "projection_mask_ratio": (support > 0).float().mean().detach(),
+        "projection_strength_mean": support.float().mean().detach(),
+        "wpf_slot0_strength_max": torch.zeros((), device=raw.device),
+        "projection_delta_ratio": torch.zeros((), device=raw.device),
+        "unknown_projection_delta_max": torch.zeros((), device=raw.device),
+        "boundary_active": torch.as_tensor(boundary_state is not None, device=raw.device, dtype=torch.float32),
+        "boundary_strength": schedule.detach(),
+        "boundary_delta_ratio": (delta.norm() / raw.norm().clamp_min(1e-8)).detach(),
+        "boundary_non_slot0_delta_max": non_slot0.detach(),
+        "combined_delta_ratio": (delta.norm() / raw.norm().clamp_min(1e-8)).detach(),
+        "residual_coordinate": torch.ones((), device=raw.device),
+    }
+
+
 def world_projection_weight(
     visibility: torch.Tensor,
     confidence: torch.Tensor,
@@ -1040,7 +1115,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         stage_id = -1
         stage_start = None
 
-        def projected_step(model_output, timestep, sample, *step_args, **step_kwargs):
+        def residual_step(model_output, timestep, sample, *step_args, **step_kwargs):
             nonlocal stage_id, stage_start
             step_index = int(step_kwargs.get("cur_sampling_step", 0))
             if step_index == 0:
@@ -1048,29 +1123,21 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 stage_start = sample.detach().clone()
             if stage_id >= len(context.canonical_latents) or stage_start is None:
                 raise RuntimeError(f"unexpected Helios pyramid stage {stage_id}")
+            # ``sample`` and ``model_output`` remain in residual coordinates.
+            # The canonical world is never blended into a scheduler update.
             result = original_step(model_output, timestep, sample, *step_args, **step_kwargs)
-            z_raw = result[0]
+            residual_raw = result[0]
             sigmas = step_kwargs.get("dmd_sigmas", getattr(scheduler, "sigmas", None))
             if sigmas is None or len(sigmas) <= step_index:
                 raise RuntimeError("Helios scheduler did not expose the active stage sigma coordinate")
             current_sigma = sigmas[step_index]
             next_sigma = sigmas[min(step_index + 1, len(sigmas) - 1)]
-            endpoint = context.canonical_latents[stage_id].to(device=z_raw.device, dtype=z_raw.dtype)
-            visible = context.visibility[stage_id].to(device=z_raw.device)
-            confidence = context.confidence[stage_id].to(device=z_raw.device)
-            z_world = build_world_state_at_sigma(
-                stage_id=stage_id,
-                current_sigma=current_sigma,
-                next_sigma=next_sigma,
-                canonical_endpoint=endpoint,
-                stage_start_state=stage_start,
-            )
+            visible = context.visibility[stage_id].to(device=residual_raw.device)
             config = context.config
-            stage_lambda_max = config.lambda_max(stage_id)
             boundary_endpoint = (
                 None if context.previous_boundary_latents is None
                 else context.previous_boundary_latents[stage_id].to(
-                    device=z_raw.device, dtype=z_raw.dtype,
+                    device=residual_raw.device, dtype=residual_raw.dtype,
                 )
             )
             boundary_state = (
@@ -1081,31 +1148,11 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 )
             )
             boundary_beta_max = config.boundary_beta_max(stage_id)
-            projected, diagnostic = apply_world_and_boundary_projection(
-                z_raw, z_world, visible, confidence,
-                boundary_state=boundary_state,
+            residual, diagnostic = apply_residual_boundary_bridge(
+                residual_raw, boundary_state, visible,
                 boundary_beta_max=boundary_beta_max,
                 sigma=next_sigma,
-                lambda_max=stage_lambda_max,
-                gamma=config.gamma,
-                confidence_ramp_min=config.confidence_ramp_min,
-                confidence_ramp_max=config.confidence_ramp_max,
-                temporal_warmup=config.temporal_warmup,
             )
-            raw_final_weight = world_projection_weight(
-                visible, confidence,
-                sigma=next_sigma,
-                lambda_max=stage_lambda_max,
-                gamma=config.gamma,
-                confidence_ramp_min=config.confidence_ramp_min,
-                confidence_ramp_max=config.confidence_ramp_max,
-                device=z_raw.device,
-            )[0]
-            context.final_projection_weight = _final_wpf_strength(
-                raw_final_weight,
-                temporal_warmup=config.temporal_warmup,
-                boundary_active=boundary_state is not None,
-            ).detach()
             context.diagnostics.append({
                 "stage_id": int(stage_id),
                 "step_id": int(step_index),
@@ -1113,10 +1160,26 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 "next_sigma": float(torch.as_tensor(next_sigma).detach().cpu()),
                 **{key: float(value.detach().cpu()) for key, value in diagnostic.items()},
             })
-            return (projected, *result[1:])
+            return (residual, *result[1:])
 
-        scheduler.step = projected_step
+        scheduler.step = residual_step
         try:
-            return super().stage2_sample(*args, **kwargs)
+            residual = super().stage2_sample(*args, **kwargs)
+            endpoint = context.canonical_latents[-1].to(
+                device=residual.device, dtype=residual.dtype,
+            )
+            support = context.visibility[-1].to(device=residual.device)
+            composed, base = compose_canonical_residual(endpoint, support, residual)
+            context.final_projection_weight = support.detach()
+            context.final_residual_diagnostics = {
+                "canonical_base_norm": float(base.float().norm().detach().cpu()),
+                "residual_norm": float(residual.float().norm().detach().cpu()),
+                "composed_norm": float(composed.float().norm().detach().cpu()),
+                "known_region_exact_base_max_error": float(
+                    ((composed.float() - base.float()) * (support >= 1.0).expand_as(composed)).abs().max().detach().cpu()
+                ),
+                "soft_wpf_used": False,
+            }
+            return composed
         finally:
             scheduler.step = original_step

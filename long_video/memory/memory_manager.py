@@ -17,7 +17,7 @@ class MemoryManager:
     REQUIRED_TRANSLATION = 2.5
     REQUIRED_VIEW_CHANGE_RADIANS = float(np.deg2rad(25.0))
     REQUIRED_NEW_AREA_RATIO = 0.05
-    REQUIRED_MAX_WORLD_OVERLAP = 0.20
+    REQUIRED_MAX_WORLD_OVERLAP = 0.50
     ACTIVE = "ACTIVE"
     TRANSITION = "TRANSITION"
     CANDIDATE = "CANDIDATE"
@@ -35,7 +35,7 @@ class MemoryManager:
         min_translation_baseline=2.5,
         min_view_diversity=float(np.deg2rad(25.0)),
         min_new_area_ratio=0.05,
-        max_world_overlap=0.20,
+        max_world_overlap=0.50,
         max_overlap_rgb_error=0.25,
         max_overlap_depth_error=0.5,
         generated_confidence=0.25,
@@ -121,12 +121,12 @@ class MemoryManager:
             "new_area": self.buffer.mean_new_area_ratio >= self.min_new_area_ratio,
         }
         enough_frames = len(self.buffer) >= self.min_transition_frames
-        world_overlap_below_max = overlap < self.max_world_overlap
+        world_overlap_at_most_max = overlap <= self.max_world_overlap
         condition_ready = any(conditions.values())
         return {
-            "ready": bool(enough_frames and world_overlap_below_max and condition_ready),
+            "ready": bool(enough_frames and world_overlap_at_most_max and condition_ready),
             "enough_frames": bool(enough_frames),
-            "world_overlap_below_max": bool(world_overlap_below_max),
+            "world_overlap_at_most_max": bool(world_overlap_at_most_max),
             "frame_count": int(len(self.buffer)),
             "mode": self.transition_readiness_mode,
             "conditions": conditions,
@@ -142,7 +142,7 @@ class MemoryManager:
                 "view_change_radians": float(self.min_view_diversity),
                 "view_change_degrees": float(np.rad2deg(self.min_view_diversity)),
                 "new_area": float(self.min_new_area_ratio),
-                "maximum_world_overlap_exclusive": float(self.max_world_overlap),
+                "maximum_world_overlap_inclusive": float(self.max_world_overlap),
                 "minimum_frames": int(self.min_transition_frames),
             },
         }

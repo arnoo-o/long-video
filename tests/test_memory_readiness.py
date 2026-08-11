@@ -24,31 +24,31 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
         min_translation_baseline=2.5,
         min_view_diversity=0.4363323129985824,
         min_new_area_ratio=0.05,
-        max_world_overlap=0.20,
+        max_world_overlap=0.50,
     )
     manager.buffer = _ReadinessBuffer(11, translation=3.0, view_change=0.0, new_area=0.0)
     assert not manager._ready(0.01)
     manager.buffer = _ReadinessBuffer(12, translation=0.0, view_change=0.5, new_area=0.0)
-    report = manager.readiness_report(0.01)
+    report = manager.readiness_report(0.50)
     assert report["ready"]
     assert report["conditions"] == {
         "translation": False,
         "view_change": True,
         "new_area": False,
     }
-    assert report["world_overlap_below_max"] is True
+    assert report["world_overlap_at_most_max"] is True
 
 
-def test_world_overlap_must_be_strictly_below_twenty_percent():
+def test_world_overlap_must_be_at_most_fifty_percent():
     manager = MemoryManager()
     manager.buffer = _ReadinessBuffer(
         12, translation=3.0, view_change=1.0, new_area=0.5, coverage=0.20,
     )
-    assert not manager._ready(0.20)
+    assert not manager._ready(0.501)
     manager.buffer = _ReadinessBuffer(
-        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.199,
+        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.50,
     )
-    assert manager._ready(0.199)
+    assert manager._ready(0.50)
 
 
 def test_readiness_uses_current_chunk_overlap_not_history_mean():
@@ -56,9 +56,9 @@ def test_readiness_uses_current_chunk_overlap_not_history_mean():
     manager.buffer = _ReadinessBuffer(
         12, translation=0.0, view_change=0.5, new_area=0.5, coverage=0.95,
     )
-    report = manager.readiness_report(0.10)
+    report = manager.readiness_report(0.25)
     assert report["ready"]
-    assert report["values"]["current_chunk_world_overlap"] == 0.10
+    assert report["values"]["current_chunk_world_overlap"] == 0.25
 
 
 def test_readiness_policy_rejects_conflicting_mode_or_thresholds():

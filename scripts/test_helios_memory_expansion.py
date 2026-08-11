@@ -75,7 +75,7 @@ def main():
         geometry_backend=backend,coverage_threshold=min(0.99,mean_coverage+0.05),
         low_coverage_chunks=1,min_transition_frames=12,keyframe_count=8,heldout_count=4,
         min_translation_baseline=2.5,min_view_diversity=float(np.deg2rad(25.0)),
-        min_new_area_ratio=0.05,max_world_overlap=0.20,
+        min_new_area_ratio=0.05,max_world_overlap=0.50,
         max_overlap_rgb_error=0.5,max_overlap_depth_error=1.0,
         reactivation_hysteresis=0.0,
     )

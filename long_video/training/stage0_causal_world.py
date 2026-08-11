@@ -154,8 +154,8 @@ def stage0_flow_matching_loss(
     dtype = opt.transformer_compute_dtype(pipe.transformer)
     prediction = opt.transformer_model_forward(
         pipe,
-        [item["noisy_latents"].to(dtype=dtype)],
-        [item["timesteps"]],
+        item["noisy_latents"].to(dtype=dtype),
+        item["timesteps"],
         prompt_embeds,
         histories,
         attention_kwargs={
@@ -168,9 +168,13 @@ def stage0_flow_matching_loss(
         target_channel_fusion_latents=None,
         is_first_denoising_step=False,
     )
-    if not isinstance(prediction, list) or len(prediction) != 1:
-        raise TypeError("native Helios Stage0 forward must return one prediction")
-    flow_error = (prediction[0].float() - item["target"].float()).square()
+    if isinstance(prediction, (list, tuple)):
+        if len(prediction) != 1:
+            raise TypeError("native Helios Stage0 forward must return one prediction")
+        prediction = prediction[0]
+    if not torch.is_tensor(prediction):
+        raise TypeError("native Helios Stage0 forward must return a tensor")
+    flow_error = (prediction.float() - item["target"].float()).square()
     if loss_weights is None:
         flow_loss = flow_error.mean()
         temporal_weights = None

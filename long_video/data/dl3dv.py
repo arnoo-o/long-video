@@ -166,7 +166,7 @@ class DL3DVScene:
     source_hw: tuple[int, int]
 
 
-def load_dl3dv_scene(scene_root, *, source_fps=30.0):
+def load_dl3dv_scene(scene_root, *, source_fps=30.0, duration=None):
     """Read official Nerfstudio images+poses, never COLMAP point geometry."""
     root = Path(scene_root)
     matches = sorted(root.rglob("transforms.json"))
@@ -179,19 +179,24 @@ def load_dl3dv_scene(scene_root, *, source_fps=30.0):
     from PIL import Image
     paths, times, poses, ks = [], [], [], []
     first_hw = None
+    inferred_fps = ((len(frames) - 1) / float(duration)
+                    if duration is not None and float(duration) > 0 else float(source_fps))
     for ordinal, frame in enumerate(frames):
         rel = str(frame["file_path"])
         path = transform_path.parent / rel
         if not path.suffix:
             for suffix in (".png", ".jpg", ".jpeg"):
                 if path.with_suffix(suffix).is_file(): path = path.with_suffix(suffix); break
+        if not path.is_file():
+            alternatives = sorted(transform_path.parent.glob(f"images_*/{path.name}"))
+            if len(alternatives) == 1: path = alternatives[0]
         if not path.is_file(): raise FileNotFoundError(path)
         with Image.open(path) as im: width, height = im.size
         if first_hw is None: first_hw = (height, width)
         if first_hw != (height, width): raise ValueError("mixed image sizes are unsupported")
         pose = np.asarray(frame["transform_matrix"], np.float32)
         if pose.shape != (4, 4): raise ValueError("transform_matrix must be 4x4")
-        paths.append(path); times.append(_frame_time(frame, ordinal, source_fps))
+        paths.append(path); times.append(_frame_time(frame, ordinal, inferred_fps))
         poses.append(pose @ OPENGL_TO_OPENCV)
         ks.append(_intrinsics(meta, frame, width, height))
     order = np.argsort(np.asarray(times), kind="stable")

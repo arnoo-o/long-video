@@ -92,8 +92,8 @@ def image_quality(scene):
     return {"brightness_mean": float(np.mean(brightness)), "sharpness_mean": float(np.mean(sharpness))}
 
 
-def qualifies(path, source_fps):
-    scene = load_dl3dv_scene(path, source_fps=source_fps)
+def qualifies(path, source_fps, duration=None):
+    scene = load_dl3dv_scene(path, source_fps=source_fps, duration=duration)
     quality = image_quality(scene)
     trajectories = select_revisit_trajectories(scene)
     reasons = []
@@ -124,7 +124,7 @@ def main():
         if counts[env] >= args.indoor_target or record["scene_hash"] in attempted: continue
         path = download_hash(record, args.raw_root)
         try:
-            accepted, report = qualifies(path, args.source_fps)
+            accepted, report = qualifies(path, args.source_fps, record.get("duration"))
         except Exception as error:
             accepted, report = False, {"reasons": [f"inspection_error:{type(error).__name__}:{error}"]}
         attempt = {**record, "raw_path": str(path), "accepted": accepted, "inspection": report}

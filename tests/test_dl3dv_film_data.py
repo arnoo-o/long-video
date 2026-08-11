@@ -63,6 +63,21 @@ def test_nerfstudio_pose_becomes_source_relative_opencv(tmp_path):
     assert np.allclose(np.linalg.det(local[:, :3, :3]), 1)
 
 
+def test_official_stale_images_path_uses_480p_images_directory(tmp_path):
+    image_root = tmp_path / "images_8"; image_root.mkdir()
+    frames = []
+    for index in range(2):
+        Image.new("RGB", (800, 480)).save(image_root / f"frame_{index:05d}.png")
+        frames.append({"file_path": f"images/frame_{index:05d}.png",
+                       "transform_matrix": np.eye(4).tolist()})
+    (tmp_path / "transforms.json").write_text(json.dumps({
+        "fl_x": 500, "fl_y": 500, "frames": frames,
+    }))
+    scene = load_dl3dv_scene(tmp_path, duration=2.0)
+    assert all(path.parent.name == "images_8" for path in scene.image_paths)
+    np.testing.assert_allclose(scene.frame_times, [0, 2])
+
+
 def test_crop_resize_intrinsics_tracks_pixel_centers():
     k = np.array([[500, 0, 399.5], [0, 500, 239.5], [0, 0, 1]], np.float32)
     crop, out = center_crop_resize_geometry((480, 854), k, (384, 640))

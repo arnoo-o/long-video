@@ -145,7 +145,8 @@ def main():
     splits = assign_splits(qualified); args.output_root.mkdir(parents=True, exist_ok=True)
     records, scene_summary = [], []
     for scene_record in qualified:
-        scene = load_dl3dv_scene(scene_record["raw_path"], source_fps=args.source_fps)
+        scene = load_dl3dv_scene(scene_record["raw_path"], source_fps=args.source_fps,
+                                 duration=scene_record.get("duration"))
         specs = select_revisit_trajectories(scene, max_trajectories=2)
         if not specs: raise ValueError(f"qualified scene lost all trajectories: {scene_record['scene_hash']}")
         split = splits[scene_record["scene_hash"]]

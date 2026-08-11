@@ -946,7 +946,14 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             if first_frame_latent is None
             else first_frame_latent.detach().to(device=device, dtype=torch.float32)
         ))
-        object.__setattr__(self, "_canonical_world_support", canonical_support)
+        cached_support = None
+        if canonical_support is not None:
+            cached_support = CanonicalWorldSupport(
+                canonical_support.visibility.to(device=device, dtype=torch.float32),
+                canonical_support.confidence.to(device=device, dtype=torch.float32),
+                canonical_support.safe_support.to(device=device, dtype=torch.float32),
+            )
+        object.__setattr__(self, "_canonical_world_support", cached_support)
         object.__setattr__(self, "_canonical_pixel_visibility", (
             None if pixel_visibility is None
             else self._coerce_visibility_mask(pixel_visibility).to(device=device, dtype=torch.float32)

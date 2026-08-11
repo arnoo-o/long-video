@@ -7,6 +7,7 @@ therefore leaves training and ordinary inference unchanged.
 from __future__ import annotations
 
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -1104,19 +1105,30 @@ def sparse_pixel_constraint(
     with torch.enable_grad():
         for _ in range(int(steps)):
             variable = x0_opt.detach().requires_grad_(True)
-            decoded = decode_fn(variable)
-            if tuple(decoded.shape) != tuple(warp.shape):
-                raise RuntimeError(
-                    f"decoded 33-frame RGB {tuple(decoded.shape)} != renderer {tuple(warp.shape)}"
+            # Wan's decoder does not implement gradient checkpointing.  Save
+            # its backward activations on CPU so the joint 33-frame graph does
+            # not coexist with ~48 GiB of resident Helios state on H100.
+            # This changes storage only: decode, loss, and gradient are exact.
+            saved_tensor_context = (
+                torch.autograd.graph.save_on_cpu(pin_memory=True)
+                if variable.is_cuda else nullcontext()
+            )
+            with saved_tensor_context:
+                decoded = decode_fn(variable)
+                if tuple(decoded.shape) != tuple(warp.shape):
+                    raise RuntimeError(
+                        f"decoded 33-frame RGB {tuple(decoded.shape)} != renderer {tuple(warp.shape)}"
+                    )
+                warp_value = warp.to(device=decoded.device, dtype=decoded.dtype)
+                visible_value = visible.to(device=decoded.device, dtype=decoded.dtype)
+                pixel_loss = (
+                    visible_value * (decoded - warp_value).abs()
+                ).sum() / (3.0 * visible_value.sum() + float(epsilon))
+                latent_loss = (variable.float() - base.float()).square().mean()
+                loss = pixel_loss.float() + float(lambda_z) * latent_loss
+                gradient, = torch.autograd.grad(
+                    loss, variable, create_graph=False, retain_graph=False,
                 )
-            warp_value = warp.to(device=decoded.device, dtype=decoded.dtype)
-            visible_value = visible.to(device=decoded.device, dtype=decoded.dtype)
-            pixel_loss = (
-                visible_value * (decoded - warp_value).abs()
-            ).sum() / (3.0 * visible_value.sum() + float(epsilon))
-            latent_loss = (variable.float() - base.float()).square().mean()
-            loss = pixel_loss.float() + float(lambda_z) * latent_loss
-            gradient, = torch.autograd.grad(loss, variable, create_graph=False, retain_graph=False)
             grad_float = gradient.float()
             grad_norm = grad_float.norm()
             clip_scale = (float(max_grad_norm) / grad_norm.clamp_min(float(epsilon))).clamp(max=1.0)
@@ -1132,6 +1144,9 @@ def sparse_pixel_constraint(
         "sparse_grad_norm": last_grad_norm,
         "sparse_clipped_grad_norm": last_clipped_norm,
         "sparse_visible_pixel_count": visible_count,
+        "sparse_activation_offload": torch.as_tensor(
+            float(base.is_cuda), device=base.device,
+        ),
         "sparse_latent_delta_ratio": (
             (x0_opt.float() - base.float()).norm()
             / base.float().norm().clamp_min(float(epsilon))

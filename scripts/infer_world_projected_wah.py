@@ -539,6 +539,7 @@ def main():
             "stages": [2],
             "decodes_noisy_latent": False,
             "joint_33_frame_optimization": True,
+            "vae_backward_activation_offload": "saved_tensors_cpu",
             "optimizer_created": False,
             "vae_encode_used": False,
             "step0": {"steps": 1, "lr": 0.005, "lambda_z": 1.0, "max_grad_norm": 1.0},

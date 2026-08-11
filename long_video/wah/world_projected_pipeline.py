@@ -29,6 +29,7 @@ DEFAULT_TEMPORAL_WARMUP: tuple[float, ...] = (
     0.0, 0.25, 0.60, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
 )
 WAH_VISIBLE_TOKEN_THRESHOLD = 0.1
+WORLD_OWNERSHIP_COVERAGE_THRESHOLD = 0.9
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,7 @@ class WorldProjectionConfig:
 
 @dataclass(frozen=True)
 class CanonicalWorldSupport:
-    """The one canonical 33-to-9 support representation shared by all paths."""
+    """Canonical coverage plus the binary ownership mask shared by WAH/clamp."""
 
     visibility: torch.Tensor
     confidence: torch.Tensor
@@ -95,6 +96,12 @@ class CanonicalWorldSupport:
         ):
             if not bool(torch.isfinite(value).all()) or bool((value < 0).any()) or bool((value > 1).any()):
                 raise ValueError(f"canonical {name} must be finite and in [0,1]")
+        if not bool(((self.safe_support == 0) | (self.safe_support == 1)).all()):
+            raise ValueError("canonical world ownership must contain only binary 0/1 values")
+
+    @property
+    def world_ownership_mask(self) -> torch.Tensor:
+        return self.safe_support
 
 
 @dataclass(frozen=True)
@@ -179,6 +186,8 @@ class WorldProjectionContext:
                     f"stage {stage_id} support shape mismatch: latent={tuple(latent.shape)} "
                     f"visibility={tuple(visible.shape)} confidence={tuple(confidence.shape)}"
                 )
+            if not bool(((visible == 0) | (visible == 1)).all()):
+                raise ValueError(f"stage {stage_id} world ownership must be binary")
         if self.previous_boundary_latents is not None:
             if len(self.previous_boundary_latents) != count:
                 raise ValueError("boundary pyramid must match world stage count")
@@ -403,9 +412,9 @@ def build_canonical_world_support(
     latent_height: int = 48,
     latent_width: int = 80,
     temporal_scale: int = 4,
-    visible_threshold: float = WAH_VISIBLE_TOKEN_THRESHOLD,
+    visible_threshold: float = WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
 ) -> CanonicalWorldSupport:
-    """Build the only 33-to-9 visibility/confidence mapping used by WAH/WPF/Anchor."""
+    """Build raw coverage and strict binary ownership from renderer visibility."""
     visibility_value = torch.as_tensor(visibility, dtype=torch.float32)
     confidence_value = torch.as_tensor(confidence, dtype=torch.float32)
     if tuple(confidence_value.shape) != tuple(visibility_value.shape):
@@ -431,13 +440,10 @@ def build_canonical_world_support(
         weighted_confidence / canonical_visibility.clamp_min(1e-6),
         torch.zeros_like(weighted_confidence),
     ).clamp(0.0, 1.0)
-    canonical_safe_support = smooth_latent_visibility(canonical_visibility)
-    canonical_safe_support = torch.where(
-        canonical_safe_support >= float(visible_threshold),
-        canonical_safe_support,
-        torch.zeros_like(canonical_safe_support),
-    )
-    canonical_confidence = canonical_confidence * (canonical_safe_support > 0).to(
+    canonical_safe_support = (
+        canonical_visibility >= float(visible_threshold)
+    ).to(canonical_visibility.dtype)
+    canonical_confidence = canonical_confidence * canonical_safe_support.to(
         canonical_confidence.dtype
     )
     return CanonicalWorldSupport(
@@ -453,7 +459,7 @@ def build_single_frame_world_support(
     *,
     latent_height: int = 48,
     latent_width: int = 80,
-    visible_threshold: float = WAH_VISIBLE_TOKEN_THRESHOLD,
+    visible_threshold: float = WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
 ) -> CanonicalWorldSupport:
     """Build latent support for one explicitly encoded shared boundary RGB frame."""
     visibility_value = torch.as_tensor(visibility, dtype=torch.float32)
@@ -488,9 +494,8 @@ def build_single_frame_world_support(
         weighted / visibility_value.clamp_min(1e-6),
         torch.zeros_like(weighted),
     ).clamp(0.0, 1.0)
-    safe = smooth_latent_visibility(visibility_value)
-    safe = torch.where(safe >= float(visible_threshold), safe, torch.zeros_like(safe))
-    canonical_confidence = canonical_confidence * (safe > 0).to(canonical_confidence.dtype)
+    safe = (visibility_value >= float(visible_threshold)).to(visibility_value.dtype)
+    canonical_confidence = canonical_confidence * safe.to(canonical_confidence.dtype)
     return CanonicalWorldSupport(visibility_value, canonical_confidence, safe)
 
 
@@ -498,7 +503,7 @@ def mask_canonical_latent(
     latent: torch.Tensor,
     safe_support: torch.Tensor,
 ) -> torch.Tensor:
-    """Hard-zero VAE fill-only latents while retaining soft support separately."""
+    """Hard-zero every VAE placeholder latent outside binary world ownership."""
     expected = (latent.shape[0], 1, latent.shape[2], latent.shape[3], latent.shape[4])
     if tuple(safe_support.shape) != expected:
         raise ValueError(f"safe support {tuple(safe_support.shape)} != {expected}")
@@ -598,26 +603,30 @@ def build_world_projection_context(
             latent_width=clean_latent.shape[-1],
             temporal_scale=temporal_scale,
         )
-    full_visibility = canonical_support.safe_support
+    full_visibility_coverage = canonical_support.visibility
     full_confidence = canonical_support.confidence
     expected_support = (
         clean_latent.shape[0], 1, clean_latent.shape[2],
         clean_latent.shape[3], clean_latent.shape[4],
     )
-    if tuple(full_visibility.shape) != expected_support or tuple(full_confidence.shape) != expected_support:
+    if tuple(full_visibility_coverage.shape) != expected_support or tuple(full_confidence.shape) != expected_support:
         raise ValueError(
             f"canonical support must align to clean latent {expected_support}, got "
-            f"{tuple(full_visibility.shape)}/{tuple(full_confidence.shape)}"
+            f"{tuple(full_visibility_coverage.shape)}/{tuple(full_confidence.shape)}"
         )
     visible_pyramid, confidence_pyramid = [], []
     for endpoint in canonical:
-        stage_visibility = _resize_video_latents(
-            full_visibility, endpoint.shape[-2], endpoint.shape[-1], mode="area",
+        stage_coverage = _resize_video_latents(
+            full_visibility_coverage, endpoint.shape[-2], endpoint.shape[-1], mode="area",
         ).clamp(0.0, 1.0)
-        visible_pyramid.append(stage_visibility)
-        confidence_pyramid.append(_resize_video_latents(
+        stage_ownership = (
+            stage_coverage >= WORLD_OWNERSHIP_COVERAGE_THRESHOLD
+        ).to(stage_coverage.dtype)
+        visible_pyramid.append(stage_ownership)
+        stage_confidence = _resize_video_latents(
             full_confidence, endpoint.shape[-2], endpoint.shape[-1], mode="area",
-        ).clamp(0.0, 1.0))
+        ).clamp(0.0, 1.0)
+        confidence_pyramid.append(stage_confidence * stage_ownership)
     boundary = None
     if previous_clean_boundary_latent is not None:
         previous = previous_clean_boundary_latent.detach()
@@ -928,6 +937,8 @@ def apply_boundary_then_world_clamp(
     if tuple(support.shape) != expected_support:
         raise ValueError(f"world clamp support must be {expected_support}")
     mask = support.to(device=z_raw.device, dtype=torch.float32).clamp(0.0, 1.0)
+    if not bool(((mask == 0) | (mask == 1)).all()):
+        raise ValueError("per-step world ownership mask must be binary")
     unknown = 1.0 - mask
     raw = z_raw.float()
     boundary_delta = torch.zeros_like(raw)

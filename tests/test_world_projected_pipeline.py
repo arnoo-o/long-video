@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from long_video.wah.world_projected_pipeline import (
     DEFAULT_TEMPORAL_WARMUP,
-    WAH_VISIBLE_TOKEN_THRESHOLD,
+    WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
     DelayedNodeActivationQueue,
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
@@ -56,20 +56,21 @@ def test_residual_boundary_only_changes_unknown_slot0():
 def test_boundary_then_world_clamp_has_fixed_order_and_exact_regions():
     raw = torch.zeros(1, 1, 2, 1, 3)
     world = torch.full_like(raw, 8.0)
-    support = torch.tensor([[[[[1.0, 0.0, 0.5]], [[1.0, 0.0, 0.5]]]]])
+    support = torch.tensor([[[[[1.0, 0.0, 1.0]], [[1.0, 0.0, 1.0]]]]])
     boundary = torch.full((1, 1, 1, 1, 3), 4.0)
     result, metrics = apply_boundary_then_world_clamp(
         raw, world, support, boundary, sigma=0.0, boundary_beta_max=0.5,
     )
     # Known is exactly world; unknown slot0 receives Boundary before clamp;
-    # soft support follows M*world+(1-M)*candidate.
+    # Ownership is strictly binary.
     torch.testing.assert_close(result[:, :, 0, :, 0], torch.full((1, 1, 1), 8.0))
     torch.testing.assert_close(result[:, :, 0, :, 1], torch.full((1, 1, 1), 2.0))
-    torch.testing.assert_close(result[:, :, 0, :, 2], torch.full((1, 1, 1), 4.5))
+    torch.testing.assert_close(result[:, :, 0, :, 2], torch.full((1, 1, 1), 8.0))
     assert float(result[:, :, 1, :, 1].abs().max()) == 0.0
     assert float(metrics["unknown_projection_delta_max"]) == 0.0
     assert float(metrics["world_clamp_formula_max_error"]) == 0.0
     assert float(metrics["per_step_world_clamp"]) == 1.0
+    assert set(torch.unique(support).tolist()) == {0.0, 1.0}
 
 
 def test_world_projection_is_exact_identity_in_unknown_region_and_bounded():
@@ -414,11 +415,12 @@ def test_canonical_support_uses_exact_33_to_9_groups_once():
     assert tuple(support.safe_support.shape) == (1, 1, 9, 8, 8)
     center_visibility = support.visibility[0, 0, :, 4, 4]
     torch.testing.assert_close(center_visibility, torch.arange(1, 10) / 9.0)
+    center_ownership = support.world_ownership_mask[0, 0, :, 4, 4]
+    assert center_ownership.tolist() == [0.0] * 8 + [1.0]
+    assert set(torch.unique(support.world_ownership_mask).tolist()) <= {0.0, 1.0}
     center_confidence = support.confidence[0, 0, :, 4, 4]
-    torch.testing.assert_close(center_confidence, 0.2 + torch.arange(9) * 0.1)
-    assert torch.all(
-        support.safe_support[support.safe_support > 0] >= WAH_VISIBLE_TOKEN_THRESHOLD
-    )
+    assert center_confidence[:-1].eq(0).all()
+    torch.testing.assert_close(center_confidence[-1], torch.tensor(1.0))
 
 
 def test_safe_support_masks_fill_only_latent_and_tokens_share_grouped_support():
@@ -447,7 +449,7 @@ def test_previous_world_boundary_replaces_slot0_latent_visibility_and_confidence
         latent_frames=9, latent_height=8, latent_width=8,
     )
     previous_latent = torch.randn(1, 4, 1, 8, 8)
-    previous_visibility = torch.full((1, 1, 1, 8, 8), 0.75)
+    previous_visibility = torch.ones((1, 1, 1, 8, 8))
     previous_confidence = torch.full((1, 1, 1, 8, 8), 0.6)
     clean, cached_first, replaced, applied = apply_previous_world_boundary(
         latent, first, support,
@@ -461,6 +463,23 @@ def test_previous_world_boundary_replaces_slot0_latent_visibility_and_confidence
     assert torch.equal(replaced.safe_support[:, :, 0:1], previous_visibility)
     assert torch.equal(replaced.visibility[:, :, 0:1], previous_visibility)
     assert torch.equal(replaced.confidence[:, :, 0:1], previous_confidence)
+
+
+def test_fill_only_and_subthreshold_coverage_never_gain_world_ownership():
+    visibility = torch.zeros(33, 10, 10)
+    visibility[:, :9] = 1.0
+    confidence = torch.ones_like(visibility)
+    support = build_canonical_world_support(
+        visibility, confidence, latent_frames=9, latent_height=1, latent_width=1,
+    )
+    # Every temporal group has exactly 90% real renderer coverage and is owned.
+    assert torch.equal(support.world_ownership_mask, torch.ones_like(support.world_ownership_mask))
+    visibility[:, 0, 0] = 0.0
+    support = build_canonical_world_support(
+        visibility, confidence, latent_frames=9, latent_height=1, latent_width=1,
+    )
+    assert torch.equal(support.world_ownership_mask, torch.zeros_like(support.world_ownership_mask))
+    assert WORLD_OWNERSHIP_COVERAGE_THRESHOLD == 0.9
 
 
 def test_wah_history_mapping_reuses_cached_canonical_support_without_regrouping():

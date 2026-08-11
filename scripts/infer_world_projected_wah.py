@@ -101,7 +101,7 @@ from long_video.wah.spatial_reanchor import (
 )
 from long_video.wah.world_projected_pipeline import (
     DelayedNodeActivationQueue,
-    WAH_VISIBLE_TOKEN_THRESHOLD,
+    WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
     apply_previous_world_boundary,
@@ -538,7 +538,7 @@ def main():
         "projection": {
             "mode": "per_step_scheduler_aligned_world_clamp",
             "soft_wpf_enabled": False,
-            "formula": "L=B+(1-M)*R; B=M*E(W)",
+            "formula": "z_next=M_world*z_world+(1-M_world)*z_candidate",
         },
         "legacy_soft_wpf_parameters_ignored": vars(projection_config),
         "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
@@ -548,8 +548,10 @@ def main():
             [13, 14, 15, 16], [17, 18, 19, 20], [21, 22, 23, 24],
             [25, 26, 27, 28], [29, 30, 31, 32],
         ],
-        "canonical_support_shared_by": ["WAH", "Canonical Residual Base"],
-        "canonical_safe_support_threshold": WAH_VISIBLE_TOKEN_THRESHOLD,
+        "canonical_support_shared_by": ["WAH", "Per-Step World Clamp"],
+        "canonical_safe_support_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
+        "world_ownership_binary": True,
+        "world_ownership_coverage_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
         "shared_world_boundary_slot": 0,
         "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
@@ -914,6 +916,16 @@ def main():
                 )
                 if fill_only_latent_abs_max != 0.0:
                     raise RuntimeError("fill-only canonical latent was not hard masked")
+                ownership = canonical_support.world_ownership_mask
+                if not bool(((ownership == 0) | (ownership == 1)).all()):
+                    raise RuntimeError("world ownership mask is not binary")
+                fill_owned_latent_count = int((
+                    (canonical_support.visibility < WORLD_OWNERSHIP_COVERAGE_THRESHOLD)
+                    & (ownership > 0)
+                ).sum().item())
+                if fill_owned_latent_count != 0:
+                    raise RuntimeError("fill-only latent cells acquired world ownership")
+                world_owned_latent_ratio = float(ownership.float().mean().item())
                 shared_boundary_latent_max_abs_diff = None
                 shared_boundary_visibility_max_abs_diff = None
                 shared_boundary_confidence_max_abs_diff = None
@@ -981,6 +993,10 @@ def main():
                     "canonical_visibility_mean": float(canonical_support.visibility.mean()),
                     "canonical_safe_support_mean": float(canonical_support.safe_support.mean()),
                     "canonical_confidence_mean": float(canonical_support.confidence.mean()),
+                    "world_ownership_binary": True,
+                    "world_ownership_coverage_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
+                    "fill_owned_latent_count": fill_owned_latent_count,
+                    "world_owned_latent_ratio": world_owned_latent_ratio,
                     "fill_only_latent_abs_max": fill_only_latent_abs_max,
                     "shared_world_boundary_applied": boundary_world_shared,
                     "shared_boundary_latent_max_abs_diff": shared_boundary_latent_max_abs_diff,

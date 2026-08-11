@@ -935,35 +935,35 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         device = self._wah_execution_device()
         height = int(height if height is not None else getattr(self, "_canonical_conditioning_height", 384))
         width = int(width if width is not None else getattr(self, "_canonical_conditioning_width", 640))
-        self._canonical_warp_video_tensor = self._coerce_warp_video_tensor(
+        object.__setattr__(self, "_canonical_warp_video_tensor", self._coerce_warp_video_tensor(
             canonical_warp_rgb, height=height, width=width, device=device,
-        ).detach()
-        self._canonical_warp_latents = canonical_warp_latents.detach().to(
+        ).detach())
+        object.__setattr__(self, "_canonical_warp_latents", canonical_warp_latents.detach().to(
             device=device, dtype=torch.float32,
-        )
-        self._canonical_warp_first_frame_latent = (
+        ))
+        object.__setattr__(self, "_canonical_warp_first_frame_latent", (
             self._canonical_warp_latents[:, :, :1]
             if first_frame_latent is None
             else first_frame_latent.detach().to(device=device, dtype=torch.float32)
-        )
-        self._canonical_world_support = canonical_support
-        self._canonical_pixel_visibility = (
+        ))
+        object.__setattr__(self, "_canonical_world_support", canonical_support)
+        object.__setattr__(self, "_canonical_pixel_visibility", (
             None if pixel_visibility is None
             else self._coerce_visibility_mask(pixel_visibility).to(device=device, dtype=torch.float32)
-        )
-        self._canonical_pixel_confidence = (
+        ))
+        object.__setattr__(self, "_canonical_pixel_confidence", (
             None if pixel_confidence is None
             else self._coerce_visibility_mask(pixel_confidence).to(device=device, dtype=torch.float32)
-        )
-        self._canonical_conditioning_cache_hit = False
+        ))
+        object.__setattr__(self, "_canonical_conditioning_cache_hit", False)
 
     def clear_canonical_warp_conditioning(self) -> None:
-        self._canonical_warp_video_tensor = None
-        self._canonical_warp_latents = None
-        self._canonical_warp_first_frame_latent = None
-        self._canonical_world_support = None
-        self._canonical_pixel_visibility = None
-        self._canonical_pixel_confidence = None
+        for name in (
+            "_canonical_warp_video_tensor", "_canonical_warp_latents",
+            "_canonical_warp_first_frame_latent", "_canonical_world_support",
+            "_canonical_pixel_visibility", "_canonical_pixel_confidence",
+        ):
+            object.__setattr__(self, name, None)
 
     def _visibility_mask_to_history_latents(
         self, visibility_mask, *, latent_frames, latent_height, latent_width, temporal_scale,
@@ -1006,7 +1006,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             if candidate is not None:
                 candidate = candidate.to(device=cached_video.device, dtype=cached_video.dtype)
                 if tuple(candidate.shape) == tuple(cached_video.shape) and torch.equal(candidate, cached_video):
-                    self._canonical_conditioning_cache_hit = True
+                    object.__setattr__(self, "_canonical_conditioning_cache_hit", True)
                     first = getattr(
                         self, "_canonical_warp_first_frame_latent", None,
                     )

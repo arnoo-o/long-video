@@ -252,6 +252,12 @@ def main():
     pipe = WarpAsHistoryPipeline.from_pretrained(
         options.model, torch_dtype=torch.bfloat16,
     ).to(options.device)
+    # Diffusers 0.36's generic video-LoRA loader probes this optional config
+    # key before loading the pinned official WAH adapter.  Helios predates the
+    # key, so register the explicit no-image-channel value without changing
+    # transformer weights or conditioning semantics.
+    if not hasattr(pipe.transformer.config, "image_dim"):
+        pipe.transformer.register_to_config(image_dim=None)
     pipe.set_progress_bar_config(disable=True)
     controller = install_stage0_causal_world_film(pipe.transformer).to(options.device, torch.float32)
     if hasattr(pipe.transformer, "enable_gradient_checkpointing"):

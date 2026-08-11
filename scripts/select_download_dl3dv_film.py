@@ -63,15 +63,17 @@ def download_hash(record, raw_root):
     destination = raw_root / batch / scene_hash
     if destination.exists(): return destination
     raw_root.mkdir(parents=True, exist_ok=True)
+    cache_root = raw_root / ".hf_download_cache"
     archive = Path(hf_hub_download(
         repo_id=OFFICIAL_REPO, repo_type="dataset", filename=f"{batch}/{scene_hash}.zip",
-        local_dir=raw_root, cache_dir=raw_root / ".cache",
+        local_dir=raw_root, cache_dir=cache_root,
     ))
     batch_root = raw_root / batch
     before = {x.resolve() for x in batch_root.iterdir()} if batch_root.exists() else set()
     with zipfile.ZipFile(archive) as handle:
         handle.extractall(batch_root)
     archive.unlink()
+    if cache_root.exists(): shutil.rmtree(cache_root)
     if not destination.exists():
         after = [x for x in batch_root.iterdir() if x.resolve() not in before and x.is_dir()]
         if len(after) == 1: after[0].rename(destination)

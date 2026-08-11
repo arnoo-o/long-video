@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -79,19 +80,23 @@ class GenericRGBVideoDataset(Dataset):
 class Stage0FilmTrainer:
     """Small optimizer wrapper; all model computation remains native train_exact."""
 
-    def __init__(self, pipe, pi3_backend, *, learning_rate=1e-4, max_grad_norm=1.0):
+    def __init__(self, pipe, pi3_backend, *, learning_rate=1e-4, weight_decay=0.01,
+                 max_grad_norm=1.0):
         self.names, self.parameters = freeze_causal_world_training_stack(pipe, pi3_backend)
         self.pipe = pipe
         self.max_grad_norm = float(max_grad_norm)
-        self.optimizer = torch.optim.AdamW(self.parameters, lr=float(learning_rate), weight_decay=0.0)
+        self.optimizer = torch.optim.AdamW(
+            self.parameters, lr=float(learning_rate), weight_decay=float(weight_decay),
+        )
         self.step_index = 0
 
-    def step(self, *, contract, prompt_embeds, target_latents, histories, world0, visibility0, args, device):
+    def step(self, *, contract, prompt_embeds, target_latents, histories, world0, visibility0,
+             args, device, loss_weights=None):
         contract.validate()
         self.optimizer.zero_grad(set_to_none=True)
-        loss = stage0_flow_matching_loss(
+        loss, flow_loss, corr_loss = stage0_flow_matching_loss(
             self.pipe, prompt_embeds, target_latents, histories,
-            world0, visibility0, args, device,
+            world0, visibility0, args, device, loss_weights=loss_weights,
         )
         loss.backward()
         illegal = [name for name, parameter in self.pipe.transformer.named_parameters()
@@ -101,7 +106,9 @@ class Stage0FilmTrainer:
         grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, self.max_grad_norm)
         self.optimizer.step()
         self.step_index += 1
-        return {"step": self.step_index, "loss": float(loss.detach()), "grad_norm": float(grad_norm)}
+        return {"step": self.step_index, "total_loss": float(loss.detach()),
+                "flow_loss": float(flow_loss.detach()), "corr_loss": float(corr_loss.detach()),
+                "grad_norm": float(grad_norm)}
 
 
 def freeze_causal_world_training_stack(pipe, pi3_backend):
@@ -114,7 +121,8 @@ def freeze_causal_world_training_stack(pipe, pi3_backend):
     if model is not None:
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-    trainable = [parameter for parameter in controller.film.parameters() if parameter.requires_grad]
+    trainable = [parameter for module in (controller.point_encoder, controller.film_head)
+                 for parameter in module.parameters() if parameter.requires_grad]
     if {name for name, parameter in pipe.transformer.named_parameters() if parameter.requires_grad} != set(names):
         raise RuntimeError("Stage0 FiLM must be the only trainable transformer module")
     return names, trainable
@@ -122,6 +130,7 @@ def freeze_causal_world_training_stack(pipe, pi3_backend):
 
 def stage0_flow_matching_loss(
     pipe, prompt_embeds, target_latents, histories, world0, visibility0, args, device,
+    *, loss_weights=None,
 ):
     """Run the pinned train-exact Stage0 objective with causal FiLM context.
 
@@ -140,7 +149,8 @@ def stage0_flow_matching_loss(
     if tuple(world0.shape) != expected:
         raise ValueError(f"causal world Stage0 shape {tuple(world0.shape)} != {expected}")
     controller = pipe.transformer.stage0_causal_world_film
-    controller.set_context(world0, visibility0)
+    controller.set_point_context(world0, visibility0)
+    controller.set_training_schedule(item, pipe.scheduler.end_sigmas[0])
     dtype = opt.transformer_compute_dtype(pipe.transformer)
     prediction = opt.transformer_model_forward(
         pipe,
@@ -160,23 +170,54 @@ def stage0_flow_matching_loss(
     )
     if not isinstance(prediction, list) or len(prediction) != 1:
         raise TypeError("native Helios Stage0 forward must return one prediction")
-    return (prediction[0].float() - item["target"].float()).square().mean()
+    flow_error = (prediction[0].float() - item["target"].float()).square()
+    if loss_weights is None:
+        flow_loss = flow_error.mean()
+        temporal_weights = None
+    else:
+        temporal_weights = torch.as_tensor(
+            loss_weights, device=flow_error.device, dtype=flow_error.dtype,
+        ).view(1, 1, -1, 1, 1)
+        if temporal_weights.shape[2] != flow_error.shape[2]:
+            raise ValueError("loss_weights must match Stage0 latent frames")
+        flow_loss = (flow_error * temporal_weights).sum() / (
+            flow_error.shape[1] * flow_error.shape[3] * flow_error.shape[4]
+            * temporal_weights.sum().clamp_min(1e-6)
+        )
+    clean_stage0 = opt.training_exact_pyramid_latents(
+        target_latents, len(args.pyramid_num_inference_steps_list),
+    )[0].detach().to(device=world0.device, dtype=world0.dtype)
+    visible = visibility0.to(device=world0.device, dtype=world0.dtype).clamp(0, 1)
+    if temporal_weights is not None:
+        visible = visible * temporal_weights.to(visible)
+    corr_loss = (visible * (world0 - clean_stage0).abs()).sum() / (
+        16.0 * visible.sum().clamp_min(1e-6)
+    )
+    return flow_loss + 0.1 * corr_loss, flow_loss, corr_loss
 
 
 def save_film_checkpoint(path, transformer, optimizer=None, scheduler=None, *, step=0, metadata=None,
                          round_robin=None):
     controller = transformer.stage0_causal_world_film
     payload = {
-        "schema_version": 1,
-        "architecture": "stage0_causal_world_film",
+        "schema_version": 2,
+        "architecture": "stage0_point_film",
         "global_step": int(step),
-        "film": controller.film.state_dict(),
+        "point_encoder": controller.point_encoder.state_dict(),
+        "film_head": controller.film_head.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "metadata": {"uses_future_gt": False, **dict(metadata or {}),
                      "round_robin": None if round_robin is None else round_robin.state_dict()},
         "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "python_rng_state": random.getstate(),
     }
+    try:
+        import numpy as np
+        payload["numpy_rng_state"] = np.random.get_state()
+    except ImportError:
+        payload["numpy_rng_state"] = None
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
@@ -187,9 +228,11 @@ def save_film_checkpoint(path, transformer, optimizer=None, scheduler=None, *, s
 
 def load_film_checkpoint(path, transformer, optimizer=None, scheduler=None, round_robin=None):
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("architecture") != "stage0_causal_world_film":
-        raise ValueError("checkpoint is not a Stage0 causal-world FiLM checkpoint")
-    transformer.stage0_causal_world_film.film.load_state_dict(payload["film"], strict=True)
+    if payload.get("architecture") != "stage0_point_film":
+        raise ValueError("checkpoint is not a Stage0 Point-FiLM checkpoint")
+    controller = transformer.stage0_causal_world_film
+    controller.point_encoder.load_state_dict(payload["point_encoder"], strict=True)
+    controller.film_head.load_state_dict(payload["film_head"], strict=True)
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None and payload.get("scheduler") is not None:
@@ -197,4 +240,13 @@ def load_film_checkpoint(path, transformer, optimizer=None, scheduler=None, roun
     metadata = dict(payload.get("metadata") or {})
     if round_robin is not None and metadata.get("round_robin") is not None:
         round_robin.load_state_dict(metadata["round_robin"])
+    if payload.get("torch_rng_state") is not None:
+        torch.set_rng_state(payload["torch_rng_state"])
+    if torch.cuda.is_available() and payload.get("cuda_rng_state_all") is not None:
+        torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
+    if payload.get("python_rng_state") is not None:
+        random.setstate(payload["python_rng_state"])
+    if payload.get("numpy_rng_state") is not None:
+        import numpy as np
+        np.random.set_state(payload["numpy_rng_state"])
     return int(payload["global_step"]), metadata

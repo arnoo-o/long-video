@@ -170,12 +170,16 @@ def test_parent_first_renderer_keeps_parent_and_allows_distant_delta_hole():
     # The near generated point projects exactly onto the parent pixel and is
     # excluded by parent-first compositing/dilation.
     assert warp.source[0, 4, 4] == 0
+    assert warp.point_index[0, 4, 4] == 0
+    np.testing.assert_allclose(warp.winning_xyz_world[0, 4, 4], node.points_xyz[0])
     np.testing.assert_allclose(warp.rgb[0, 4, 4], [20 / 255.0, 0.0, 0.0])
     assert not warp.delta_allowed_visibility[0, 4, 4]
     assert warp.delta_output_on_parent_visible == 0
     assert warp.delta_output_on_parent_protection_mask == 0
     # The distant generated point is three pixels away and fills a true hole.
     assert warp.source[0, 4, 7] == 3
+    assert warp.point_index[0, 4, 7] == 2
+    np.testing.assert_allclose(warp.winning_xyz_world[0, 4, 7], node.points_xyz[2])
     assert warp.delta_allowed_visibility[0, 4, 7]
 
 

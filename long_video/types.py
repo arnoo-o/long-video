@@ -108,3 +108,5 @@ class WarpBatch:
     evidence_role: Optional[np.ndarray] = None
     rgb_evidence_role: Optional[np.ndarray] = None
     depth_evidence_role: Optional[np.ndarray] = None
+    point_index: Optional[np.ndarray] = None
+    winning_xyz_world: Optional[np.ndarray] = None

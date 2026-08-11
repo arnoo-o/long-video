@@ -1,4 +1,3 @@
-import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
@@ -13,15 +12,9 @@ from long_video.initialization.geometry_backend import (
     Pi3GeometryBackend,
 )
 from long_video.initialization.initial_node_pipeline import initialize_spatial_node
-from long_video.initialization.view_completion import HoloOracleCompletion
 from long_video.memory.node_builder import build_from_views
 from long_video.memory.node_store import NodeStore
 from long_video.types import RAY_DISTANCE,Z_DEPTH,ScaleMetadata,ViewSet
-
-
-class StaticCompletion:
-    def __init__(self,views): self.views=views
-    def complete(self,*args,**kwargs): return self.views
 
 
 class StaticGeometry(MultiViewGeometryBackend):
@@ -101,12 +94,12 @@ class ScaleGeometryTests(unittest.TestCase):
         self.assertNotIn(3.0,relative.depth)
 
     def test_relative_and_metric_m0(self):
-        views=tiny_views()
-        relative=initialize_spatial_node([],[],"",StaticCompletion(views),
-            StaticGeometry("relative"),{"mode":"precomputed","voxel_size":0.1})
+        views=tiny_views(two_views=8)
+        relative=initialize_spatial_node(
+            views, StaticGeometry("relative"), {"voxel_size":0.1})
         self.assertEqual(relative.scale.mode,"relative")
-        metric=initialize_spatial_node([],[],"",StaticCompletion(views),
-            StaticGeometry("metric_anchor"),{"mode":"precomputed","voxel_size":0.1})
+        metric=initialize_spatial_node(
+            views, StaticGeometry("metric_anchor"), {"voxel_size":0.1})
         self.assertEqual(metric.scale.mode,"metric_anchor")
         self.assertEqual(metric.scale.meters_per_world_unit,1.0)
 
@@ -136,53 +129,6 @@ class ScaleGeometryTests(unittest.TestCase):
             integrate_controls(np.eye(4),[{"delta_time":1.0}])
         r=integrate_controls(np.eye(4),[{"pitch_delta":10.0,"delta_time":0.1}])[-1,:3,:3]
         np.testing.assert_allclose(r.T@r,np.eye(3),atol=1e-5)
-
-
-class DiT360ERPTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        path=Path(__file__).resolve().parents[1]/"scripts"/"run_dit360_completion.py"
-        spec=importlib.util.spec_from_file_location("dit360_runner",path)
-        cls.runner=importlib.util.module_from_spec(spec); spec.loader.exec_module(cls.runner)
-
-    def test_periodic_mask_and_observation_recovery(self):
-        with tempfile.TemporaryDirectory() as root:
-            image=np.zeros((32,48,3),np.uint8); image[...,1]=173
-            image_path=Path(root)/"input.png"; __import__("PIL").Image.fromarray(image).save(image_path)
-            observed,valid,weight,conflict=self.runner.project_observations_to_erp([
-                {"image_path":str(image_path),"yaw_degrees":180,
-                 "pitch_degrees":0,"fov_degrees":90}],32,64)
-            self.assertTrue(valid[:,0].any())
-            self.assertTrue(valid[:,-1].any())
-            self.assertFalse(conflict.any())
-            restored=np.zeros_like(observed); restored[valid]=observed[valid]
-            self.assertAlmostEqual(float(restored[valid,1].mean()),173/255,places=5)
-            distance=self.runner.periodic_distance_to_observation(valid)
-            self.assertLess(abs(float(distance[:,0].mean()-distance[:,-1].mean())),2.0)
-
-    def test_exif_with_explicit_intrinsics_fails_fast(self):
-        from long_video.initialization.dit360_backend import DiT360Completion
-        from PIL import Image
-        with tempfile.TemporaryDirectory() as root:
-            path=Path(root)/"oriented.jpg"
-            exif=Image.Exif(); exif[274]=6
-            Image.new("RGB",(20,10),(1,2,3)).save(path,exif=exif)
-            with self.assertRaisesRegex(ValueError,"EXIF-oriented"):
-                DiT360Completion._materialize(
-                    [path],[{"intrinsics":np.eye(3).tolist()}],Path(root)
-                )
-    def test_holo_oracle_uses_formal_initializer(self):
-        panorama=np.zeros((16,32,3),np.uint8); panorama[...,2]=255
-        depth=np.ones((16,32),np.float32)
-        completion=HoloOracleCompletion(height=8,width=8)
-        node=initialize_spatial_node(
-            {"panorama":panorama,"depth":depth,"mask":np.ones((16,32),bool),
-             "c2w":np.eye(4,dtype=np.float32)},None,"oracle",completion,
-            GroundTruthGeometryBackend(),
-            {"mode":"holo_oracle","height":8,"width":8,"voxel_size":0.05})
-        self.assertEqual(node.scale.mode,"dataset_calibrated")
-        self.assertGreater(len(node.points_xyz),0)
-
 
 if __name__=="__main__":
     unittest.main()

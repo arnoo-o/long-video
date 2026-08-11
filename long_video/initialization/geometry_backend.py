@@ -1,6 +1,6 @@
 """Unified multi-view geometry backends.
 
-Pi3 is loaded lazily from the official Holo360D checkout so the core package
+Pi3 is loaded lazily from its official 8-view checkout so the core package
 remains importable without the third-party model environment.
 """
 from __future__ import annotations
@@ -121,7 +121,7 @@ class GroundTruthGeometryBackend(MultiViewGeometryBackend):
 
 
 class Pi3GeometryBackend(MultiViewGeometryBackend):
-    """Official Holo360D-finetuned Pi3 8-view model adapter."""
+    """Frozen official Pi3 8-view geometry adapter."""
 
     def __init__(self, checkpoint, repo_path, device, input_size=518):
         self.checkpoint = str(checkpoint)
@@ -152,6 +152,8 @@ class Pi3GeometryBackend(MultiViewGeometryBackend):
         from pi3.models.pi3 import Pi3
 
         model = Pi3().to(self.device).eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
         weights = torch.load(self.checkpoint, map_location=self.device, weights_only=False)
         if any(key.startswith("module.") for key in weights):
             weights = {key.removeprefix("module."): value for key, value in weights.items()}
@@ -189,7 +191,7 @@ class Pi3GeometryBackend(MultiViewGeometryBackend):
         import torch.nn.functional as functional
 
         if len(view_rgb) != 8:
-            raise ValueError(f"The Holo360D Pi3 checkpoint expects exactly 8 views, got {len(view_rgb)}")
+            raise ValueError(f"The Pi3 checkpoint expects exactly 8 views, got {len(view_rgb)}")
         load_diagnostics = self._load_model() if self._model is None else {}
         rgb = np.asarray(view_rgb)
         images = torch.from_numpy(rgb).to(self.device)
@@ -224,7 +226,7 @@ class Pi3GeometryBackend(MultiViewGeometryBackend):
             raw_confidence = result["conf"][0, ..., 0].float().sigmoid().unsqueeze(1)
             confidence_source = "pi3_confidence_head"
         else:
-            # Holo360D's released 8views.bin omits the confidence decoder.
+            # The released 8-view checkpoint may omit the confidence decoder.
             # Use deterministic local depth continuity rather than random head output.
             horizontal = functional.pad(
                 (predicted_z[..., 1:] - predicted_z[..., :-1]).abs(), (0, 1, 0, 0)
@@ -263,7 +265,7 @@ class Pi3GeometryBackend(MultiViewGeometryBackend):
         depth[~valid] = np.nan
         confidence[~valid] = 0.0
         diagnostics = {
-            "backend": "pi3_holo360d_8views",
+            "backend": "pi3_8view",
             "input_size": self.input_size,
             "valid_ratio": float(valid.mean()),
             "checkpoint": self.checkpoint,

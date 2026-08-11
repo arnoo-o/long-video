@@ -11,15 +11,7 @@ REQUIRED={
     "pi3":("checkpoint","repo_path","device","input_size"),
     "online_memory":("min_transition_frames","keyframe_count","heldout_count",
                      "coverage_threshold","voxel_size"),
-    "dit360":("repo_path","python_executable","base_model_path","lora_path",
-              "erp_height","erp_width","device"),
-    "oracle_wah_training":(
-        "holo_root", "scene_id", "source_frame", "source_starts", "frame_stride",
-        "num_chunks", "erp_resolution", "perspective_resolution", "fov_degrees",
-        "pixel_center", "wah_root", "wah_model", "wah_upstream_sha",
-        "pi3_checkpoint", "physical_gpu", "prompt", "seed", "output_root",
-        "checkpoint_root", "production_threshold_config",
-    ),
+    "stage0_causal_world_film":("architecture", "data", "causal_world", "training", "frozen"),
 }
 
 def _coerce(value):
@@ -52,20 +44,14 @@ def validate_config(kind,config):
             raise ValueError("transition frames must cover mapping plus held-out frames")
         forbidden=[key for key in config if key.endswith("_m")]
         if forbidden: raise ValueError(f"node-unit config must not use metric suffixes: {forbidden}")
-    if kind=="dit360" and (config["erp_height"],config["erp_width"])!=(1024,2048):
-        raise ValueError("official DiT360 requires ERP 2048x1024")
     if kind=="wah":
         expected={"conditioning_type":"warp","warp_history_downsample_mode":"short",
                   "rope_alignment":True}
         wrong={k:(config.get(k),v) for k,v in expected.items() if config.get(k)!=v}
         if wrong: raise ValueError(f"WAH spatial-history invariants violated: {wrong}")
-    if kind=="oracle_wah_training":
-        if list(config["erp_resolution"])[1] != 2 * list(config["erp_resolution"])[0]:
-            raise ValueError("Oracle ERP resolution must be 2:1")
-        if list(config["perspective_resolution"]) != [384,640]:
-            raise ValueError("WAH perspective resolution must be exactly 384x640")
-        if int(config["physical_gpu"]) != 1:
-            raise ValueError("H100 production runs are restricted to physical GPU 1")
-        if float(config["pixel_center"]) not in {0.0,0.5}:
-            raise ValueError("pixel_center must be 0.0 or 0.5")
+    if kind=="stage0_causal_world_film":
+        if config["training"].get("flow_matching_stage_id") != 0:
+            raise ValueError("causal-world FiLM training is Stage0-only")
+        if config["causal_world"].get("uses_future_gt") is not False:
+            raise ValueError("future GT is forbidden from causal world construction")
     return config

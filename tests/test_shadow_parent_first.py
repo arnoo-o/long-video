@@ -6,9 +6,9 @@ import pytest
 from long_video.geometry.point_renderer import render
 from long_video.memory.memory_manager import MemoryManager
 from long_video.online.transition_buffer import TransitionBuffer
-from long_video.oracle_training.causal_warp import CausalActiveNodeRenderer
+from long_video.online.causal_renderer import CausalActiveNodeRenderer
 from long_video.types import CameraBatch, Z_DEPTH
-from long_video.wah.world_projected_pipeline import DelayedNodeActivationQueue
+from long_video.online.delayed_activation import DelayedNodeActivationQueue
 
 
 def _transition_frame(index):

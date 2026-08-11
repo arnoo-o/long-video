@@ -148,7 +148,7 @@ class MemoryManager:
         }
 
     def _append_chunk(self, generated_rgb_for_memory, cameras, warp, frame_start):
-        from ..oracle_training.contracts import assert_no_supervision_content
+        from ..online.causal_contracts import assert_no_supervision_content
         assert_no_supervision_content({"generated_rgb_for_memory": generated_rgb_for_memory}, "MemoryManager")
         for index in range(len(generated_rgb_for_memory)):
             self.buffer.append(
@@ -376,7 +376,7 @@ class MemoryManager:
         candidate.points_depth_evidence_role=np.where(
             generated_points,"geometry_prediction","parent_warp").astype("U24")
         candidate.points_evidence_role=candidate.points_rgb_evidence_role.copy()
-        from ..oracle_training.contracts import validate_content_labels
+        from ..online.causal_contracts import validate_content_labels
         validate_content_labels(
             candidate.view_rgb_content_origin,candidate.view_depth_content_origin,
             candidate.view_rgb_evidence_role,candidate.view_depth_evidence_role)
@@ -715,7 +715,7 @@ class MemoryManager:
     def process_chunk(self, active_node, generated_rgb_for_memory, cameras, warp, frame_start,
                       *, allow_candidate_promotion=True,
                       defer_candidate_promotion=False, **forbidden):
-        from ..oracle_training.contracts import assert_no_supervision_content
+        from ..online.causal_contracts import assert_no_supervision_content
         assert_no_supervision_content(forbidden, "MemoryManager")
         generated_frame_count = len(generated_rgb_for_memory)
         if generated_frame_count < 1:

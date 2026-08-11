@@ -12,61 +12,25 @@
                    "model":  "BestWishYsh/Helios-Distilled"
                },
     "pi3":  {
-                "repo_path":  "/ephemeral/mdu/long-video/third_party/Holo360D/Pi3_Finetuned_Holo360d",
-                "parent_remote":  "https://github.com/PKU-YuanGroup/Holo360",
-                "parent_commit":  "a54b75abc5d009aa98ec165f3a45ab19b48953e4",
-                "checkpoint":  "/ephemeral/mdu/long-video-data/raw/holo360d/ckpt/8views.bin",
-                "checkpoint_bytes":  3569900346
+                "repo_path": null,
+                "checkpoint": null,
+                "view_count": 8,
+                "frozen": true
             },
-    "dit360":  {
-                   "repo_path":  "/ephemeral/mdu/long-video-third-party/DiT360",
-                   "remote":  "https://github.com/Insta360-Research-Team/DiT360.git",
-                   "commit":  "3779fe7965473f6824994c663a0ae7a76bc7aafa",
-                   "base_model":  "black-forest-labs/FLUX.1-dev",
-                   "base_model_path":  "/ephemeral/mdu/long-video-data/models/dit360/FLUX.1-dev",
-                   "lora":  "Insta360-Research/DiT360-Panorama-Image-Generation",
-                   "lora_path":  "/ephemeral/mdu/long-video-data/models/dit360/DiT360-Panorama-Image-Generation"
-               },
     "h100_wah_environment":  {
                                  "python":  "3.12.3",
                                  "pytorch":  "2.5.1+cu124",
                                  "cuda":  "12.4",
                                  "diffusers":  "0.36.0"
                              },
-    "dit360_environment":  {
-                               "path":  "/ephemeral/mdu/envs/longvideo-dit360",
-                               "python":  "3.12.3",
-                               "pytorch":  "2.6.0+cu124",
-                               "diffusers":  "0.36.0",
-                               "transformers":  "4.52.4",
-                               "accelerate":  "1.9.0",
-                               "peft":  "0.17.1"
-                           },
     "habitat_environment":  {
                                 "path":  "/ephemeral/mdu/envs/longvideo-habitat",
                                 "habitat_sim":  "0.3.3"
                             },
-    "removed_after_dit360_validation":  [
-                                            "/ephemeral/mdu/long-video-third-party/MVDiffusion",
-                                            "/ephemeral/mdu/long-video-data/models/mvdiffusion"
-                                        ],
-    "oracle_wah_p0_validation":  {
-                                     "dataset":  "Holo360D Indoor_013",
-                                     "source_erp_resolution":  [
-                                                                   1024,
-                                                                   2048
-                                                               ],
-                                     "perspective_resolution":  [
-                                                                    384,
-                                                                    640
-                                                                ],
-                                     "chunk_frames":  33,
-                                     "vae_temporal_scale":  4,
-                                     "optimizer_steps":  2,
-                                     "checkpoint_resume_verified":  true,
-                                     "rollout_chunks":  4,
-                                     "candidate_validator_runs":  2,
-                                     "candidate_promoted":  false,
-                                     "gpu":  "physical GPU 1 / visible cuda:0"
-                                 }
+    "causal_world": {
+                         "geometry": "pi3_8view",
+                         "activation_delay_chunks": 2,
+                         "parent_first_rendering": true,
+                         "uses_future_gt": false
+                    }
 }

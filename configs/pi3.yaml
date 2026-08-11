@@ -1,4 +1,4 @@
-backend: pi3_holo360d_8views
+backend: pi3_8view
 repo_path: null
 checkpoint: null
 device: cuda:0

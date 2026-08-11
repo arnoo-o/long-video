@@ -4,10 +4,6 @@ wah_path: null
 helios_path: null
 pi3_repo_path: null
 pi3_checkpoint: null
-dit360_repo_path: null
-dit360_environment: null
-dit360_base_model: null
-dit360_lora: null
 habitat_environment: null
 replicacad_root: null
 outputs_root: null

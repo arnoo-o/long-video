@@ -1,96 +1,53 @@
-"""Unified construction of the initial spatial-memory node."""
+"""Build the initial world node from eight causal RGB views using Pi3."""
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
-
 import numpy as np
 
 from ..memory.node_builder import build_from_views
-from ..types import ScaleMetadata
+from ..types import ScaleMetadata, ViewSet
 
 
-def _completion_result(completion_backend, observed_images, camera_specs, prompt, config):
-    mode = str(config.get("mode", "sparse_images_pi3"))
-    if mode == "holo_oracle":
-        if not isinstance(observed_images, dict):
-            raise TypeError("holo_oracle expects panorama/depth/mask/c2w input fields")
-        return completion_backend.complete(
-            observed_images["panorama"],
-            observed_images["depth"],
-            panorama_c2w=observed_images.get("c2w"),
-            mask=observed_images.get("mask"),
-            observed_indices=tuple(config.get("observed_indices", (0,))),
-        )
-    if mode == "precomputed":
-        return completion_backend.complete()
-    if mode != "sparse_images_pi3":
-        raise ValueError(f"Unsupported initialization mode: {mode}")
-    return completion_backend.complete(
-        observed_images,
-        camera_specs,
-        prompt,
-        output_dir=config.get("completion_output_dir"),
-        height=int(config.get("height", 512)),
-        width=int(config.get("width", 512)),
-        target_fov_degrees=float(config.get("fov_degrees", 90.0)),
-    )
-
-
-def initialize_spatial_node(
-    observed_images: Any,
-    camera_specs,
-    prompt: str,
-    completion_backend,
-    geometry_backend,
-    config: dict,
-):
-    """Complete RGB views, predict geometry, and build the unique active M0."""
-    views = _completion_result(
-        completion_backend, observed_images, camera_specs, prompt, config
-    )
-    has_known_depth = bool(np.isfinite(views.depth).any())
+def initialize_spatial_node(views: ViewSet, geometry_backend, config: dict):
+    """Predict geometry for pre-existing causal views; no completion model is used."""
+    if not isinstance(views, ViewSet) or len(views.rgb) != 8:
+        raise ValueError("initial causal world requires exactly eight RGB views for Pi3")
+    view_frames = config.get("view_frame_indices")
+    target_start = config.get("target_frame_start")
+    if target_start is not None:
+        if view_frames is None or len(view_frames) != 8:
+            raise ValueError("training initialization requires eight causal view_frame_indices")
+        if any(int(frame) >= int(target_start) for frame in view_frames):
+            raise ValueError("future/current GT views cannot initialize the causal world")
+    has_depth = bool(np.isfinite(views.depth).any())
     prediction = geometry_backend.predict(
-        views.rgb,
-        views.c2w,
-        views.intrinsics,
-        known_depth=views.depth if has_known_depth else None,
-        known_mask=np.isfinite(views.depth) if has_known_depth else None,
-        known_depth_convention=views.depth_convention if has_known_depth else None,
+        views.rgb, views.c2w, views.intrinsics,
+        known_depth=views.depth if has_depth else None,
+        known_mask=np.isfinite(views.depth) if has_depth else None,
+        known_depth_convention=views.depth_convention if has_depth else None,
     )
     completed = replace(
-        views,
-        depth=np.asarray(prediction.depth, np.float32),
+        views, depth=np.asarray(prediction.depth, np.float32),
         depth_confidence=np.asarray(prediction.depth_confidence, np.float32),
         depth_convention=prediction.depth_convention,
     )
     node = build_from_views(
-        completed,
-        node_id=str(config.get("node_id", "node_000")),
+        completed, node_id=str(config.get("node_id", "node_000")),
         center_c2w=np.asarray(config.get("center_c2w", completed.c2w[0]), np.float32),
         created_frame=int(config.get("created_frame", 0)),
-        voxel_size=float(config.get("voxel_size", 0.02)),
-        status="active",
+        voxel_size=float(config.get("voxel_size", 0.02)), status="active",
     )
     node.quality_metrics.update(
-        initialization_mode=str(config.get("mode", "sparse_images_pi3")),
-        source_priors=({
-            {"observed":0,"synthesized":1,"generated":2,"verified":3,"invalid":4}[key]:float(value)
-            for key,value in config.get("source_prior",{}).items()
-        } or None),
+        initialization_mode="causal_pi3_views",
         geometry_diagnostics=prediction.diagnostics,
         scale_info=prediction.scale_info,
-        prompt=str(prompt),
     )
     node.scale = ScaleMetadata(
         mode=prediction.scale_info.get("mode", "relative"),
         meters_per_world_unit=prediction.scale_info.get("meters_per_world_unit"),
         uncertainty=float(prediction.scale_info.get("uncertainty", 1.0)),
         anchor_source=prediction.scale_info.get("anchor_source", "unspecified"),
-        diagnostics={k:v for k,v in prediction.scale_info.items()
-                     if k not in {"mode","meters_per_world_unit","uncertainty","anchor_source"}},
     )
-    store = config.get("node_store")
-    if store is not None:
-        store.save(node)
+    if config.get("node_store") is not None:
+        config["node_store"].save(node)
     return node

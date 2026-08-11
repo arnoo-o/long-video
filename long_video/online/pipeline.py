@@ -8,6 +8,11 @@ from ..geometry.point_renderer import render
 from ..initialization.initial_node_pipeline import initialize_spatial_node
 from ..types import CameraBatch
 from ..wah.adapter import WAHAdapter
+from ..wah.stage0_causal_world_film import (
+    build_stage0_context,
+    install_stage0_causal_world_film,
+)
+from .delayed_activation import DelayedNodeActivationQueue
 
 
 class OnlineSpatialHistoryPipeline:
@@ -23,8 +28,14 @@ class OnlineSpatialHistoryPipeline:
     ):
         self.wah_pipeline = wah_pipeline
         self.wah_adapter = WAHAdapter(wah_pipeline) if wah_pipeline is not None else None
+        self.stage0_film = (
+            install_stage0_causal_world_film(wah_pipeline.transformer)
+            if wah_pipeline is not None else None
+        )
         self.active_node = active_node
         self.memory_manager = memory_manager
+        if self.memory_manager is not None and active_node is not None:
+            self.memory_manager.register(active_node)
         self.prompt = str(prompt)
         self.renderer_kwargs = {"device":"cpu",**dict(renderer_kwargs or {})}
         self.control_kwargs = dict(control_kwargs or {})
@@ -35,25 +46,20 @@ class OnlineSpatialHistoryPipeline:
         self.recent_video_history = []
         self.autoregressive_state = None
         self.frame_index = 0
+        self.chunk_index = 0
+        self.activation_queue = DelayedNodeActivationQueue(delay_chunks=2)
 
     def initialize(
         self,
-        observed_images,
-        camera_specs,
+        views,
         prompt,
-        completion_backend,
         geometry_backend,
         config,
         first_image=None,
     ):
         self.prompt = str(prompt)
         self.active_node = initialize_spatial_node(
-            observed_images,
-            camera_specs,
-            prompt,
-            completion_backend,
-            geometry_backend,
-            config,
+            views, geometry_backend, config,
         )
         self.current_camera_c2w = self.active_node.center_c2w.copy()
         if self.memory_manager is not None:
@@ -102,11 +108,24 @@ class OnlineSpatialHistoryPipeline:
         if len(intrinsics) != len(poses):
             raise ValueError("intrinsics count must match generated camera poses")
         cameras = CameraBatch(poses, intrinsics, int(height), int(width))
+        activation = self.activation_queue.activate_due(self.chunk_index)
+        if activation is not None:
+            verified_hash = self.memory_manager.verify_shadow(activation.node)
+            self.active_node = self.memory_manager.commit_shadow(
+                self.active_node, activation.node, verified_hash=verified_hash,
+            )
         reactivation_event=None
         if self.memory_manager is not None:
             self.active_node,reactivation_event=self.memory_manager.maybe_reactivate(
                 self.active_node,cameras)
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
+        import torch
+        with torch.no_grad():
+            world0, visibility0 = build_stage0_context(
+                self.wah_pipeline, warp.rgb, warp.visibility,
+                dtype=getattr(self.wah_pipeline.transformer, "dtype", None),
+            )
+        self.stage0_film.set_context(world0, visibility0)
         generated_video, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
             self.autoregressive_state, warp, output_type="np"
         )
@@ -124,8 +143,17 @@ class OnlineSpatialHistoryPipeline:
         memory_event = None
         if self.memory_manager is not None:
             self.active_node, memory_event = self.memory_manager.process_chunk(
-                self.active_node, generated_rgb_for_memory=generated, cameras=cameras, warp=warp, frame_start=frame_start
+                self.active_node, generated_rgb_for_memory=generated, cameras=cameras, warp=warp,
+                frame_start=frame_start, allow_candidate_promotion=len(self.activation_queue) == 0,
+                defer_candidate_promotion=True,
             )
+            shadow = memory_event.pop("shadow_node", None)
+            if shadow is not None:
+                scheduled = self.activation_queue.schedule(
+                    shadow, created_after_chunk=self.chunk_index,
+                )
+                memory_event["pending_node_id"] = scheduled.node_id
+                memory_event["activate_at_chunk"] = scheduled.activate_at_chunk
         high_conf = warp.visibility & (warp.confidence >= (
             self.memory_manager.high_confidence_threshold if self.memory_manager else 0.5
         ))
@@ -139,5 +167,9 @@ class OnlineSpatialHistoryPipeline:
             "reactivation_event":reactivation_event,
             "active_node_id": self.active_node.node_id,
             "memory_event": memory_event,
+            "chunk_index": self.chunk_index,
+            "stage0_film_applied": self.stage0_film.applied_calls > 0,
+            "uses_future_gt": False,
         }
+        self.chunk_index += 1
         return generated, poses, warp, statistics

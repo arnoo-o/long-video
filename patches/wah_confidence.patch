@@ -53,22 +53,6 @@ index 92a976b..df6f986 100644
          hidden_states = dispatch_attention_fn(
              query,
              key,
-@@ -566,6 +603,15 @@ class HeliosTransformerBlock(nn.Module):
-         )
-         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
- 
-+        # Optional project-owned second spatial attention.  The callback keeps
-+        # W/R outside the Helios sequence and replaces target tokens only.
-+        controller_ref = getattr(self, "_spatial_controller_ref", None)
-+        controller = None if controller_ref is None else controller_ref()
-+        if controller is not None:
-+            hidden_states = controller.spatial_attention(
-+                self, hidden_states, rotary_emb, original_context_length, scale_msa, shift_msa,
-+            )
-+
-         # 2. Cross-attention
-         if self.guidance_cross_attn:
-             history_seq_len = hidden_states.shape[1] - original_context_length
 @@ -850,6 +896,7 @@ class HeliosTransformer3DModel(
          history_visible_mask_short=None,
          history_visible_mask_mid=None,
@@ -404,22 +388,6 @@ index d69fe15..a64d387 100644
              )
          hidden_states = hidden_states.flatten(2, 3)
          hidden_states = hidden_states.type_as(query)
-@@ -1110,6 +1160,15 @@ class HeliosTransformerBlock(nn.Module):
-         )
-         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
- 
-+        # Optional project-owned second spatial attention.  The callback keeps
-+        # W/R outside the Helios sequence and replaces target tokens only.
-+        controller_ref = getattr(self, "_spatial_controller_ref", None)
-+        controller = None if controller_ref is None else controller_ref()
-+        if controller is not None:
-+            hidden_states = controller.spatial_attention(
-+                self, hidden_states, rotary_emb, original_context_length, scale_msa, shift_msa,
-+            )
-+
-         # 2. Cross-attention
-         if self.guidance_cross_attn:
-             history_seq_len = (hidden_states.shape[1] - original_context_length) // len(original_context_length_list)
 @@ -1459,6 +1518,7 @@ class HeliosTransformer3DModel(
          latents_history_mid=None,
          latents_history_long=None,

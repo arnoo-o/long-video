@@ -539,6 +539,7 @@ def main():
             "stages": [2],
             "decodes_noisy_latent": False,
             "joint_33_frame_optimization": True,
+            "x0_optimization_dtype": "float32",
             "vae_backward_activation_offload": "bounded_large_saved_tensors_cpu",
             "vae_backward_activation_offload_budget_gib": 4,
             "vae_backward_activation_offload_min_spatial_area": "96x160",

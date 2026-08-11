@@ -1098,7 +1098,10 @@ def sparse_pixel_constraint(
     if not bool(((visible == 0) | (visible == 1)).all()):
         raise ValueError("sparse constraint requires raw binary renderer visibility")
 
-    base = x0_base.detach()
+    # The requested weak learning rates are below BF16's unit-in-last-place
+    # for typical Helios latents.  Keep the sole optimization variable in
+    # FP32 so the sparse correction is not rounded to an exact no-op.
+    base = x0_base.detach().float()
     x0_opt = base
     last_pixel = torch.zeros((), device=base.device)
     last_latent = torch.zeros((), device=base.device)
@@ -1180,6 +1183,7 @@ def sparse_pixel_constraint(
             (x0_opt.float() - base.float()).norm()
             / base.float().norm().clamp_min(float(epsilon))
         ).detach(),
+        "sparse_optimization_fp32": torch.ones((), device=base.device),
     }
 
 

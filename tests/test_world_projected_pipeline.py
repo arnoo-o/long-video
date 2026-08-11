@@ -74,13 +74,14 @@ def test_clean_prediction_and_native_scheduler_alignment_are_used():
 
 
 def test_sparse_pixel_constraint_is_joint_and_only_updates_latent():
-    base = torch.zeros(1, 1, 2, 1, 2)
+    base = torch.zeros(1, 1, 2, 1, 2, dtype=torch.bfloat16)
     warp = torch.tensor([[[[[1.0, 5.0]], [[3.0, 7.0]]]]]).expand(1, 3, 2, 1, 2)
     visibility = torch.tensor([[[[[1.0, 0.0]], [[1.0, 0.0]]]]])
     decode_calls = []
 
     def decode(value):
         decode_calls.append(tuple(value.shape))
+        assert value.dtype == torch.float32
         return value.expand(1, 3, 2, 1, 2)
 
     optimized, metrics = sparse_pixel_constraint(
@@ -90,6 +91,7 @@ def test_sparse_pixel_constraint_is_joint_and_only_updates_latent():
     assert decode_calls == [tuple(base.shape)]
     assert optimized.grad_fn is None
     assert not optimized.requires_grad
+    assert optimized.dtype == torch.float32
     assert float(optimized[..., 0].abs().sum()) > 0.0
     assert float(optimized[..., 1].abs().sum()) == 0.0
     assert float(metrics["sparse_clipped_grad_norm"]) <= 1.0 + 1e-6

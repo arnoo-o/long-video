@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -21,6 +21,15 @@ except ImportError:  # Keep CPU helper tests importable without the submodule.
         pass
 
 
+# Helios uses nine temporal latent slots for the 33-frame WAH chunks.  The
+# first three latent slots are deliberately warmed up at chunk start; later
+# slots are trusted immediately.  Keep this schedule separate from the
+# renderer support masks: it is applied only to the final WPF strength.
+DEFAULT_TEMPORAL_WARMUP: tuple[float, ...] = (
+    0.0, 0.25, 0.60, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+)
+
+
 @dataclass(frozen=True)
 class WorldProjectionConfig:
     lambda_max_by_stage: tuple[float, ...] = (0.0, 0.15, 0.30)
@@ -28,6 +37,7 @@ class WorldProjectionConfig:
     gamma: float = 1.0
     confidence_ramp_min: float = 0.2
     confidence_ramp_max: float = 0.5
+    temporal_warmup: tuple[float, ...] = DEFAULT_TEMPORAL_WARMUP
 
     def __post_init__(self):
         if not self.lambda_max_by_stage:
@@ -42,6 +52,10 @@ class WorldProjectionConfig:
             raise ValueError("gamma must be non-negative")
         if not 0.0 <= self.confidence_ramp_min < self.confidence_ramp_max <= 1.0:
             raise ValueError("confidence ramp must satisfy 0 <= min < max <= 1")
+        if not self.temporal_warmup:
+            raise ValueError("temporal_warmup must not be empty")
+        if any(not 0.0 <= value <= 1.0 for value in self.temporal_warmup):
+            raise ValueError("every temporal warmup value must be in [0, 1]")
 
     def lambda_max(self, stage_id: int) -> float:
         if not 0 <= int(stage_id) < len(self.lambda_max_by_stage):
@@ -52,6 +66,11 @@ class WorldProjectionConfig:
         if not 0 <= int(stage_id) < len(self.boundary_beta_max_by_stage):
             raise ValueError(f"no boundary beta configured for stage {stage_id}")
         return float(self.boundary_beta_max_by_stage[int(stage_id)])
+
+    @property
+    def temporal_warmup_by_slot(self) -> tuple[float, ...]:
+        """Compatibility alias for callers that describe the schedule by slots."""
+        return tuple(float(value) for value in self.temporal_warmup)
 
 
 @dataclass(frozen=True)
@@ -190,6 +209,99 @@ def fill_invalid_warp_for_vae(rgb: Any, visibility: Any) -> np.ndarray:
     if np.issubdtype(value.dtype, np.integer):
         result = np.rint(result).astype(value.dtype)
     return result
+
+
+def posterior_mode_or_mean(posterior: Any) -> torch.Tensor:
+    """Return a deterministic VAE posterior representative.
+
+    The normal Helios path intentionally samples from VAE posteriors.  World
+    projection conditioning is different: its canonical endpoint must be
+    repeatable and must not advance the generation ``torch.Generator``.  A
+    few VAE implementations expose ``mode()`` while light-weight test doubles
+    only provide ``mean``; support both without ever calling ``sample``.
+    """
+    posterior = getattr(posterior, "latent_dist", posterior)
+    mode = getattr(posterior, "mode", None)
+    if callable(mode):
+        try:
+            value = mode()
+        except (AttributeError, NotImplementedError):
+            value = None
+        if value is not None:
+            return value
+    value = getattr(posterior, "mean", None)
+    if value is None:
+        raise TypeError("VAE posterior must expose mode() or mean for deterministic encoding")
+    return value
+
+
+def _encode_vae_deterministic(
+    pipe: Any,
+    video: torch.Tensor,
+    *,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+) -> torch.Tensor:
+    """Encode one video tensor with posterior mode/mean and WAH statistics."""
+    encoded_output = pipe.vae.encode(video)
+    posterior = getattr(encoded_output, "latent_dist", encoded_output)
+    encoded = posterior_mode_or_mean(posterior)
+    return (encoded - latents_mean) * latents_std
+
+
+def encode_canonical_video_latents(
+    pipe: Any,
+    video: torch.Tensor,
+    *,
+    latents_mean: torch.Tensor,
+    latents_std: torch.Tensor,
+    num_latent_frames_per_chunk: int,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode canonical WAH video latents deterministically.
+
+    This mirrors Helios' ``prepare_video_latents`` temporal grouping exactly,
+    but intentionally omits its posterior ``sample(generator=...)`` calls.
+    It is used only for the shared canonical conditioning path; ordinary
+    Helios generation continues to use the pinned stochastic implementation.
+    """
+    device = device or getattr(pipe, "_execution_device", None)
+    if device is None:
+        device = video.device
+    vae = pipe.vae
+    video = video.to(device=device, dtype=getattr(vae, "dtype", video.dtype))
+    num_frames = int(video.shape[2])
+    temporal_scale = int(getattr(pipe, "vae_scale_factor_temporal", 4))
+    min_frames = (int(num_latent_frames_per_chunk) - 1) * temporal_scale + 1
+    num_chunks = num_frames // min_frames
+    if num_chunks == 0:
+        raise ValueError(
+            f"Video must have at least {min_frames} frames (got {num_frames} frames)."
+        )
+    total_valid_frames = num_chunks * min_frames
+    start_frame = num_frames - total_valid_frames
+
+    first_frame = video[:, :, 0:1]
+    first_frame_latent = _encode_vae_deterministic(
+        pipe, first_frame, latents_mean=latents_mean, latents_std=latents_std,
+    )
+    latents_chunks = []
+    for index in range(num_chunks):
+        chunk_start = start_frame + index * min_frames
+        chunk_end = chunk_start + min_frames
+        video_chunk = video[:, :, chunk_start:chunk_end]
+        latents_chunks.append(_encode_vae_deterministic(
+            pipe, video_chunk, latents_mean=latents_mean, latents_std=latents_std,
+        ))
+    latents = torch.cat(latents_chunks, dim=2)
+    if dtype is not None:
+        first_frame_latent = first_frame_latent.to(device=device, dtype=dtype)
+        latents = latents.to(device=device, dtype=dtype)
+    else:
+        first_frame_latent = first_frame_latent.to(device=device)
+        latents = latents.to(device=device)
+    return first_frame_latent, latents
 
 
 def build_canonical_world_pyramid(clean_latent: torch.Tensor, stage_count: int = 3) -> list[torch.Tensor]:
@@ -375,6 +487,7 @@ def apply_world_projection(
     gamma: float = 1.0,
     confidence_ramp_min: float = 0.2,
     confidence_ramp_max: float = 0.5,
+    temporal_warmup: Sequence[float] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Blend a scheduler result toward verified world evidence."""
     if tuple(z_world.shape) != tuple(z_raw.shape):
@@ -384,11 +497,16 @@ def apply_world_projection(
         raise ValueError(
             f"support must be {support_shape}, got {tuple(visibility.shape)}/{tuple(confidence.shape)}"
         )
-    strength, schedule = world_projection_weight(
+    raw_strength, schedule = world_projection_weight(
         visibility, confidence, sigma=sigma, lambda_max=lambda_max, gamma=gamma,
         confidence_ramp_min=confidence_ramp_min,
         confidence_ramp_max=confidence_ramp_max,
         device=z_raw.device,
+    )
+    strength = _final_wpf_strength(
+        raw_strength,
+        temporal_warmup=temporal_warmup,
+        boundary_active=False,
     )
     projected = z_raw.float() + strength * (z_world.float() - z_raw.float())
     projected = projected.to(z_raw.dtype)
@@ -404,6 +522,7 @@ def apply_world_projection(
         "lambda": schedule.detach(),
         "projection_mask_ratio": (strength > 0).float().mean().detach(),
         "projection_strength_mean": strength.mean().detach(),
+        "wpf_slot0_strength_max": strength[:, :, 0:1].max().detach(),
         "projection_delta_ratio": (
             delta.norm() / z_raw.float().norm().clamp_min(1e-8)
         ).detach(),
@@ -425,16 +544,22 @@ def apply_world_and_boundary_projection(
     gamma: float = 1.0,
     confidence_ramp_min: float = 0.2,
     confidence_ramp_max: float = 0.5,
+    temporal_warmup: Sequence[float] | torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Apply Boundary Projection and WPF from the same scheduler output."""
     if tuple(z_world.shape) != tuple(z_raw.shape):
         raise ValueError("world/raw shape mismatch")
-    world_strength, schedule = world_projection_weight(
+    raw_world_strength, schedule = world_projection_weight(
         visibility, confidence,
         sigma=sigma, lambda_max=lambda_max, gamma=gamma,
         confidence_ramp_min=confidence_ramp_min,
         confidence_ramp_max=confidence_ramp_max,
         device=z_raw.device,
+    )
+    world_strength = _final_wpf_strength(
+        raw_world_strength,
+        temporal_warmup=temporal_warmup,
+        boundary_active=boundary_state is not None,
     )
     raw = z_raw.float()
     effective_world_strength = world_strength.clone()
@@ -457,8 +582,8 @@ def apply_world_and_boundary_projection(
             boundary_state.to(device=z_raw.device, dtype=torch.float32)
             - raw[:, :, 0:1]
         )
-        # Boundary owns beta of slot0; WPF receives only its remaining convex weight.
-        effective_world_strength[:, :, 0:1] *= 1.0 - boundary_schedule
+        # Boundary owns slot0 completely; WPF strength is strictly zero there.
+        effective_world_strength[:, :, 0:1] = 0.0
     world_delta = effective_world_strength * (z_world.float() - raw)
     combined = (raw + boundary_delta + world_delta).to(z_raw.dtype)
     unknown = visibility.to(device=z_raw.device) == 0
@@ -478,6 +603,7 @@ def apply_world_and_boundary_projection(
         "lambda": schedule.detach(),
         "projection_mask_ratio": (effective_world_strength > 0).float().mean().detach(),
         "projection_strength_mean": effective_world_strength.mean().detach(),
+        "wpf_slot0_strength_max": effective_world_strength[:, :, 0:1].max().detach(),
         "projection_delta_ratio": (
             world_delta.norm() / raw.norm().clamp_min(1e-8)
         ).detach(),
@@ -522,6 +648,49 @@ def world_projection_weight(
     return visible * confidence_weight * schedule, schedule
 
 
+def _temporal_warmup_tensor(
+    warmup: Sequence[float] | torch.Tensor | None,
+    frames: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Broadcast a WPF temporal warmup vector over latent spatial dimensions."""
+    if warmup is None:
+        # Keep small synthetic helper tensors backwards-compatible while the
+        # real Helios 9-slot path receives the validated default schedule.
+        values = (1.0,) * int(frames) if int(frames) != len(DEFAULT_TEMPORAL_WARMUP) else DEFAULT_TEMPORAL_WARMUP
+    else:
+        values = warmup.detach().flatten().tolist() if torch.is_tensor(warmup) else list(warmup)
+    if len(values) != int(frames):
+        raise ValueError(
+            f"temporal warmup must have one value per latent slot ({frames}), got {len(values)}"
+        )
+    tensor = torch.as_tensor(values, device=device, dtype=torch.float32)
+    if bool((tensor < 0).any()) or bool((tensor > 1).any()):
+        raise ValueError("temporal warmup values must be in [0, 1]")
+    return tensor.view(1, 1, int(frames), 1, 1)
+
+
+def _final_wpf_strength(
+    strength: torch.Tensor,
+    *,
+    temporal_warmup: Sequence[float] | torch.Tensor | None,
+    boundary_active: bool,
+) -> torch.Tensor:
+    """Apply warmup and slot-0 policy to the final WPF strength only."""
+    if strength.ndim != 5:
+        raise ValueError(f"WPF strength must be 5D, got {tuple(strength.shape)}")
+    warmup = _temporal_warmup_tensor(
+        temporal_warmup, int(strength.shape[2]), device=strength.device,
+    )
+    result = strength * warmup
+    if boundary_active:
+        # Boundary owns slot 0 completely; WPF must not retain even a tiny
+        # residual weight when its beta schedule is still warming up.
+        result[:, :, 0:1] = 0.0
+    return result
+
+
 class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
     """WAH subclass that projects only scheduler outputs, never predictions."""
 
@@ -530,6 +699,67 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
 
     def clear_world_projection_context(self) -> None:
         self._world_projection_context = None
+
+    def set_canonical_warp_conditioning(
+        self,
+        canonical_warp_rgb: Any,
+        canonical_warp_latents: torch.Tensor,
+        *,
+        first_frame_latent: torch.Tensor | None = None,
+        height: int | None = None,
+        width: int | None = None,
+    ) -> None:
+        """Cache the shared canonical RGB/latent pair for this chunk.
+
+        WAH normally re-encodes its warp history inside ``generate_next_chunk``
+        with a stochastic VAE posterior.  The world-projected path has already
+        encoded this exact filled RGB once, so reuse that latent and leave the
+        normal Helios generation noise path untouched.
+        """
+        device = self._wah_execution_device()
+        height = int(height if height is not None else getattr(self, "_canonical_conditioning_height", 384))
+        width = int(width if width is not None else getattr(self, "_canonical_conditioning_width", 640))
+        self._canonical_warp_video_tensor = self._coerce_warp_video_tensor(
+            canonical_warp_rgb, height=height, width=width, device=device,
+        ).detach()
+        self._canonical_warp_latents = canonical_warp_latents.detach().to(
+            device=device, dtype=torch.float32,
+        )
+        self._canonical_warp_first_frame_latent = (
+            self._canonical_warp_latents[:, :, :1]
+            if first_frame_latent is None
+            else first_frame_latent.detach().to(device=device, dtype=torch.float32)
+        )
+
+    def clear_canonical_warp_conditioning(self) -> None:
+        self._canonical_warp_video_tensor = None
+        self._canonical_warp_latents = None
+        self._canonical_warp_first_frame_latent = None
+
+    def prepare_video_latents(self, video, *args, **kwargs):
+        """Reuse a matching canonical encode; defer all other calls to WAH."""
+        cached_video = getattr(self, "_canonical_warp_video_tensor", None)
+        cached_latents = getattr(self, "_canonical_warp_latents", None)
+        if cached_video is not None and cached_latents is not None:
+            candidate = video.detach() if torch.is_tensor(video) else None
+            if candidate is not None:
+                candidate = candidate.to(device=cached_video.device, dtype=cached_video.dtype)
+                if tuple(candidate.shape) == tuple(cached_video.shape) and torch.equal(candidate, cached_video):
+                    first = getattr(
+                        self, "_canonical_warp_first_frame_latent", None,
+                    )
+                    if first is None:
+                        first = cached_latents[:, :, :1]
+                    dtype = kwargs.get("dtype")
+                    device = kwargs.get("device") or cached_latents.device
+                    if dtype is not None:
+                        first = first.to(device=device, dtype=dtype)
+                        latents = cached_latents.to(device=device, dtype=dtype)
+                    else:
+                        first = first.to(device=device)
+                        latents = cached_latents.to(device=device)
+                    return first, latents
+        return super().prepare_video_latents(video, *args, **kwargs)
 
     def stage2_sample(self, *args, **kwargs):  # noqa: C901 - preserves pinned pipeline semantics.
         context = getattr(self, "_world_projection_context", None)
@@ -591,8 +821,9 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 gamma=config.gamma,
                 confidence_ramp_min=config.confidence_ramp_min,
                 confidence_ramp_max=config.confidence_ramp_max,
+                temporal_warmup=config.temporal_warmup,
             )
-            context.final_projection_weight = world_projection_weight(
+            raw_final_weight = world_projection_weight(
                 visible, confidence,
                 sigma=next_sigma,
                 lambda_max=stage_lambda_max,
@@ -600,14 +831,12 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 confidence_ramp_min=config.confidence_ramp_min,
                 confidence_ramp_max=config.confidence_ramp_max,
                 device=z_raw.device,
-            )[0].detach()
-            if boundary_state is not None:
-                beta = float(boundary_beta_max) * (
-                    1.0 - torch.as_tensor(
-                        next_sigma, device=z_raw.device, dtype=torch.float32,
-                    ).clamp(0.0, 1.0)
-                )
-                context.final_projection_weight[:, :, 0:1] *= 1.0 - beta
+            )[0]
+            context.final_projection_weight = _final_wpf_strength(
+                raw_final_weight,
+                temporal_warmup=config.temporal_warmup,
+                boundary_active=boundary_state is not None,
+            ).detach()
             context.diagnostics.append({
                 "stage_id": int(stage_id),
                 "step_id": int(step_index),

@@ -101,7 +101,9 @@ from long_video.wah.world_projected_pipeline import (
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
     build_world_projection_context,
+    encode_canonical_video_latents,
     fill_invalid_warp_for_vae,
+    posterior_mode_or_mean,
 )
 from warp_as_history.training.core import training_exact_pyramid_latents
 
@@ -257,38 +259,38 @@ def load_phase_a_zero(transformer, checkpoint):
     }
 
 
-def clean_warp_latents(pipe, state, warp):
-    generator = state["generator"]
-    saved_rng = generator.get_state()
-    filled_rgb = fill_invalid_warp_for_vae(warp.rgb, warp.visibility)
+def clean_warp_latents(
+    pipe, state, warp, *, canonical_warp_rgb=None, return_first_frame=False,
+):
+    """Encode the chunk's already-filled canonical warp deterministically."""
+    if canonical_warp_rgb is None:
+        canonical_warp_rgb = fill_invalid_warp_for_vae(warp.rgb, warp.visibility)
     pipe._prepare_autoregressive_warp_chunk(
         state,
-        filled_rgb,
+        canonical_warp_rgb,
         np.asarray(warp.visibility, np.float32)[None, None],
         np.asarray(warp.confidence * warp.visibility, np.float32)[None, None],
     )
     raw = state["online_warp_video_tensor"]
     device = pipe._wah_execution_device()
     mean, std = pipe._latent_stats(device)
-    try:
-        _, clean = pipe.prepare_video_latents(
-            raw,
-            latents_mean=mean,
-            latents_std=std,
-            num_latent_frames_per_chunk=LATENT_FRAMES,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-        )
-    finally:
-        generator.set_state(saved_rng)
-    return clean.detach()
+    first_frame_latent, clean = encode_canonical_video_latents(
+        pipe,
+        raw,
+        latents_mean=mean,
+        latents_std=std,
+        num_latent_frames_per_chunk=LATENT_FRAMES,
+        dtype=torch.float32,
+        device=device,
+    )
+    clean = clean.detach()
+    if return_first_frame:
+        return first_frame_latent.detach(), clean
+    return clean
 
 
 def clean_boundary_frame_latent(pipe, state, frame):
     """Encode the one true stride-32 shared RGB frame with WAH VAE statistics."""
-    generator = state["generator"]
-    saved_rng = generator.get_state()
     device = pipe._wah_execution_device()
     tensor = pipe._coerce_warp_video_tensor(
         [np.asarray(frame)], height=HEIGHT, width=WIDTH, device=device,
@@ -296,11 +298,10 @@ def clean_boundary_frame_latent(pipe, state, frame):
     if tuple(tensor.shape) != (1, 3, 1, HEIGHT, WIDTH):
         raise RuntimeError(f"single-frame boundary RGB tensor shape mismatch: {tuple(tensor.shape)}")
     mean, std = pipe._latent_stats(device)
-    try:
-        latent = pipe.vae.encode(tensor).latent_dist.sample(generator=generator)
-        latent = (latent - mean) * std
-    finally:
-        generator.set_state(saved_rng)
+    encoded_output = pipe.vae.encode(tensor)
+    posterior = getattr(encoded_output, "latent_dist", encoded_output)
+    latent = posterior_mode_or_mean(posterior)
+    latent = (latent - mean) * std
     if tuple(latent.shape[2:]) != (1, 48, 80):
         raise RuntimeError(f"single-frame boundary VAE latent shape mismatch: {tuple(latent.shape)}")
     return latent.detach().to(dtype=torch.float32)
@@ -524,6 +525,7 @@ def main():
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
         "projection": vars(projection_config),
+        "wpf_temporal_warmup": list(projection_config.temporal_warmup),
         "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
         "canonical_warp_vae_fill": "per_frame_nearest_visible_with_chunk_mean_fallback",
         "source_world_filter": source_world_filter,
@@ -549,7 +551,7 @@ def main():
             "temporal_slots": [0],
             "beta_max_by_stage": list(projection_config.boundary_beta_max_by_stage),
             "scheduler_aligned": True,
-            "wpf_uses_remaining_slot0_weight": True,
+            "wpf_uses_remaining_slot0_weight": False,
             "combined_with_wpf_from_same_z_raw": True,
         },
         "uses_future_gt": False,
@@ -610,7 +612,16 @@ def main():
                 )
                 warp = rendered.warp
                 node_at_start = renderer.active_node
-                clean = clean_warp_latents(pipe, state, warp)
+                # Fill invalid renderer pixels exactly once.  The visibility,
+                # confidence, depth, and source arrays remain the raw renderer
+                # evidence; this RGB copy is used only as shared conditioning.
+                canonical_warp_rgb = fill_invalid_warp_for_vae(
+                    warp.rgb, warp.visibility,
+                )
+                canonical_first_frame_latent, clean = clean_warp_latents(
+                    pipe, state, warp, canonical_warp_rgb=canonical_warp_rgb,
+                    return_first_frame=True,
+                )
                 stage_shapes = prepare_spatial_context(
                     controller, pipe.transformer, clean, warp,
                     poses[start:start + CHUNK_FRAMES],
@@ -629,10 +640,15 @@ def main():
                 )
                 boundary_source_global_frame = state.get("boundary_source_global_frame")
                 pipe.set_world_projection_context(projection)
+                pipe.set_canonical_warp_conditioning(
+                    canonical_warp_rgb, clean,
+                    first_frame_latent=canonical_first_frame_latent,
+                    height=HEIGHT, width=WIDTH,
+                )
                 try:
                     output, state = pipe.generate_next_chunk(
                         state,
-                        warp_video=warp.rgb,
+                        warp_video=canonical_warp_rgb,
                         warp_visibility_mask=np.asarray(warp.visibility, np.float32)[None, None],
                         warp_confidence_mask=np.asarray(
                             warp.confidence * warp.visibility, np.float32,
@@ -641,6 +657,7 @@ def main():
                     )
                 finally:
                     pipe.clear_world_projection_context()
+                    pipe.clear_canonical_warp_conditioning()
                     controller.clear_context()
                 generated = video_array(output)
                 if len(generated) != CHUNK_FRAMES:
@@ -719,6 +736,12 @@ def main():
                         raise RuntimeError("stage0 World Projection must remain exactly disabled")
                     if stage_id == 0 and any(item["boundary_delta_ratio"] != 0.0 for item in stage_items):
                         raise RuntimeError("stage0 Boundary Bridge must remain exactly disabled")
+                    if projection.previous_boundary_latents is not None and any(
+                        item["wpf_slot0_strength_max"] != 0.0 for item in stage_items
+                    ):
+                        raise RuntimeError(
+                            f"stage {stage_id} Boundary Bridge left non-zero WPF slot0 strength"
+                        )
                     if stage_id > 0:
                         next_sigmas = [item["next_sigma"] for item in stage_items]
                         if len(set(next_sigmas)) != expected_steps:

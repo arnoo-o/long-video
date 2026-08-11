@@ -2,7 +2,9 @@ import torch
 from types import SimpleNamespace
 
 from long_video.wah.world_projected_pipeline import (
+    DEFAULT_TEMPORAL_WARMUP,
     DelayedNodeActivationQueue,
+    WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
     apply_world_and_boundary_projection,
     apply_world_projection,
@@ -11,6 +13,8 @@ from long_video.wah.world_projected_pipeline import (
     build_boundary_state_at_sigma,
     build_world_state_at_sigma,
     fill_invalid_warp_for_vae,
+    encode_canonical_video_latents,
+    posterior_mode_or_mean,
     smooth_latent_visibility,
     world_projection_weight,
 )
@@ -144,12 +148,13 @@ def test_boundary_and_world_projection_share_raw_origin_with_slot0_priority():
         sigma=0.0, lambda_max=0.25, gamma=1.0,
         confidence_ramp_min=0.2, confidence_ramp_max=0.5,
     )
-    # slot0: beta*boundary + (1-beta)*lambda*world; later slots: lambda*world.
-    expected = torch.tensor([1.2, 0.5, 0.5, 0.5, 0.5]).view(1, 1, 5, 1, 1)
+    # Boundary owns slot0; later slots receive WPF from the same raw origin.
+    expected = torch.tensor([0.8, 0.5, 0.5, 0.5, 0.5]).view(1, 1, 5, 1, 1)
     torch.testing.assert_close(projected, expected.expand_as(projected))
     assert float(metrics["boundary_active"]) == 1.0
     assert float(metrics["boundary_non_slot0_delta_max"]) == 0.0
     assert float(metrics["unknown_projection_delta_max"]) == 0.0
+    assert float(metrics["wpf_slot0_strength_max"]) == 0.0
 
 
 def test_boundary_only_changes_temporal_slot0_and_stage0_is_disabled():
@@ -220,3 +225,113 @@ def test_delayed_node_activation_waits_full_chunk_and_schedule_cannot_be_replace
     activated = queue.activate_due(7)
     render_node = activated.node
     assert render_node.node_id == "node_001"
+
+
+def test_temporal_warmup_only_scales_final_wpf_strength():
+    raw = torch.zeros(1, 2, 9, 1, 1)
+    world = torch.ones_like(raw)
+    visibility = torch.ones(1, 1, 9, 1, 1)
+    confidence = torch.ones_like(visibility)
+    projected, metrics = apply_world_projection(
+        raw, world, visibility, confidence,
+        sigma=0.0, lambda_max=0.5,
+        temporal_warmup=DEFAULT_TEMPORAL_WARMUP,
+    )
+    expected = torch.tensor(DEFAULT_TEMPORAL_WARMUP).view(1, 1, 9, 1, 1) * 0.5
+    torch.testing.assert_close(projected[:, :1], expected)
+    assert float(metrics["wpf_slot0_strength_max"]) == 0.0
+    assert torch.equal(visibility, torch.ones_like(visibility))
+    assert torch.equal(confidence, torch.ones_like(confidence))
+
+
+def test_boundary_active_wpf_slot0_is_strictly_zero_even_with_custom_warmup():
+    raw = torch.zeros(1, 1, 9, 1, 1)
+    world = torch.ones_like(raw)
+    boundary = torch.ones(1, 1, 1, 1, 1)
+    support = torch.ones(1, 1, 9, 1, 1)
+    projected, metrics = apply_world_and_boundary_projection(
+        raw, world, support, support,
+        boundary_state=boundary, boundary_beta_max=0.2, sigma=0.0,
+        lambda_max=0.5, temporal_warmup=(1.0,) * 9,
+    )
+    torch.testing.assert_close(projected[:, :, 0], torch.full((1, 1, 1, 1), 0.2))
+    assert float(metrics["wpf_slot0_strength_max"]) == 0.0
+
+
+def test_deterministic_canonical_encode_uses_mode_and_does_not_consume_generator():
+    class Posterior:
+        sample_calls = 0
+
+        def __init__(self, value):
+            self.mean = value
+            self.mode_calls = 0
+
+        def mode(self):
+            self.mode_calls += 1
+            return self.mean + 1.0
+
+        def sample(self, *args, **kwargs):  # pragma: no cover - must never run
+            type(self).sample_calls += 1
+            raise AssertionError("canonical VAE encode must not sample")
+
+    class VAE:
+        dtype = torch.float32
+
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, video):
+            self.calls.append(video.detach().clone())
+            value = video.mean(dim=1, keepdim=True)
+            return type("Encoded", (), {"latent_dist": Posterior(value)})()
+
+    class Pipe:
+        vae_scale_factor_temporal = 4
+
+        def __init__(self):
+            self.vae = VAE()
+
+    pipe = Pipe()
+    video = torch.linspace(-1.0, 1.0, 33 * 2 * 2 * 3).reshape(1, 3, 33, 2, 2)
+    generator = torch.Generator().manual_seed(123)
+    before = generator.get_state()
+    first_a, clean_a = encode_canonical_video_latents(
+        pipe, video, latents_mean=torch.zeros(1, 1, 1, 1, 1),
+        latents_std=torch.ones(1, 1, 1, 1, 1), num_latent_frames_per_chunk=9,
+        dtype=torch.float32, device="cpu",
+    )
+    first_b, clean_b = encode_canonical_video_latents(
+        pipe, video, latents_mean=torch.zeros(1, 1, 1, 1, 1),
+        latents_std=torch.ones(1, 1, 1, 1, 1), num_latent_frames_per_chunk=9,
+        dtype=torch.float32, device="cpu",
+    )
+    assert torch.equal(first_a, first_b)
+    assert torch.equal(clean_a, clean_b)
+    assert torch.equal(before, generator.get_state())
+    assert len(pipe.vae.calls) == 4
+    assert Posterior.sample_calls == 0
+
+
+def test_posterior_mode_falls_back_to_mean_without_sampling():
+    mean = torch.randn(1, 2, 1, 1, 1)
+    torch.testing.assert_close(
+        posterior_mode_or_mean(type("Encoded", (), {"latent_dist": type("Posterior", (), {"mean": mean})()})()),
+        mean,
+    )
+
+
+def test_cached_wah_conditioning_reuses_exact_first_frame_and_clean_latents():
+    pipe = WorldProjectedWarpAsHistoryPipeline.__new__(WorldProjectedWarpAsHistoryPipeline)
+    pipe._wah_execution_device = lambda: torch.device("cpu")
+    pipe._coerce_warp_video_tensor = lambda value, height, width, device: value.detach().clone()
+    rgb = torch.zeros(1, 3, 9, 2, 2)
+    first = torch.full((1, 2, 1, 1, 1), 7.0)
+    clean = torch.arange(18, dtype=torch.float32).reshape(1, 2, 9, 1, 1)
+    pipe.set_canonical_warp_conditioning(
+        rgb, clean, first_frame_latent=first, height=2, width=2,
+    )
+    cached_first, cached_clean = pipe.prepare_video_latents(
+        rgb, dtype=torch.float32, device=torch.device("cpu"), generator=object(),
+    )
+    assert torch.equal(cached_first, first)
+    assert torch.equal(cached_clean, clean)

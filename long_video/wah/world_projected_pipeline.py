@@ -1540,7 +1540,9 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                     return self.vae.decode(vae_latents, return_dict=False)[0]
 
                 with temporarily_offload_frozen_transformer_blocks(
-                    self.transformer, restore_device=z_raw.device, block_count=16,
+                    self.transformer,
+                    restore_device=z_raw.device,
+                    block_count=len(self.transformer.blocks),
                 ) as offloaded_block_count:
                     optimized_clean, sparse_metrics = sparse_pixel_constraint(
                         clean_candidate,

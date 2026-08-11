@@ -3,18 +3,23 @@ from types import SimpleNamespace
 
 from long_video.wah.world_projected_pipeline import (
     DEFAULT_TEMPORAL_WARMUP,
+    WAH_VISIBLE_TOKEN_THRESHOLD,
     DelayedNodeActivationQueue,
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
     apply_world_and_boundary_projection,
     apply_world_projection,
+    apply_previous_world_boundary,
+    build_canonical_world_support,
     build_canonical_world_pyramid,
     build_world_projection_context,
     build_boundary_state_at_sigma,
     build_world_state_at_sigma,
+    canonical_support_to_tokens,
     fill_invalid_warp_for_vae,
     encode_canonical_video_latents,
     posterior_mode_or_mean,
+    mask_canonical_latent,
     smooth_latent_visibility,
     world_projection_weight,
 )
@@ -335,3 +340,103 @@ def test_cached_wah_conditioning_reuses_exact_first_frame_and_clean_latents():
     )
     assert torch.equal(cached_first, first)
     assert torch.equal(cached_clean, clean)
+
+
+def test_canonical_support_uses_exact_33_to_9_groups_once():
+    visibility = torch.zeros(33, 16, 16)
+    confidence = torch.zeros_like(visibility)
+    groups = [(0, 1)] + [(1 + 4 * index, 5 + 4 * index) for index in range(8)]
+    for index, (start, stop) in enumerate(groups):
+        visibility[start:stop, 2:14, 2:14] = (index + 1) / 9.0
+        confidence[start:stop, 2:14, 2:14] = 0.2 + index * 0.1
+    support = build_canonical_world_support(
+        visibility, confidence, latent_frames=9, latent_height=8, latent_width=8,
+        temporal_scale=4,
+    )
+    assert tuple(support.visibility.shape) == (1, 1, 9, 8, 8)
+    assert tuple(support.confidence.shape) == (1, 1, 9, 8, 8)
+    assert tuple(support.safe_support.shape) == (1, 1, 9, 8, 8)
+    center_visibility = support.visibility[0, 0, :, 4, 4]
+    torch.testing.assert_close(center_visibility, torch.arange(1, 10) / 9.0)
+    center_confidence = support.confidence[0, 0, :, 4, 4]
+    torch.testing.assert_close(center_confidence, 0.2 + torch.arange(9) * 0.1)
+    assert torch.all(
+        support.safe_support[support.safe_support > 0] >= WAH_VISIBLE_TOKEN_THRESHOLD
+    )
+
+
+def test_safe_support_masks_fill_only_latent_and_tokens_share_grouped_support():
+    visibility = torch.zeros(33, 16, 16)
+    visibility[:, 3:13, 3:13] = 1.0
+    confidence = torch.ones_like(visibility)
+    support = build_canonical_world_support(
+        visibility, confidence, latent_frames=9, latent_height=8, latent_width=8,
+    )
+    latent = torch.ones(1, 4, 9, 8, 8)
+    safe = mask_canonical_latent(latent, support.safe_support)
+    invalid = (support.safe_support == 0).expand_as(safe)
+    assert torch.equal(safe[invalid], torch.zeros_like(safe[invalid]))
+    tokens = canonical_support_to_tokens(
+        support.safe_support,
+        latent_height=4, latent_width=4, patch_height=2, patch_width=2,
+    )
+    assert tuple(tokens.shape) == (1, 9 * 2 * 2, 1)
+
+
+def test_previous_world_boundary_replaces_slot0_latent_visibility_and_confidence_exactly():
+    latent = torch.randn(1, 4, 9, 8, 8)
+    first = torch.randn(1, 4, 1, 8, 8)
+    support = build_canonical_world_support(
+        torch.ones(33, 16, 16), torch.full((33, 16, 16), 0.7),
+        latent_frames=9, latent_height=8, latent_width=8,
+    )
+    previous_latent = torch.randn(1, 4, 1, 8, 8)
+    previous_visibility = torch.full((1, 1, 1, 8, 8), 0.75)
+    previous_confidence = torch.full((1, 1, 1, 8, 8), 0.6)
+    clean, cached_first, replaced, applied = apply_previous_world_boundary(
+        latent, first, support,
+        previous_latent=previous_latent,
+        previous_visibility=previous_visibility,
+        previous_confidence=previous_confidence,
+    )
+    assert applied
+    assert torch.equal(clean[:, :, 0:1], previous_latent)
+    assert torch.equal(cached_first, previous_latent)
+    assert torch.equal(replaced.safe_support[:, :, 0:1], previous_visibility)
+    assert torch.equal(replaced.visibility[:, :, 0:1], previous_visibility)
+    assert torch.equal(replaced.confidence[:, :, 0:1], previous_confidence)
+
+
+def test_wah_history_mapping_reuses_cached_canonical_support_without_regrouping():
+    pipe = WorldProjectedWarpAsHistoryPipeline.__new__(WorldProjectedWarpAsHistoryPipeline)
+    pipe._wah_execution_device = lambda: torch.device("cpu")
+    pipe._coerce_warp_video_tensor = lambda value, height, width, device: value.clone()
+    pipe._coerce_visibility_mask = lambda value: torch.as_tensor(value, dtype=torch.float32)
+    pixel_visibility = torch.ones(1, 1, 33, 16, 16)
+    pixel_visibility[:, :, :, :2] = 0
+    pixel_confidence = torch.full_like(pixel_visibility, 0.6) * pixel_visibility
+    support = build_canonical_world_support(
+        pixel_visibility, pixel_confidence,
+        latent_frames=9, latent_height=8, latent_width=8,
+    )
+    pipe.set_canonical_warp_conditioning(
+        torch.zeros(1, 3, 33, 16, 16),
+        torch.zeros(1, 4, 9, 8, 8),
+        canonical_support=support,
+        pixel_visibility=pixel_visibility,
+        pixel_confidence=pixel_confidence,
+        height=16,
+        width=16,
+    )
+    mapped_visibility = pipe._visibility_mask_to_history_latents(
+        pixel_visibility,
+        latent_frames=9, latent_height=8, latent_width=8, temporal_scale=4,
+    )
+    mapped_weighted_confidence = pipe._visibility_mask_to_history_latents(
+        pixel_confidence,
+        latent_frames=9, latent_height=8, latent_width=8, temporal_scale=4,
+    )
+    assert torch.equal(mapped_visibility, support.safe_support)
+    assert torch.equal(
+        mapped_weighted_confidence, support.safe_support * support.confidence,
+    )

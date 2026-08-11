@@ -28,6 +28,7 @@ except ImportError:  # Keep CPU helper tests importable without the submodule.
 DEFAULT_TEMPORAL_WARMUP: tuple[float, ...] = (
     0.0, 0.25, 0.60, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
 )
+WAH_VISIBLE_TOKEN_THRESHOLD = 0.1
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,29 @@ class WorldProjectionConfig:
     def temporal_warmup_by_slot(self) -> tuple[float, ...]:
         """Compatibility alias for callers that describe the schedule by slots."""
         return tuple(float(value) for value in self.temporal_warmup)
+
+
+@dataclass(frozen=True)
+class CanonicalWorldSupport:
+    """The one canonical 33-to-9 support representation shared by all paths."""
+
+    visibility: torch.Tensor
+    confidence: torch.Tensor
+    safe_support: torch.Tensor
+
+    def __post_init__(self):
+        expected = tuple(self.visibility.shape)
+        if len(expected) != 5 or expected[1] != 1:
+            raise ValueError(f"canonical visibility must be [B,1,T,H,W], got {expected}")
+        if tuple(self.confidence.shape) != expected or tuple(self.safe_support.shape) != expected:
+            raise ValueError("canonical visibility/confidence/safe support shapes must match")
+        for name, value in (
+            ("visibility", self.visibility),
+            ("confidence", self.confidence),
+            ("safe_support", self.safe_support),
+        ):
+            if not bool(torch.isfinite(value).all()) or bool((value < 0).any()) or bool((value > 1).any()):
+                raise ValueError(f"canonical {name} must be finite and in [0,1]")
 
 
 @dataclass(frozen=True)
@@ -370,6 +394,188 @@ def smooth_latent_visibility(value: torch.Tensor) -> torch.Tensor:
     return softened.reshape(batch, frames, 1, height, width).permute(0, 2, 1, 3, 4)
 
 
+def build_canonical_world_support(
+    visibility: Any,
+    confidence: Any,
+    *,
+    latent_frames: int = 9,
+    latent_height: int = 48,
+    latent_width: int = 80,
+    temporal_scale: int = 4,
+    visible_threshold: float = WAH_VISIBLE_TOKEN_THRESHOLD,
+) -> CanonicalWorldSupport:
+    """Build the only 33-to-9 visibility/confidence mapping used by WAH/WPF/Anchor."""
+    visibility_value = torch.as_tensor(visibility, dtype=torch.float32)
+    confidence_value = torch.as_tensor(confidence, dtype=torch.float32)
+    if tuple(confidence_value.shape) != tuple(visibility_value.shape):
+        raise ValueError("pixel visibility and confidence shapes must match")
+    visibility_value = visibility_value.clamp(0.0, 1.0)
+    confidence_value = confidence_value.clamp(0.0, 1.0)
+    canonical_visibility = pixel_support_to_latent(
+        visibility_value,
+        latent_frames=latent_frames,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        temporal_scale=temporal_scale,
+    )
+    weighted_confidence = pixel_support_to_latent(
+        confidence_value * visibility_value,
+        latent_frames=latent_frames,
+        latent_height=latent_height,
+        latent_width=latent_width,
+        temporal_scale=temporal_scale,
+    )
+    canonical_confidence = torch.where(
+        canonical_visibility > 0,
+        weighted_confidence / canonical_visibility.clamp_min(1e-6),
+        torch.zeros_like(weighted_confidence),
+    ).clamp(0.0, 1.0)
+    canonical_safe_support = smooth_latent_visibility(canonical_visibility)
+    canonical_safe_support = torch.where(
+        canonical_safe_support >= float(visible_threshold),
+        canonical_safe_support,
+        torch.zeros_like(canonical_safe_support),
+    )
+    canonical_confidence = canonical_confidence * (canonical_safe_support > 0).to(
+        canonical_confidence.dtype
+    )
+    return CanonicalWorldSupport(
+        visibility=canonical_visibility,
+        confidence=canonical_confidence,
+        safe_support=canonical_safe_support,
+    )
+
+
+def build_single_frame_world_support(
+    visibility: Any,
+    confidence: Any,
+    *,
+    latent_height: int = 48,
+    latent_width: int = 80,
+    visible_threshold: float = WAH_VISIBLE_TOKEN_THRESHOLD,
+) -> CanonicalWorldSupport:
+    """Build latent support for one explicitly encoded shared boundary RGB frame."""
+    visibility_value = torch.as_tensor(visibility, dtype=torch.float32)
+    confidence_value = torch.as_tensor(confidence, dtype=torch.float32)
+    if visibility_value.ndim == 2:
+        visibility_value = visibility_value[None, None, None]
+        confidence_value = confidence_value[None, None, None]
+    elif visibility_value.ndim == 3:
+        visibility_value = visibility_value[:, None, None]
+        confidence_value = confidence_value[:, None, None]
+    if visibility_value.ndim != 5 or tuple(confidence_value.shape) != tuple(visibility_value.shape):
+        raise ValueError("single-frame support must become matching [B,1,1,H,W] tensors")
+    # Preserve the original tensors so confidence can be averaged only over
+    # actually visible pixels before spatial downsampling.
+    original_visibility = torch.as_tensor(visibility, dtype=torch.float32)
+    original_confidence = torch.as_tensor(confidence, dtype=torch.float32)
+    if original_visibility.ndim == 2:
+        original_visibility = original_visibility[None, None, None]
+        original_confidence = original_confidence[None, None, None]
+    elif original_visibility.ndim == 3:
+        original_visibility = original_visibility[:, None, None]
+        original_confidence = original_confidence[:, None, None]
+    visibility_value = _resize_video_latents(
+        original_visibility.clamp(0.0, 1.0), latent_height, latent_width, mode="area",
+    )
+    weighted = _resize_video_latents(
+        original_visibility.clamp(0.0, 1.0) * original_confidence.clamp(0.0, 1.0),
+        latent_height, latent_width, mode="area",
+    )
+    canonical_confidence = torch.where(
+        visibility_value > 0,
+        weighted / visibility_value.clamp_min(1e-6),
+        torch.zeros_like(weighted),
+    ).clamp(0.0, 1.0)
+    safe = smooth_latent_visibility(visibility_value)
+    safe = torch.where(safe >= float(visible_threshold), safe, torch.zeros_like(safe))
+    canonical_confidence = canonical_confidence * (safe > 0).to(canonical_confidence.dtype)
+    return CanonicalWorldSupport(visibility_value, canonical_confidence, safe)
+
+
+def mask_canonical_latent(
+    latent: torch.Tensor,
+    safe_support: torch.Tensor,
+) -> torch.Tensor:
+    """Hard-zero VAE fill-only latents while retaining soft support separately."""
+    expected = (latent.shape[0], 1, latent.shape[2], latent.shape[3], latent.shape[4])
+    if tuple(safe_support.shape) != expected:
+        raise ValueError(f"safe support {tuple(safe_support.shape)} != {expected}")
+    return latent * (safe_support.to(device=latent.device) > 0).to(latent.dtype)
+
+
+def apply_previous_world_boundary(
+    canonical_latent: torch.Tensor,
+    first_frame_latent: torch.Tensor,
+    canonical_support: CanonicalWorldSupport,
+    *,
+    previous_latent: torch.Tensor | None,
+    previous_visibility: torch.Tensor | None,
+    previous_confidence: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, CanonicalWorldSupport, bool]:
+    """Make the current slot0 exactly equal to the previous rendered world boundary."""
+    applied = previous_latent is not None
+    latent = canonical_latent.clone()
+    first = first_frame_latent.clone()
+    visibility = canonical_support.visibility.clone()
+    safe_support = canonical_support.safe_support.clone()
+    confidence = canonical_support.confidence.clone()
+    if applied:
+        if previous_visibility is None or previous_confidence is None:
+            raise ValueError("previous world boundary latent/support state is incomplete")
+        expected_latent = tuple(latent[:, :, 0:1].shape)
+        expected_support = tuple(safe_support[:, :, 0:1].shape)
+        if tuple(previous_latent.shape) != expected_latent:
+            raise ValueError(f"previous boundary latent {tuple(previous_latent.shape)} != {expected_latent}")
+        if tuple(previous_visibility.shape) != expected_support:
+            raise ValueError("previous boundary visibility shape mismatch")
+        if tuple(previous_confidence.shape) != expected_support:
+            raise ValueError("previous boundary confidence shape mismatch")
+        previous_latent = previous_latent.to(device=latent.device, dtype=latent.dtype)
+        previous_visibility = previous_visibility.to(
+            device=safe_support.device, dtype=safe_support.dtype,
+        )
+        previous_confidence = previous_confidence.to(
+            device=confidence.device, dtype=confidence.dtype,
+        )
+        latent[:, :, 0:1] = previous_latent
+        first = previous_latent.clone()
+        visibility[:, :, 0:1] = previous_visibility
+        safe_support[:, :, 0:1] = previous_visibility
+        confidence[:, :, 0:1] = previous_confidence
+    support = CanonicalWorldSupport(visibility, confidence, safe_support)
+    latent = mask_canonical_latent(latent, safe_support.to(latent.device))
+    first = mask_canonical_latent(first, safe_support[:, :, 0:1].to(first.device))
+    return latent, first, support, applied
+
+
+def canonical_support_to_tokens(
+    support: torch.Tensor,
+    *,
+    latent_height: int,
+    latent_width: int,
+    patch_height: int,
+    patch_width: int,
+) -> torch.Tensor:
+    """Resize an already-grouped canonical support and pool only spatial patches."""
+    if support.ndim != 5 or support.shape[1] != 1:
+        raise ValueError(f"canonical support must be [B,1,T,H,W], got {tuple(support.shape)}")
+    stage = _resize_video_latents(
+        support, int(latent_height), int(latent_width), mode="area",
+    ).clamp(0.0, 1.0)
+    batch, _, frames, height, width = stage.shape
+    if height % int(patch_height) or width % int(patch_width):
+        raise ValueError("stage support must be divisible by the spatial patch size")
+    flat = stage.permute(0, 2, 1, 3, 4).reshape(batch * frames, 1, height, width)
+    pooled = F.avg_pool2d(
+        flat,
+        kernel_size=(int(patch_height), int(patch_width)),
+        stride=(int(patch_height), int(patch_width)),
+    )
+    pooled = pooled.reshape(batch, frames, pooled.shape[-2], pooled.shape[-1], 1)
+    return pooled.reshape(batch, -1, 1).clamp(0.0, 1.0)
+
+
 def build_world_projection_context(
     clean_latent: torch.Tensor,
     visibility: Any,
@@ -379,28 +585,35 @@ def build_world_projection_context(
     temporal_scale: int = 4,
     config: WorldProjectionConfig | None = None,
     previous_clean_boundary_latent: torch.Tensor | None = None,
+    canonical_support: CanonicalWorldSupport | None = None,
 ) -> WorldProjectionContext:
     canonical = build_canonical_world_pyramid(clean_latent, stage_count)
-    full_visibility = pixel_support_to_latent(
-        visibility,
-        latent_frames=clean_latent.shape[2],
-        latent_height=clean_latent.shape[-2],
-        latent_width=clean_latent.shape[-1],
-        temporal_scale=temporal_scale,
+    if canonical_support is None:
+        canonical_support = build_canonical_world_support(
+            visibility,
+            confidence,
+            latent_frames=clean_latent.shape[2],
+            latent_height=clean_latent.shape[-2],
+            latent_width=clean_latent.shape[-1],
+            temporal_scale=temporal_scale,
+        )
+    full_visibility = canonical_support.safe_support
+    full_confidence = canonical_support.confidence
+    expected_support = (
+        clean_latent.shape[0], 1, clean_latent.shape[2],
+        clean_latent.shape[3], clean_latent.shape[4],
     )
-    full_confidence = pixel_support_to_latent(
-        confidence,
-        latent_frames=clean_latent.shape[2],
-        latent_height=clean_latent.shape[-2],
-        latent_width=clean_latent.shape[-1],
-        temporal_scale=temporal_scale,
-    )
+    if tuple(full_visibility.shape) != expected_support or tuple(full_confidence.shape) != expected_support:
+        raise ValueError(
+            f"canonical support must align to clean latent {expected_support}, got "
+            f"{tuple(full_visibility.shape)}/{tuple(full_confidence.shape)}"
+        )
     visible_pyramid, confidence_pyramid = [], []
     for endpoint in canonical:
         stage_visibility = _resize_video_latents(
             full_visibility, endpoint.shape[-2], endpoint.shape[-1], mode="area",
         ).clamp(0.0, 1.0)
-        visible_pyramid.append(smooth_latent_visibility(stage_visibility))
+        visible_pyramid.append(stage_visibility)
         confidence_pyramid.append(_resize_video_latents(
             full_confidence, endpoint.shape[-2], endpoint.shape[-1], mode="area",
         ).clamp(0.0, 1.0))
@@ -706,6 +919,9 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         canonical_warp_latents: torch.Tensor,
         *,
         first_frame_latent: torch.Tensor | None = None,
+        canonical_support: CanonicalWorldSupport | None = None,
+        pixel_visibility: Any | None = None,
+        pixel_confidence: Any | None = None,
         height: int | None = None,
         width: int | None = None,
     ) -> None:
@@ -730,11 +946,56 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             if first_frame_latent is None
             else first_frame_latent.detach().to(device=device, dtype=torch.float32)
         )
+        self._canonical_world_support = canonical_support
+        self._canonical_pixel_visibility = (
+            None if pixel_visibility is None
+            else self._coerce_visibility_mask(pixel_visibility).to(device=device, dtype=torch.float32)
+        )
+        self._canonical_pixel_confidence = (
+            None if pixel_confidence is None
+            else self._coerce_visibility_mask(pixel_confidence).to(device=device, dtype=torch.float32)
+        )
+        self._canonical_conditioning_cache_hit = False
 
     def clear_canonical_warp_conditioning(self) -> None:
         self._canonical_warp_video_tensor = None
         self._canonical_warp_latents = None
         self._canonical_warp_first_frame_latent = None
+        self._canonical_world_support = None
+        self._canonical_pixel_visibility = None
+        self._canonical_pixel_confidence = None
+
+    def _visibility_mask_to_history_latents(
+        self, visibility_mask, *, latent_frames, latent_height, latent_width, temporal_scale,
+    ):
+        """Reuse the one canonical 33-to-9 support instead of regrouping pixels."""
+        support = getattr(self, "_canonical_world_support", None)
+        if support is not None and int(latent_frames) == int(support.safe_support.shape[2]):
+            value = visibility_mask.to(
+                device=support.safe_support.device, dtype=torch.float32,
+            )
+            pixel_visibility = getattr(self, "_canonical_pixel_visibility", None)
+            pixel_confidence = getattr(self, "_canonical_pixel_confidence", None)
+            canonical = None
+            if pixel_visibility is not None and tuple(value.shape) == tuple(pixel_visibility.shape):
+                if torch.equal(value, pixel_visibility):
+                    canonical = support.safe_support
+            if canonical is None and pixel_confidence is not None and tuple(value.shape) == tuple(pixel_confidence.shape):
+                if torch.equal(value, pixel_confidence * pixel_visibility):
+                    # The pinned WAH path divides this weighted value by its
+                    # visibility latent, yielding canonical confidence.
+                    canonical = support.safe_support * support.confidence
+            if canonical is not None:
+                return _resize_video_latents(
+                    canonical, int(latent_height), int(latent_width), mode="area",
+                ).to(device=value.device, dtype=torch.float32)
+        return super()._visibility_mask_to_history_latents(
+            visibility_mask,
+            latent_frames=latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
+            temporal_scale=temporal_scale,
+        )
 
     def prepare_video_latents(self, video, *args, **kwargs):
         """Reuse a matching canonical encode; defer all other calls to WAH."""
@@ -745,6 +1006,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             if candidate is not None:
                 candidate = candidate.to(device=cached_video.device, dtype=cached_video.dtype)
                 if tuple(candidate.shape) == tuple(cached_video.shape) and torch.equal(candidate, cached_video):
+                    self._canonical_conditioning_cache_hit = True
                     first = getattr(
                         self, "_canonical_warp_first_frame_latent", None,
                     )

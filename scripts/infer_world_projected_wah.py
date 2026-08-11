@@ -94,15 +94,20 @@ from long_video.wah.spatial_reanchor import (
     install_spatial_reanchor,
     plucker_camera_rays,
     resize_latents_spatial,
-    visibility_to_target_tokens,
 )
 from long_video.wah.world_projected_pipeline import (
     DelayedNodeActivationQueue,
+    WAH_VISIBLE_TOKEN_THRESHOLD,
     WorldProjectedWarpAsHistoryPipeline,
     WorldProjectionConfig,
+    apply_previous_world_boundary,
+    build_canonical_world_support,
+    build_single_frame_world_support,
     build_world_projection_context,
+    canonical_support_to_tokens,
     encode_canonical_video_latents,
     fill_invalid_warp_for_vae,
+    mask_canonical_latent,
     posterior_mode_or_mean,
 )
 from warp_as_history.training.core import training_exact_pyramid_latents
@@ -307,30 +312,28 @@ def clean_boundary_frame_latent(pipe, state, frame):
     return latent.detach().to(dtype=torch.float32)
 
 
-def prepare_spatial_context(controller, transformer, clean, warp, poses, intrinsics, start):
+def prepare_spatial_context(
+    controller, transformer, clean, canonical_support, poses, intrinsics, start,
+):
     patch = tuple(int(value) for value in transformer.config.patch_size)
     stage_contexts, shapes = [], []
     for stage in training_exact_pyramid_latents(clean, len(PYRAMID_STEPS)):
         latent_height, latent_width = map(int, stage.shape[-2:])
         stage_warp = resize_latents_spatial(clean, height=latent_height, width=latent_width)
         token_height, token_width = latent_height // patch[-2], latent_width // patch[-1]
-        visible_tokens = visibility_to_target_tokens(
-            np.asarray(warp.visibility, np.float32),
-            latent_frames=LATENT_FRAMES,
+        visible_tokens = canonical_support_to_tokens(
+            canonical_support.safe_support,
             latent_height=latent_height,
             latent_width=latent_width,
             patch_height=patch[-2],
             patch_width=patch[-1],
-            temporal_scale=VAE_TEMPORAL_SCALE,
         )
-        confidence_tokens = visibility_to_target_tokens(
-            np.asarray(warp.confidence * warp.visibility, np.float32),
-            latent_frames=LATENT_FRAMES,
+        confidence_tokens = canonical_support_to_tokens(
+            canonical_support.confidence,
             latent_height=latent_height,
             latent_width=latent_width,
             patch_height=patch[-2],
             patch_width=patch[-1],
-            temporal_scale=VAE_TEMPORAL_SCALE,
         )
         plucker = plucker_camera_rays(
             poses,
@@ -528,6 +531,14 @@ def main():
         "wpf_temporal_warmup": list(projection_config.temporal_warmup),
         "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
         "canonical_warp_vae_fill": "per_frame_nearest_visible_with_chunk_mean_fallback",
+        "canonical_support_temporal_groups": [
+            [0], [1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12],
+            [13, 14, 15, 16], [17, 18, 19, 20], [21, 22, 23, 24],
+            [25, 26, 27, 28], [29, 30, 31, 32],
+        ],
+        "canonical_support_shared_by": ["WAH", "Spatial Anchor", "WPF"],
+        "canonical_safe_support_threshold": WAH_VISIBLE_TOKEN_THRESHOLD,
+        "shared_world_boundary_slot": 0,
         "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
         "memory_config": memory_config,
@@ -618,12 +629,50 @@ def main():
                 canonical_warp_rgb = fill_invalid_warp_for_vae(
                     warp.rgb, warp.visibility,
                 )
-                canonical_first_frame_latent, clean = clean_warp_latents(
+                canonical_first_frame_latent, canonical_latent = clean_warp_latents(
                     pipe, state, warp, canonical_warp_rgb=canonical_warp_rgb,
                     return_first_frame=True,
                 )
+                canonical_support = build_canonical_world_support(
+                    np.asarray(warp.visibility, np.float32),
+                    np.asarray(warp.confidence, np.float32),
+                    latent_frames=LATENT_FRAMES,
+                    latent_height=int(canonical_latent.shape[-2]),
+                    latent_width=int(canonical_latent.shape[-1]),
+                    temporal_scale=VAE_TEMPORAL_SCALE,
+                )
+                previous_world_boundary_latent = state.get("previous_world_boundary_latent")
+                previous_world_boundary_visibility = state.get(
+                    "previous_world_boundary_visibility"
+                )
+                previous_world_boundary_confidence = state.get(
+                    "previous_world_boundary_confidence"
+                )
+                clean, canonical_first_frame_latent, canonical_support, boundary_world_shared = (
+                    apply_previous_world_boundary(
+                        canonical_latent,
+                        canonical_first_frame_latent,
+                        canonical_support,
+                        previous_latent=previous_world_boundary_latent,
+                        previous_visibility=previous_world_boundary_visibility,
+                        previous_confidence=previous_world_boundary_confidence,
+                    )
+                )
+                world_boundary_latent = clean_boundary_frame_latent(
+                    pipe, state, canonical_warp_rgb[-1],
+                )
+                world_boundary_support = build_single_frame_world_support(
+                    np.asarray(warp.visibility[-1], np.float32),
+                    np.asarray(warp.confidence[-1], np.float32),
+                    latent_height=int(world_boundary_latent.shape[-2]),
+                    latent_width=int(world_boundary_latent.shape[-1]),
+                )
+                world_boundary_latent = mask_canonical_latent(
+                    world_boundary_latent,
+                    world_boundary_support.safe_support.to(world_boundary_latent.device),
+                )
                 stage_shapes = prepare_spatial_context(
-                    controller, pipe.transformer, clean, warp,
+                    controller, pipe.transformer, clean, canonical_support,
                     poses[start:start + CHUNK_FRAMES],
                     intrinsics[start:start + CHUNK_FRAMES], start,
                 )
@@ -637,12 +686,18 @@ def main():
                     previous_clean_boundary_latent=state.get(
                         "previous_shared_frame_clean_latent"
                     ),
+                    canonical_support=canonical_support,
                 )
                 boundary_source_global_frame = state.get("boundary_source_global_frame")
                 pipe.set_world_projection_context(projection)
                 pipe.set_canonical_warp_conditioning(
                     canonical_warp_rgb, clean,
                     first_frame_latent=canonical_first_frame_latent,
+                    canonical_support=canonical_support,
+                    pixel_visibility=np.asarray(warp.visibility, np.float32)[None, None],
+                    pixel_confidence=np.asarray(
+                        warp.confidence * warp.visibility, np.float32,
+                    )[None, None],
                     height=HEIGHT, width=WIDTH,
                 )
                 try:
@@ -659,6 +714,11 @@ def main():
                     pipe.clear_world_projection_context()
                     pipe.clear_canonical_warp_conditioning()
                     controller.clear_context()
+                canonical_conditioning_cache_hit = bool(
+                    getattr(pipe, "_canonical_conditioning_cache_hit", False)
+                )
+                if not canonical_conditioning_cache_hit:
+                    raise RuntimeError("WAH discarded the cached canonical first-frame/warp latents")
                 generated = video_array(output)
                 if len(generated) != CHUNK_FRAMES:
                     raise RuntimeError(f"chunk returned {len(generated)} frames, expected {CHUNK_FRAMES}")
@@ -668,6 +728,13 @@ def main():
                     pipe, state, generated[-1],
                 )
                 state["boundary_source_global_frame"] = int(start + CHUNK_STRIDE)
+                state["previous_world_boundary_latent"] = world_boundary_latent.detach()
+                state["previous_world_boundary_visibility"] = (
+                    world_boundary_support.safe_support.detach()
+                )
+                state["previous_world_boundary_confidence"] = (
+                    world_boundary_support.confidence.detach()
+                )
 
                 first = 0 if chunk_index == 0 else 1
                 memory_generated = generated[first:]
@@ -821,6 +888,39 @@ def main():
 
                 visible = np.asarray(warp.visibility, bool)
                 confidence = np.asarray(warp.confidence, np.float32)
+                fill_only = canonical_support.safe_support.to(clean.device) <= 0
+                fill_only_latent_abs_max = float(
+                    clean.float().masked_select(fill_only.expand_as(clean)).abs().max().cpu()
+                    if bool(fill_only.any()) else 0.0
+                )
+                if fill_only_latent_abs_max != 0.0:
+                    raise RuntimeError("fill-only canonical latent was not hard masked")
+                shared_boundary_latent_max_abs_diff = None
+                shared_boundary_visibility_max_abs_diff = None
+                shared_boundary_confidence_max_abs_diff = None
+                if boundary_world_shared:
+                    shared_boundary_latent_max_abs_diff = float((
+                        clean[:, :, 0:1].float()
+                        - previous_world_boundary_latent.to(clean.device).float()
+                    ).abs().max().cpu())
+                    shared_boundary_visibility_max_abs_diff = float((
+                        canonical_support.safe_support[:, :, 0:1].float()
+                        - previous_world_boundary_visibility.to(
+                            canonical_support.safe_support.device
+                        ).float()
+                    ).abs().max().cpu())
+                    shared_boundary_confidence_max_abs_diff = float((
+                        canonical_support.confidence[:, :, 0:1].float()
+                        - previous_world_boundary_confidence.to(
+                            canonical_support.confidence.device
+                        ).float()
+                    ).abs().max().cpu())
+                    if any(value != 0.0 for value in (
+                        shared_boundary_latent_max_abs_diff,
+                        shared_boundary_visibility_max_abs_diff,
+                        shared_boundary_confidence_max_abs_diff,
+                    )):
+                        raise RuntimeError("shared canonical world boundary slot0 is not exact")
                 shadow_metadata_node = (
                     shadow_node
                     if shadow_node is not None
@@ -857,6 +957,16 @@ def main():
                     "candidate_promotion_blocked_by_pending": promotion_blocked_by_pending,
                     "world_coverage": float(np.asarray(warp.coverage_per_frame).mean()),
                     "world_confidence_mean": float(confidence[visible].mean() if visible.any() else 0.0),
+                    "canonical_support_shape": list(canonical_support.safe_support.shape),
+                    "canonical_conditioning_cache_hit": canonical_conditioning_cache_hit,
+                    "canonical_visibility_mean": float(canonical_support.visibility.mean()),
+                    "canonical_safe_support_mean": float(canonical_support.safe_support.mean()),
+                    "canonical_confidence_mean": float(canonical_support.confidence.mean()),
+                    "fill_only_latent_abs_max": fill_only_latent_abs_max,
+                    "shared_world_boundary_applied": boundary_world_shared,
+                    "shared_boundary_latent_max_abs_diff": shared_boundary_latent_max_abs_diff,
+                    "shared_boundary_visibility_max_abs_diff": shared_boundary_visibility_max_abs_diff,
+                    "shared_boundary_confidence_max_abs_diff": shared_boundary_confidence_max_abs_diff,
                     "candidate_created": "candidate_id" in event,
                     "candidate_accepted": bool(event.get("accepted", False)),
                     "candidate_id": event.get("candidate_id"),

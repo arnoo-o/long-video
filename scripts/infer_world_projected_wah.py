@@ -291,8 +291,10 @@ def clean_boundary_frame_latent(pipe, state, frame):
     saved_rng = generator.get_state()
     device = pipe._wah_execution_device()
     tensor = pipe._coerce_warp_video_tensor(
-        np.asarray(frame)[None], height=HEIGHT, width=WIDTH, device=device,
+        [np.asarray(frame)], height=HEIGHT, width=WIDTH, device=device,
     ).to(device=device, dtype=pipe.vae.dtype)
+    if tuple(tensor.shape) != (1, 3, 1, HEIGHT, WIDTH):
+        raise RuntimeError(f"single-frame boundary RGB tensor shape mismatch: {tuple(tensor.shape)}")
     mean, std = pipe._latent_stats(device)
     try:
         latent = pipe.vae.encode(tensor).latent_dist.sample(generator=generator)

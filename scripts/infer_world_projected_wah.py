@@ -532,11 +532,11 @@ def main():
         "source_image": str(source_path),
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
-        "generation_mode": "canonical_residual",
-        "canonical_residual_formula": "L=B+(1-M)*R; B=M*E(W)",
+        "generation_mode": "canonical_residual_per_step_world_clamp",
+        "canonical_residual_formula": "z_next=M*z_world(next_sigma)+(1-M)*z_candidate at every scheduler step",
         "soft_wpf_enabled": False,
         "projection": {
-            "mode": "canonical_residual",
+            "mode": "per_step_scheduler_aligned_world_clamp",
             "soft_wpf_enabled": False,
             "formula": "L=B+(1-M)*R; B=M*E(W)",
         },
@@ -820,8 +820,6 @@ def main():
                     stage_items = [item for item in stage_diagnostics if item["stage_id"] == stage_id]
                     if [item["step_id"] for item in stage_items] != list(range(expected_steps)):
                         raise RuntimeError(f"stage {stage_id} did not execute {expected_steps} ordered updates")
-                    if stage_id == 0 and any(item["projection_delta_ratio"] != 0.0 for item in stage_items):
-                        raise RuntimeError("stage0 World Projection must remain exactly disabled")
                     if stage_id == 0 and any(item["boundary_delta_ratio"] != 0.0 for item in stage_items):
                         raise RuntimeError("stage0 Boundary Bridge must remain exactly disabled")
                     if projection.previous_boundary_latents is not None and any(

@@ -10,6 +10,7 @@ from long_video.wah.world_projected_pipeline import (
     apply_world_and_boundary_projection,
     apply_world_projection,
     apply_residual_boundary_bridge,
+    apply_boundary_then_world_clamp,
     apply_previous_world_boundary,
     build_canonical_world_support,
     build_canonical_world_pyramid,
@@ -50,6 +51,25 @@ def test_residual_boundary_only_changes_unknown_slot0():
     torch.testing.assert_close(result[:, :, 0, :, 1], torch.full_like(result[:, :, 0, :, 1], 0.2))
     assert float(result[:, :, 1:].abs().max()) == 0.0
     assert float(metrics["projection_delta_ratio"]) == 0.0
+
+
+def test_boundary_then_world_clamp_has_fixed_order_and_exact_regions():
+    raw = torch.zeros(1, 1, 2, 1, 3)
+    world = torch.full_like(raw, 8.0)
+    support = torch.tensor([[[[[1.0, 0.0, 0.5]], [[1.0, 0.0, 0.5]]]]])
+    boundary = torch.full((1, 1, 1, 1, 3), 4.0)
+    result, metrics = apply_boundary_then_world_clamp(
+        raw, world, support, boundary, sigma=0.0, boundary_beta_max=0.5,
+    )
+    # Known is exactly world; unknown slot0 receives Boundary before clamp;
+    # soft support follows M*world+(1-M)*candidate.
+    torch.testing.assert_close(result[:, :, 0, :, 0], torch.full((1, 1, 1), 8.0))
+    torch.testing.assert_close(result[:, :, 0, :, 1], torch.full((1, 1, 1), 2.0))
+    torch.testing.assert_close(result[:, :, 0, :, 2], torch.full((1, 1, 1), 4.5))
+    assert float(result[:, :, 1, :, 1].abs().max()) == 0.0
+    assert float(metrics["unknown_projection_delta_max"]) == 0.0
+    assert float(metrics["world_clamp_formula_max_error"]) == 0.0
+    assert float(metrics["per_step_world_clamp"]) == 1.0
 
 
 def test_world_projection_is_exact_identity_in_unknown_region_and_bounded():

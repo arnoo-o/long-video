@@ -910,6 +910,76 @@ def apply_residual_boundary_bridge(
     }
 
 
+def apply_boundary_then_world_clamp(
+    z_raw: torch.Tensor,
+    z_world: torch.Tensor,
+    support: torch.Tensor,
+    boundary_state: torch.Tensor | None,
+    *,
+    sigma: float | torch.Tensor,
+    boundary_beta_max: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply unknown-only Boundary Bridge, then hard-clamp world every step."""
+    if tuple(z_world.shape) != tuple(z_raw.shape):
+        raise ValueError("world/raw shape mismatch")
+    expected_support = (
+        z_raw.shape[0], 1, z_raw.shape[2], z_raw.shape[3], z_raw.shape[4],
+    )
+    if tuple(support.shape) != expected_support:
+        raise ValueError(f"world clamp support must be {expected_support}")
+    mask = support.to(device=z_raw.device, dtype=torch.float32).clamp(0.0, 1.0)
+    unknown = 1.0 - mask
+    raw = z_raw.float()
+    boundary_delta = torch.zeros_like(raw)
+    boundary_schedule = torch.zeros((), device=raw.device, dtype=torch.float32)
+    if boundary_state is not None:
+        expected_boundary = (
+            raw.shape[0], raw.shape[1], 1, raw.shape[3], raw.shape[4],
+        )
+        if tuple(boundary_state.shape) != expected_boundary:
+            raise ValueError("world-clamp boundary state shape mismatch")
+        sigma_value = torch.as_tensor(sigma, device=raw.device, dtype=torch.float32).clamp(0.0, 1.0)
+        boundary_schedule = float(boundary_beta_max) * (1.0 - sigma_value)
+        boundary_delta[:, :, 0:1] = boundary_schedule * unknown[:, :, 0:1] * (
+            boundary_state.to(device=raw.device, dtype=torch.float32) - raw[:, :, 0:1]
+        )
+    candidate = raw + boundary_delta
+    world = z_world.to(device=raw.device, dtype=torch.float32)
+    clamped = mask * world + unknown * candidate
+    world_delta = clamped - candidate
+    zero_support = mask == 0
+    unknown_world_delta_max = (
+        world_delta.masked_select(zero_support.expand_as(world_delta)).abs().max()
+        if bool(zero_support.any()) else torch.zeros((), device=raw.device)
+    )
+    if float(unknown_world_delta_max.detach().cpu()) != 0.0:
+        raise RuntimeError("per-step world clamp changed an M=0 latent element")
+    non_slot0 = (
+        boundary_delta[:, :, 1:].abs().max()
+        if raw.shape[2] > 1 else torch.zeros((), device=raw.device)
+    )
+    if float(non_slot0.detach().cpu()) != 0.0:
+        raise RuntimeError("Boundary Bridge changed temporal slots 1..8")
+    formula_error = (
+        clamped - (mask * world + unknown * candidate)
+    ).abs().max()
+    return clamped.to(z_raw.dtype), {
+        "lambda": torch.ones((), device=raw.device),
+        "projection_mask_ratio": (mask > 0).float().mean().detach(),
+        "projection_strength_mean": mask.mean().detach(),
+        "wpf_slot0_strength_max": torch.zeros((), device=raw.device),
+        "projection_delta_ratio": (world_delta.norm() / candidate.norm().clamp_min(1e-8)).detach(),
+        "unknown_projection_delta_max": unknown_world_delta_max.detach(),
+        "boundary_active": torch.as_tensor(boundary_state is not None, device=raw.device, dtype=torch.float32),
+        "boundary_strength": boundary_schedule.detach(),
+        "boundary_delta_ratio": (boundary_delta.norm() / raw.norm().clamp_min(1e-8)).detach(),
+        "boundary_non_slot0_delta_max": non_slot0.detach(),
+        "combined_delta_ratio": ((clamped - raw).norm() / raw.norm().clamp_min(1e-8)).detach(),
+        "per_step_world_clamp": torch.ones((), device=raw.device),
+        "world_clamp_formula_max_error": formula_error.detach(),
+    }
+
+
 def world_projection_weight(
     visibility: torch.Tensor,
     confidence: torch.Tensor,
@@ -1115,7 +1185,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         stage_id = -1
         stage_start = None
 
-        def residual_step(model_output, timestep, sample, *step_args, **step_kwargs):
+        def world_clamped_step(model_output, timestep, sample, *step_args, **step_kwargs):
             nonlocal stage_id, stage_start
             step_index = int(step_kwargs.get("cur_sampling_step", 0))
             if step_index == 0:
@@ -1123,21 +1193,29 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 stage_start = sample.detach().clone()
             if stage_id >= len(context.canonical_latents) or stage_start is None:
                 raise RuntimeError(f"unexpected Helios pyramid stage {stage_id}")
-            # ``sample`` and ``model_output`` remain in residual coordinates.
-            # The canonical world is never blended into a scheduler update.
+            # Helios performs its native full-latent update first.  Only the
+            # scheduler result is then boundary-adjusted and world-clamped.
             result = original_step(model_output, timestep, sample, *step_args, **step_kwargs)
-            residual_raw = result[0]
+            z_raw = result[0]
             sigmas = step_kwargs.get("dmd_sigmas", getattr(scheduler, "sigmas", None))
             if sigmas is None or len(sigmas) <= step_index:
                 raise RuntimeError("Helios scheduler did not expose the active stage sigma coordinate")
             current_sigma = sigmas[step_index]
             next_sigma = sigmas[min(step_index + 1, len(sigmas) - 1)]
-            visible = context.visibility[stage_id].to(device=residual_raw.device)
+            endpoint = context.canonical_latents[stage_id].to(device=z_raw.device, dtype=z_raw.dtype)
+            visible = context.visibility[stage_id].to(device=z_raw.device)
+            z_world = build_world_state_at_sigma(
+                stage_id=stage_id,
+                current_sigma=current_sigma,
+                next_sigma=next_sigma,
+                canonical_endpoint=endpoint,
+                stage_start_state=stage_start,
+            )
             config = context.config
             boundary_endpoint = (
                 None if context.previous_boundary_latents is None
                 else context.previous_boundary_latents[stage_id].to(
-                    device=residual_raw.device, dtype=residual_raw.dtype,
+                    device=z_raw.device, dtype=z_raw.dtype,
                 )
             )
             boundary_state = (
@@ -1148,8 +1226,8 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 )
             )
             boundary_beta_max = config.boundary_beta_max(stage_id)
-            residual, diagnostic = apply_residual_boundary_bridge(
-                residual_raw, boundary_state, visible,
+            z_next, diagnostic = apply_boundary_then_world_clamp(
+                z_raw, z_world, visible, boundary_state,
                 boundary_beta_max=boundary_beta_max,
                 sigma=next_sigma,
             )
@@ -1160,26 +1238,38 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 "next_sigma": float(torch.as_tensor(next_sigma).detach().cpu()),
                 **{key: float(value.detach().cpu()) for key, value in diagnostic.items()},
             })
-            return (residual, *result[1:])
+            return (z_next, *result[1:])
 
-        scheduler.step = residual_step
+        scheduler.step = world_clamped_step
         try:
-            residual = super().stage2_sample(*args, **kwargs)
+            sampled = super().stage2_sample(*args, **kwargs)
             endpoint = context.canonical_latents[-1].to(
-                device=residual.device, dtype=residual.dtype,
+                device=sampled.device, dtype=sampled.dtype,
             )
-            support = context.visibility[-1].to(device=residual.device)
-            composed, base = compose_canonical_residual(endpoint, support, residual)
+            support = context.visibility[-1].to(device=sampled.device, dtype=torch.float32).clamp(0.0, 1.0)
+            base = support * endpoint.float()
             context.final_projection_weight = support.detach()
+            final_step = context.diagnostics[-1] if context.diagnostics else None
+            if final_step is None or final_step["stage_id"] != len(context.canonical_latents) - 1:
+                raise RuntimeError("final scheduler step did not record a world clamp")
+            if final_step["next_sigma"] != 0.0 or final_step["world_clamp_formula_max_error"] != 0.0:
+                raise RuntimeError("final scheduler output is not a verified sigma-zero world clamp")
             context.final_residual_diagnostics = {
                 "canonical_base_norm": float(base.float().norm().detach().cpu()),
-                "residual_norm": float(residual.float().norm().detach().cpu()),
-                "composed_norm": float(composed.float().norm().detach().cpu()),
+                "sampled_norm": float(sampled.float().norm().detach().cpu()),
+                "composed_norm": float(sampled.float().norm().detach().cpu()),
                 "known_region_exact_base_max_error": float(
-                    ((composed.float() - base.float()) * (support >= 1.0).expand_as(composed)).abs().max().detach().cpu()
+                    ((sampled.float() - base) * (support >= 1.0).expand_as(sampled)).abs().max().detach().cpu()
                 ),
+                "per_step_world_clamp_step_count": int(len(context.diagnostics)),
+                "final_step_next_sigma": float(final_step["next_sigma"]),
+                "final_step_world_clamp_formula_max_error": float(
+                    final_step["world_clamp_formula_max_error"]
+                ),
+                "final_output_posthoc_clamp_applied": False,
                 "soft_wpf_used": False,
+                "residual_coordinates_used": False,
             }
-            return composed
+            return sampled
         finally:
             scheduler.step = original_step

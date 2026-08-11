@@ -94,19 +94,49 @@ class TransitionBuffer:
         return float(np.mean([1.0 - frame.coverage for frame in self.frames]))
 
     def select_keyframes(self, count=8, heldout_count=4):
+        """Select mapping and held-out frames around the causal boundary.
+
+        The newest buffered frame is the boundary that will be shared with the
+        next generated chunk.  It must participate in mapping (never validation
+        holdout).  To retain the old ``latest-heldout`` behaviour, holdouts are
+        the newest frames *before* that boundary; the remaining older frames
+        form the diversity-selection pool.
+        """
         if not self.frames:
             return [], []
+        count = int(count)
+        heldout_count = int(heldout_count)
+        if count < 1 or heldout_count < 0:
+            raise ValueError("keyframe and held-out counts must be positive/non-negative")
         if len(self.frames) < count + heldout_count:
             return [], []
-        mapping_candidates = self.frames[:-heldout_count]
-        count = min(int(count), len(mapping_candidates))
+        boundary = self.frames[-1]
+        earlier = self.frames[:-1]
+        if heldout_count:
+            # Keep the existing latest-heldout policy while reserving the
+            # newest frame for the shared chunk boundary.
+            heldout = earlier[-heldout_count:]
+            mapping_candidates = earlier[:-heldout_count] + [boundary]
+        else:
+            heldout = []
+            mapping_candidates = list(earlier) + [boundary]
+        earlier_mapping_count = count - 1
+        if len(mapping_candidates) - 1 < earlier_mapping_count:
+            return [], []
+
+        # Boundary is forced into mapping.  Select the remaining frames from
+        # the earlier pool by the same translation/view-diversity farthest-point
+        # heuristic as before (which seeds selection with the oldest frame).
+        earlier_mapping = mapping_candidates[:-1]
+        if earlier_mapping_count == 0:
+            return [boundary], heldout
         selected = [0]
-        positions = np.stack([frame.camera_c2w[:3, 3] for frame in mapping_candidates])
-        directions = np.stack([frame.camera_c2w[:3, 2] for frame in mapping_candidates])
+        positions = np.stack([frame.camera_c2w[:3, 3] for frame in earlier_mapping])
+        directions = np.stack([frame.camera_c2w[:3, 2] for frame in earlier_mapping])
         directions /= np.linalg.norm(directions, axis=1, keepdims=True).clip(1e-8)
-        while len(selected) < count:
-            scores = np.full(len(mapping_candidates), -np.inf, np.float32)
-            for index in range(len(mapping_candidates)):
+        while len(selected) < earlier_mapping_count:
+            scores = np.full(len(earlier_mapping), -np.inf, np.float32)
+            for index in range(len(earlier_mapping)):
                 if index in selected:
                     continue
                 translation = min(np.linalg.norm(positions[index] - positions[j]) for j in selected)
@@ -116,6 +146,5 @@ class TransitionBuffer:
                 )
                 scores[index] = translation + 0.25 * angle
             selected.append(int(np.argmax(scores)))
-        mapping = [mapping_candidates[index] for index in sorted(selected)]
-        heldout = self.frames[-heldout_count:]
+        mapping = [earlier_mapping[index] for index in sorted(selected)] + [boundary]
         return mapping, heldout

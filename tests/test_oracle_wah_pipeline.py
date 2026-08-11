@@ -170,8 +170,14 @@ def test_m1_parent_rgb_and_generated_new_region_provenance(tmp_path):
         np.ones((4, 8), bool), voxel_size=0,
     )
     manager.register(parent)
-    candidate, mapping, heldout = manager.build_candidate(parent, 12)
+    # The latest buffered frame is the causal boundary and is included in the
+    # mapping set, so candidate creation is stamped with global frame 11.
+    candidate, mapping, heldout = manager.build_candidate(parent, 11)
     assert len(mapping) == 8 and len(heldout) == 4
+    assert candidate.quality_metrics["shadow_boundary_frame"] == 11
+    assert max(candidate.quality_metrics["shadow_mapping_frame_indices"]) == 11
+    assert all(index <= 11 for index in candidate.quality_metrics["shadow_mapping_frame_indices"])
+    assert 11 not in candidate.quality_metrics["shadow_heldout_frame_indices"]
     assert np.all(candidate.view_rgb[:, :, :4] == 51)
     assert np.all(candidate.view_rgb[:, :, 4:] == 200)
     assert np.all(candidate.view_rgb_content_origin[:, :, :4] == "oracle_source")

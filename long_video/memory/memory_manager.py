@@ -1,6 +1,8 @@
 """Online spatial-memory state machine and candidate-node validation."""
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 
 from ..geometry.point_renderer import render
@@ -90,6 +92,10 @@ class MemoryManager:
         self.transition_readiness_mode = "any"
         self.current_world_overlap = 1.0
         self.nodes = {}
+        # Accepted candidates may remain in this shadow registry until the
+        # inference scheduler reaches their activation chunk.  A shadow is
+        # immutable while pending and is committed exactly once at activation.
+        self.shadow_candidates = {}
         self.events = []
 
     def register(self, node):
@@ -228,6 +234,23 @@ class MemoryManager:
         frames, heldout = self.buffer.select_keyframes(self.keyframe_count,self.heldout_count)
         if len(frames) != self.keyframe_count or len(heldout) != self.heldout_count:
             raise RuntimeError("Need 8 mapping and at least 4 held-out transition frames")
+        created_frame = int(created_frame)
+        if not self.buffer.frames:
+            raise RuntimeError("candidate construction requires a non-empty transition buffer")
+        boundary_frame = self.buffer.frames[-1]
+        if int(boundary_frame.global_frame_index) != created_frame:
+            raise RuntimeError(
+                "transition boundary does not match candidate creation frame: "
+                f"{boundary_frame.global_frame_index} != {created_frame}"
+            )
+        mapping_indices = [int(frame.global_frame_index) for frame in frames]
+        heldout_indices = [int(frame.global_frame_index) for frame in heldout]
+        if not mapping_indices or max(mapping_indices) != created_frame:
+            raise RuntimeError("mapping keyframes must include the causal boundary frame")
+        if any(index > created_frame for index in mapping_indices + heldout_indices):
+            raise RuntimeError("candidate keyframes cannot use frames after the causal boundary")
+        if created_frame in heldout_indices:
+            raise RuntimeError("causal boundary frame cannot be held out")
         generated_rgb = rgb_to_float01(np.stack([frame.generated_rgb for frame in frames]))
         parent_rgb = rgb_to_float01(np.stack([frame.old_node_warp for frame in frames]))
         known_mask = np.stack([frame.warp_visibility for frame in frames])
@@ -290,6 +313,11 @@ class MemoryManager:
             status="candidate",
             parent_id=active_node.node_id,
         )
+        candidate.quality_metrics.update({
+            "shadow_boundary_frame": int(created_frame),
+            "shadow_mapping_frame_indices": mapping_indices,
+            "shadow_heldout_frame_indices": heldout_indices,
+        })
         view_rgb_origin=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_rgb_content_origin,
                      "model_generated") for frame in frames])
@@ -424,6 +452,8 @@ class MemoryManager:
 
     def _merge_verified_points(self, active, candidate):
         """Preserve every committed parent point and append verified novel voxels only."""
+        if getattr(candidate, "quality_metrics", None) is None:
+            candidate.quality_metrics = {}
         parent_count = len(active.points_xyz)
         verified = getattr(candidate, "_verified_new_point_mask", None)
         if verified is None:
@@ -505,13 +535,138 @@ class MemoryManager:
             ),
             "cumulative_point_count": int(len(candidate.points_xyz)),
         })
+        # Keep the split boundary directly on the node as well as in the
+        # quality report.  The direct attribute is intentionally dynamic for
+        # compatibility with schema-v3/v4 SpatialNode instances; renderers
+        # fall back to quality_metrics when loading an older node.
+        candidate.parent_point_count = int(parent_count)
         if hasattr(candidate, "_verified_new_point_mask"):
             del candidate._verified_new_point_mask
         return candidate
 
+    @staticmethod
+    def shadow_points_sha256(node):
+        """Return a deterministic digest of the committed point payload.
+
+        A shadow is immutable between candidate creation and scheduled
+        activation.  Hashing the four persisted point arrays catches both
+        accidental writes and hostile/tampered replacements while avoiding
+        non-deterministic object metadata.
+        """
+        digest = hashlib.sha256()
+        for name in (
+            "points_xyz", "points_rgb", "points_confidence", "points_source",
+        ):
+            value = np.ascontiguousarray(np.asarray(getattr(node, name)))
+            digest.update(name.encode("utf-8"))
+            digest.update(value.dtype.str.encode("ascii"))
+            digest.update(repr(tuple(value.shape)).encode("ascii"))
+            digest.update(value.tobytes(order="C"))
+        return digest.hexdigest()
+
+    @classmethod
+    def _freeze_shadow_points(cls, shadow):
+        for name in (
+            "points_xyz", "points_rgb", "points_confidence", "points_source",
+        ):
+            value = np.asarray(getattr(shadow, name))
+            # ``setflags`` is best effort for exotic array wrappers; all normal
+            # NumPy arrays used by SpatialNode are made read-only here.
+            try:
+                value.setflags(write=False)
+            except ValueError as error:
+                raise RuntimeError(f"cannot freeze shadow field {name}") from error
+            setattr(shadow, name, value)
+        return shadow
+
+    def prepare_shadow(self, active, candidate):
+        """Merge and freeze an accepted candidate without changing the parent.
+
+        This is the deferred counterpart to :meth:`promote`.  It performs the
+        cumulative parent+delta merge exactly once, stores the immutable shadow
+        and leaves ``active`` ACTIVE until :meth:`commit_shadow` runs.
+        """
+        if getattr(active, "status", None) != "active":
+            raise RuntimeError("shadow preparation requires an ACTIVE parent")
+        if getattr(candidate, "status", None) not in {"candidate", "shadow"}:
+            raise RuntimeError(
+                f"cannot prepare candidate {getattr(candidate, 'node_id', None)} "
+                f"from status {getattr(candidate, 'status', None)!r}"
+            )
+        if getattr(candidate, "status", None) == "shadow":
+            # Never rebuild or mutate an already pending shadow.
+            return candidate
+        shadow = self._merge_verified_points(active, candidate)
+        shadow.status = "shadow"
+        shadow.parent_id = active.node_id
+        if getattr(shadow, "quality_metrics", None) is None:
+            shadow.quality_metrics = {}
+        shadow_hash = self.shadow_points_sha256(shadow)
+        shadow.quality_metrics.update({
+            "shadow_status": "frozen",
+            "shadow_hash_at_creation": shadow_hash,
+        })
+        shadow.shadow_hash_at_creation = shadow_hash
+        shadow.shadow_hash_at_activation = None
+        self._freeze_shadow_points(shadow)
+        self.shadow_candidates[shadow.node_id] = shadow
+        self.register(shadow)
+        self.state = self.CANDIDATE
+        if self.node_store is not None:
+            self.node_store.save(shadow)
+        return shadow
+
+    def verify_shadow(self, shadow):
+        """Verify the frozen point payload immediately before activation."""
+        expected = getattr(shadow, "shadow_hash_at_creation", None)
+        if expected is None:
+            expected = shadow.quality_metrics.get("shadow_hash_at_creation")
+        if not expected:
+            raise RuntimeError(f"shadow {shadow.node_id} has no creation SHA256")
+        actual = self.shadow_points_sha256(shadow)
+        if actual != expected:
+            raise RuntimeError(
+                f"shadow hash mismatch for {shadow.node_id}: expected {expected}, got {actual}"
+            )
+        shadow.shadow_hash_at_activation = actual
+        shadow.shadow_hash_equal = True
+        shadow.quality_metrics["shadow_hash_at_activation"] = actual
+        shadow.quality_metrics["shadow_hash_equal"] = True
+        return actual
+
+    def commit_shadow(self, active, shadow, *, verified_hash=None):
+        """Verify and activate a scheduled shadow at its exact due chunk."""
+        if getattr(shadow, "status", None) != "shadow":
+            raise RuntimeError(
+                f"shadow {getattr(shadow, 'node_id', None)} is not pending activation"
+            )
+        if getattr(shadow, "parent_id", None) != getattr(active, "node_id", None):
+            raise RuntimeError(
+                f"shadow parent mismatch: {getattr(shadow, 'parent_id', None)} != "
+                f"{getattr(active, 'node_id', None)}"
+            )
+        if verified_hash is None:
+            verified_hash = self.verify_shadow(shadow)
+        elif verified_hash != getattr(shadow, "shadow_hash_at_activation", None):
+            raise RuntimeError("commit_shadow received an unverified shadow hash")
+        active.status = "archived"
+        shadow.status = "active"
+        self.register(active)
+        self.register(shadow)
+        if self.node_store is not None:
+            self.node_store.save(active)
+            self.node_store.save(shadow)
+        self.shadow_candidates.pop(shadow.node_id, None)
+        self.buffer.clear()
+        self.low_count = 0
+        self.state = self.ACTIVE_NEW_NODE
+        return shadow
+
     def promote(self, active, candidate, offline_gt_metrics=None):
         if offline_gt_metrics is not None:
             raise ValueError("promotion cannot consume offline ground-truth metrics")
+        if getattr(candidate, "status", None) == "shadow":
+            return self.commit_shadow(active, candidate)
         candidate = self._merge_verified_points(active, candidate)
         active.status = "archived"
         candidate.status = "active"
@@ -527,7 +682,8 @@ class MemoryManager:
         return candidate
 
     def process_chunk(self, active_node, generated_rgb_for_memory, cameras, warp, frame_start,
-                      *, allow_candidate_promotion=True, **forbidden):
+                      *, allow_candidate_promotion=True,
+                      defer_candidate_promotion=False, **forbidden):
         from ..oracle_training.contracts import assert_no_supervision_content
         assert_no_supervision_content(forbidden, "MemoryManager")
         generated_frame_count = len(generated_rgb_for_memory)
@@ -549,6 +705,7 @@ class MemoryManager:
         readiness = self.readiness_report(mean_coverage)
         event["readiness"] = readiness
         event["candidate_promotion_blocked"] = not bool(allow_candidate_promotion)
+        event["candidate_promotion_deferred"] = bool(defer_candidate_promotion)
         if (allow_candidate_promotion and self.state==self.TRANSITION and readiness["ready"] and
                 self.buffer.can_attempt(candidate_created_frame)):
             candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
@@ -556,7 +713,20 @@ class MemoryManager:
             if not accepted:
                 raise RuntimeError("readiness-qualified candidate must be accepted")
             event.update(candidate_id=candidate.node_id, accepted=accepted, metrics=metrics)
-            active_node = self.promote(active_node, candidate)
+            if defer_candidate_promotion:
+                shadow = self.prepare_shadow(active_node, candidate)
+                event.update(
+                    shadow_node=shadow,
+                    shadow_frozen=True,
+                    shadow_hash_at_creation=shadow.quality_metrics.get(
+                        "shadow_hash_at_creation"
+                    ),
+                    shadow_parent_point_count=shadow.quality_metrics.get(
+                        "parent_point_count"
+                    ),
+                )
+            else:
+                active_node = self.promote(active_node, candidate)
         event["state"] = self.state
         self.events.append(event)
         return active_node, event

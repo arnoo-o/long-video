@@ -576,8 +576,24 @@ def main():
                 scheduled_at_start = activation_queue.pending
                 activated = activation_queue.activate_due(chunk_index)
                 activated_node_id = None
+                activated_shadow_hash = None
+                activated_shadow_hash_at_creation = None
+                activated_shadow_hash_equal = None
                 if activated is not None:
-                    renderer.active_node = activated.node
+                    # A shadow is immutable while pending.  Verify its point
+                    # payload before the one and only parent->child commit,
+                    # then render the newly active cumulative node this chunk.
+                    activation_parent = renderer.active_node
+                    activated_shadow_hash_at_creation = getattr(
+                        activated.node, "shadow_hash_at_creation", None,
+                    ) or activated.node.quality_metrics.get("shadow_hash_at_creation")
+                    activated_shadow_hash = manager.verify_shadow(activated.node)
+                    renderer.active_node = manager.commit_shadow(
+                        activation_parent,
+                        activated.node,
+                        verified_hash=activated_shadow_hash,
+                    )
+                    activated_shadow_hash_equal = True
                     activated_node_id = activated.node_id
                 scheduled_node_id = (
                     scheduled_at_start.node_id
@@ -652,11 +668,17 @@ def main():
                     warp=memory_warp,
                     frame_start=start + first,
                     allow_candidate_promotion=not promotion_blocked_by_pending,
+                    defer_candidate_promotion=True,
                 )
                 candidate_schedule = None
+                shadow_node = event.get("shadow_node")
                 if event.get("accepted"):
+                    if shadow_node is None:
+                        raise RuntimeError("deferred candidate event did not expose its shadow node")
+                    if shadow_node.status != "shadow" or next_active.node_id != node_at_start.node_id:
+                        raise RuntimeError("candidate shadow changed the active node before activation")
                     candidate_schedule = activation_queue.schedule(
-                        next_active, created_after_chunk=chunk_index,
+                        shadow_node, created_after_chunk=chunk_index,
                     )
                 scheduled_node_id = (
                     activation_queue.pending.node_id
@@ -668,9 +690,10 @@ def main():
                 verified_ratio = None
                 promotion_metrics = {}
                 if event.get("accepted"):
-                    verified_ratio = float(next_active.quality_metrics.get("verified_point_ratio", 0.0))
+                    metrics_node = shadow_node or next_active
+                    verified_ratio = float(metrics_node.quality_metrics.get("verified_point_ratio", 0.0))
                     promotion_metrics = {
-                        key: next_active.quality_metrics.get(key)
+                        key: metrics_node.quality_metrics.get(key)
                         for key in (
                             "parent_points_preserved",
                             "parent_point_count",
@@ -775,6 +798,11 @@ def main():
 
                 visible = np.asarray(warp.visibility, bool)
                 confidence = np.asarray(warp.confidence, np.float32)
+                shadow_metadata_node = (
+                    shadow_node
+                    if shadow_node is not None
+                    else (activated.node if activated is not None else None)
+                )
                 record = {
                     "chunk_index": chunk_index,
                     "active_node_id": node_at_start.node_id,
@@ -813,6 +841,32 @@ def main():
                     "verified_point_ratio": verified_ratio,
                     "promotion_metrics": promotion_metrics,
                     "candidate_metrics": metrics,
+                    "shadow_frozen": event.get("shadow_frozen", False),
+                    "shadow_hash_at_creation": (
+                        activated_shadow_hash_at_creation
+                        if activated is not None else event.get("shadow_hash_at_creation")
+                    ),
+                    "shadow_hash_at_activation": (
+                        activated_shadow_hash if activated is not None else None
+                    ),
+                    "shadow_hash_equal": (
+                        activated_shadow_hash_equal if activated is not None else None
+                    ),
+                    "new_shadow_hash_at_creation": event.get("shadow_hash_at_creation"),
+                    "shadow_boundary_frame": (
+                        shadow_metadata_node.quality_metrics.get("shadow_boundary_frame")
+                        if shadow_metadata_node is not None else None
+                    ),
+                    "shadow_mapping_frame_indices": (
+                        shadow_metadata_node.quality_metrics.get("shadow_mapping_frame_indices")
+                        if shadow_metadata_node is not None else None
+                    ),
+                    "delta_output_on_parent_visible": getattr(
+                        warp, "delta_output_on_parent_visible", 0
+                    ),
+                    "delta_output_on_parent_protection_mask": getattr(
+                        warp, "delta_output_on_parent_protection_mask", 0
+                    ),
                     "transition_buffer": {
                         "frame_count": len(manager.buffer),
                         "translation_baseline": manager.buffer.translation_baseline,

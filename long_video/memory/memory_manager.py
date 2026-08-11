@@ -6,7 +6,7 @@ import hashlib
 import numpy as np
 
 from ..geometry.point_renderer import render
-from ..data.camera import rgb_to_float01
+from ..data.camera import rgb_to_float01, rgb_to_uint8
 from ..types import ScaleMetadata, ViewSet, Z_DEPTH
 from .node_builder import build_from_views
 from ..online.transition_buffer import TransitionBuffer
@@ -303,20 +303,51 @@ class MemoryManager:
             image_confidence=image_confidence,
             depth_convention=prediction.depth_convention or Z_DEPTH,
         )
+        boundary_mapping_position = mapping_indices.index(created_frame)
+        # Canonical Surface Commit: Pi3 consumes all eight mapping views, but
+        # persistent generated geometry is emitted by the causal boundary
+        # surface only.  Earlier views remain geometry/validation context and
+        # cannot inject parallel point-cloud copies into the new world node.
+        surface_slice = slice(boundary_mapping_position, boundary_mapping_position + 1)
+        surface_views = ViewSet(
+            rgb=views.rgb[surface_slice],
+            depth=views.depth[surface_slice],
+            depth_confidence=views.depth_confidence[surface_slice],
+            c2w=views.c2w[surface_slice],
+            intrinsics=views.intrinsics[surface_slice],
+            source=views.source[surface_slice],
+            image_confidence=views.image_confidence[surface_slice],
+            depth_convention=views.depth_convention,
+        )
         node_index = max([int(key.split("_")[-1]) for key in self.nodes] + [0]) + 1
         candidate = build_from_views(
-            views,
+            surface_views,
             node_id=f"node_{node_index:03d}",
-            center_c2w=c2w[len(c2w) // 2],
+            center_c2w=c2w[boundary_mapping_position],
             created_frame=created_frame,
             voxel_size=self.voxel_size,
             status="candidate",
             parent_id=active_node.node_id,
         )
+        # Retain the complete 8-view Pi3 geometry package for validation and
+        # diagnostics without allowing those seven context views to emit
+        # persistent points.
+        candidate.view_rgb = rgb_to_uint8(views.rgb)
+        candidate.view_depth = np.asarray(views.depth)
+        candidate.view_c2w = np.asarray(views.c2w)
+        candidate.intrinsics = np.asarray(views.intrinsics)
+        candidate.view_source = np.asarray(views.source)
+        candidate.view_image_confidence = np.asarray(views.image_confidence)
+        candidate.view_depth_confidence = np.asarray(views.depth_confidence)
         candidate.quality_metrics.update({
             "shadow_boundary_frame": int(created_frame),
             "shadow_mapping_frame_indices": mapping_indices,
             "shadow_heldout_frame_indices": heldout_indices,
+            "canonical_surface_commit": True,
+            "geometry_input_view_count": int(len(frames)),
+            "persistent_surface_view_count": 1,
+            "persistent_surface_mapping_position": int(boundary_mapping_position),
+            "persistent_surface_global_frame": int(created_frame),
         })
         view_rgb_origin=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_rgb_content_origin,

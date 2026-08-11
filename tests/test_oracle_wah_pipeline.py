@@ -152,7 +152,7 @@ def test_m1_parent_rgb_and_generated_new_region_provenance(tmp_path):
         pose = np.eye(4, dtype=np.float32); pose[0, 3] = index * 0.05
         visible = np.zeros((h, w), bool); visible[:, :4] = True
         manager.buffer.append(
-            generated_rgb=np.full((h, w, 3), 200, np.uint8), camera_c2w=pose,
+            generated_rgb=np.full((h, w, 3), 240 if index == 11 else 200, np.uint8), camera_c2w=pose,
             intrinsics=intrinsics_from_fov(90, w, h),
             old_node_warp=np.full((h, w, 3), 0.2, np.float32),
             warp_visibility=visible, old_node_warp_depth=np.full((h, w), 1.5, np.float32),
@@ -179,7 +179,9 @@ def test_m1_parent_rgb_and_generated_new_region_provenance(tmp_path):
     assert all(index <= 11 for index in candidate.quality_metrics["shadow_mapping_frame_indices"])
     assert 11 not in candidate.quality_metrics["shadow_heldout_frame_indices"]
     assert np.all(candidate.view_rgb[:, :, :4] == 51)
-    assert np.all(candidate.view_rgb[:, :, 4:] == 200)
+    boundary_position = candidate.quality_metrics["persistent_surface_mapping_position"]
+    assert np.all(candidate.view_rgb[boundary_position, :, 4:] == 240)
+    assert np.all(np.delete(candidate.view_rgb[:, :, 4:], boundary_position, axis=0) == 200)
     assert np.all(candidate.view_rgb_content_origin[:, :, :4] == "oracle_source")
     assert np.all(candidate.view_rgb_content_origin[:, :, 4:] == "model_generated")
     assert np.all(candidate.view_depth_content_origin[:, :, 4:] == "pi3_prediction")
@@ -189,6 +191,15 @@ def test_m1_parent_rgb_and_generated_new_region_provenance(tmp_path):
     assert np.all(candidate.view_depth_evidence_role[:, :, :4] == "parent_warp")
     assert np.ptp(candidate.view_image_confidence[:, :, 4:]) > 0
     assert candidate.quality_metrics["geometry_diagnostics"]["confidence_type"] == "heuristic"
+    assert candidate.quality_metrics["canonical_surface_commit"] is True
+    assert candidate.quality_metrics["geometry_input_view_count"] == 8
+    assert candidate.quality_metrics["persistent_surface_view_count"] == 1
+    assert candidate.quality_metrics["persistent_surface_global_frame"] == 11
+    generated_points = candidate.points_source == 2
+    assert generated_points.any()
+    assert np.all(candidate.points_rgb[generated_points] == 240)
+    assert np.all(candidate.observation_count == 1)
+    assert np.all(candidate.point_view_mask == 1)
     accepted, metrics = manager.validate_candidate(candidate, mapping, heldout)
     assert accepted
     assert metrics["mandatory_acceptance_by_readiness"] is True

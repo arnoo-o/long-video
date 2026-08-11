@@ -532,13 +532,17 @@ def main():
         "source_image": str(source_path),
         "spatial_memory_attention_enabled": False,
         "spatial_memory_parameters_deleted": False,
-        "generation_mode": "canonical_residual_per_step_world_clamp",
-        "canonical_residual_formula": "z_next=M*z_world(next_sigma)+(1-M)*z_candidate at every scheduler step",
+        "generation_mode": "stage2_rgb_pixel_consistency_clamp",
+        "canonical_residual_formula": None,
         "soft_wpf_enabled": False,
         "projection": {
-            "mode": "per_step_scheduler_aligned_world_clamp",
+            "mode": "stage2_clean_x0_rgb_pixel_clamp",
             "soft_wpf_enabled": False,
-            "formula": "z_next=M_world*z_world+(1-M_world)*z_candidate",
+            "formula": "I_mix=V_renderer*I_warp+(1-V_renderer)*I_model",
+            "stages": [2],
+            "decodes_noisy_latent": False,
+            "coverage_threshold_used": False,
+            "nearest_fill_used": False,
         },
         "legacy_soft_wpf_parameters_ignored": vars(projection_config),
         "pyramid_num_inference_steps_list": list(PYRAMID_STEPS),
@@ -548,10 +552,12 @@ def main():
             [13, 14, 15, 16], [17, 18, 19, 20], [21, 22, 23, 24],
             [25, 26, 27, 28], [29, 30, 31, 32],
         ],
-        "canonical_support_shared_by": ["WAH", "Per-Step World Clamp"],
+        "canonical_support_shared_by": ["WAH"],
         "canonical_safe_support_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
         "world_ownership_binary": True,
-        "world_ownership_coverage_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
+        "world_ownership_applies_to": ["WAH conditioning only"],
+        "rgb_clamp_visibility_source": "raw renderer visibility",
+        "rgb_clamp_coverage_threshold": None,
         "shared_world_boundary_slot": 0,
         "source_world_filter": source_world_filter,
         "deprecated_confidence_threshold_ignored": ARGS.confidence_threshold,
@@ -713,6 +719,9 @@ def main():
                 )
                 boundary_source_global_frame = state.get("boundary_source_global_frame")
                 pipe.set_world_projection_context(projection)
+                pipe.set_rgb_pixel_clamp_context(
+                    warp.rgb, warp.visibility, height=HEIGHT, width=WIDTH,
+                )
                 pipe.set_canonical_warp_conditioning(
                     canonical_warp_rgb, clean,
                     first_frame_latent=canonical_first_frame_latent,
@@ -824,19 +833,26 @@ def main():
                         raise RuntimeError(f"stage {stage_id} did not execute {expected_steps} ordered updates")
                     if stage_id == 0 and any(item["boundary_delta_ratio"] != 0.0 for item in stage_items):
                         raise RuntimeError("stage0 Boundary Bridge must remain exactly disabled")
-                    if projection.previous_boundary_latents is not None and any(
-                        item["wpf_slot0_strength_max"] != 0.0 for item in stage_items
-                    ):
+                    expected_rgb_clamp = 1.0 if stage_id == 2 else 0.0
+                    if any(item["rgb_pixel_clamp"] != expected_rgb_clamp for item in stage_items):
                         raise RuntimeError(
-                            f"stage {stage_id} Boundary Bridge left non-zero WPF slot0 strength"
+                            f"stage {stage_id} RGB clamp activation does not match stage-2-only policy"
                         )
+                    if stage_id < 2 and any(
+                        item["projection_strength_mean"] != 0.0 for item in stage_items
+                    ):
+                        raise RuntimeError(f"stage {stage_id} unexpectedly applied RGB clamp")
+                    if stage_id == 2 and any(
+                        item["rgb_visible_exact_warp_max_error"] != 0.0
+                        or item["rgb_unknown_exact_model_max_error"] != 0.0
+                        or item["rgb_composite_formula_max_error"] != 0.0
+                        for item in stage_items
+                    ):
+                        raise RuntimeError("stage2 RGB pixel composition is not exact")
                     if stage_id > 0:
                         next_sigmas = [item["next_sigma"] for item in stage_items]
                         if len(set(next_sigmas)) != expected_steps:
                             raise RuntimeError(f"stage {stage_id} did not expose distinct next_sigma values")
-                        strengths = [item["projection_strength_mean"] for item in stage_items]
-                        if any(right < left for left, right in zip(strengths, strengths[1:])):
-                            raise RuntimeError(f"stage {stage_id} projection strength did not increase")
                         boundary_strengths = [item["boundary_strength"] for item in stage_items]
                         if projection.previous_boundary_latents is not None and any(
                             right < left for left, right in zip(
@@ -859,8 +875,8 @@ def main():
                     for stage_id in range(len(PYRAMID_STEPS))
                 }
                 projection_weight = projection.final_projection_weight
-                if projection_weight is None or tuple(projection_weight.shape[2:]) != (9, 48, 80):
-                    raise RuntimeError("final stage projection weight must be [B,1,9,48,80]")
+                if projection_weight is None or tuple(projection_weight.shape[2:]) != (33, HEIGHT, WIDTH):
+                    raise RuntimeError("RGB clamp visibility must be raw [B,1,33,H,W] pixels")
                 projection_weight = projection_weight.detach().float().cpu()
                 chunk_boundary = None
                 if chunk_index > 0:
@@ -995,6 +1011,10 @@ def main():
                     "canonical_confidence_mean": float(canonical_support.confidence.mean()),
                     "world_ownership_binary": True,
                     "world_ownership_coverage_threshold": WORLD_OWNERSHIP_COVERAGE_THRESHOLD,
+                    "world_ownership_applies_to": "WAH conditioning only",
+                    "rgb_clamp_visibility_source": "raw renderer pixels",
+                    "rgb_clamp_coverage_threshold": None,
+                    "rgb_clamp_nearest_fill_used": False,
                     "fill_owned_latent_count": fill_owned_latent_count,
                     "world_owned_latent_ratio": world_owned_latent_ratio,
                     "fill_only_latent_abs_max": fill_only_latent_abs_max,
@@ -1044,6 +1064,7 @@ def main():
                     "candidate_readiness": event["readiness"],
                     "projection_stages": stage_diagnostics,
                     "canonical_residual": projection.final_residual_diagnostics,
+                    "rgb_pixel_clamp": projection.final_residual_diagnostics,
                     "boundary_projection_active": bool(
                         projection.previous_boundary_latents is not None
                     ),

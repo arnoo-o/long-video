@@ -1,4 +1,5 @@
 import torch
+import pytest
 from types import SimpleNamespace
 
 from long_video.wah.world_projected_pipeline import (
@@ -18,14 +19,76 @@ from long_video.wah.world_projected_pipeline import (
     build_boundary_state_at_sigma,
     build_world_state_at_sigma,
     canonical_support_to_tokens,
+    composite_renderer_rgb,
     compose_canonical_residual,
     fill_invalid_warp_for_vae,
     encode_canonical_video_latents,
     posterior_mode_or_mean,
+    rgb_pixel_clamp_enabled,
+    scheduler_align_clean_prediction,
+    scheduler_clean_prediction,
     mask_canonical_latent,
     smooth_latent_visibility,
     world_projection_weight,
 )
+
+
+def test_rgb_pixel_clamp_uses_raw_visibility_without_gap_fill():
+    model = torch.tensor([[[[[0.1, 0.2, 0.3]]]]]).expand(1, 3, 1, 1, 3).clone()
+    warp = torch.tensor([[[[[0.8, 0.9, 1.0]]]]]).expand_as(model).clone()
+    visibility = torch.tensor([[[[[1.0, 0.0, 1.0]]]]])
+    mixed, metrics = composite_renderer_rgb(model, warp, visibility)
+    torch.testing.assert_close(mixed[..., 0], warp[..., 0])
+    torch.testing.assert_close(mixed[..., 1], model[..., 1])
+    torch.testing.assert_close(mixed[..., 2], warp[..., 2])
+    assert float(metrics["rgb_visible_exact_warp_max_error"]) == 0.0
+    assert float(metrics["rgb_unknown_exact_model_max_error"]) == 0.0
+    assert float(metrics["rgb_composite_formula_max_error"]) == 0.0
+
+
+def test_rgb_pixel_clamp_is_stage2_only():
+    assert not rgb_pixel_clamp_enabled(0, 3)
+    assert not rgb_pixel_clamp_enabled(1, 3)
+    assert rgb_pixel_clamp_enabled(2, 3)
+
+
+def test_rgb_pixel_clamp_rejects_soft_or_thresholded_visibility():
+    rgb = torch.zeros(1, 3, 1, 1, 1)
+    with pytest.raises(ValueError):
+        composite_renderer_rgb(rgb, rgb, torch.full((1, 1, 1, 1, 1), 0.9))
+
+
+def test_clean_prediction_and_native_scheduler_alignment_are_used():
+    class FakeScheduler:
+        def __init__(self):
+            self.convert_calls = 0
+            self.noise_calls = 0
+
+        def convert_flow_pred_to_x0(self, *, flow_pred, xt, timestep, sigmas, timesteps):
+            self.convert_calls += 1
+            return xt - flow_pred
+
+        def add_noise(self, clean, noise, timestep, *, sigmas, timesteps):
+            self.noise_calls += 1
+            return clean + 0.25 * noise
+
+    scheduler = FakeScheduler()
+    sample = torch.full((1, 2, 1, 1, 1), 4.0)
+    flow = torch.ones_like(sample)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    timesteps = torch.tensor([999, 500, 0])
+    clean = scheduler_clean_prediction(
+        scheduler, flow, torch.tensor(999), sample,
+        dmd_sigmas=sigmas, dmd_timesteps=timesteps,
+    )
+    torch.testing.assert_close(clean, torch.full_like(clean, 3.0))
+    aligned = scheduler_align_clean_prediction(
+        scheduler, clean, step_index=0, stage_start_state=torch.full_like(clean, 8.0),
+        dmd_sigmas=sigmas, dmd_timesteps=timesteps, all_timesteps=timesteps[:2],
+    )
+    torch.testing.assert_close(aligned, torch.full_like(clean, 5.0))
+    assert scheduler.convert_calls == 1
+    assert scheduler.noise_calls == 1
 
 
 def test_canonical_residual_composition_gives_world_exclusive_known_pixels():

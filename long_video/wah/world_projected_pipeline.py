@@ -170,6 +170,8 @@ class WorldProjectionContext:
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     final_projection_weight: torch.Tensor | None = None
     final_residual_diagnostics: dict[str, Any] | None = None
+    pixel_warp_rgb: torch.Tensor | None = None
+    pixel_visibility: torch.Tensor | None = None
 
     def __post_init__(self):
         count = len(self.canonical_latents)
@@ -202,6 +204,19 @@ class WorldProjectionContext:
                     raise ValueError(
                         f"stage {stage_id} boundary shape {tuple(boundary.shape)} != {expected}"
                     )
+        if (self.pixel_warp_rgb is None) != (self.pixel_visibility is None):
+            raise ValueError("pixel RGB clamp requires both warp RGB and visibility")
+        if self.pixel_warp_rgb is not None:
+            expected = (
+                self.pixel_warp_rgb.shape[0], 1, self.pixel_warp_rgb.shape[2],
+                self.pixel_warp_rgb.shape[3], self.pixel_warp_rgb.shape[4],
+            )
+            if self.pixel_warp_rgb.ndim != 5 or tuple(self.pixel_visibility.shape) != expected:
+                raise ValueError("pixel RGB clamp tensors must be aligned [B,C/T,H,W]")
+            if not bool(torch.isfinite(self.pixel_warp_rgb).all()):
+                raise ValueError("pixel warp RGB must be finite")
+            if not bool(((self.pixel_visibility == 0) | (self.pixel_visibility == 1)).all()):
+                raise ValueError("renderer pixel visibility must be binary")
 
 
 def _resize_video_latents(value: torch.Tensor, height: int, width: int, *, mode: str) -> torch.Tensor:
@@ -991,6 +1006,114 @@ def apply_boundary_then_world_clamp(
     }
 
 
+def composite_renderer_rgb(
+    model_rgb: torch.Tensor,
+    warp_rgb: torch.Tensor,
+    renderer_visibility: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Composite raw renderer RGB over a decoded clean prediction per pixel.
+
+    This path deliberately accepts no latent support or coverage threshold.
+    Renderer-visible pixels belong to the point cloud; every pixel gap remains
+    exactly the model prediction.
+    """
+    if model_rgb.ndim != 5 or tuple(warp_rgb.shape) != tuple(model_rgb.shape):
+        raise ValueError("model/warp RGB must have the same [B,3,T,H,W] shape")
+    expected_visibility = (
+        model_rgb.shape[0], 1, model_rgb.shape[2],
+        model_rgb.shape[3], model_rgb.shape[4],
+    )
+    if tuple(renderer_visibility.shape) != expected_visibility:
+        raise ValueError(
+            f"renderer visibility must be {expected_visibility}, got {tuple(renderer_visibility.shape)}"
+        )
+    visibility = renderer_visibility.to(device=model_rgb.device, dtype=torch.float32)
+    if not bool(((visibility == 0) | (visibility == 1)).all()):
+        raise ValueError("RGB clamp visibility must be raw binary renderer visibility")
+    model = model_rgb.float()
+    warp = warp_rgb.to(device=model_rgb.device, dtype=torch.float32)
+    mixed = visibility * warp + (1.0 - visibility) * model
+    visible = (visibility == 1).expand_as(mixed)
+    unknown = (visibility == 0).expand_as(mixed)
+    visible_error = (
+        (mixed - warp).masked_select(visible).abs().max()
+        if bool(visible.any()) else torch.zeros((), device=mixed.device)
+    )
+    unknown_error = (
+        (mixed - model).masked_select(unknown).abs().max()
+        if bool(unknown.any()) else torch.zeros((), device=mixed.device)
+    )
+    if float(visible_error.detach().cpu()) != 0.0:
+        raise RuntimeError("RGB clamp changed a renderer-visible pixel")
+    if float(unknown_error.detach().cpu()) != 0.0:
+        raise RuntimeError("RGB clamp changed a point-cloud gap")
+    return mixed.to(model_rgb.dtype), {
+        "rgb_visibility_mean": visibility.mean().detach(),
+        "rgb_visible_exact_warp_max_error": visible_error.detach(),
+        "rgb_unknown_exact_model_max_error": unknown_error.detach(),
+        "rgb_composite_formula_max_error": (
+            mixed - (visibility * warp + (1.0 - visibility) * model)
+        ).abs().max().detach(),
+    }
+
+
+def scheduler_clean_prediction(
+    scheduler: Any,
+    model_output: torch.Tensor,
+    timestep: float | torch.Tensor,
+    sample: torch.Tensor,
+    *,
+    dmd_sigmas: torch.Tensor,
+    dmd_timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """Use Helios' native flow conversion; never decode a noisy latent."""
+    timestep_value = torch.as_tensor(timestep, device=model_output.device).item()
+    timestep_batch = torch.full(
+        (model_output.shape[0],), timestep_value,
+        dtype=torch.long, device=model_output.device,
+    )
+    return scheduler.convert_flow_pred_to_x0(
+        flow_pred=model_output,
+        xt=sample,
+        timestep=timestep_batch,
+        sigmas=dmd_sigmas,
+        timesteps=dmd_timesteps,
+    )
+
+
+def scheduler_align_clean_prediction(
+    scheduler: Any,
+    clean_prediction: torch.Tensor,
+    *,
+    step_index: int,
+    stage_start_state: torch.Tensor,
+    dmd_sigmas: torch.Tensor,
+    dmd_timesteps: torch.Tensor,
+    all_timesteps: torch.Tensor,
+) -> torch.Tensor:
+    """Return an RGB-composited clean endpoint to Helios' native next coordinate."""
+    if int(step_index) >= len(all_timesteps) - 1:
+        return clean_prediction
+    next_timestep = torch.full(
+        (clean_prediction.shape[0],), all_timesteps[int(step_index) + 1],
+        dtype=torch.long, device=clean_prediction.device,
+    )
+    return scheduler.add_noise(
+        clean_prediction,
+        stage_start_state.to(clean_prediction.device, clean_prediction.dtype),
+        next_timestep,
+        sigmas=dmd_sigmas,
+        timesteps=dmd_timesteps,
+    )
+
+
+def rgb_pixel_clamp_enabled(stage_id: int, stage_count: int) -> bool:
+    """RGB consistency is intentionally restricted to the final pyramid stage."""
+    if int(stage_count) <= 0:
+        raise ValueError("stage_count must be positive")
+    return int(stage_id) == int(stage_count) - 1
+
+
 def world_projection_weight(
     visibility: torch.Tensor,
     confidence: torch.Tensor,
@@ -1065,6 +1188,38 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
 
     def set_world_projection_context(self, context: WorldProjectionContext | None) -> None:
         self._world_projection_context = context
+
+    def set_rgb_pixel_clamp_context(
+        self,
+        raw_warp_rgb: Any,
+        raw_renderer_visibility: Any,
+        *,
+        height: int,
+        width: int,
+    ) -> None:
+        """Attach the unfilled renderer evidence used only by stage-2 RGB clamp."""
+        context = getattr(self, "_world_projection_context", None)
+        if context is None:
+            raise RuntimeError("set world projection context before RGB clamp pixels")
+        device = self._wah_execution_device()
+        rgb = self._coerce_warp_video_tensor(
+            raw_warp_rgb, height=int(height), width=int(width), device=device,
+        ).to(device=device, dtype=self.vae.dtype)
+        visibility = torch.as_tensor(
+            raw_renderer_visibility, device=device, dtype=torch.float32,
+        )
+        if visibility.ndim == 3:
+            visibility = visibility.unsqueeze(0).unsqueeze(0)
+        elif visibility.ndim == 4:
+            visibility = visibility.unsqueeze(1)
+        expected = (rgb.shape[0], 1, rgb.shape[2], rgb.shape[3], rgb.shape[4])
+        if tuple(visibility.shape) != expected:
+            raise ValueError(
+                f"raw renderer visibility must align exactly to RGB {expected}, got {tuple(visibility.shape)}"
+            )
+        visibility = (visibility > 0).to(torch.float32)
+        context.pixel_warp_rgb = rgb.detach()
+        context.pixel_visibility = visibility.detach()
 
     def clear_world_projection_context(self) -> None:
         self._world_projection_context = None
@@ -1204,24 +1359,19 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 stage_start = sample.detach().clone()
             if stage_id >= len(context.canonical_latents) or stage_start is None:
                 raise RuntimeError(f"unexpected Helios pyramid stage {stage_id}")
-            # Helios performs its native full-latent update first.  Only the
-            # scheduler result is then boundary-adjusted and world-clamped.
+            # Helios always performs its native scheduler update first.
             result = original_step(model_output, timestep, sample, *step_args, **step_kwargs)
             z_raw = result[0]
             sigmas = step_kwargs.get("dmd_sigmas", getattr(scheduler, "sigmas", None))
+            dmd_timesteps = step_kwargs.get("dmd_timesteps", getattr(scheduler, "timesteps", None))
+            all_timesteps = step_kwargs.get("all_timesteps")
             if sigmas is None or len(sigmas) <= step_index:
                 raise RuntimeError("Helios scheduler did not expose the active stage sigma coordinate")
+            if dmd_timesteps is None or all_timesteps is None:
+                raise RuntimeError("Helios scheduler did not expose native DMD timestep coordinates")
             current_sigma = sigmas[step_index]
             next_sigma = sigmas[min(step_index + 1, len(sigmas) - 1)]
-            endpoint = context.canonical_latents[stage_id].to(device=z_raw.device, dtype=z_raw.dtype)
             visible = context.visibility[stage_id].to(device=z_raw.device)
-            z_world = build_world_state_at_sigma(
-                stage_id=stage_id,
-                current_sigma=current_sigma,
-                next_sigma=next_sigma,
-                canonical_endpoint=endpoint,
-                stage_start_state=stage_start,
-            )
             config = context.config
             boundary_endpoint = (
                 None if context.previous_boundary_latents is None
@@ -1237,11 +1387,94 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                 )
             )
             boundary_beta_max = config.boundary_beta_max(stage_id)
-            z_next, diagnostic = apply_boundary_then_world_clamp(
-                z_raw, z_world, visible, boundary_state,
-                boundary_beta_max=boundary_beta_max,
-                sigma=next_sigma,
-            )
+            if not rgb_pixel_clamp_enabled(stage_id, len(context.canonical_latents)):
+                # Stage 0/1 retain only the existing Boundary Bridge.  They do
+                # not decode, composite, encode, or apply any world clamp.
+                z_next, diagnostic = apply_residual_boundary_bridge(
+                    z_raw, boundary_state, visible,
+                    boundary_beta_max=boundary_beta_max, sigma=next_sigma,
+                )
+                diagnostic.update({
+                    "projection_mask_ratio": torch.zeros((), device=z_raw.device),
+                    "projection_strength_mean": torch.zeros((), device=z_raw.device),
+                    "per_step_world_clamp": torch.zeros((), device=z_raw.device),
+                    "world_clamp_formula_max_error": torch.zeros((), device=z_raw.device),
+                    "rgb_pixel_clamp": torch.zeros((), device=z_raw.device),
+                    "rgb_visibility_mean": torch.zeros((), device=z_raw.device),
+                    "rgb_visible_exact_warp_max_error": torch.zeros((), device=z_raw.device),
+                    "rgb_unknown_exact_model_max_error": torch.zeros((), device=z_raw.device),
+                    "rgb_composite_formula_max_error": torch.zeros((), device=z_raw.device),
+                    "rgb_clamp_clean_delta_ratio": torch.zeros((), device=z_raw.device),
+                })
+            else:
+                if context.pixel_warp_rgb is None or context.pixel_visibility is None:
+                    raise RuntimeError("stage-2 RGB clamp is missing raw renderer pixels")
+                # Obtain the true clean/x0 prediction from the scheduler's
+                # native flow coordinate.  No noisy latent is ever decoded.
+                clean_model = scheduler_clean_prediction(
+                    scheduler, model_output, timestep, sample,
+                    dmd_sigmas=sigmas, dmd_timesteps=dmd_timesteps,
+                )
+                # Keep Boundary Bridge in clean coordinates and only in its
+                # existing unknown slot0 region before RGB composition.
+                clean_candidate, diagnostic = apply_residual_boundary_bridge(
+                    clean_model, boundary_endpoint, visible,
+                    boundary_beta_max=boundary_beta_max, sigma=next_sigma,
+                )
+                latents_mean, latents_std = self._latent_stats(z_raw.device)
+                vae_dtype = self.vae.dtype
+                vae_latents = (
+                    clean_candidate.to(dtype=vae_dtype) / latents_std + latents_mean
+                )
+                model_rgb = self.vae.decode(vae_latents, return_dict=False)[0]
+                warp_rgb = context.pixel_warp_rgb.to(
+                    device=model_rgb.device, dtype=model_rgb.dtype,
+                )
+                pixel_visibility = context.pixel_visibility.to(model_rgb.device)
+                mixed_rgb, rgb_metrics = composite_renderer_rgb(
+                    model_rgb, warp_rgb, pixel_visibility,
+                )
+                mixed_clean = _encode_vae_deterministic(
+                    self, mixed_rgb.to(dtype=vae_dtype),
+                    latents_mean=latents_mean, latents_std=latents_std,
+                ).to(device=z_raw.device, dtype=z_raw.dtype)
+                if tuple(mixed_clean.shape) != tuple(z_raw.shape):
+                    raise RuntimeError(
+                        f"RGB clamp re-encode {tuple(mixed_clean.shape)} != scheduler {tuple(z_raw.shape)}"
+                    )
+                z_next = scheduler_align_clean_prediction(
+                    scheduler, mixed_clean,
+                    step_index=step_index,
+                    stage_start_state=stage_start,
+                    dmd_sigmas=sigmas,
+                    dmd_timesteps=dmd_timesteps,
+                    all_timesteps=all_timesteps,
+                )
+                diagnostic.update(rgb_metrics)
+                diagnostic.update({
+                    "projection_mask_ratio": rgb_metrics["rgb_visibility_mean"],
+                    "projection_strength_mean": rgb_metrics["rgb_visibility_mean"],
+                    "projection_delta_ratio": (
+                        (z_next.float() - z_raw.float()).norm()
+                        / z_raw.float().norm().clamp_min(1e-8)
+                    ).detach(),
+                    "unknown_projection_delta_max": rgb_metrics[
+                        "rgb_unknown_exact_model_max_error"
+                    ],
+                    "combined_delta_ratio": (
+                        (z_next.float() - z_raw.float()).norm()
+                        / z_raw.float().norm().clamp_min(1e-8)
+                    ).detach(),
+                    "per_step_world_clamp": torch.ones((), device=z_raw.device),
+                    "world_clamp_formula_max_error": rgb_metrics[
+                        "rgb_composite_formula_max_error"
+                    ],
+                    "rgb_pixel_clamp": torch.ones((), device=z_raw.device),
+                    "rgb_clamp_clean_delta_ratio": (
+                        (mixed_clean.float() - clean_model.float()).norm()
+                        / clean_model.float().norm().clamp_min(1e-8)
+                    ).detach(),
+                })
             context.diagnostics.append({
                 "stage_id": int(stage_id),
                 "step_id": int(step_index),
@@ -1254,30 +1487,32 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         scheduler.step = world_clamped_step
         try:
             sampled = super().stage2_sample(*args, **kwargs)
-            endpoint = context.canonical_latents[-1].to(
-                device=sampled.device, dtype=sampled.dtype,
-            )
-            support = context.visibility[-1].to(device=sampled.device, dtype=torch.float32).clamp(0.0, 1.0)
-            base = support * endpoint.float()
-            context.final_projection_weight = support.detach()
+            if context.pixel_visibility is None:
+                raise RuntimeError("stage-2 RGB clamp did not retain renderer visibility")
+            context.final_projection_weight = context.pixel_visibility.detach()
             final_step = context.diagnostics[-1] if context.diagnostics else None
             if final_step is None or final_step["stage_id"] != len(context.canonical_latents) - 1:
-                raise RuntimeError("final scheduler step did not record a world clamp")
-            if final_step["next_sigma"] != 0.0 or final_step["world_clamp_formula_max_error"] != 0.0:
-                raise RuntimeError("final scheduler output is not a verified sigma-zero world clamp")
+                raise RuntimeError("final scheduler step did not record the RGB clamp")
+            if (
+                final_step["next_sigma"] != 0.0
+                or final_step["rgb_pixel_clamp"] != 1.0
+                or final_step["rgb_composite_formula_max_error"] != 0.0
+            ):
+                raise RuntimeError("final scheduler output is not a verified sigma-zero RGB clamp")
             context.final_residual_diagnostics = {
-                "canonical_base_norm": float(base.float().norm().detach().cpu()),
                 "sampled_norm": float(sampled.float().norm().detach().cpu()),
                 "composed_norm": float(sampled.float().norm().detach().cpu()),
-                "known_region_exact_base_max_error": float(
-                    ((sampled.float() - base) * (support >= 1.0).expand_as(sampled)).abs().max().detach().cpu()
-                ),
-                "per_step_world_clamp_step_count": int(len(context.diagnostics)),
+                "stage2_rgb_clamp_step_count": int(sum(
+                    item["rgb_pixel_clamp"] == 1.0 for item in context.diagnostics
+                )),
                 "final_step_next_sigma": float(final_step["next_sigma"]),
-                "final_step_world_clamp_formula_max_error": float(
-                    final_step["world_clamp_formula_max_error"]
+                "final_rgb_composite_formula_max_error": float(
+                    final_step["rgb_composite_formula_max_error"]
                 ),
                 "final_output_posthoc_clamp_applied": False,
+                "noisy_latent_decoded": False,
+                "clamp_coverage_threshold_used": False,
+                "clamp_nearest_fill_used": False,
                 "soft_wpf_used": False,
                 "residual_coordinates_used": False,
             }

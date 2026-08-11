@@ -1,0 +1,29 @@
+official_repo: DL3DV/DL3DV-ALL-480P
+resolution: 480P
+file_type: images+poses
+target_scenes: 256
+split_scenes:
+  train: 224
+  val: 16
+  diagnostic: 16
+environment_targets:
+  indoor: 128
+  outdoor: 128
+video:
+  target_height: 384
+  target_width: 640
+  target_fps: 24
+  interpolation: none
+  chunk_frames: 33
+  chunk_stride: 32
+  preferred_chunk_counts: [12, 8]
+trajectory:
+  maximum_per_scene: 2
+  types: [source_revisit, world_revisit]
+training:
+  trainable_chunks: all
+  round_robin: deterministic
+  uses_future_gt: false
+  initial_world_inputs: [source_rgb]
+  history_world_inputs: [causally_generated_rgb]
+  forbidden_world_inputs: [dl3dv_colmap_points, future_gt_rgb, future_depth]

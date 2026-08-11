@@ -34,6 +34,21 @@ def validate_generic_rgb_manifest(path):
     return records
 
 
+def validate_dl3dv_film_manifest(path):
+    """Validate the standalone DL3DV trajectory schema and causal contract."""
+    from ..data.dl3dv import validate_trajectory_record
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if payload.get("dataset") != "DL3DV-10K official 480P images+poses":
+        raise ValueError("not a DL3DV FiLM manifest")
+    if payload.get("uses_future_gt") is not False:
+        raise ValueError("DL3DV manifest must declare uses_future_gt=false")
+    root = Path(path).parent
+    records = payload.get("records") or []
+    if not records: raise ValueError("DL3DV manifest has no trajectories")
+    for record in records: validate_trajectory_record(record, root)
+    return records
+
+
 class GenericRGBVideoDataset(Dataset):
     """Plain video/camera records; no scene or dataset-specific fields."""
 
@@ -148,7 +163,8 @@ def stage0_flow_matching_loss(
     return (prediction[0].float() - item["target"].float()).square().mean()
 
 
-def save_film_checkpoint(path, transformer, optimizer=None, scheduler=None, *, step=0, metadata=None):
+def save_film_checkpoint(path, transformer, optimizer=None, scheduler=None, *, step=0, metadata=None,
+                         round_robin=None):
     controller = transformer.stage0_causal_world_film
     payload = {
         "schema_version": 1,
@@ -157,7 +173,8 @@ def save_film_checkpoint(path, transformer, optimizer=None, scheduler=None, *, s
         "film": controller.film.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "metadata": {"uses_future_gt": False, **dict(metadata or {})},
+        "metadata": {"uses_future_gt": False, **dict(metadata or {}),
+                     "round_robin": None if round_robin is None else round_robin.state_dict()},
         "torch_rng_state": torch.get_rng_state(),
     }
     target = Path(path)
@@ -168,7 +185,7 @@ def save_film_checkpoint(path, transformer, optimizer=None, scheduler=None, *, s
     return target
 
 
-def load_film_checkpoint(path, transformer, optimizer=None, scheduler=None):
+def load_film_checkpoint(path, transformer, optimizer=None, scheduler=None, round_robin=None):
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if payload.get("architecture") != "stage0_causal_world_film":
         raise ValueError("checkpoint is not a Stage0 causal-world FiLM checkpoint")
@@ -177,4 +194,7 @@ def load_film_checkpoint(path, transformer, optimizer=None, scheduler=None):
         optimizer.load_state_dict(payload["optimizer"])
     if scheduler is not None and payload.get("scheduler") is not None:
         scheduler.load_state_dict(payload["scheduler"])
-    return int(payload["global_step"]), dict(payload.get("metadata") or {})
+    metadata = dict(payload.get("metadata") or {})
+    if round_robin is not None and metadata.get("round_robin") is not None:
+        round_robin.load_state_dict(metadata["round_robin"])
+    return int(payload["global_step"]), metadata

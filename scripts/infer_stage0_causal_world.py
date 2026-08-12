@@ -65,17 +65,22 @@ def main():
     online.wah_adapter.configure_state(online.autoregressive_state)
     if args.film_checkpoint:
         load_film_checkpoint(args.film_checkpoint, pipe.transformer)
+    for parameter in pipe.transformer.parameters():
+        parameter.requires_grad_(False)
+    for parameter in pipe.vae.parameters():
+        parameter.requires_grad_(False)
     controls = json.loads(args.controls.read_text(encoding="utf-8"))
     intrinsics = resize_intrinsics(
         node.view_intrinsics[0], node.view_rgb.shape[1:3], (args.height, args.width),
     )
     frames, diagnostics = [], []
-    for chunk_controls in controls:
-        generated, _poses, _warp, report = online.generate_chunk(
-            chunk_controls, intrinsics, args.height, args.width,
-        )
-        frames.append(generated if not frames else generated[1:])
-        diagnostics.append(report)
+    with torch.inference_mode():
+        for chunk_controls in controls:
+            generated, _poses, _warp, report = online.generate_chunk(
+                chunk_controls, intrinsics, args.height, args.width,
+            )
+            frames.append(generated if not frames else generated[1:])
+            diagnostics.append(report)
     video = np.concatenate(frames)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if video.dtype != np.uint8:

@@ -37,6 +37,9 @@ class OnlineSpatialHistoryPipeline:
             active_node.center_c2w.copy() if active_node is not None else np.eye(4, dtype=np.float32)
         )
         self.recent_video_history = []
+        self.wah_fill_frame = (
+            np.asarray(active_node.view_rgb[0]).copy() if active_node is not None else None
+        )
         self.autoregressive_state = None
         self.frame_index = 0
         self.chunk_index = 0
@@ -61,6 +64,7 @@ class OnlineSpatialHistoryPipeline:
         if self.wah_pipeline is not None:
             if first_image is None:
                 first_image = np.asarray(self.active_node.view_rgb[0])
+            self.wah_fill_frame = np.asarray(first_image).copy()
             kwargs = {
                 "conditioning_type": "warp",
                 "warp_history_downsample_mode": "short",
@@ -142,12 +146,13 @@ class OnlineSpatialHistoryPipeline:
             )
         try:
             _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
-                self.autoregressive_state, warp, output_type="np"
+                self.autoregressive_state, warp, output_type="np", fill_frame=self.wah_fill_frame,
             )
         finally:
             if hasattr(self.wah_pipeline, "clear_rgb_clamp_context"):
                 self.wah_pipeline.clear_rgb_clamp_context()
         generated_chunk = self._decode_last_latent_chunk()
+        self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):
             raise ValueError("current WAH latent chunk and target cameras must both contain 33 frames")
         frame_offset = 0 if self.chunk_index == 0 else 1

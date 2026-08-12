@@ -105,6 +105,18 @@ class MemoryManager:
         self.low_count = self.low_count + 1 if coverage < self.coverage_threshold else 0
         return self.low_count
 
+    @staticmethod
+    def parent_pixel_visibility_per_frame(warp):
+        """Measure parent-world screen coverage only on renderer RGB pixels."""
+        visibility = np.asarray(warp.visibility)
+        if visibility.ndim != 3:
+            raise ValueError(
+                f"renderer visibility must be [T,H,W], got {visibility.shape}"
+            )
+        if visibility.dtype != np.bool_:
+            visibility = visibility > 0
+        return visibility.reshape(len(visibility), -1).mean(axis=1, dtype=np.float64)
+
     def _ready(self, current_world_overlap=None):
         return bool(self.readiness_report(current_world_overlap)["ready"])
 
@@ -121,12 +133,12 @@ class MemoryManager:
             "new_area": self.buffer.mean_new_area_ratio >= self.min_new_area_ratio,
         }
         enough_frames = len(self.buffer) >= self.min_transition_frames
-        world_overlap_at_most_max = overlap <= self.max_world_overlap
+        world_overlap_below_max = overlap < self.max_world_overlap
         condition_ready = any(conditions.values())
         return {
-            "ready": bool(enough_frames and world_overlap_at_most_max and condition_ready),
+            "ready": bool(enough_frames and world_overlap_below_max and condition_ready),
             "enough_frames": bool(enough_frames),
-            "world_overlap_at_most_max": bool(world_overlap_at_most_max),
+            "world_overlap_below_max": bool(world_overlap_below_max),
             "frame_count": int(len(self.buffer)),
             "mode": self.transition_readiness_mode,
             "conditions": conditions,
@@ -142,7 +154,7 @@ class MemoryManager:
                 "view_change_radians": float(self.min_view_diversity),
                 "view_change_degrees": float(np.rad2deg(self.min_view_diversity)),
                 "new_area": float(self.min_new_area_ratio),
-                "maximum_world_overlap_inclusive": float(self.max_world_overlap),
+                "maximum_world_overlap_exclusive": float(self.max_world_overlap),
                 "minimum_frames": int(self.min_transition_frames),
             },
         }
@@ -150,6 +162,7 @@ class MemoryManager:
     def _append_chunk(self, generated_rgb_for_memory, cameras, warp, frame_start):
         from ..online.causal_contracts import assert_no_supervision_content
         assert_no_supervision_content({"generated_rgb_for_memory": generated_rgb_for_memory}, "MemoryManager")
+        parent_pixel_visibility = self.parent_pixel_visibility_per_frame(warp)
         for index in range(len(generated_rgb_for_memory)):
             self.buffer.append(
                 generated_rgb=np.asarray(generated_rgb_for_memory[index]),
@@ -183,7 +196,7 @@ class MemoryManager:
                 ),
                 old_node_depth_convention=Z_DEPTH,
                 warp_confidence=np.asarray(warp.confidence[index]),
-                coverage=float(warp.coverage_per_frame[index]),
+                coverage=float(parent_pixel_visibility[index]),
                 global_frame_index=int(frame_start + index),
             )
 
@@ -725,15 +738,19 @@ class MemoryManager:
         # frame (the right-open range endpoint).
         candidate_created_frame = int(frame_start) + generated_frame_count - 1
         self.register(active_node)
-        mean_coverage = float(np.mean(warp.coverage_per_frame))
-        self.current_world_overlap = mean_coverage
-        self.observe(mean_coverage)
-        event = {"state": self.state, "coverage": mean_coverage}
+        parent_pixel_visibility = self.parent_pixel_visibility_per_frame(warp)
+        current_pixel_coverage = float(parent_pixel_visibility[-1])
+        self.current_world_overlap = current_pixel_coverage
+        self.observe(current_pixel_coverage)
+        event = {"state": self.state, "coverage": current_pixel_coverage,
+                 "parent_pixel_visibility_ratio": current_pixel_coverage,
+                 "parent_pixel_visibility_ratio_per_frame":
+                     parent_pixel_visibility.tolist()}
         # Permanent policy: every causal generated frame contributes to readiness.
         # Low coverage is diagnostic only and never gates candidate construction.
         self.state = self.TRANSITION
         self._append_chunk(generated_rgb_for_memory, cameras, warp, frame_start)
-        readiness = self.readiness_report(mean_coverage)
+        readiness = self.readiness_report(current_pixel_coverage)
         event["readiness"] = readiness
         event["candidate_promotion_blocked"] = not bool(allow_candidate_promotion)
         event["candidate_promotion_deferred"] = bool(defer_candidate_promotion)

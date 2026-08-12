@@ -40,7 +40,7 @@ class OnlineSpatialHistoryPipeline:
         self.autoregressive_state = None
         self.frame_index = 0
         self.chunk_index = 0
-        self.activation_queue = DelayedNodeActivationQueue(delay_chunks=2)
+        self.activation_queue = DelayedNodeActivationQueue(delay_chunks=1)
 
     def initialize(
         self,

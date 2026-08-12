@@ -1,4 +1,4 @@
-"""Immutable accepted shadows activate exactly two chunks later."""
+"""Immutable shadows activate at the nearest subsequent latent boundary."""
 from collections import deque
 from dataclasses import dataclass
 
@@ -15,9 +15,9 @@ class ScheduledNodeActivation:
 
 
 class DelayedNodeActivationQueue:
-    def __init__(self, delay_chunks=2, max_pending=1):
-        if delay_chunks != 2:
-            raise ValueError("causal world activation delay is fixed at two chunks")
+    def __init__(self, delay_chunks=1, max_pending=1):
+        if delay_chunks != 1:
+            raise ValueError("causal world activation delay is fixed at one chunk boundary")
         if max_pending != 1:
             raise ValueError("only one immutable shadow may be pending")
         self._queue = deque()
@@ -32,7 +32,7 @@ class DelayedNodeActivationQueue:
     def schedule(self, node, *, created_after_chunk):
         if self._queue:
             raise RuntimeError("a pending shadow cannot be replaced")
-        entry = ScheduledNodeActivation(node, int(created_after_chunk), int(created_after_chunk) + 2)
+        entry = ScheduledNodeActivation(node, int(created_after_chunk), int(created_after_chunk) + 1)
         self._queue.append(entry)
         return entry
 

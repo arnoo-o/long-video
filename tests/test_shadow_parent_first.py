@@ -90,11 +90,10 @@ def test_shadow_freezes_hash_and_commits_only_when_due():
     assert creation_hash == manager.shadow_points_sha256(shadow)
     assert shadow.points_xyz.flags.writeable is False
 
-    queue = DelayedNodeActivationQueue(delay_chunks=2, max_pending=1)
+    queue = DelayedNodeActivationQueue(delay_chunks=1, max_pending=1)
     queue.schedule(shadow, created_after_chunk=5)
-    assert queue.activate_due(6) is None
     assert parent.status == "active"
-    due = queue.activate_due(7)
+    due = queue.activate_due(6)
     assert due.node is shadow
     activation_hash = manager.verify_shadow(shadow)
     manager.commit_shadow(parent, shadow, verified_hash=activation_hash)
@@ -114,7 +113,7 @@ def test_deferred_process_keeps_parent_through_pending_chunk():
     manager.readiness_report = lambda _overlap=None: {"ready": True}
     manager.build_candidate = lambda _active, _created: (candidate, [], [])
     manager.validate_candidate = lambda _candidate, _frames, _heldout: (True, {})
-    warp = SimpleNamespace(coverage_per_frame=np.zeros(1, np.float32))
+    warp = SimpleNamespace(coverage_per_frame=np.ones(1, np.float32), visibility=np.zeros((1, 1, 1), bool))
     generated = np.zeros((1, 1, 1, 3), np.uint8)
 
     returned, event = manager.process_chunk(

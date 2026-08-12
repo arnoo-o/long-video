@@ -42,7 +42,11 @@ def main():
     gt=[]; warp=[]; reports=[]
     with torch.inference_mode():
       for c in range(int(rec['chunk_count'])):
-        b=c*32; frames=[np.asarray(Image.open(root/rec['rgb_dir']/f'{i:06d}.png').convert('RGB')) for i in range(b,b+33)]
+        b=c*32; frames=[]
+        for i in range(b,b+33):
+            matches=list((root/rec['rgb_dir']).glob(f'{i:06d}.*'))
+            if len(matches)!=1: raise FileNotFoundError(f'expected one frame {i}: {matches}')
+            frames.append(np.asarray(Image.open(matches[0]).convert('RGB')))
         gt.extend(frames if not gt else frames[1:]); online.frame_index=b; online.chunk_index=c
         w,_,_,_=online.prepare_supervised_chunk(poses[b:b+33],K[b:b+33],384,640); warp.extend([np.asarray(x) for x in w.rgb] if not warp else [np.asarray(x) for x in w.rgb[1:]])
         _, report = online.generate_chunk_at_cameras(poses[b:b+33],K[b:b+33],384,640); reports.append(report)

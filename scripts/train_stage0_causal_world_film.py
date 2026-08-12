@@ -40,6 +40,26 @@ CATEGORY_CYCLE = (
 )
 
 
+def select_fixed_training_pool(records):
+    """Select the fixed 80-trajectory training pool without creating records."""
+    quotas = {"source_revisit": 28, "world_revisit": 28,
+              "large_motion": 16, "normal_motion": 8}
+    selected = []
+    for category, quota in quotas.items():
+        candidates = [r for r in records if r.get("sample_type") == category]
+        candidates.sort(key=lambda r: str(r.get("trajectory_id", "")))
+        if len(candidates) < quota:
+            raise ValueError(f"DL3DV training pool needs {quota} {category}, found {len(candidates)}")
+        selected.extend(candidates[:quota])
+    if len(selected) != 80:
+        raise AssertionError("fixed training pool must contain exactly 80 trajectories")
+    eight = [r for r in selected if int(r["chunk_count"]) == 8]
+    twelve = [r for r in selected if int(r["chunk_count"]) == 12]
+    if len(eight) != 40 or len(twelve) != 40:
+        raise ValueError(f"fixed training pool needs 40/40 8/12-chunk trajectories, got {len(eight)}/{len(twelve)}")
+    return selected
+
+
 def training_args():
     return SimpleNamespace(
         height=384, width=640, pyramid_num_inference_steps_list=[2, 2, 2],
@@ -251,7 +271,9 @@ def main():
     random.seed(options.seed); np.random.seed(options.seed); torch.manual_seed(options.seed)
     sys.path.insert(0, str(options.wah_root))
     from warp_as_history import WarpAsHistoryPipeline
-    records = [x for x in validate_dl3dv_film_manifest(options.manifest) if x["split"] == "train"]
+    records = select_fixed_training_pool(
+        [x for x in validate_dl3dv_film_manifest(options.manifest) if x["split"] == "train"]
+    )
     root = options.manifest.parent
     options.run_dir.mkdir(parents=True, exist_ok=bool(options.resume))
     pipe = WarpAsHistoryPipeline.from_pretrained(

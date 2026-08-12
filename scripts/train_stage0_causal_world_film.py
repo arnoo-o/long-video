@@ -23,6 +23,7 @@ from long_video.online.pipeline import OnlineSpatialHistoryPipeline
 from long_video.training.causal_rollout import AllChunkRoundRobin, current_chunk_loss_weights
 from long_video.training.stage0_causal_world import (
     Stage0FilmTrainer,
+    load_film_checkpoint,
     save_film_checkpoint,
     validate_dl3dv_film_manifest,
 )
@@ -164,7 +165,8 @@ def build_online(pipe, geometry, record, root, device, seed):
     return online, poses, intrinsics
 
 
-def run_one_step(pipe, geometry, trainer, scheduler, record, current, root, args, device, seed):
+def run_one_step(pipe, geometry, trainer, scheduler, record, current, root, args, device, seed,
+                 *, require_nonzero_gradient=True):
     from warp_as_history.training import core as opt
     start = time.perf_counter()
     online, poses, intrinsics = build_online(pipe, geometry, record, root, device, seed)
@@ -198,6 +200,7 @@ def run_one_step(pipe, geometry, trainer, scheduler, record, current, root, args
         target_latents=target_latents, histories=histories,
         world0=point_feature, visibility0=visibility0, args=args, device=device,
         loss_weights=current_chunk_loss_weights(int(record["chunk_count"]), int(current)),
+        require_nonzero_gradient=require_nonzero_gradient,
     )
     scheduler.step()
     controller = pipe.transformer.stage0_causal_world_film
@@ -240,6 +243,8 @@ def main():
     parser.add_argument("--total-steps", type=int, default=1000)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--seed", type=int, default=20260812)
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="resume from a saved Point-FiLM checkpoint")
     options = parser.parse_args()
     if options.smoke and options.total_steps != 1000:
         raise ValueError("smoke uses its fixed three cases; do not combine with --total-steps")
@@ -248,7 +253,7 @@ def main():
     from warp_as_history import WarpAsHistoryPipeline
     records = [x for x in validate_dl3dv_film_manifest(options.manifest) if x["split"] == "train"]
     root = options.manifest.parent
-    options.run_dir.mkdir(parents=True, exist_ok=False)
+    options.run_dir.mkdir(parents=True, exist_ok=bool(options.resume))
     pipe = WarpAsHistoryPipeline.from_pretrained(
         options.model, torch_dtype=torch.bfloat16,
     ).to(options.device)
@@ -286,6 +291,12 @@ def main():
         lambda step: min(1.0, (step + 1) / warmup) * max(0.0, (total - step) / max(1, total)),
     )
     round_robin = AllChunkRoundRobin()
+    resume_step = 0
+    if options.resume is not None:
+        resume_step, _ = load_film_checkpoint(
+            options.resume, pipe.transformer, trainer.optimizer, scheduler, round_robin
+        )
+        trainer.step_index = resume_step
     schedule = PairSchedule(root, records, round_robin)
     args = training_args()
     metrics, times, sample_counts = [], [], Counter()
@@ -296,7 +307,9 @@ def main():
         twelve = next(x for x in records if int(x["chunk_count"]) == 12)
         cases = [(any_record, 0, "single_chunk"), (eight, 4, "8chunk_middle"),
                  (twelve, 10, "12chunk_late")]
-    for step in range(1, total + 1):
+    if resume_step >= total:
+        raise ValueError(f"checkpoint step {resume_step} is already >= total_steps {total}")
+    for step in range(resume_step + 1, total + 1):
         if options.smoke:
             record, current, category = cases[step - 1]
             round_robin.counts[record["trajectory_id"]][current] += 1
@@ -311,6 +324,7 @@ def main():
             result = run_one_step(
                 pipe, geometry, trainer, scheduler, record, current, root, args,
                 options.device, options.seed + step,
+                require_nonzero_gradient=bool(options.smoke),
             )
         except RuntimeError as error:
             if category != "world_revisit" or "real causal promotion" not in str(error): raise

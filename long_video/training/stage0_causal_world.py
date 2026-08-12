@@ -91,7 +91,7 @@ class Stage0FilmTrainer:
         self.step_index = 0
 
     def step(self, *, contract, prompt_embeds, target_latents, histories, world0, visibility0,
-             args, device, loss_weights=None):
+             args, device, loss_weights=None, require_nonzero_gradient=True):
         contract.validate()
         self.optimizer.zero_grad(set_to_none=True)
         loss, flow_loss, corr_loss = stage0_flow_matching_loss(
@@ -108,15 +108,21 @@ class Stage0FilmTrainer:
             parameter.grad.detach().float().square().sum() for parameter in gradient_parameters
         )
         trainable_grad_norm = torch.sqrt(gradient_square) if gradient_parameters else torch.tensor(0.0)
-        if not torch.isfinite(trainable_grad_norm) or float(trainable_grad_norm) <= 0.0:
+        zero_or_invalid_gradient = (not torch.isfinite(trainable_grad_norm) or
+                                    float(trainable_grad_norm) <= 0.0)
+        if zero_or_invalid_gradient and require_nonzero_gradient:
             raise RuntimeError("Point-FiLM backward produced no finite non-zero trainable gradient")
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, self.max_grad_norm)
-        self.optimizer.step()
+        if zero_or_invalid_gradient:
+            grad_norm = torch.tensor(0.0, device=trainable_grad_norm.device)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters, self.max_grad_norm)
+            self.optimizer.step()
         self.step_index += 1
         return {"step": self.step_index, "total_loss": float(loss.detach()),
                 "flow_loss": float(flow_loss.detach()), "corr_loss": float(corr_loss.detach()),
                 "grad_norm": float(grad_norm),
-                "trainable_gradient_parameter_count": len(gradient_parameters)}
+                "trainable_gradient_parameter_count": len(gradient_parameters),
+                "zero_trainable_gradient": bool(zero_or_invalid_gradient)}
 
 
 def freeze_causal_world_training_stack(pipe, pi3_backend):

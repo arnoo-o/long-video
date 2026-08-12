@@ -8,7 +8,6 @@ except ImportError:
     WarpAsHistoryPipeline = object
 
 PYRAMID_INFERENCE_STEPS = (2, 2, 4)
-HELIOS_PYRAMID_NUM_INFERENCE_STEPS = (1, 1, 2)
 STAGE2_CLAMP_STATES = (1, 1, 1, 0)
 
 def clamp_enabled(stage_id: int, step_id: int) -> bool:

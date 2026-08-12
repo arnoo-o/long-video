@@ -17,6 +17,7 @@ from long_video.memory.memory_manager import MemoryManager
 from long_video.memory.node_store import NodeStore
 from long_video.online.pipeline import OnlineSpatialHistoryPipeline
 from long_video.training.stage0_causal_world import load_film_checkpoint
+from long_video.wah.stage0_causal_world_film import install_stage0_causal_world_film
 
 
 def main():
@@ -39,6 +40,14 @@ def main():
     from warp_as_history import WarpAsHistoryPipeline
     node = NodeStore(args.session).load(args.node_id)
     pipe = WarpAsHistoryPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(args.device)
+    if not hasattr(pipe.transformer.config, "image_dim"):
+        pipe.transformer.register_to_config(image_dim=None)
+    official_wah_lora = (
+        args.wah_root / "checkpoints" / "warp-as-history"
+        / "visible_lora_state_step1000.safetensors"
+    ).resolve()
+    pipe._configure_wah_lora(str(official_wah_lora))
+    install_stage0_causal_world_film(pipe.transformer).to(args.device, torch.float32)
     geometry = Pi3GeometryBackend(args.pi3_checkpoint, args.pi3_repo, args.device)
     manager = MemoryManager.from_config(load_yaml("configs/online_memory.yaml"), geometry_backend=geometry)
     online = OnlineSpatialHistoryPipeline(

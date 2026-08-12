@@ -97,13 +97,19 @@ def test_depth_anchor_failure_retries_unanchored_only_when_depth_rejection_is_ig
     assert prediction.scale_info["anchor_source"] == "unanchored_pi3_mandatory_promotion"
 
 
-def test_generated_points_must_not_project_onto_parent_visible_pixels():
+def test_generated_points_keep_nine_pixels_from_parent_interior_except_boundary():
     candidate = SimpleNamespace(
-        points_xyz=np.asarray([[0, 0, 1], [1, 0, 1]], np.float32),
-        points_source=np.asarray([2, 2], np.int8),
+        points_xyz=np.asarray([
+            [15, 15, 1],  # parent interior pixel
+            [22, 15, 1],  # within nine pixels of parent interior
+            [29, 15, 1],  # ten pixels from the nearest parent interior pixel
+            [10, 15, 1],  # parent boundary pixel is explicitly exempt
+            [21, 15, 1],  # generated points do not exclude each other
+        ], np.float32),
+        points_source=np.asarray([2, 2, 2, 2, 2], np.int8),
     )
-    parent_visible = np.zeros((2, 2), bool)
-    parent_visible[0, 0] = True
+    parent_visible = np.zeros((32, 32), bool)
+    parent_visible[10:21, 10:21] = True
     frame = SimpleNamespace(
         camera_c2w=np.eye(4, dtype=np.float32),
         intrinsics=np.eye(3, dtype=np.float32),
@@ -112,4 +118,8 @@ def test_generated_points_must_not_project_onto_parent_visible_pixels():
 
     keep = MemoryManager._outside_parent_projection_mask(candidate, [frame])
 
-    assert keep.tolist() == [False, True]
+    assert keep.tolist() == [False, False, True, True, False]
+
+
+def test_new_world_voxel_default_is_point_zero_zero_five():
+    assert MemoryManager().voxel_size == 0.005

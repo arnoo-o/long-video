@@ -17,7 +17,8 @@ class MemoryManager:
     REQUIRED_TRANSLATION = 2.5
     REQUIRED_VIEW_CHANGE_RADIANS = float(np.deg2rad(25.0))
     REQUIRED_NEW_AREA_RATIO = 0.05
-    REQUIRED_MAX_WORLD_OVERLAP = 0.50
+    REQUIRED_MAX_WORLD_OVERLAP = 0.10
+    PARENT_PROJECTION_CLEARANCE_PIXELS = 9
     ACTIVE = "ACTIVE"
     TRANSITION = "TRANSITION"
     CANDIDATE = "CANDIDATE"
@@ -35,12 +36,12 @@ class MemoryManager:
         min_translation_baseline=2.5,
         min_view_diversity=float(np.deg2rad(25.0)),
         min_new_area_ratio=0.05,
-        max_world_overlap=0.50,
+        max_world_overlap=0.10,
         max_overlap_rgb_error=0.25,
         max_overlap_depth_error=0.5,
         generated_confidence=0.25,
         keyframe_count=8,
-        voxel_size=0.02,
+        voxel_size=0.005,
         heldout_count=4,
         max_buffer_length=96,
         max_age_frames=240,
@@ -419,9 +420,40 @@ class MemoryManager:
         self.state = self.CANDIDATE
         return candidate, frames, heldout
 
-    @staticmethod
-    def _outside_parent_projection_mask(candidate, frames):
-        """Keep generated points only if no parent point projects at that pixel in any view."""
+    @classmethod
+    def _parent_projection_exclusion_mask(cls, parent_visible):
+        """Protect a 9-pixel neighborhood around non-boundary parent pixels."""
+        parent = np.asarray(parent_visible, bool)
+        if parent.ndim != 2:
+            raise ValueError(f"parent visibility must be [H,W], got {parent.shape}")
+        boundary = np.zeros_like(parent)
+        for row in range(parent.shape[0]):
+            columns = np.flatnonzero(parent[row])
+            if columns.size:
+                boundary[row, columns[0]] = True
+                boundary[row, columns[-1]] = True
+        for column in range(parent.shape[1]):
+            rows = np.flatnonzero(parent[:, column])
+            if rows.size:
+                boundary[rows[0], column] = True
+                boundary[rows[-1], column] = True
+        interior = parent & ~boundary
+        radius = cls.PARENT_PROJECTION_CLEARANCE_PIXELS
+        protected = np.zeros_like(parent)
+        padded_interior = np.pad(interior, radius, mode="constant")
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if dx * dx + dy * dy > radius * radius:
+                    continue
+                protected |= padded_interior[
+                    radius + dy:radius + dy + parent.shape[0],
+                    radius + dx:radius + dx + parent.shape[1],
+                ]
+        return protected & ~boundary
+
+    @classmethod
+    def _outside_parent_projection_mask(cls, candidate, frames):
+        """Keep generated points at least 9 pixels from non-boundary parent pixels."""
         points = np.asarray(candidate.points_xyz, np.float32)
         overlaps_parent = np.zeros(len(points), bool)
         for frame in frames:
@@ -432,11 +464,12 @@ class MemoryManager:
             u = np.rint(projected[:, 0] / np.maximum(z, 1e-8)).astype(np.int64)
             v = np.rint(projected[:, 1] / np.maximum(z, 1e-8)).astype(np.int64)
             parent_visible = np.asarray(frame.warp_visibility, bool)
+            parent_exclusion = cls._parent_projection_exclusion_mask(parent_visible)
             height, width = parent_visible.shape
             inside = (z > 0) & (u >= 0) & (u < width) & (v >= 0) & (v < height)
             if inside.any():
                 indices = np.flatnonzero(inside)
-                overlaps_parent[indices] |= parent_visible[v[indices], u[indices]]
+                overlaps_parent[indices] |= parent_exclusion[v[indices], u[indices]]
         return (np.asarray(candidate.points_source) == 2) & ~overlaps_parent
 
     def validate_candidate(self, candidate, frames, heldout):

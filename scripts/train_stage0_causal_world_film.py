@@ -64,11 +64,6 @@ def select_fixed_training_pool(records):
     twelve = [r for r in selected if int(r["chunk_count"]) == 12]
     # Do not fabricate trajectories when the downloaded manifest has fewer than
     # 40 eight-chunk records; use every available eight-chunk trajectory.
-    if len(eight) < 40:
-        extras = [r for r in records if int(r["chunk_count"]) == 12 and r not in selected]
-        selected.extend(extras[:40 - len(eight)])
-        eight = [r for r in selected if int(r["chunk_count"]) == 8]
-        twelve = [r for r in selected if int(r["chunk_count"]) == 12]
     if len(selected) != 80:
         raise AssertionError(f"fixed training pool must contain 80 trajectories, got {len(selected)}")
     return selected

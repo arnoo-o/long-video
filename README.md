@@ -1,61 +1,19 @@
 # long-video
 
-The repository implements one causal long-video architecture:
+Causal long-video inference uses one compact path:
 
-1. The pinned original Warp-as-History (WAH) path provides permanent source and
-   temporal history plus the current rendered warp.
-2. Frozen Pi3 predicts geometry only from causally available generated views.
-3. `MemoryManager` validates candidates, preserves parent points, freezes shadow
-   nodes, and activates them two chunks later.
-4. Parent-First rendering prevents the newest delta from overwriting committed
-   world points.
-5. A small spatially aligned FiLM modulates only the Stage0 latent before the
-   existing Helios patch embedding. Stage1 and Stage2 remain native Helios.
+1. Pi3 builds and grows the causal point-cloud world from the source and prior generated chunks.
+2. Parent-First renderer produces aligned warp RGB, binary visibility, and confidence.
+3. Pinned original Warp-as-History consumes the rendered warp as history conditioning.
+4. Helios samples three pyramid stages with `[2, 2, 4]` scheduler updates.
+5. Only Stage2 steps 0, 1, and 2 apply renderer RGB consistency; Stage2 step 3 remains native Helios.
 
-## Stage0 causal-world FiLM
+The clamp is `I_mixed = M * I_warp + (1-M) * I_model`, where `M` is raw binary
+renderer visibility. It decodes the clean/x0 prediction, composites pixels,
+deterministically VAE-encodes the result, and returns it to the native next
+scheduler coordinate. There is no final post-hoc clamp.
 
-For aligned Stage0 latent `Z0`, current-world latent `W0`, and continuous
-renderer visibility `V0`, a per-position 1x1x1 MLP computes 16-channel gamma
-and beta:
+DL3DV download, selection, manifest, and preprocessing tools are retained under
+`scripts/select_download_dl3dv_film.py` and `scripts/build_dl3dv_film_dataset.py`.
 
-    Z0' = Z0 * (1 + V0 * gamma(W0)) + V0 * beta(W0)
-
-The MLP is fixed at `16 -> 32 -> 32`; its final layer is zero initialized.
-There is no spatial or temporal pooling. A pre-hook applies it immediately
-before the existing Stage0 patch embedding, and exact shape matching prevents
-it from running at Stage1 or Stage2.
-
-Helios, original WAH, VAE, and Pi3 are frozen. Only
-`stage0_causal_world_film.film.*` is trainable. Generic RGB-video manifests use
-camera poses and intrinsics; future target RGB/depth are supervision only and
-are rejected from causal-world construction.
-
-## Pinned WAH
-
-Apply the confidence patch only to WAH commit
-`09aa6461355b298bfced51007bd709a251d6033a`:
-
-    WAH_ROOT=/path/to/Warp-as-History bash scripts/apply_wah_patch.sh
-    WAH_ROOT=/path/to/Warp-as-History bash scripts/check_wah_patch.sh
-
-The conditioning route remains the baseline route:
-
-    warp RGB -> official VAE -> patch_short/history -> Helios
-
-`WAHAdapter` passes renderer RGB, visibility, and confidence without replacing
-their temporal grouping or token support.
-
-## Causal world
-
-Only generated RGB is appended to `TransitionBuffer`. Pi3 candidate geometry
-is built after the chunk, never from the supervised target. Accepted nodes are
-immutable shadows until their scheduled activation. Rendering splits stable
-parent and latest delta point sets and performs hard Parent-First composition.
-
-The main entrypoints are:
-
-- `scripts/infer_stage0_causal_world.py`
-- `scripts/train_stage0_causal_world_film.py`
-
-Configuration lives in `configs/stage0_causal_world_film.yaml`,
-`configs/online_memory.yaml`, `configs/pi3.yaml`, and `configs/wah.yaml`.
+Pinned WAH commit: `09aa6461355b298bfced51007bd709a251d6033a`.

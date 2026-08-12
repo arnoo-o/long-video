@@ -11,7 +11,6 @@ REQUIRED={
     "pi3":("checkpoint","repo_path","device","input_size"),
     "online_memory":("min_transition_frames","keyframe_count","heldout_count",
                      "coverage_threshold","voxel_size"),
-    "stage0_causal_world_film":("architecture", "data", "causal_world", "training", "frozen"),
 }
 
 def _coerce(value):
@@ -49,9 +48,5 @@ def validate_config(kind,config):
                   "rope_alignment":True}
         wrong={k:(config.get(k),v) for k,v in expected.items() if config.get(k)!=v}
         if wrong: raise ValueError(f"WAH spatial-history invariants violated: {wrong}")
-    if kind=="stage0_causal_world_film":
-        if config["training"].get("flow_matching_stage_id") != 0:
-            raise ValueError("causal-world FiLM training is Stage0-only")
-        if config["causal_world"].get("uses_future_gt") is not False:
-            raise ValueError("future GT is forbidden from causal world construction")
     return config
+

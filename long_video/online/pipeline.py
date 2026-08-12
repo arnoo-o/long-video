@@ -9,11 +9,6 @@ from ..geometry.point_renderer import render
 from ..initialization.initial_node_pipeline import initialize_spatial_node
 from ..types import CameraBatch
 from ..wah.adapter import WAHAdapter
-from ..wah.stage0_causal_world_film import (
-    aggregate_winning_points,
-    fixed_source_scale,
-    install_stage0_causal_world_film,
-)
 from .delayed_activation import DelayedNodeActivationQueue
 
 
@@ -30,10 +25,6 @@ class OnlineSpatialHistoryPipeline:
     ):
         self.wah_pipeline = wah_pipeline
         self.wah_adapter = WAHAdapter(wah_pipeline) if wah_pipeline is not None else None
-        self.stage0_film = (
-            install_stage0_causal_world_film(wah_pipeline.transformer)
-            if wah_pipeline is not None else None
-        )
         self.active_node = active_node
         self.memory_manager = memory_manager
         if self.memory_manager is not None and active_node is not None:
@@ -50,13 +41,6 @@ class OnlineSpatialHistoryPipeline:
         self.frame_index = 0
         self.chunk_index = 0
         self.activation_queue = DelayedNodeActivationQueue(delay_chunks=2)
-        self.source_c2w_fixed = (
-            active_node.center_c2w.copy() if active_node is not None else None
-        )
-        self.source_depth_scale = (
-            fixed_source_scale(np.asarray(active_node.view_depth[0]))
-            if active_node is not None else None
-        )
 
     def initialize(
         self,
@@ -71,8 +55,6 @@ class OnlineSpatialHistoryPipeline:
             views, geometry_backend, config,
         )
         self.current_camera_c2w = self.active_node.center_c2w.copy()
-        self.source_c2w_fixed = self.active_node.center_c2w.copy()
-        self.source_depth_scale = fixed_source_scale(np.asarray(self.active_node.view_depth[0]))
         if self.memory_manager is not None:
             self.memory_manager.geometry_backend = geometry_backend
             self.memory_manager.register(self.active_node)
@@ -91,7 +73,6 @@ class OnlineSpatialHistoryPipeline:
                 **kwargs,
             )
             self.wah_adapter.configure_state(self.autoregressive_state)
-            self.stage0_film.bind_inference_scheduler(self.wah_pipeline.scheduler)
         return self.active_node
 
     @staticmethod
@@ -155,19 +136,17 @@ class OnlineSpatialHistoryPipeline:
             self.active_node,reactivation_event=self.memory_manager.maybe_reactivate(
                 self.active_node,cameras)
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
-        import torch
-        with torch.no_grad():
-            point_feature, visibility0 = aggregate_winning_points(
-                warp, self.source_c2w_fixed, self.source_depth_scale,
-                self.stage0_film.point_encoder,
-                device=self.wah_pipeline._wah_execution_device(),
-                dtype=getattr(self.wah_pipeline.transformer, "dtype", None),
+        if hasattr(self.wah_pipeline, "set_rgb_clamp_context"):
+            self.wah_pipeline.set_rgb_clamp_context(
+                warp.rgb, warp.visibility, height=cameras.height, width=cameras.width,
             )
-        self.stage0_film.set_point_context(point_feature, visibility0)
-        self.stage0_film.bind_inference_scheduler(self.wah_pipeline.scheduler)
-        _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
-            self.autoregressive_state, warp, output_type="np"
-        )
+        try:
+            _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
+                self.autoregressive_state, warp, output_type="np"
+            )
+        finally:
+            if hasattr(self.wah_pipeline, "clear_rgb_clamp_context"):
+                self.wah_pipeline.clear_rgb_clamp_context()
         generated_chunk = self._decode_last_latent_chunk()
         if len(poses) != len(generated_chunk):
             raise ValueError("current WAH latent chunk and target cameras must both contain 33 frames")
@@ -217,7 +196,7 @@ class OnlineSpatialHistoryPipeline:
             "active_node_id": self.active_node.node_id,
             "memory_event": memory_event,
             "chunk_index": self.chunk_index,
-            "stage0_film_applied": self.stage0_film.applied_calls > 0,
+            "rgb_clamp_diagnostics": list(getattr(self.wah_pipeline, "_rgb_clamp_diagnostics", [])),
             "uses_future_gt": False,
         }
         self.chunk_index += 1
@@ -235,63 +214,6 @@ class OnlineSpatialHistoryPipeline:
             raise ValueError("intrinsics must be [T,3,3] and match c2w")
         return self._generate_cameras(CameraBatch(poses, intrinsics, int(height), int(width)))
 
-    def prepare_supervised_chunk(self, c2w, intrinsics, height, width):
-        """Build the exact causal inference conditioning without generating GT.
-
-        This is the training boundary: it renders only the world committed by
-        earlier model generations, installs Point-FiLM context, and asks the
-        pinned WAH implementation to build its native TEMP/CURRENT_WARP
-        histories.  It neither advances AR state nor writes current GT into the
-        world.
-        """
-        poses = np.asarray(c2w, np.float32)
-        intrinsics = np.asarray(intrinsics, np.float32)
-        if intrinsics.ndim == 2:
-            intrinsics = np.repeat(intrinsics[None], len(poses), axis=0)
-        cameras = CameraBatch(poses, intrinsics, int(height), int(width))
-        activation = self.activation_queue.activate_due(self.chunk_index)
-        if activation is not None:
-            verified_hash = self.memory_manager.verify_shadow(activation.node)
-            self.active_node = self.memory_manager.commit_shadow(
-                self.active_node, activation.node, verified_hash=verified_hash,
-            )
-        if self.memory_manager is not None:
-            self.active_node, _ = self.memory_manager.maybe_reactivate(self.active_node, cameras)
-        warp = render(self.active_node, cameras, **self.renderer_kwargs)
-        import torch
-        point_feature, visibility0 = aggregate_winning_points(
-            warp, self.source_c2w_fixed, self.source_depth_scale,
-            self.stage0_film.point_encoder,
-            device=self.wah_pipeline._wah_execution_device(),
-            dtype=getattr(self.wah_pipeline.transformer, "dtype", None),
-        )
-        self.stage0_film.set_point_context(point_feature, visibility0)
-        self.stage0_film.bind_inference_scheduler(self.wah_pipeline.scheduler)
-        state = self.autoregressive_state
-        inputs = self.wah_adapter.warp_inputs(warp)
-        self.wah_adapter.configure_state(state)
-        self.wah_pipeline._prepare_autoregressive_warp_chunk(
-            state, inputs["warp_video"], inputs["warp_visibility_mask"],
-            inputs["warp_confidence_mask"],
-        )
-        history_sizes = list(state["history_sizes"])
-        count = int(state["num_history_latent_frames"])
-        long_history, mid_history, short_history = state["history_latents"][
-            :, :, -count:
-        ].split(history_sizes, dim=2)
-        prefix = state.get("image_latents")
-        if prefix is None:
-            prefix = torch.zeros_like(short_history[:, :, :1])
-        base_short = torch.cat([prefix, short_history], dim=2)
-        histories = self.wah_pipeline._build_pyramid_base_histories(
-            state=state,
-            device=self.wah_pipeline._wah_execution_device(),
-            history_dtype=base_short.dtype,
-            generator=state.get("generator"),
-            base_latents_history_short=base_short,
-        )
-        return warp, point_feature, visibility0, histories
-
     def generate_chunk(self, controls, intrinsics, height, width):
         poses = integrate_controls(
             self.current_camera_c2w, controls,
@@ -303,3 +225,4 @@ class OnlineSpatialHistoryPipeline:
         if intrinsics.ndim == 2:
             intrinsics = np.repeat(intrinsics[None], len(poses), axis=0)
         return self._generate_cameras(CameraBatch(poses, intrinsics, int(height), int(width)))
+

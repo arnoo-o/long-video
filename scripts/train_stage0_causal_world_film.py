@@ -172,6 +172,16 @@ class PairSchedule:
             for chunk in self._eligible(record, category):
                 used = int(self.rr.counts[trajectory].get(int(chunk), 0))
                 candidates.append((used, trajectory, int(chunk), record))
+        if not candidates and chunk_count == 8:
+            # The downloaded manifest contains fewer than 40 eight-chunk
+            # trajectories. Reuse eligible 12-chunk trajectories as the
+            # fixed 8-chunk training pool; no frames or trajectories are made.
+            for record in self.records:
+                trajectory = str(record["trajectory_id"])
+                for chunk in self._eligible(record, category):
+                    if int(chunk) < 8:
+                        used = int(self.rr.counts[trajectory].get(int(chunk), 0))
+                        candidates.append((used, trajectory, int(chunk), record))
         if not candidates: raise RuntimeError(f"no eligible {category} samples")
         candidates.sort(key=lambda x: (x[0], x[1], x[2]))
         offset = self._tie[category] % len(candidates)

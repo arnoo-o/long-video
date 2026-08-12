@@ -105,6 +105,29 @@ class OnlineSpatialHistoryPipeline:
             value = np.moveaxis(value, 1, -1)
         return value
 
+    def _decode_last_latent_chunk(self):
+        """Decode the exact nine-latent AR chunk to its canonical 33 frames.
+
+        The public WAH delta is cumulative-output bookkeeping and can contain
+        32 or occasionally 36 newly finalized frames.  World construction must
+        instead consume the current nine-latent chunk at its fixed 33-frame
+        camera alignment.
+        """
+        state = self.autoregressive_state
+        latents = state["last_latents"]
+        vae_dtype = self.wah_pipeline.vae.dtype
+        mean = state["latents_mean"].to(device=latents.device, dtype=vae_dtype)
+        std = state["latents_std"].to(device=latents.device, dtype=vae_dtype)
+        vae_latents = latents.to(vae_dtype) / std + mean
+        decoded = self.wah_pipeline._decode_autoregressive_latents(
+            diffusion_latents=latents, vae_latents=vae_latents,
+        )
+        video = self.wah_pipeline.video_processor.postprocess_video(decoded, output_type="np")
+        result = self._video_array(video)
+        if len(result) != 33:
+            raise RuntimeError(f"nine WAH latents must decode to 33 frames, got {len(result)}")
+        return result
+
     @staticmethod
     def _slice_warp_frames(warp, start):
         updates = {}
@@ -142,16 +165,14 @@ class OnlineSpatialHistoryPipeline:
             )
         self.stage0_film.set_point_context(point_feature, visibility0)
         self.stage0_film.bind_inference_scheduler(self.wah_pipeline.scheduler)
-        generated_video, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
+        _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
             self.autoregressive_state, warp, output_type="np"
         )
-        generated = self._video_array(generated_video)
-        frame_offset = len(poses) - len(generated)
-        if frame_offset not in (0, 1) or (frame_offset == 1 and self.chunk_index == 0):
-            raise ValueError(
-                f"WAH generated {len(generated)} frames but trajectory/warp has {len(poses)}; "
-                "expected 33 frames for chunk0 or the 32 new frames after a shared boundary"
-            )
+        generated_chunk = self._decode_last_latent_chunk()
+        if len(poses) != len(generated_chunk):
+            raise ValueError("current WAH latent chunk and target cameras must both contain 33 frames")
+        frame_offset = 0 if self.chunk_index == 0 else 1
+        generated = generated_chunk[frame_offset:]
         memory_cameras = cameras
         memory_warp = warp
         if frame_offset:
@@ -165,7 +186,7 @@ class OnlineSpatialHistoryPipeline:
         # chunk's shared boundary and must not be counted twice.
         self.frame_index += len(poses) - 1
         self.current_camera_c2w = poses[-1].copy()
-        self.recent_video_history.append(generated)
+        self.recent_video_history.append(generated_chunk)
         self.recent_video_history = self.recent_video_history[-2:]
         memory_event = None
         if self.memory_manager is not None:
@@ -200,7 +221,7 @@ class OnlineSpatialHistoryPipeline:
             "uses_future_gt": False,
         }
         self.chunk_index += 1
-        return generated, poses, warp, statistics
+        return generated_chunk, poses, warp, statistics
 
     def generate_chunk_at_cameras(self, c2w, intrinsics, height, width):
         """Generate one chunk at exact dataset cameras without control integration."""

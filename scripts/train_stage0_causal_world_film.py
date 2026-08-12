@@ -259,6 +259,17 @@ def main():
     if not hasattr(pipe.transformer.config, "image_dim"):
         pipe.transformer.register_to_config(image_dim=None)
     pipe.set_progress_bar_config(disable=True)
+    # Load/freeze the pinned official WAH adapter before installing the only
+    # trainable module.  Diffusers' first adapter load marks the existing
+    # transformer parameters frozen; doing it after Point-FiLM installation
+    # would inadvertently freeze the new head as well.
+    official_wah_lora = (
+        options.wah_root / "checkpoints" / "warp-as-history"
+        / "visible_lora_state_step1000.safetensors"
+    ).resolve()
+    if not official_wah_lora.is_file():
+        raise FileNotFoundError(f"missing pinned official WAH LoRA: {official_wah_lora}")
+    pipe._configure_wah_lora(str(official_wah_lora))
     controller = install_stage0_causal_world_film(pipe.transformer).to(options.device, torch.float32)
     if hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()

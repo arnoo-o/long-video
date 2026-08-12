@@ -10,7 +10,6 @@ from ..types import WarpBatch
 
 
 INVALID_SOURCE = 4
-PARENT_DILATION_PIXELS = 2
 _POINT_FIELDS = (
     "points_xyz", "points_rgb", "points_confidence", "points_source",
 )
@@ -72,21 +71,6 @@ def _slice_node(node, start, stop):
     return view
 
 
-def _binary_dilation(mask, iterations=PARENT_DILATION_PIXELS):
-    """Square-structuring-element binary dilation without an extra dependency."""
-    value = np.asarray(mask, bool)
-    if value.ndim != 3:
-        raise ValueError(f"visibility must be [T,H,W], got {value.shape}")
-    result = value.copy()
-    for _ in range(int(iterations)):
-        padded = np.pad(result, ((0, 0), (1, 1), (1, 1)), mode="constant")
-        result = np.logical_or.reduce([
-            padded[:, dy:dy + result.shape[1], dx:dx + result.shape[2]]
-            for dy in range(3) for dx in range(3)
-        ])
-    return result
-
-
 def _optional_composite(parent_value, delta_value, allowed):
     if parent_value is None and delta_value is None:
         return None
@@ -104,16 +88,16 @@ def _compose_parent_first(parent, delta, node, cameras, near, far):
     """Composite stable parent pixels before the newest point delta.
 
     The delta is intentionally not submitted to the same z-buffer as the
-    parent.  A two-pixel dilation around parent support prevents newly inferred
-    points from flickering across parent silhouettes while still allowing them
+    parent.  A strict parent-pixel exclusion prevents newly inferred
+    points from replacing parent samples while still allowing them
     to fill genuinely unknown regions.
     """
     parent_visibility = np.asarray(parent.visibility, bool)
     delta_visibility = np.asarray(delta.visibility, bool)
-    parent_dilated = _binary_dilation(parent_visibility, PARENT_DILATION_PIXELS)
-    delta_allowed = delta_visibility & ~parent_dilated
+    parent_protection = parent_visibility
+    delta_allowed = delta_visibility & ~parent_protection
     delta_output_on_parent_visible = int(np.count_nonzero(delta_allowed & parent_visibility))
-    delta_output_on_parent_protection_mask = int(np.count_nonzero(delta_allowed & parent_dilated))
+    delta_output_on_parent_protection_mask = int(np.count_nonzero(delta_allowed & parent_protection))
     if delta_output_on_parent_visible or delta_output_on_parent_protection_mask:
         raise RuntimeError("parent-first delta escaped the parent exclusion mask")
 
@@ -144,7 +128,7 @@ def _compose_parent_first(parent, delta, node, cameras, near, far):
     # WarpBatch schema.  Consumers that do not inspect it remain compatible.
     result.parent_first = True
     result.parent_visibility = parent_visibility
-    result.parent_dilated_visibility = parent_dilated
+    result.parent_protection_visibility = parent_protection
     result.delta_allowed_visibility = delta_allowed
     result.parent_point_count = int(_effective_parent_point_count(node))
     result.delta_output_on_parent_visible = delta_output_on_parent_visible
@@ -204,7 +188,7 @@ def render_numpy_reference(node, cameras, near=.05, far=100., point_radius=0, de
 
 
 def _render_gpu_single(
-    node, cameras, near=.05, far=100., point_radius=1, depth_epsilon=1e-5,
+    node, cameras, near=.05, far=100., point_radius=0, depth_epsilon=1e-5,
     device="cuda:0", chunk_points=1_000_000,
 ):
     import torch
@@ -290,7 +274,7 @@ def _render_gpu_single(
 
 
 def render(
-    node, cameras, near=.05, far=100., point_radius=1, depth_epsilon=1e-5,
+    node, cameras, near=.05, far=100., point_radius=0, depth_epsilon=1e-5,
     device="cpu", chunk_points=1_000_000,
 ):
     """Render a node, splitting cumulative parent points from its latest delta."""

@@ -158,28 +158,29 @@ def test_parent_first_renderer_keeps_parent_and_allows_distant_delta_hole():
     cameras = CameraBatch(pose[None], intrinsics[None], 8, 8)
     node = _node(
         "node_001",
-        [[0, 0, 2], [0, 0, 1], [3, 0, 1]],
+        [[0, 0, 2], [0, 0, 1], [1, 0, 1]],
         [0, 3, 3],
         status="active",
     )
     node.points_rgb[:] = np.asarray([[20, 0, 0], [220, 0, 0], [0, 220, 0]], np.uint8)
     node.points_confidence[:] = [0.9, 0.1, 0.8]
     node.quality_metrics["parent_point_count"] = 1
-    warp = render(node, cameras, point_radius=0, device="cpu")
+    warp = render(node, cameras, device='cpu')
     # The near generated point projects exactly onto the parent pixel and is
-    # excluded by parent-first compositing/dilation.
+    # excluded by parent-first compositing.
     assert warp.source[0, 4, 4] == 0
     assert warp.point_index[0, 4, 4] == 0
     np.testing.assert_allclose(warp.winning_xyz_world[0, 4, 4], node.points_xyz[0])
     np.testing.assert_allclose(warp.rgb[0, 4, 4], [20 / 255.0, 0.0, 0.0])
+    assert int(warp.visibility.sum()) == 2
     assert not warp.delta_allowed_visibility[0, 4, 4]
     assert warp.delta_output_on_parent_visible == 0
     assert warp.delta_output_on_parent_protection_mask == 0
-    # The distant generated point is three pixels away and fills a true hole.
-    assert warp.source[0, 4, 7] == 3
-    assert warp.point_index[0, 4, 7] == 2
-    np.testing.assert_allclose(warp.winning_xyz_world[0, 4, 7], node.points_xyz[2])
-    assert warp.delta_allowed_visibility[0, 4, 7]
+    # The distant generated point is one pixel away and fills a true hole.
+    assert warp.source[0, 4, 5] == 3
+    assert warp.point_index[0, 4, 5] == 2
+    np.testing.assert_allclose(warp.winning_xyz_world[0, 4, 5], node.points_xyz[2])
+    assert warp.delta_allowed_visibility[0, 4, 5]
 
 
 def test_causal_renderer_exposes_the_composited_warp_to_conditioning():

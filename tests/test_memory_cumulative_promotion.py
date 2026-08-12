@@ -121,5 +121,5 @@ def test_generated_points_keep_nine_pixels_from_parent_interior_except_boundary(
     assert keep.tolist() == [False, False, True, True, False]
 
 
-def test_source_and_new_world_voxel_default_is_point_zero_one():
-    assert MemoryManager().voxel_size == 0.01
+def test_source_and_new_world_voxel_default_is_point_zero_two():
+    assert MemoryManager().voxel_size == 0.02

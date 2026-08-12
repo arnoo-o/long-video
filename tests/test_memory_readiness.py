@@ -24,12 +24,12 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
         min_translation_baseline=2.5,
         min_view_diversity=0.4363323129985824,
         min_new_area_ratio=0.05,
-        max_world_overlap=0.02,
+        max_world_overlap=0.25,
     )
     manager.buffer = _ReadinessBuffer(11, translation=3.0, view_change=0.0, new_area=0.0)
     assert not manager._ready(0.01)
     manager.buffer = _ReadinessBuffer(12, translation=0.0, view_change=0.5, new_area=0.0)
-    report = manager.readiness_report(0.019)
+    report = manager.readiness_report(0.249)
     assert report["ready"]
     assert report["conditions"] == {
         "translation": False,
@@ -39,17 +39,17 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
     assert report["world_overlap_below_max"] is True
 
 
-def test_world_overlap_must_be_strictly_below_two_percent():
+def test_world_overlap_must_be_strictly_below_twenty_five_percent():
     manager = MemoryManager()
     manager.buffer = _ReadinessBuffer(
         12, translation=3.0, view_change=1.0, new_area=0.5, coverage=0.20,
     )
-    assert not manager._ready(0.021)
+    assert not manager._ready(0.251)
     manager.buffer = _ReadinessBuffer(
-        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.02,
+        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.25,
     )
-    assert not manager._ready(0.02)
-    assert manager._ready(0.019)
+    assert not manager._ready(0.25)
+    assert manager._ready(0.249)
 
 
 def test_readiness_uses_current_chunk_overlap_not_history_mean():
@@ -57,9 +57,9 @@ def test_readiness_uses_current_chunk_overlap_not_history_mean():
     manager.buffer = _ReadinessBuffer(
         12, translation=0.0, view_change=0.5, new_area=0.5, coverage=0.95,
     )
-    report = manager.readiness_report(0.01)
+    report = manager.readiness_report(0.20)
     assert report["ready"]
-    assert report["values"]["current_chunk_world_overlap"] == 0.01
+    assert report["values"]["current_chunk_world_overlap"] == 0.20
 
 
 def test_readiness_policy_rejects_conflicting_mode_or_thresholds():

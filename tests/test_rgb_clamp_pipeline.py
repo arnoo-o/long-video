@@ -1,11 +1,12 @@
 import torch
 from long_video.wah.rgb_clamp_pipeline import (
-    PYRAMID_INFERENCE_STEPS, STAGE2_CLAMP_STATES,
+    HELIOS_PYRAMID_NUM_INFERENCE_STEPS, PYRAMID_INFERENCE_STEPS, STAGE2_CLAMP_STATES,
     clamp_enabled, composite_renderer_rgb,
 )
 
 def test_pyramid_steps_and_stage2_schedule():
     assert PYRAMID_INFERENCE_STEPS == (2, 2, 4)
+    assert HELIOS_PYRAMID_NUM_INFERENCE_STEPS == (1, 1, 2)
     assert [[i for i in range(n)] for n in PYRAMID_INFERENCE_STEPS] == [[0,1],[0,1],[0,1,2,3]]
     assert [int(clamp_enabled(2, i)) for i in range(4)] == list(STAGE2_CLAMP_STATES)
     assert not any(clamp_enabled(stage, step) for stage in (0,1) for step in range(4))

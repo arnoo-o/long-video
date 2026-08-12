@@ -23,15 +23,15 @@ def main():
     from long_video.memory.memory_manager import MemoryManager
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
-    from long_video.wah.rgb_clamp_pipeline import RGBClampWarpAsHistoryPipeline, PYRAMID_INFERENCE_STEPS
+    from long_video.wah.rgb_clamp_pipeline import HELIOS_PYRAMID_NUM_INFERENCE_STEPS, RGBClampWarpAsHistoryPipeline
     node=NodeStore(a.session).load('node_000'); pipe=RGBClampWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
     geo=Pi3GeometryBackend(a.pi3_checkpoint,a.pi3_repo,a.device); manager=MemoryManager.from_config(load_yaml('configs/online_memory.yaml'),geometry_backend=geo)
-    online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=manager,prompt=a.prompt,renderer_kwargs={'device':a.device},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
-    online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(PYRAMID_INFERENCE_STEPS))
+    online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=manager,prompt=a.prompt,renderer_kwargs={'device':a.device},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(HELIOS_PYRAMID_NUM_INFERENCE_STEPS)})
+    online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(HELIOS_PYRAMID_NUM_INFERENCE_STEPS))
     online.wah_adapter.configure_state(online.autoregressive_state); controls=json.loads(a.controls.read_text()); K=resize_intrinsics(node.view_intrinsics[0],node.view_rgb.shape[1:3],(a.height,a.width))
     generated=[]; warps=[]; panels=[]; reports=[]
     with torch.inference_mode():

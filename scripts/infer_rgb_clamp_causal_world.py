@@ -22,9 +22,25 @@ def main():
     from long_video.initialization.geometry_backend import Pi3GeometryBackend
     from long_video.memory.memory_manager import MemoryManager
     from long_video.memory.node_store import NodeStore
+    from long_video.memory.node_builder import build_from_views
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.wah.rgb_clamp_pipeline import PYRAMID_INFERENCE_STEPS, RGBClampWarpAsHistoryPipeline
-    node=NodeStore(a.session).load('node_000'); pipe=RGBClampWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
+    from long_video.types import ViewSet
+    stored_node=NodeStore(a.session).load('node_000')
+    source_views=ViewSet(
+        rgb=stored_node.view_rgb,depth=stored_node.view_depth,
+        depth_confidence=stored_node.view_depth_confidence,
+        c2w=stored_node.view_c2w,intrinsics=stored_node.view_intrinsics,
+        source=stored_node.view_source,image_confidence=stored_node.view_image_confidence,
+        depth_convention=stored_node.depth_convention,
+    )
+    node=build_from_views(
+        source_views,node_id='node_000',center_c2w=stored_node.center_c2w,
+        created_frame=stored_node.created_frame,voxel_size=0.01,status='active',
+    )
+    node.scale=stored_node.scale; node.model_versions=stored_node.model_versions
+    node.quality_metrics.update(stored_node.quality_metrics,source_voxel_size=0.01)
+    pipe=RGBClampWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
     for module in (pipe.transformer,pipe.vae):

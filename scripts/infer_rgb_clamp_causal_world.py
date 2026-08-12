@@ -6,13 +6,6 @@ import imageio.v2 as imageio
 import numpy as np
 from PIL import Image
 import torch
-from long_video.config import load_yaml
-from long_video.data.camera import resize_intrinsics
-from long_video.initialization.geometry_backend import Pi3GeometryBackend
-from long_video.memory.memory_manager import MemoryManager
-from long_video.memory.node_store import NodeStore
-from long_video.online.pipeline import OnlineSpatialHistoryPipeline
-from long_video.wah.rgb_clamp_pipeline import PYRAMID_INFERENCE_STEPS
 
 def u8(value):
     x=np.asarray(value)
@@ -23,7 +16,14 @@ def main():
     p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--pi3-repo',type=Path,required=True)
     p.add_argument('--pi3-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
-    sys.path.insert(0,str(a.wah_root)); from long_video.wah.rgb_clamp_pipeline import RGBClampWarpAsHistoryPipeline, PYRAMID_INFERENCE_STEPS
+    sys.path.insert(0,str(a.wah_root))
+    from long_video.config import load_yaml
+    from long_video.data.camera import resize_intrinsics
+    from long_video.initialization.geometry_backend import Pi3GeometryBackend
+    from long_video.memory.memory_manager import MemoryManager
+    from long_video.memory.node_store import NodeStore
+    from long_video.online.pipeline import OnlineSpatialHistoryPipeline
+    from long_video.wah.rgb_clamp_pipeline import RGBClampWarpAsHistoryPipeline, PYRAMID_INFERENCE_STEPS
     node=NodeStore(a.session).load('node_000'); pipe=RGBClampWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))

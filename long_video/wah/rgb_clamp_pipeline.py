@@ -42,8 +42,9 @@ class RGBClampWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         self._rgb_clamp_context=(rgb.detach(),(mask>0).detach()); self._rgb_clamp_diagnostics=[]
     def clear_rgb_clamp_context(self): self._rgb_clamp_context=None
     def _latent_stats(self,device):
-        mean=torch.tensor(self.vae.config.latents_mean,device=device).view(1,-1,1,1,1)
-        std=1/torch.tensor(self.vae.config.latents_std,device=device).view(1,-1,1,1,1)
+        vae_dtype=next(self.vae.parameters()).dtype
+        mean=torch.tensor(self.vae.config.latents_mean,device=device,dtype=vae_dtype).view(1,-1,1,1,1)
+        std=1/torch.tensor(self.vae.config.latents_std,device=device,dtype=vae_dtype).view(1,-1,1,1,1)
         return mean,std
     def stage2_sample(self,*args,**kwargs):
         context=getattr(self,"_rgb_clamp_context",None)

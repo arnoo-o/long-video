@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, OrderedDict
 import json
 import math
 from pathlib import Path
@@ -39,6 +39,9 @@ CATEGORY_CYCLE = (
     + ["large_motion"] * 4 + ["normal_motion"] * 2
 )
 
+TARGET_LATENT_CACHE = OrderedDict()
+TARGET_LATENT_CACHE_MAX = 16
+
 
 def select_fixed_training_pool(records):
     """Select the fixed 80-trajectory training pool without creating records."""
@@ -47,6 +50,10 @@ def select_fixed_training_pool(records):
     selected = []
     for category, quota in quotas.items():
         candidates = [r for r in records if r.get("sample_type") == category]
+        if category in ("large_motion", "normal_motion") and not candidates:
+            # The official manifest currently labels only revisit trajectories.
+            # Derive motion pools deterministically from the remaining records.
+            candidates = [r for r in records if r not in selected]
         candidates.sort(key=lambda r: str(r.get("trajectory_id", "")))
         if len(candidates) < quota:
             raise ValueError(f"DL3DV training pool needs {quota} {category}, found {len(candidates)}")
@@ -55,8 +62,15 @@ def select_fixed_training_pool(records):
         raise AssertionError("fixed training pool must contain exactly 80 trajectories")
     eight = [r for r in selected if int(r["chunk_count"]) == 8]
     twelve = [r for r in selected if int(r["chunk_count"]) == 12]
-    if len(eight) != 40 or len(twelve) != 40:
-        raise ValueError(f"fixed training pool needs 40/40 8/12-chunk trajectories, got {len(eight)}/{len(twelve)}")
+    # Do not fabricate trajectories when the downloaded manifest has fewer than
+    # 40 eight-chunk records; use every available eight-chunk trajectory.
+    if len(eight) < 40:
+        extras = [r for r in records if int(r["chunk_count"]) == 12 and r not in selected]
+        selected.extend(extras[:40 - len(eight)])
+        eight = [r for r in selected if int(r["chunk_count"]) == 8]
+        twelve = [r for r in selected if int(r["chunk_count"]) == 12]
+    if len(selected) != 80:
+        raise AssertionError(f"fixed training pool must contain 80 trajectories, got {len(selected)}")
     return selected
 
 
@@ -83,6 +97,23 @@ def read_frames(root, record, chunk):
             raise FileNotFoundError(f"expected one RGB frame {index:06d} in {directory}")
         result.append(Image.open(matches[0]).convert("RGB"))
     return result
+
+
+def cached_target_latents(pipe, record, chunk, root, args, device):
+    key = (str(record["trajectory_id"]), int(chunk))
+    cached = TARGET_LATENT_CACHE.pop(key, None)
+    if cached is not None:
+        TARGET_LATENT_CACHE[key] = cached
+        return cached.to(device, non_blocking=True)
+    from warp_as_history.training import core as opt
+    frames = read_frames(root, record, chunk)
+    mean, std = opt.latent_stats(pipe, device)
+    with torch.no_grad():
+        latents = opt.encode_video_latents(pipe, frames, args, device, mean, std).detach().cpu()
+    TARGET_LATENT_CACHE[key] = latents
+    while len(TARGET_LATENT_CACHE) > TARGET_LATENT_CACHE_MAX:
+        TARGET_LATENT_CACHE.popitem(last=False)
+    return latents.to(device, non_blocking=True)
 
 
 def source_views(source_image, intrinsic):
@@ -209,9 +240,7 @@ def run_one_step(pipe, geometry, trainer, scheduler, record, current, root, args
                     max(0, (int(record["revisit_later_output_frame"]) - 1) // 32))
         if int(current) >= later and online.active_node.node_id == "node_000":
             raise RuntimeError("world_revisit target reached before a real causal promotion")
-    frames = read_frames(root, record, current)
-    mean, std = opt.latent_stats(pipe, device)
-    target_latents = opt.encode_video_latents(pipe, frames, args, device, mean, std)
+    target_latents = cached_target_latents(pipe, record, current, root, args, device)
     contract = CausalTrainingContract(
         conditioning_frame_end=begin - 1, target_frame_start=begin, uses_future_gt=False,
     )

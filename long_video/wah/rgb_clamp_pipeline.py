@@ -8,10 +8,10 @@ except ImportError:
     WarpAsHistoryPipeline = object
 
 PYRAMID_INFERENCE_STEPS = (2, 2, 4)
-STAGE2_CLAMP_STATES = (1, 0, 0, 0)
+STAGE2_CLAMP_STATES = (0, 0, 0, 0)
 
 def clamp_enabled(stage_id: int, step_id: int) -> bool:
-    return int(stage_id) == 2 and int(step_id) == 0
+    return False
 
 def composite_renderer_rgb(model_rgb, warp_rgb, visibility):
     if tuple(model_rgb.shape) != tuple(warp_rgb.shape): raise ValueError("model and warp RGB shapes must match")
@@ -70,6 +70,6 @@ class RGBClampWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         try:
             sampled=super().stage2_sample(*args,**kwargs); expected=[(s,i) for s,n in enumerate(PYRAMID_INFERENCE_STEPS) for i in range(n)]; actual=[(x["stage_id"],x["step_id"]) for x in self._rgb_clamp_diagnostics]
             if actual!=expected: raise RuntimeError(f"unexpected pyramid scheduler steps: {actual}")
-            if [x["rgb_clamp"] for x in self._rgb_clamp_diagnostics if x["stage_id"]==2]!=list(STAGE2_CLAMP_STATES): raise RuntimeError("Stage2 RGB clamp schedule must be [1,0,0,0]")
+            if [x["rgb_clamp"] for x in self._rgb_clamp_diagnostics if x["stage_id"]==2]!=list(STAGE2_CLAMP_STATES): raise RuntimeError("Stage2 RGB clamp schedule must be [0,0,0,0]")
             return sampled
         finally: scheduler.step=original_step

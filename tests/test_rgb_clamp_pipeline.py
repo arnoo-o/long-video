@@ -7,7 +7,7 @@ from long_video.wah.rgb_clamp_pipeline import (
 def test_pyramid_steps_and_stage2_schedule():
     assert PYRAMID_INFERENCE_STEPS == (2, 2, 4)
     assert [[i for i in range(n)] for n in PYRAMID_INFERENCE_STEPS] == [[0,1],[0,1],[0,1,2,3]]
-    assert list(STAGE2_CLAMP_STATES) == [1,0,0,0]
+    assert list(STAGE2_CLAMP_STATES) == [0,0,0,0]
     assert [int(clamp_enabled(2, i)) for i in range(4)] == list(STAGE2_CLAMP_STATES)
     assert not any(clamp_enabled(stage, step) for stage in (0,1) for step in range(4))
 

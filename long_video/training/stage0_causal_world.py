@@ -159,6 +159,7 @@ def stage0_flow_matching_loss(
     controller = pipe.transformer.stage0_causal_world_film
     controller.set_point_context(world0, visibility0)
     controller.set_training_schedule(item, pipe.scheduler.end_sigmas[0])
+    applied_before = int(controller.applied_calls)
     dtype = opt.transformer_compute_dtype(pipe.transformer)
     prediction = opt.transformer_model_forward(
         pipe,
@@ -182,6 +183,12 @@ def stage0_flow_matching_loss(
         prediction = prediction[0]
     if not torch.is_tensor(prediction):
         raise TypeError("native Helios Stage0 forward must return a tensor")
+    if int(controller.applied_calls) != applied_before + 1:
+        raise RuntimeError(
+            "Point-FiLM Stage0 hook did not run exactly once: "
+            f"feature={tuple(world0.shape)}, latent={tuple(item['noisy_latents'].shape)}, "
+            f"applied_delta={int(controller.applied_calls) - applied_before}"
+        )
     flow_error = (prediction.float() - item["target"].float()).square()
     if loss_weights is None:
         flow_loss = flow_error.mean()

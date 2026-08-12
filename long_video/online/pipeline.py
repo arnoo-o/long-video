@@ -1,6 +1,7 @@
 """End-to-end online spatial-history generation."""
 from __future__ import annotations
 
+from dataclasses import fields, replace
 import numpy as np
 
 from ..data.controls import integrate_controls
@@ -104,6 +105,16 @@ class OnlineSpatialHistoryPipeline:
             value = np.moveaxis(value, 1, -1)
         return value
 
+    @staticmethod
+    def _slice_warp_frames(warp, start):
+        updates = {}
+        frame_count = len(warp.rgb)
+        for item in fields(warp):
+            value = getattr(warp, item.name)
+            if isinstance(value, np.ndarray) and value.ndim and len(value) == frame_count:
+                updates[item.name] = value[int(start):]
+        return replace(warp, **updates)
+
     def _generate_cameras(self, cameras):
         if self.active_node is None:
             raise RuntimeError("initialize() must establish M0 before generation")
@@ -135,20 +146,32 @@ class OnlineSpatialHistoryPipeline:
             self.autoregressive_state, warp, output_type="np"
         )
         generated = self._video_array(generated_video)
-        if len(generated) != len(poses):
+        frame_offset = len(poses) - len(generated)
+        if frame_offset not in (0, 1) or (frame_offset == 1 and self.chunk_index == 0):
             raise ValueError(
                 f"WAH generated {len(generated)} frames but trajectory/warp has {len(poses)}; "
-                "silent truncation is forbidden"
+                "expected 33 frames for chunk0 or the 32 new frames after a shared boundary"
             )
-        frame_start = self.frame_index
-        self.frame_index += len(poses)
+        memory_cameras = cameras
+        memory_warp = warp
+        if frame_offset:
+            memory_cameras = CameraBatch(
+                cameras.c2w[frame_offset:], cameras.intrinsics[frame_offset:],
+                cameras.height, cameras.width,
+            )
+            memory_warp = self._slice_warp_frames(warp, frame_offset)
+        frame_start = self.frame_index + frame_offset
+        # A 33-frame chunk advances by stride 32; its final frame is the next
+        # chunk's shared boundary and must not be counted twice.
+        self.frame_index += len(poses) - 1
         self.current_camera_c2w = poses[-1].copy()
         self.recent_video_history.append(generated)
         self.recent_video_history = self.recent_video_history[-2:]
         memory_event = None
         if self.memory_manager is not None:
             self.active_node, memory_event = self.memory_manager.process_chunk(
-                self.active_node, generated_rgb_for_memory=generated, cameras=cameras, warp=warp,
+                self.active_node, generated_rgb_for_memory=generated,
+                cameras=memory_cameras, warp=memory_warp,
                 frame_start=frame_start, allow_candidate_promotion=len(self.activation_queue) == 0,
                 defer_candidate_promotion=True,
             )

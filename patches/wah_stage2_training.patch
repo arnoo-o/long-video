@@ -1,7 +1,8 @@
 diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
+index 23679a2..4c72585 100644
 --- a/warp_as_history/pipeline.py
 +++ b/warp_as_history/pipeline.py
-@@ -2514,12 +2514,32 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+@@ -2514,12 +2514,23 @@ class WarpAsHistoryPipeline(HeliosPipeline):
          i = 0
          try:
              for i_s in range(pyramid_num_stages):
@@ -19,8 +20,6 @@ diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
 +                        self._set_wah_lora_enabled(False)
                  else:
 -                    self._set_wah_lora_enabled(False)
-+                    # Training-only adapter routing.  Never fuse adapters here:
-+                    # a fused Stage0 WAH adapter would contaminate Stage1/2.
 +                    self._unfuse_wah_lora()
 +                    adapter_name = pyramid_adapters.get(i_s)
 +                    use_wah_lora = adapter_name == self._wah_adapter_name
@@ -29,44 +28,129 @@ diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
 +                    else:
 +                        self.transformer.set_adapter(adapter_name)
 +                        self.transformer.enable_adapters()
-+                    trainable_adapter = getattr(self, "_trainable_pyramid_adapter_name", None)
-+                    for parameter_name, parameter in self.transformer.named_parameters():
-+                        if "lora_" in parameter_name:
-+                            parameter.requires_grad_(
-+                                trainable_adapter is not None
-+                                and f".{trainable_adapter}." in parameter_name
-+                            )
- 
+
                  patch_size = self.transformer.config.patch_size
                  image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
-@@ -2623,8 +2643,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
-                         if use_wah_lora and state.get("lora_prompt_embeds") is not None
+@@ -2585,6 +2596,23 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                     )
+
+                 for idx, t in enumerate(timesteps):
++                    completion_name = getattr(self, "_stage2_completion_adapter_name", None)
++                    completion_schedule = tuple(getattr(
++                        self, "_stage2_completion_schedule", (0, 0, 0, 0)
++                    ))
++                    completion_active = bool(
++                        i_s == 2 and completion_name is not None
++                        and idx < len(completion_schedule) and completion_schedule[idx]
++                    )
++                    if completion_name is not None and i_s in (1, 2):
++                        self._unfuse_wah_lora()
++                        if completion_active:
++                            self.transformer.set_adapter(completion_name)
++                            self.transformer.enable_adapters()
++                        else:
++                            self.transformer.disable_adapters()
++                    self._stage2_completion_step_active = completion_active
++                    self._stage2_base_model_output = None
+                     if i_s == 0:
+                         current_indices_hidden_states = pyramid_base_histories["indices_hidden_states"]
+                         current_indices_latents_history_short = pyramid_base_histories[
+@@ -2623,7 +2651,71 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                          else prompt_embeds
                      )
- 
+
 -                    with self.transformer.cache_context("cond"):
 +                    stage2_observer = getattr(self, "_stage2_training_observer", None)
-+                    stage2_training = (
++                    stage2_training = bool(
 +                        i_s == 2 and stage2_observer is not None
 +                        and stage2_observer.should_train_step(idx)
 +                    )
++                    if stage2_training and completion_active:
++                        # Compute the frozen-Helios preservation target first,
++                        # using the exact real x_t/timestep/conditioning.
++                        self.transformer.disable_adapters()
++                        with torch.no_grad(), self.transformer.cache_context("completion_base_cond"):
++                            base_pred = self.transformer(
++                                hidden_states=model_latents, timestep=timestep,
++                                encoder_hidden_states=current_prompt_embeds,
++                                attention_kwargs=attention_kwargs, return_dict=False,
++                                indices_hidden_states=current_indices_hidden_states,
++                                indices_latents_history_short=current_indices_latents_history_short,
++                                indices_latents_history_mid=current_indices_latents_history_mid,
++                                indices_latents_history_long=current_indices_latents_history_long,
++                                latents_history_short=_optional_to_dtype(
++                                    current_latents_history_short, transformer_dtype),
++                                latents_history_mid=_optional_to_dtype(
++                                    current_latents_history_mid, transformer_dtype),
++                                latents_history_long=_optional_to_dtype(
++                                    current_latents_history_long, transformer_dtype),
++                                history_visible_mask_short=current_history_visible_mask_short,
++                                history_confidence_short=current_history_confidence_short,
++                                history_visible_mask_mid=current_history_visible_mask_mid,
++                                history_visible_mask_long=current_history_visible_mask_long,
++                            )[0]
++                        if self.do_classifier_free_guidance:
++                            with torch.no_grad(), self.transformer.cache_context("completion_base_uncond"):
++                                base_uncond = self.transformer(
++                                    hidden_states=model_latents, timestep=timestep,
++                                    encoder_hidden_states=negative_prompt_embeds,
++                                    attention_kwargs=attention_kwargs, return_dict=False,
++                                    indices_hidden_states=current_indices_hidden_states,
++                                    indices_latents_history_short=current_indices_latents_history_short,
++                                    indices_latents_history_mid=current_indices_latents_history_mid,
++                                    indices_latents_history_long=current_indices_latents_history_long,
++                                    latents_history_short=_optional_to_dtype(
++                                        current_latents_history_short, transformer_dtype),
++                                    latents_history_mid=_optional_to_dtype(
++                                        current_latents_history_mid, transformer_dtype),
++                                    latents_history_long=_optional_to_dtype(
++                                        current_latents_history_long, transformer_dtype),
++                                    history_visible_mask_short=current_history_visible_mask_short,
++                                    history_confidence_short=current_history_confidence_short,
++                                    history_visible_mask_mid=current_history_visible_mask_mid,
++                                    history_visible_mask_long=current_history_visible_mask_long,
++                                )[0]
++                            if self.config.is_cfg_zero_star:
++                                flat_positive = base_pred.view(batch_size, -1)
++                                flat_negative = base_uncond.view(batch_size, -1)
++                                base_alpha = optimized_scale(flat_positive, flat_negative)
++                                base_alpha = base_alpha.view(
++                                    batch_size, *([1] * (len(base_pred.shape) - 1))
++                                ).to(base_pred.dtype)
++                                base_pred = base_uncond * base_alpha + guidance_scale * (
++                                    base_pred - base_uncond * base_alpha)
++                            else:
++                                base_pred = base_uncond + guidance_scale * (base_pred - base_uncond)
++                        self._stage2_base_model_output = base_pred.detach()
++                        self.transformer.set_adapter(completion_name)
++                        self.transformer.enable_adapters()
 +                    with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("cond"):
                          noise_pred = self.transformer(
                              hidden_states=model_latents,
                              timestep=timestep,
-@@ -2720,6 +2745,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+@@ -2646,7 +2738,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         )[0]
+
+                     if self.do_classifier_free_guidance:
+-                        with self.transformer.cache_context("uncond"):
++                        with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("uncond"):
+                             noise_uncond = self.transformer(
+                                 hidden_states=model_latents,
+                                 timestep=timestep,
+@@ -2720,6 +2812,16 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                      i += 1
          finally:
              self._unfuse_wah_lora()
++            self._stage2_completion_step_active = False
++            self._stage2_base_model_output = None
 +            if getattr(self, "_pyramid_adapter_names", None) is not None:
 +                self.transformer.set_adapter(self._wah_adapter_name)
-+                trainable_adapter = getattr(self, "_trainable_pyramid_adapter_name", None)
 +                for parameter_name, parameter in self.transformer.named_parameters():
 +                    if "lora_" in parameter_name:
 +                        parameter.requires_grad_(
-+                            trainable_adapter is not None
-+                            and f".{trainable_adapter}." in parameter_name
++                            f".{getattr(self, '_trainable_pyramid_adapter_name', '')}."
++                            in parameter_name
 +                        )
              self._set_wah_lora_enabled(bool(state["lora_active"]))
- 
+
          total_prev_history = sum(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))

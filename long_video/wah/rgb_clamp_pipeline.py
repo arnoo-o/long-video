@@ -64,6 +64,10 @@ class RGBClampWarpAsHistoryPipeline(WarpAsHistoryPipeline):
                         "dmd_timesteps":step_kwargs.get("dmd_timesteps"),
                         "dmd_noisy_tensor":step_kwargs.get("dmd_noisy_tensor"),
                         "all_timesteps":step_kwargs.get("all_timesteps"),
+                        "completion_adapter_active":bool(getattr(
+                            self,"_stage2_completion_step_active",False)),
+                        "base_model_output":getattr(self,"_stage2_base_model_output",None),
+                        "point_visibility":context[1],
                     })
                 if observed is not None:
                     model_output,sample=observed

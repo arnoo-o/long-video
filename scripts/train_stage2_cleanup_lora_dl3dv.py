@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train a Stage2-only cleanup LoRA on causal DL3DV 24fps trajectories."""
+"""Train a point-masked Stage2 completion LoRA on causal DL3DV trajectories."""
 from __future__ import annotations
 
 import argparse
@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument("--initial-world-cache-root", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--total-steps", type=int, default=1500)
+    parser.add_argument("--total-steps", type=int, default=1400)
     parser.add_argument("--seed", type=int, default=20260813)
     parser.add_argument("--record-count", type=int, default=100)
     parser.add_argument("--prompt", default="A stable realistic view of the same scene.")
@@ -68,22 +68,22 @@ def deterministic_video_latent(pipe, frames, device):
     return clean.detach()
 
 
-def cleanup_state(transformer):
-    from long_video.training.stage2_cleanup import cleanup_parameter_items
+def completion_state(transformer):
+    from long_video.training.stage2_cleanup import completion_parameter_items
     return {name: value.detach().cpu().clone()
-            for name, value in cleanup_parameter_items(transformer)}
+            for name, value in completion_parameter_items(transformer)}
 
 
 def scheduler_lambda(step):
     if step < 50:
         return float(step + 1) / 50.0
-    progress = (step - 50) / max(1, 1500 - 50)
+    progress = (step - 50) / max(1, 1400 - 50)
     return max(0.0, 1.0 - progress)
 
 
 def save_checkpoint(path, *, pipe, optimizer, lr_scheduler, step, sampler):
     payload = {
-        "stage2_cleanup": cleanup_state(pipe.transformer),
+        "stage2_completion": completion_state(pipe.transformer),
         "optimizer": optimizer.state_dict(), "lr_scheduler": lr_scheduler.state_dict(),
         "global_step": int(step), "sampling_state": sampler.state_dict(),
         "trajectory_counters": copy.deepcopy(sampler.trajectory_counts),
@@ -129,7 +129,7 @@ def build_online(args, pipe, geometry, record, arrays):
 
 
 def run_trajectory(args, pipe, geometry, record, supervision_chunk, selected_stage2_step):
-    from long_video.training.stage2_cleanup import Stage2FlowObserver
+    from long_video.training.stage2_cleanup import Stage2CompletionObserver
 
     arrays = load_record_arrays(args.dataset_root, record)
     online = build_online(args, pipe, geometry, record, arrays)
@@ -141,7 +141,7 @@ def run_trajectory(args, pipe, geometry, record, supervision_chunk, selected_sta
             if chunk_index == supervision_chunk:
                 gt = [read_rgb(path) for path in arrays["rgb_paths"][indices]]
                 z_gt = deterministic_video_latent(pipe, gt, args.device)
-                observer = Stage2FlowObserver(z_gt, pipe.scheduler, selected_stage2_step)
+                observer = Stage2CompletionObserver(z_gt, pipe.scheduler, selected_stage2_step)
                 pipe._stage2_training_observer = observer
             else:
                 pipe._stage2_training_observer = None
@@ -174,7 +174,7 @@ def main():
     from long_video.config import load_yaml
     from long_video.initialization.geometry_backend import Pi3GeometryBackend
     from long_video.training.stage2_cleanup import (
-        BalancedChunkSampler, configure_trainable_cleanup_adapter,
+        BalancedChunkSampler, configure_trainable_completion_adapter,
         select_balanced_training_records,
     )
     from long_video.wah.rgb_clamp_pipeline import RGBClampWarpAsHistoryPipeline
@@ -204,12 +204,12 @@ def main():
     if not official.is_file():
         raise FileNotFoundError(official)
     pipe._configure_wah_lora(str(official))
-    trainable = configure_trainable_cleanup_adapter(pipe)
+    trainable = configure_trainable_completion_adapter(pipe)
     for module in (pipe.vae, pipe.text_encoder):
         for parameter in module.parameters(): parameter.requires_grad_(False)
     if hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
-    optimizer = torch.optim.AdamW([value for _, value in trainable], lr=5e-5, weight_decay=0.01)
+    optimizer = torch.optim.AdamW([value for _, value in trainable], lr=1e-5, weight_decay=0.01)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler_lambda)
     sampler = BalancedChunkSampler(args.seed)
     geometry = Pi3GeometryBackend(args.pi3_checkpoint, args.pi3_repo, args.device)
@@ -219,46 +219,53 @@ def main():
               "gradient_checkpointing": True, "training_record_count": len(records)}
     (args.run_dir / "status.json").write_text(json.dumps(status, indent=2))
     if args.smoke_only:
-        before = cleanup_state(pipe.transformer)
+        before = completion_state(pipe.transformer)
         optimizer.zero_grad(set_to_none=True)
         observer, online, reports, diagnostics = run_trajectory(
-            args, pipe, geometry, records[0], supervision_chunk=1, selected_stage2_step=0,
+            args, pipe, geometry, records[0], supervision_chunk=0, selected_stage2_step=2,
         )
         grad_norm = float(torch.nn.utils.clip_grad_norm_([value for _, value in trainable], 1.0))
-        only_cleanup_has_grad = any(
+        only_completion_has_grad = any(
             value.grad is not None and bool(torch.count_nonzero(value.grad)) for _, value in trainable
         ) and all(
             value.grad is None or not bool(torch.count_nonzero(value.grad))
             for name, value in pipe.transformer.named_parameters()
-            if ".stage2_cleanup." not in name
+            if ".stage2_completion." not in name
         )
         optimizer.step()
-        after = cleanup_state(pipe.transformer)
+        after = completion_state(pipe.transformer)
+        selected_loss = observer.losses[2]
         result = {
             "passed": bool(
-                set(observer.losses) == {0} and math.isfinite(observer.losses[0])
-                and only_cleanup_has_grad and any(not torch.equal(before[name], after[name]) for name in before)
-                and len(reports) == 2 and online.chunk_index == 2
+                set(observer.losses) == {2} and math.isfinite(selected_loss["total"])
+                and only_completion_has_grad
+                and any(not torch.equal(before[name], after[name]) for name in before)
+                and len(reports) == 1 and online.chunk_index == 1
                 and all(report.get("uses_future_gt") is False for report in reports)
             ),
-            "selected_stage2_step": 0, "stage2_loss": observer.losses.get(0),
-            "grad_norm": grad_norm, "only_cleanup_has_grad": only_cleanup_has_grad,
+            "selected_stage2_step": 2, "total_loss": selected_loss["total"],
+            "gen_loss": selected_loss["gen"], "keep_loss": selected_loss["keep"],
+            "point_mask_ratio": selected_loss["point_mask_ratio"],
+            "grad_norm": grad_norm, "only_completion_has_grad": only_completion_has_grad,
             "clamp_schedule": [item["rgb_clamp"] for item in reports[-1]["rgb_clamp_diagnostics"]
                                if item["stage_id"] == 2],
+            "completion_schedule": [int(item["completion_adapter_active"])
+                                    for item in observer.records],
             "initial_world_from_cache": True, "gradient_checkpointing": True,
             **diagnostics,
         }
-        result["passed"] = result["passed"] and result["clamp_schedule"] == [1, 1, 0, 0]
+        result["passed"] = bool(result["passed"] and result["clamp_schedule"] == [1, 1, 0, 0]
+                                and result["completion_schedule"] == [0, 0, 1, 1])
         (args.run_dir / "smoke_result.json").write_text(json.dumps(result, indent=2))
         if not result["passed"]:
-            raise RuntimeError(f"minimal 2-chunk smoke failed: {result}")
+            raise RuntimeError(f"minimal 1-step/1-chunk smoke failed: {result}")
         return
     started = time.time(); status["state"] = "training"; recent_step_times = []
     (args.run_dir / "status.json").write_text(json.dumps(status, indent=2))
     for step in range(1, args.total_steps + 1):
         step_started = time.time()
         trajectory_length, supervision = sampler.choose(step)
-        selected_stage2_step = (step - 1) % 4
+        selected_stage2_step = sampler.choose_stage2_step()
         record = records[(step - 1) % len(records)]
         optimizer.zero_grad(set_to_none=True)
         observer, online, reports, diagnostics = run_trajectory(
@@ -269,27 +276,33 @@ def main():
         elapsed = time.time() - started; step_time = time.time() - step_started
         recent_step_times = (recent_step_times + [step_time])[-20:]
         if step % 10 == 0:
-            values = cleanup_state(pipe.transformer)
+            values = completion_state(pipe.transformer)
             norm = math.sqrt(sum(float((value.float() ** 2).sum()) for value in values.values()))
+            selected_loss = observer.losses[selected_stage2_step]
             event = {
-                "global_step": step, "total_loss": observer.losses[selected_stage2_step],
+                "global_step": step, "total_loss": selected_loss["total"],
+                "gen_loss": selected_loss["gen"], "keep_loss": selected_loss["keep"],
+                "lambda_keep": 0.1, "point_mask_ratio": selected_loss["point_mask_ratio"],
                 "selected_stage2_step": selected_stage2_step,
-                **{f"stage2_step{i}_loss": observer.losses.get(i) for i in range(4)},
+                "stage2_step2_loss": selected_loss["total"] if selected_stage2_step == 2 else None,
+                "stage2_step3_loss": selected_loss["total"] if selected_stage2_step == 3 else None,
                 "lr": optimizer.param_groups[0]["lr"], "grad_norm": grad_norm,
                 "stage2_lora_parameter_norm": norm, "trajectory_length": trajectory_length,
                 "supervision_chunk_index": supervision, **diagnostics,
                 "clamp_step0_executed": True, "clamp_step1_executed": True,
+                "completion_step2_count": sampler.stage2_step_counts[2],
+                "completion_step3_count": sampler.stage2_step_counts[3],
                 **{f"{i}_chunk_cumulative_count": sampler.trajectory_counts.get(i, 0) for i in range(1, 7)},
                 "optimizer_step_time_sec": step_time, "elapsed_training_time_sec": elapsed,
             }
             (metrics_dir / f"step_{step:04d}.json").write_text(json.dumps(event, indent=2))
-        if step % 100 == 0:
+        if step % 50 == 0:
             save_checkpoint(checkpoints_dir / f"checkpoint_step_{step:04d}.pt", pipe=pipe,
                             optimizer=optimizer, lr_scheduler=lr_scheduler, step=step, sampler=sampler)
         status.update(global_step=step, elapsed_training_time_sec=elapsed,
                       recent_step_times_sec=recent_step_times)
         (args.run_dir / "status.json").write_text(json.dumps(status, indent=2))
-        print(json.dumps({"step": step, "loss": observer.losses[selected_stage2_step],
+        print(json.dumps({"step": step, "loss": observer.losses[selected_stage2_step]["total"],
                           "selected_stage2_step": selected_stage2_step,
                           "seconds": step_time, "trajectory_length": trajectory_length,
                           "supervision_chunk": supervision}), flush=True)

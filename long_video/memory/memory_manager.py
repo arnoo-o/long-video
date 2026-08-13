@@ -16,7 +16,7 @@ class MemoryManager:
     REQUIRED_HISTORY_FRAMES = 12
     REQUIRED_TRANSLATION = 2.5
     REQUIRED_VIEW_CHANGE_RADIANS = float(np.deg2rad(25.0))
-    REQUIRED_NEW_AREA_RATIO = 0.05
+    REQUIRED_NEW_AREA_RATIO = 0.15
     REQUIRED_MAX_WORLD_OVERLAP = 0.25
     PARENT_PROJECTION_CLEARANCE_PIXELS = 9
     ACTIVE = "ACTIVE"
@@ -35,7 +35,7 @@ class MemoryManager:
         min_transition_frames=12,
         min_translation_baseline=2.5,
         min_view_diversity=float(np.deg2rad(25.0)),
-        min_new_area_ratio=0.05,
+        min_new_area_ratio=0.15,
         max_world_overlap=0.25,
         max_overlap_rgb_error=0.25,
         max_overlap_depth_error=0.5,
@@ -318,24 +318,9 @@ class MemoryManager:
             depth_convention=prediction.depth_convention or Z_DEPTH,
         )
         boundary_mapping_position = mapping_indices.index(created_frame)
-        # Canonical Surface Commit: Pi3 consumes all eight mapping views, but
-        # persistent generated geometry is emitted by the causal boundary
-        # surface only.  Earlier views remain geometry/validation context and
-        # cannot inject parallel point-cloud copies into the new world node.
-        surface_slice = slice(boundary_mapping_position, boundary_mapping_position + 1)
-        surface_views = ViewSet(
-            rgb=views.rgb[surface_slice],
-            depth=views.depth[surface_slice],
-            depth_confidence=views.depth_confidence[surface_slice],
-            c2w=views.c2w[surface_slice],
-            intrinsics=views.intrinsics[surface_slice],
-            source=views.source[surface_slice],
-            image_confidence=views.image_confidence[surface_slice],
-            depth_convention=views.depth_convention,
-        )
         node_index = max([int(key.split("_")[-1]) for key in self.nodes] + [0]) + 1
         candidate = build_from_views(
-            surface_views,
+            views,
             node_id=f"node_{node_index:03d}",
             center_c2w=c2w[boundary_mapping_position],
             created_frame=created_frame,
@@ -343,9 +328,6 @@ class MemoryManager:
             status="candidate",
             parent_id=active_node.node_id,
         )
-        # Retain the complete 8-view Pi3 geometry package for validation and
-        # diagnostics without allowing those seven context views to emit
-        # persistent points.
         candidate.view_rgb = rgb_to_uint8(views.rgb)
         candidate.view_depth = np.asarray(views.depth)
         candidate.view_c2w = np.asarray(views.c2w)
@@ -357,11 +339,12 @@ class MemoryManager:
             "shadow_boundary_frame": int(created_frame),
             "shadow_mapping_frame_indices": mapping_indices,
             "shadow_heldout_frame_indices": heldout_indices,
-            "canonical_surface_commit": True,
+            "canonical_surface_commit": False,
+            "multi_view_surface_commit": True,
             "geometry_input_view_count": int(len(frames)),
-            "persistent_surface_view_count": 1,
-            "persistent_surface_mapping_position": int(boundary_mapping_position),
-            "persistent_surface_global_frame": int(created_frame),
+            "persistent_surface_view_count": int(len(frames)),
+            "persistent_surface_mapping_positions": list(range(len(frames))),
+            "persistent_surface_global_frames": mapping_indices,
         })
         view_rgb_origin=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_rgb_content_origin,

@@ -23,7 +23,7 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
         min_transition_frames=12,
         min_translation_baseline=2.5,
         min_view_diversity=0.4363323129985824,
-        min_new_area_ratio=0.05,
+        min_new_area_ratio=0.15,
         max_world_overlap=0.25,
     )
     manager.buffer = _ReadinessBuffer(11, translation=3.0, view_change=0.0, new_area=0.0)
@@ -50,6 +50,21 @@ def test_world_overlap_must_be_strictly_below_twenty_five_percent():
     )
     assert not manager._ready(0.25)
     assert manager._ready(0.249)
+
+
+def test_new_area_condition_requires_fifteen_percent():
+    manager = MemoryManager()
+    manager.buffer = _ReadinessBuffer(
+        12, translation=0.0, view_change=0.0, new_area=0.149,
+    )
+    assert not manager._ready(0.20)
+    manager.buffer = _ReadinessBuffer(
+        12, translation=0.0, view_change=0.0, new_area=0.15,
+    )
+    report = manager.readiness_report(0.20)
+    assert report["ready"]
+    assert report["conditions"]["new_area"] is True
+    assert report["thresholds"]["new_area"] == 0.15
 
 
 def test_readiness_uses_current_chunk_overlap_not_history_mean():

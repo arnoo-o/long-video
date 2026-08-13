@@ -1,0 +1,70 @@
+diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
+--- a/warp_as_history/pipeline.py
++++ b/warp_as_history/pipeline.py
+@@ -2514,12 +2514,32 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+         i = 0
+         try:
+             for i_s in range(pyramid_num_stages):
+-                use_wah_lora = bool(state["lora_active"]) and i_s == 0
+-                if use_wah_lora:
+-                    if not self._fuse_wah_lora():
+-                        self._set_wah_lora_enabled(True)
++                pyramid_adapters = getattr(self, "_pyramid_adapter_names", None)
++                if pyramid_adapters is None:
++                    use_wah_lora = bool(state["lora_active"]) and i_s == 0
++                    if use_wah_lora:
++                        if not self._fuse_wah_lora():
++                            self._set_wah_lora_enabled(True)
++                    else:
++                        self._set_wah_lora_enabled(False)
+                 else:
+-                    self._set_wah_lora_enabled(False)
++                    # Training-only adapter routing.  Never fuse adapters here:
++                    # a fused Stage0 WAH adapter would contaminate Stage1/2.
++                    self._unfuse_wah_lora()
++                    adapter_name = pyramid_adapters.get(i_s)
++                    use_wah_lora = adapter_name == self._wah_adapter_name
++                    if adapter_name is None:
++                        self.transformer.disable_adapters()
++                    else:
++                        self.transformer.set_adapter(adapter_name)
++                        self.transformer.enable_adapters()
++                    trainable_adapter = getattr(self, "_trainable_pyramid_adapter_name", None)
++                    for parameter_name, parameter in self.transformer.named_parameters():
++                        if "lora_" in parameter_name:
++                            parameter.requires_grad_(
++                                trainable_adapter is not None
++                                and f".{trainable_adapter}." in parameter_name
++                            )
+ 
+                 patch_size = self.transformer.config.patch_size
+                 image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
+@@ -2623,8 +2643,11 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         if use_wah_lora and state.get("lora_prompt_embeds") is not None
+                         else prompt_embeds
+                     )
+ 
+-                    with self.transformer.cache_context("cond"):
++                    stage2_training = i_s == 2 and getattr(
++                        self, "_stage2_training_observer", None
++                    ) is not None
++                    with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("cond"):
+                         noise_pred = self.transformer(
+                             hidden_states=model_latents,
+                             timestep=timestep,
+@@ -2720,6 +2743,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                     i += 1
+         finally:
+             self._unfuse_wah_lora()
++            if getattr(self, "_pyramid_adapter_names", None) is not None:
++                self.transformer.set_adapter(self._wah_adapter_name)
++                trainable_adapter = getattr(self, "_trainable_pyramid_adapter_name", None)
++                for parameter_name, parameter in self.transformer.named_parameters():
++                    if "lora_" in parameter_name:
++                        parameter.requires_grad_(
++                            trainable_adapter is not None
++                            and f".{trainable_adapter}." in parameter_name
++                        )
+             self._set_wah_lora_enabled(bool(state["lora_active"]))
+ 
+         total_prev_history = sum(int(x) for x in state.get("prev_chunk_history_sizes", (0, 0, 0)))

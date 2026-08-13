@@ -54,6 +54,19 @@ class RGBClampWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             nonlocal stage_id,stage_start
             step_id=int(step_kwargs.get("cur_sampling_step",0))
             if step_id==0: stage_id+=1; stage_start=sample.detach().clone()
+            observer=getattr(self,"_stage2_training_observer",None)
+            if stage_id==2 and observer is not None:
+                with torch.enable_grad():
+                    observed=observer({
+                        "stage_id":stage_id,"step_id":step_id,
+                        "model_output":model_output,"sample":sample,"timestep":timestep,
+                        "dmd_sigmas":step_kwargs.get("dmd_sigmas"),
+                        "dmd_timesteps":step_kwargs.get("dmd_timesteps"),
+                        "dmd_noisy_tensor":step_kwargs.get("dmd_noisy_tensor"),
+                        "all_timesteps":step_kwargs.get("all_timesteps"),
+                    })
+                if observed is not None:
+                    model_output,sample=observed
             result=original_step(model_output,timestep,sample,*step_args,**step_kwargs); enabled=clamp_enabled(stage_id,step_id)
             self._rgb_clamp_diagnostics.append({"stage_id":stage_id,"step_id":step_id,"rgb_clamp":int(enabled)})
             if not enabled: return result

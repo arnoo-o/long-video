@@ -39,20 +39,22 @@ diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
  
                  patch_size = self.transformer.config.patch_size
                  image_seq_len = (latents.shape[-1] * latents.shape[-2] * latents.shape[-3]) // (
-@@ -2623,8 +2643,11 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+@@ -2623,8 +2643,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                          if use_wah_lora and state.get("lora_prompt_embeds") is not None
                          else prompt_embeds
                      )
  
 -                    with self.transformer.cache_context("cond"):
-+                    stage2_training = i_s == 2 and getattr(
-+                        self, "_stage2_training_observer", None
-+                    ) is not None
++                    stage2_observer = getattr(self, "_stage2_training_observer", None)
++                    stage2_training = (
++                        i_s == 2 and stage2_observer is not None
++                        and stage2_observer.should_train_step(idx)
++                    )
 +                    with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("cond"):
                          noise_pred = self.transformer(
                              hidden_states=model_latents,
                              timestep=timestep,
-@@ -2720,6 +2743,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+@@ -2720,6 +2745,15 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                      i += 1
          finally:
              self._unfuse_wah_lora()

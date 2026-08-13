@@ -1,0 +1,18 @@
+diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
+--- a/warp_as_history/pipeline.py
++++ b/warp_as_history/pipeline.py
+@@ -2636,9 +2636,11 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         else prompt_embeds
+                     )
+ 
+-                    stage2_training = i_s == 2 and getattr(
+-                        self, "_stage2_training_observer", None
+-                    ) is not None
++                    stage2_observer = getattr(self, "_stage2_training_observer", None)
++                    stage2_training = (
++                        i_s == 2 and stage2_observer is not None
++                        and stage2_observer.should_train_step(idx)
++                    )
+                     with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("cond"):
+                         noise_pred = self.transformer(
+                             hidden_states=model_latents,

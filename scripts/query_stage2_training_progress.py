@@ -24,6 +24,7 @@ def progress_summary(run_dir: Path):
     return {
         "global_step": int(latest["global_step"]), "total_steps": 1500,
         "latest_metrics": str(metrics[-1]), "total_loss": latest.get("total_loss"),
+        "selected_stage2_step": latest.get("selected_stage2_step"),
         "stage2_losses": [latest.get(f"stage2_step{i}_loss") for i in range(4)],
         "learning_rate": latest.get("lr"), "grad_norm": latest.get("grad_norm"),
         "trajectory_length": latest.get("trajectory_length"),

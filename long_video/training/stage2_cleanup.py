@@ -13,6 +13,24 @@ STAGE2_TARGET_MODULES = (
 )
 
 
+def select_balanced_training_records(records, count: int = 100):
+    """Select a stable 50/50 indoor/outdoor subset shared by cache and training."""
+    count = int(count)
+    if count <= 0 or count % 2:
+        raise ValueError("training record count must be a positive even number")
+    selected = []
+    for environment in ("indoor", "outdoor"):
+        pool = sorted(
+            (item for item in records if item.get("split") == "train"
+             and item.get("environment") == environment),
+            key=lambda item: item["trajectory_id"],
+        )
+        if len(pool) < count // 2:
+            raise RuntimeError(f"insufficient {environment} train trajectories")
+        selected.extend(pool[:count // 2])
+    return sorted(selected, key=lambda item: item["trajectory_id"])
+
+
 def curriculum_max_chunks(step: int) -> int:
     for upper, count in ((400, 1), (800, 2), (1000, 3), (1200, 4), (1400, 5)):
         if int(step) <= upper:
@@ -53,12 +71,17 @@ class BalancedChunkSampler:
 class Stage2FlowObserver:
     """Backpropagate each real Stage2 state independently, then detach it."""
 
-    def __init__(self, z_gt: torch.Tensor, scheduler, loss_scale: float = 0.25):
+    def __init__(self, z_gt: torch.Tensor, scheduler, selected_step: int):
         self.z_gt = z_gt.detach()
         self.scheduler = scheduler
-        self.loss_scale = float(loss_scale)
-        self.losses: list[float] = []
+        self.selected_step = int(selected_step)
+        if self.selected_step not in range(4):
+            raise ValueError("selected Stage2 step must be in [0,3]")
+        self.losses: dict[int, float] = {}
         self.records: list[dict] = []
+
+    def should_train_step(self, step_id: int) -> bool:
+        return int(step_id) == self.selected_step
 
     @staticmethod
     def _sigma(timestep, timesteps, sigmas, *, device, dtype):
@@ -76,20 +99,26 @@ class Stage2FlowObserver:
             return None
         prediction = event["model_output"]
         x_t = event["sample"]
+        step_id = int(event["step_id"])
+        self.records.append({"step_id": step_id})
+        if step_id != self.selected_step:
+            return prediction.detach(), x_t.detach()
         sigma = self._sigma(event["timestep"], event["dmd_timesteps"], event["dmd_sigmas"],
                             device=x_t.device, dtype=x_t.dtype)
         target = (x_t.detach() - self.z_gt.to(device=x_t.device, dtype=x_t.dtype)) / sigma
         loss = torch.nn.functional.mse_loss(prediction.float(), target.float())
         if not bool(torch.isfinite(loss)):
             raise RuntimeError(f"non-finite Stage2 loss at step {event['step_id']}")
-        (loss * self.loss_scale).backward()
-        self.losses.append(float(loss.detach()))
-        self.records.append({"step_id": int(event["step_id"]), "sigma": float(sigma.detach())})
+        loss.backward()
+        self.losses[step_id] = float(loss.detach())
+        self.records[-1]["sigma"] = float(sigma.detach())
         return prediction.detach(), x_t.detach()
 
     def assert_complete(self):
-        if [x["step_id"] for x in self.records] != [0, 1, 2, 3] or len(self.losses) != 4:
-            raise RuntimeError(f"expected all four Stage2 losses, got {self.records}")
+        if [x["step_id"] for x in self.records] != [0, 1, 2, 3]:
+            raise RuntimeError(f"expected all four Stage2 scheduler steps, got {self.records}")
+        if set(self.losses) != {self.selected_step}:
+            raise RuntimeError(f"expected only Stage2 step {self.selected_step} loss, got {self.losses}")
 
 
 def cleanup_parameter_items(transformer):

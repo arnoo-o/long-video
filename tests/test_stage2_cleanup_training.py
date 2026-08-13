@@ -4,6 +4,7 @@ import torch
 
 from long_video.training.stage2_cleanup import (
     BalancedChunkSampler, Stage2FlowObserver, curriculum_max_chunks,
+    select_balanced_training_records,
 )
 from scripts.query_stage2_training_progress import progress_summary
 
@@ -15,9 +16,20 @@ def test_curriculum_and_balanced_supervision():
     assert abs(selected.count(0) - selected.count(1)) <= 1
 
 
-def test_stage2_observer_backprops_each_step_and_detaches():
+def test_balanced_training_record_selection():
+    records = [
+        {"trajectory_id": f"{environment}_{index:03d}", "split": "train",
+         "environment": environment}
+        for environment in ("indoor", "outdoor") for index in range(75)
+    ]
+    selected = select_balanced_training_records(records, 100)
+    assert len(selected) == 100
+    assert sum(item["environment"] == "indoor" for item in selected) == 50
+
+
+def test_stage2_observer_backprops_only_selected_step_and_detaches():
     z_gt = torch.zeros(1, 1, 1, 1, 1)
-    observer = Stage2FlowObserver(z_gt, scheduler=None)
+    observer = Stage2FlowObserver(z_gt, scheduler=None, selected_step=2)
     for step in range(4):
         prediction = torch.ones_like(z_gt, requires_grad=True)
         sample = torch.full_like(z_gt, 2.0)
@@ -25,9 +37,13 @@ def test_stage2_observer_backprops_each_step_and_detaches():
                            "sample": sample, "timestep": torch.tensor(10),
                            "dmd_timesteps": torch.tensor([10, 0]),
                            "dmd_sigmas": torch.tensor([0.5, 0.0])})
-        assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+        if step == 2:
+            assert prediction.grad is not None and torch.isfinite(prediction.grad).all()
+        else:
+            assert prediction.grad is None
         assert not result[0].requires_grad and not result[1].requires_grad
     observer.assert_complete()
+    assert set(observer.losses) == {2}
 
 
 def test_progress_query_is_read_only(tmp_path):

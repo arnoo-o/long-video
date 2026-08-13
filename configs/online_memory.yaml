@@ -5,7 +5,7 @@ min_transition_frames: 12
 min_translation_baseline: 2.5
 min_view_diversity: 0.4363323129985824
 min_new_area_ratio: 0.15
-max_world_overlap: 0.25
+max_world_overlap: 0.10
 transition_readiness_mode: any
 max_overlap_depth_error: 0.5
 generated_confidence: 0.25

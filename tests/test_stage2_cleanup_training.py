@@ -18,6 +18,11 @@ def test_curriculum_and_balanced_supervision():
     choices = [sampler.choose_stage2_step() for _ in range(1000)]
     assert set(choices) == {2, 3}
     assert abs(choices.count(2) - choices.count(3)) < 100
+    state = sampler.state_dict()
+    expected = [sampler.choose_stage2_step() for _ in range(20)]
+    resumed = BalancedChunkSampler(seed=999)
+    resumed.load_state_dict(state)
+    assert [resumed.choose_stage2_step() for _ in range(20)] == expected
 
 
 def test_balanced_training_record_selection():

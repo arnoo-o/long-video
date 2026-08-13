@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--record-count", type=int, default=100)
     parser.add_argument("--prompt", default="A stable realistic view of the same scene.")
     parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--resume-checkpoint", type=Path)
     return parser.parse_args()
 
 
@@ -92,6 +93,31 @@ def save_checkpoint(path, *, pipe, optimizer, lr_scheduler, step, sampler):
                       "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
     }
     torch.save(payload, path)
+
+
+def restore_checkpoint(path, *, pipe, optimizer, lr_scheduler, sampler):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    required = {"stage2_completion", "optimizer", "lr_scheduler", "global_step",
+                "rng_state", "sampling_state"}
+    if not required.issubset(checkpoint):
+        raise RuntimeError(f"incomplete Stage2 completion checkpoint: {sorted(checkpoint)}")
+    current = dict(pipe.transformer.named_parameters())
+    state = checkpoint["stage2_completion"]
+    expected = set(completion_state(pipe.transformer))
+    if set(state) != expected:
+        raise RuntimeError("resume checkpoint does not match stage2_completion adapter")
+    with torch.no_grad():
+        for name, value in state.items():
+            current[name].copy_(value.to(device=current[name].device, dtype=current[name].dtype))
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    sampler.load_state_dict(checkpoint["sampling_state"])
+    rng = checkpoint["rng_state"]
+    random.setstate(rng["python"]); np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch"])
+    if torch.cuda.is_available() and rng.get("cuda") is not None:
+        torch.cuda.set_rng_state_all(rng["cuda"])
+    return int(checkpoint["global_step"])
 
 
 def build_online(args, pipe, geometry, record, arrays):
@@ -212,11 +238,22 @@ def main():
     optimizer = torch.optim.AdamW([value for _, value in trainable], lr=1e-5, weight_decay=0.01)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler_lambda)
     sampler = BalancedChunkSampler(args.seed)
+    start_step = 0
+    if args.resume_checkpoint is not None:
+        if not args.resume_checkpoint.is_file():
+            raise FileNotFoundError(args.resume_checkpoint)
+        start_step = restore_checkpoint(
+            args.resume_checkpoint, pipe=pipe, optimizer=optimizer,
+            lr_scheduler=lr_scheduler, sampler=sampler,
+        )
+        if start_step >= args.total_steps:
+            raise ValueError(f"resume step {start_step} must be below total steps {args.total_steps}")
     geometry = Pi3GeometryBackend(args.pi3_checkpoint, args.pi3_repo, args.device)
-    status = {"pid": os.getpid(), "global_step": 0, "total_steps": args.total_steps,
+    status = {"pid": os.getpid(), "global_step": start_step, "total_steps": args.total_steps,
               "run_dir": str(args.run_dir), "metrics_dir": str(metrics_dir),
               "checkpoint_dir": str(checkpoints_dir), "state": "smoke" if args.smoke_only else "training",
-              "gradient_checkpointing": True, "training_record_count": len(records)}
+              "gradient_checkpointing": True, "training_record_count": len(records),
+              "resumed_from": str(args.resume_checkpoint) if args.resume_checkpoint else None}
     (args.run_dir / "status.json").write_text(json.dumps(status, indent=2))
     if args.smoke_only:
         before = completion_state(pipe.transformer)
@@ -262,7 +299,7 @@ def main():
         return
     started = time.time(); status["state"] = "training"; recent_step_times = []
     (args.run_dir / "status.json").write_text(json.dumps(status, indent=2))
-    for step in range(1, args.total_steps + 1):
+    for step in range(start_step + 1, args.total_steps + 1):
         step_started = time.time()
         trajectory_length, supervision = sampler.choose(step)
         selected_stage2_step = sampler.choose_stage2_step()

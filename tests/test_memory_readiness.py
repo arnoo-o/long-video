@@ -24,12 +24,12 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
         min_translation_baseline=2.5,
         min_view_diversity=0.4363323129985824,
         min_new_area_ratio=0.15,
-        max_world_overlap=0.10,
+        max_world_overlap=0.02,
     )
     manager.buffer = _ReadinessBuffer(11, translation=3.0, view_change=0.0, new_area=0.0)
     assert not manager._ready(0.01)
     manager.buffer = _ReadinessBuffer(12, translation=0.0, view_change=0.5, new_area=0.0)
-    report = manager.readiness_report(0.099)
+    report = manager.readiness_report(0.019)
     assert report["ready"]
     assert report["conditions"] == {
         "translation": False,
@@ -39,17 +39,17 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
     assert report["world_overlap_below_max"] is True
 
 
-def test_world_overlap_must_be_strictly_below_ten_percent():
+def test_world_overlap_must_be_strictly_below_two_percent():
     manager = MemoryManager()
     manager.buffer = _ReadinessBuffer(
         12, translation=3.0, view_change=1.0, new_area=0.5, coverage=0.20,
     )
-    assert not manager._ready(0.101)
+    assert not manager._ready(0.021)
     manager.buffer = _ReadinessBuffer(
-        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.10,
+        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.02,
     )
-    assert not manager._ready(0.10)
-    assert manager._ready(0.099)
+    assert not manager._ready(0.02)
+    assert manager._ready(0.019)
 
 
 def test_new_area_condition_requires_fifteen_percent():
@@ -57,11 +57,11 @@ def test_new_area_condition_requires_fifteen_percent():
     manager.buffer = _ReadinessBuffer(
         12, translation=0.0, view_change=0.0, new_area=0.149,
     )
-    assert not manager._ready(0.099)
+    assert not manager._ready(0.019)
     manager.buffer = _ReadinessBuffer(
         12, translation=0.0, view_change=0.0, new_area=0.15,
     )
-    report = manager.readiness_report(0.099)
+    report = manager.readiness_report(0.019)
     assert report["ready"]
     assert report["conditions"]["new_area"] is True
     assert report["thresholds"]["new_area"] == 0.15
@@ -72,9 +72,9 @@ def test_readiness_uses_current_chunk_overlap_not_history_mean():
     manager.buffer = _ReadinessBuffer(
         12, translation=0.0, view_change=0.5, new_area=0.5, coverage=0.95,
     )
-    report = manager.readiness_report(0.099)
+    report = manager.readiness_report(0.019)
     assert report["ready"]
-    assert report["values"]["current_chunk_world_overlap"] == 0.099
+    assert report["values"]["current_chunk_world_overlap"] == 0.019
 
 
 def test_readiness_policy_rejects_conflicting_mode_or_thresholds():

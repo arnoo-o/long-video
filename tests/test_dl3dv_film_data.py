@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from long_video.data.dl3dv import (
-    CHUNK_STRIDE, center_crop_resize_geometry, chunk_real_indices,
+    CHUNK_STRIDE, build_interpolated_timeline, center_crop_resize_geometry,
+    chunk_real_indices, interpolate_timeline_c2w,
     load_dl3dv_scene, ranked_candidates, read_official_metadata,
     resample_real_frame_indices, source_relative_opencv_c2w,
 )
@@ -46,6 +47,22 @@ def test_real_frame_resampling_never_synthesizes_indices():
     assert set(indices).issubset(set(range(20)))
     assert len(np.unique(indices)) < len(indices)  # duplicates are real frames, never RIFE frames
 
+
+def test_dense_timeline_aligns_rife_alpha_and_slerp_pose():
+    times = np.array([0.0, 0.25, 0.5])
+    timeline = build_interpolated_timeline(times, 0, 13, target_fps=24)
+    np.testing.assert_allclose(np.diff(timeline["timestamps"]), 1/24)
+    assert timeline["is_real"].tolist() == [True] + [False]*5 + [True] + [False]*5 + [True]
+    poses = np.repeat(np.eye(4, dtype=np.float32)[None], 3, axis=0)
+    poses[:, 0, 3] = [0, 1, 2]
+    angle = np.deg2rad(90)
+    poses[1, :3, :3] = [[np.cos(angle), 0, np.sin(angle)], [0, 1, 0],
+                         [-np.sin(angle), 0, np.cos(angle)]]
+    poses[2, :3, :3] = poses[1, :3, :3] @ poses[1, :3, :3]
+    dense = interpolate_timeline_c2w(poses, timeline)
+    np.testing.assert_allclose(dense[0], np.eye(4), atol=1e-6)
+    np.testing.assert_allclose(dense[6], poses[1], atol=1e-5)
+    np.testing.assert_allclose(np.linalg.det(dense[:, :3, :3]), 1, atol=1e-5)
 
 def test_nerfstudio_pose_becomes_source_relative_opencv(tmp_path):
     frames = []

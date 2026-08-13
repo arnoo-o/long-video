@@ -137,23 +137,103 @@ def resample_real_frame_indices(frame_times, target_fps=TARGET_FPS):
     return np.where(choose_left, left, right).astype(np.int64)
 
 
+def build_interpolated_timeline(frame_times, start_real_index, frame_count,
+                                target_fps=TARGET_FPS, atol=1e-8):
+    """Describe a dense timeline without duplicating sparse source frames."""
+    times = np.asarray(frame_times, np.float64)
+    start = int(start_real_index)
+    if times.ndim != 1 or len(times) < 2 or np.any(np.diff(times) <= 0):
+        raise ValueError("frame times must be strictly increasing")
+    if not 0 <= start < len(times):
+        raise IndexError("start_real_index is outside the scene")
+    target = times[start] + np.arange(int(frame_count), dtype=np.float64) / float(target_fps)
+    if target[-1] > times[-1] + atol:
+        raise ValueError("dense timeline would extrapolate beyond valid poses")
+    right = np.searchsorted(times, target, side="left").clip(0, len(times) - 1)
+    exact = np.isclose(target, times[right], rtol=0.0, atol=atol)
+    left = np.where(exact, right, right - 1)
+    if np.any(left < 0):
+        raise ValueError("dense timeline would extrapolate before valid poses")
+    span = times[right] - times[left]
+    alpha = np.zeros_like(target)
+    alpha[~exact] = (target[~exact] - times[left[~exact]]) / span[~exact]
+    snap_left = alpha < 0.01
+    snap_right = (1.0 - alpha) < 0.01
+    is_real = snap_left | snap_right | exact
+    rgb_real_index = np.where(snap_right, right, left).astype(np.int64)
+    return {"timestamps": target, "left_real_indices": left.astype(np.int64),
+            "right_real_indices": right.astype(np.int64), "alpha": alpha,
+            "is_real": is_real, "rgb_real_indices": rgb_real_index}
+
+def _rotation_matrix_to_quaternion(matrix):
+    m = np.asarray(matrix, np.float64); trace = np.trace(m)
+    if trace > 0:
+        s = math.sqrt(trace + 1.0) * 2
+        q = np.array([0.25*s, (m[2,1]-m[1,2])/s, (m[0,2]-m[2,0])/s, (m[1,0]-m[0,1])/s])
+    else:
+        i = int(np.argmax(np.diag(m))); j, k = (i+1)%3, (i+2)%3
+        s = math.sqrt(max(0.0, 1.0+m[i,i]-m[j,j]-m[k,k])) * 2
+        q = np.empty(4); q[i+1] = 0.25*s; q[0] = (m[k,j]-m[j,k])/s
+        q[j+1] = (m[j,i]+m[i,j])/s; q[k+1] = (m[k,i]+m[i,k])/s
+    return q / np.linalg.norm(q)
+
+
+def _quaternion_to_rotation_matrix(q):
+    w,x,y,z = np.asarray(q,np.float64) / np.linalg.norm(q)
+    return np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
+                     [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
+                     [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
+
+
+def interpolate_c2w_slerp(left_c2w, right_c2w, alpha):
+    """Linearly interpolate camera center and SLERP camera orientation."""
+    left, right = np.asarray(left_c2w,np.float64), np.asarray(right_c2w,np.float64)
+    a = float(alpha)
+    q0 = _rotation_matrix_to_quaternion(left[:3,:3])
+    q1 = _rotation_matrix_to_quaternion(right[:3,:3])
+    dot = float(np.dot(q0,q1))
+    if dot < 0: q1, dot = -q1, -dot
+    if dot > .9995:
+        q = q0 + a*(q1-q0); q /= np.linalg.norm(q)
+    else:
+        theta = math.acos(np.clip(dot,-1,1))
+        q = (math.sin((1-a)*theta)*q0 + math.sin(a*theta)*q1) / math.sin(theta)
+    out = np.eye(4); out[:3,:3] = _quaternion_to_rotation_matrix(q)
+    out[:3,3] = (1-a)*left[:3,3] + a*right[:3,3]
+    return out.astype(np.float32)
+
+
+def interpolate_timeline_c2w(c2w, timeline, source_output_index=0):
+    poses = np.asarray(c2w,np.float32)
+    dense = np.stack([interpolate_c2w_slerp(poses[l],poses[r],a)
+                      for l,r,a in zip(timeline["left_real_indices"],
+                                       timeline["right_real_indices"],timeline["alpha"])])
+    return source_relative_opencv_c2w(dense, int(source_output_index))
+
 def _frame_time(frame, ordinal, source_fps):
     for key in ("time", "timestamp", "time_sec"):
         if key in frame: return float(frame[key])
     return float(ordinal) / float(source_fps)
 
 
+
 def _intrinsics(meta, frame, width, height):
     def get(name, default=None):
         value = frame.get(name, meta.get(name, default))
         return None if value is None else float(value)
+    declared_w, declared_h = get("w", width), get("h", height)
+    if declared_w <= 0 or declared_h <= 0:
+        raise ValueError("declared camera resolution must be positive")
+    sx, sy = float(width) / declared_w, float(height) / declared_h
     fx, fy = get("fl_x"), get("fl_y")
     if fx is None and get("camera_angle_x") is not None:
-        fx = 0.5 * width / math.tan(0.5 * get("camera_angle_x"))
+        fx = 0.5 * declared_w / math.tan(0.5 * get("camera_angle_x"))
     if fy is None: fy = fx
     if fx is None: raise ValueError("DL3DV transforms must provide fl_x or camera_angle_x")
-    cx, cy = get("cx", (width - 1) / 2), get("cy", (height - 1) / 2)
-    return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], np.float32)
+    cx = get("cx", (declared_w - 1) / 2)
+    cy = get("cy", (declared_h - 1) / 2)
+    return np.array([[fx * sx, 0, (cx + .5) * sx - .5],
+                     [0, fy * sy, (cy + .5) * sy - .5], [0, 0, 1]], np.float32)
 
 
 @dataclass

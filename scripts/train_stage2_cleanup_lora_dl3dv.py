@@ -144,26 +144,28 @@ def run_trajectory(args, pipe, geometry, record, supervision_chunk, *, train):
     online = build_online(args, pipe, geometry, record, arrays)
     reports = []
     observer = None
-    for chunk_index in range(int(supervision_chunk) + 1):
-        indices = slice(chunk_index * 32, chunk_index * 32 + 33)
-        if chunk_index == supervision_chunk:
-            gt = [read_rgb(path) for path in arrays["rgb_paths"][indices]]
-            z_gt = deterministic_video_latent(pipe, gt, args.device)
-            observer = Stage2FlowObserver(z_gt, pipe.scheduler)
-            pipe._stage2_training_observer = observer
-        else:
-            pipe._stage2_training_observer = None
-        video, _, warp, report = online.generate_chunk_at_cameras(
-            arrays["c2w"][indices], arrays["k"][indices], 384, 640
-        )
-        reports.append(report)
-        if chunk_index == supervision_chunk:
-            observer.assert_complete()
-            diagnostics = report["rgb_clamp_diagnostics"]
-            clamps = [item["rgb_clamp"] for item in diagnostics if item["stage_id"] == 2]
-            if clamps != [1, 1, 0, 0]:
-                raise RuntimeError(f"formal clamp schedule not executed: {clamps}")
-    pipe._stage2_training_observer = None
+    try:
+        for chunk_index in range(int(supervision_chunk) + 1):
+            indices = slice(chunk_index * 32, chunk_index * 32 + 33)
+            if chunk_index == supervision_chunk:
+                gt = [read_rgb(path) for path in arrays["rgb_paths"][indices]]
+                z_gt = deterministic_video_latent(pipe, gt, args.device)
+                observer = Stage2FlowObserver(z_gt, pipe.scheduler)
+                pipe._stage2_training_observer = observer
+            else:
+                pipe._stage2_training_observer = None
+            video, _, warp, report = online.generate_chunk_at_cameras(
+                arrays["c2w"][indices], arrays["k"][indices], 384, 640
+            )
+            reports.append(report)
+            if chunk_index == supervision_chunk:
+                observer.assert_complete()
+                diagnostics = report["rgb_clamp_diagnostics"]
+                clamps = [item["rgb_clamp"] for item in diagnostics if item["stage_id"] == 2]
+                if clamps != [1, 1, 0, 0]:
+                    raise RuntimeError(f"formal clamp schedule not executed: {clamps}")
+    finally:
+        pipe._stage2_training_observer = None
     event = reports[-1].get("memory_event") or {}
     return observer, online, reports, {
         "warp_visibility_ratio": float(np.asarray(warp.visibility).mean()),
@@ -211,7 +213,8 @@ def smoke_test(args, pipe, geometry, records, trainable, optimizer, lr_scheduler
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     load_cleanup_state(pipe.transformer, initial_cleanup)
     load_cleanup_state(pipe.transformer, saved["stage2_cleanup"])
-    checkpoint_roundtrip = all(torch.equal(after_cleanup[name], cleanup_state(pipe.transformer)[name])
+    restored_cleanup = cleanup_state(pipe.transformer)
+    checkpoint_roundtrip = all(torch.equal(after_cleanup[name], restored_cleanup[name])
                                for name in after_cleanup)
     checks = {
         "official_wah_loaded": bool(getattr(pipe, "_wah_loaded_lora_path", None)),

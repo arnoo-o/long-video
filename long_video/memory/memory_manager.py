@@ -17,7 +17,7 @@ class MemoryManager:
     REQUIRED_TRANSLATION = 2.5
     REQUIRED_VIEW_CHANGE_RADIANS = float(np.deg2rad(25.0))
     REQUIRED_NEW_AREA_RATIO = 0.15
-    REQUIRED_MAX_WORLD_OVERLAP = 0.08
+    REQUIRED_MAX_WORLD_OVERLAP = 0.20
     PARENT_PROJECTION_CLEARANCE_PIXELS = 9
     ACTIVE = "ACTIVE"
     TRANSITION = "TRANSITION"
@@ -36,7 +36,7 @@ class MemoryManager:
         min_translation_baseline=2.5,
         min_view_diversity=float(np.deg2rad(25.0)),
         min_new_area_ratio=0.15,
-        max_world_overlap=0.08,
+        max_world_overlap=0.20,
         max_overlap_rgb_error=0.25,
         max_overlap_depth_error=0.5,
         generated_confidence=0.25,

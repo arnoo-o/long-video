@@ -62,7 +62,7 @@ def main():
         min_translation_baseline=2.5,
         min_view_diversity=float(np.deg2rad(25.0)),
         min_new_area_ratio=0.15,
-        max_world_overlap=0.08,
+        max_world_overlap=0.20,
         keyframe_count=8,
         heldout_count=4,
     )

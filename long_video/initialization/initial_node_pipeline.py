@@ -35,7 +35,7 @@ def initialize_spatial_node(views: ViewSet, geometry_backend, config: dict):
         completed, node_id=str(config.get("node_id", "node_000")),
         center_c2w=np.asarray(config.get("center_c2w", completed.c2w[0]), np.float32),
         created_frame=int(config.get("created_frame", 0)),
-        voxel_size=float(config.get("voxel_size", 0.008)), status="active",
+        voxel_size=float(config.get("voxel_size", 0.02)), status="active",
     )
     node.quality_metrics.update(
         initialization_mode="causal_recal3r_views",

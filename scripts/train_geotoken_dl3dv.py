@@ -118,8 +118,8 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     if not metadata_path.is_file():
         raise FileNotFoundError(f"ReCal3R initial world cache is required: {metadata_path}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("geometry_backend") != "recal3r" or float(metadata.get("voxel_size", -1)) != 0.008:
-        raise RuntimeError(f"initial world must be a ReCal3R voxel-0.008 cache: {cache}")
+    if metadata.get("geometry_backend") != "recal3r" or float(metadata.get("voxel_size", -1)) != 0.02:
+        raise RuntimeError(f"initial world must be a ReCal3R voxel-0.02 cache: {cache}")
     node = NodeStore(cache).load("node_000")
     manager = None
     if geometry_backend is not None:
@@ -334,8 +334,6 @@ def main():
         metadata = json.loads((geometry_root / "metadata.json").read_text())
         if not metadata.get("valid", False):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
-        if float(metadata.get("voxel_size", -1)) != 0.008:
-            raise RuntimeError(f"full-scene geometry must be voxel-0.008: {geometry_root}")
         source = read_rgb(args.dataset_root / record["source"])
         data_load_seconds = time.time() - total_started
         if phase == "C" and geometry_backend is None:

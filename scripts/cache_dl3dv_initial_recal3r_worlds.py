@@ -15,7 +15,7 @@ def main():
     p.add_argument("--recal3r-checkpoint", type=Path, required=True)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--record-count", type=int, default=100)
-    p.add_argument("--voxel-size", type=float, default=0.008)
+    p.add_argument("--voxel-size", type=float, default=0.02)
     a = p.parse_args()
     from long_video.initialization.initial_node_pipeline import initialize_spatial_node
     from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend

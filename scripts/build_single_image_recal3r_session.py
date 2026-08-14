@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("--height", type=int, default=384)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--fov-degrees", type=float, default=90.0)
-    parser.add_argument("--voxel-size", type=float, default=0.008)
+    parser.add_argument("--voxel-size", type=float, default=0.02)
     return parser.parse_args()
 
 

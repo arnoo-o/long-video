@@ -17,6 +17,14 @@ PYRAMID_INFERENCE_STEPS = (2, 2, 2)
 WPF_LAMBDAS = ((0.00, 0.05), (0.15, 0.20), (0.25, 0.30))
 
 
+def build_world_state_at_sigma(
+    stage_start: torch.Tensor, endpoint: torch.Tensor, next_sigma: Any,
+) -> torch.Tensor:
+    """Interpolate from the real stage start toward its clean world endpoint."""
+    sigma = torch.as_tensor(next_sigma, device=stage_start.device, dtype=torch.float32)
+    return sigma * stage_start.float() + (1 - sigma) * endpoint.float()
+
+
 def posterior_mode_or_mean(posterior: Any) -> torch.Tensor:
     posterior = getattr(posterior, "latent_dist", posterior)
     mode = getattr(posterior, "mode", None)
@@ -209,8 +217,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             endpoint = context.endpoints[stage_id].to(device=z_raw.device, dtype=z_raw.dtype)
             if endpoint.shape != stage_start.shape:
                 raise RuntimeError(f"Stage{stage_id} endpoint/start shape mismatch")
-            # This follows the requested WPF trajectory coordinate exactly.
-            z_world = next_sigma * stage_start.float() - (1 - next_sigma) * endpoint.float()
+            z_world = build_world_state_at_sigma(stage_start, endpoint, next_sigma)
             visible = context.visibility[stage_id].to(z_raw.device)
             confidence = context.confidence[stage_id].to(z_raw.device)
             strength = float(WPF_LAMBDAS[stage_id][step_id]) * self._confidence_weight(visible, confidence)

@@ -39,17 +39,17 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
     assert report["world_overlap_below_max"] is True
 
 
-def test_world_overlap_must_be_strictly_below_two_percent():
+def test_world_overlap_must_be_strictly_below_eight_percent():
     manager = MemoryManager()
     manager.buffer = _ReadinessBuffer(
         12, translation=3.0, view_change=1.0, new_area=0.5, coverage=0.20,
     )
-    assert not manager._ready(0.021)
+    assert not manager._ready(0.081)
     manager.buffer = _ReadinessBuffer(
-        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.02,
+        12, translation=3.0, view_change=0.0, new_area=0.0, coverage=0.08,
     )
-    assert not manager._ready(0.02)
-    assert manager._ready(0.019)
+    assert not manager._ready(0.08)
+    assert manager._ready(0.079)
 
 
 def test_new_area_condition_requires_fifteen_percent():

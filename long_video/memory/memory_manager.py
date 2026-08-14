@@ -455,20 +455,76 @@ class MemoryManager:
                 overlaps_parent[indices] |= parent_exclusion[v[indices], u[indices]]
         return (np.asarray(candidate.points_source) == 2) & ~overlaps_parent
 
-    def validate_candidate(self, candidate, frames, heldout):
-        """Commit every finite, parent-nonoverlapping generated point.
+    def _depth_consistent_observation_mask(
+        self, candidate, frames, *, minimum_observations=3, minimum_frame_gap=5,
+    ):
+        """Require repeated, temporally separated depth agreement per point."""
+        points = np.asarray(candidate.points_xyz, np.float32)
+        generated = np.asarray(
+            getattr(candidate, "points_source", np.full(len(points), 2, np.int8))
+        ) == 2
+        view_depth = np.asarray(candidate.view_depth, np.float32)
+        if len(frames) != len(view_depth):
+            raise ValueError("candidate depth views must match mapping frames")
+        if candidate.depth_convention != Z_DEPTH:
+            raise ValueError("candidate depth consistency requires Z_DEPTH geometry")
 
-        Candidate admission already happened in ``readiness_report``.  No RGB,
-        depth, pose, confidence, support-view, occlusion, or camera-baseline
-        metric is allowed to veto either the node or its otherwise valid novel
-        points.
-        """
+        order = np.argsort([int(frame.global_frame_index) for frame in frames])
+        observation_count = np.zeros(len(points), np.int16)
+        last_observation_frame = np.full(len(points), np.iinfo(np.int64).min, np.int64)
+        for view_index in order:
+            frame = frames[int(view_index)]
+            frame_index = int(frame.global_frame_index)
+            c2w = np.asarray(frame.camera_c2w, np.float32)
+            camera = (points - c2w[:3, 3]) @ c2w[:3, :3]
+            z_proj = camera[:, 2]
+            projectable = generated & np.isfinite(camera).all(axis=1) & np.isfinite(z_proj) & (z_proj > 0)
+            point_indices = np.flatnonzero(projectable)
+            if not len(point_indices):
+                continue
+            projected = camera[point_indices] @ np.asarray(frame.intrinsics, np.float32).T
+            u = np.rint(projected[:, 0] / z_proj[point_indices]).astype(np.int64)
+            v = np.rint(projected[:, 1] / z_proj[point_indices]).astype(np.int64)
+            depth = view_depth[int(view_index)]
+            height, width = depth.shape
+            inside = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+            point_indices = point_indices[inside]
+            if not len(point_indices):
+                continue
+            u, v = u[inside], v[inside]
+            z_obs = depth[v, u]
+            z_value = z_proj[point_indices]
+            consistent = (
+                np.isfinite(z_obs) & (z_obs > 0)
+                & np.isfinite(z_value) & (z_value > 0)
+                & (np.abs(z_value - z_obs) <= self.max_overlap_depth_error)
+            )
+            point_indices = point_indices[consistent]
+            if not len(point_indices):
+                continue
+            separated = observation_count[point_indices] == 0
+            previously_observed = ~separated
+            separated[previously_observed] = (
+                frame_index - last_observation_frame[point_indices[previously_observed]]
+                >= int(minimum_frame_gap)
+            )
+            accepted_indices = point_indices[separated]
+            observation_count[accepted_indices] += 1
+            last_observation_frame[accepted_indices] = frame_index
+        return observation_count >= int(minimum_observations), observation_count
+
+    def validate_candidate(self, candidate, frames, heldout):
+        """Commit only novel points with three separated depth observations."""
         self.state = self.VALIDATING
         del heldout
         generated = np.asarray(candidate.points_source) == 2
         finite = np.isfinite(np.asarray(candidate.points_xyz)).all(axis=1)
         nonoverlap = self._outside_parent_projection_mask(candidate, frames)
-        eligible = generated & finite & nonoverlap
+        depth_consistent, depth_observation_count = self._depth_consistent_observation_mask(
+            candidate, frames, minimum_observations=3, minimum_frame_gap=5,
+        )
+        candidate.observation_count[generated] = depth_observation_count[generated]
+        eligible = generated & finite & nonoverlap & depth_consistent
         candidate.points_source[eligible] = 3
         candidate.points_confidence[eligible] = np.maximum(
             candidate.points_confidence[eligible], 0.9
@@ -480,9 +536,19 @@ class MemoryManager:
             "valid_depth_ratio": float(np.isfinite(candidate.view_depth).mean()),
             "new_point_ratio": float(candidate.quality_metrics.get("new_point_ratio",0.0)),
             "distinct_view_count": int(candidate.observation_count.max(initial=0)),
-            "mandatory_acceptance_by_readiness": True,
+            "mandatory_acceptance_by_readiness": False,
             "legacy_rgb_pose_depth_confidence_gates_used": False,
             "legacy_point_verification_gates_used": False,
+            "depth_consistency_required": True,
+            "depth_consistency_absolute_threshold": float(self.max_overlap_depth_error),
+            "depth_consistency_minimum_observations": 3,
+            "depth_consistency_minimum_frame_gap": 5,
+            "depth_consistent_generated_point_count": int(
+                (generated & depth_consistent).sum()
+            ),
+            "depth_inconsistent_generated_point_count": int(
+                (generated & ~depth_consistent).sum()
+            ),
             "eligible_nonoverlap_point_count": int(eligible.sum()),
             "parent_projection_overlap_rejected_point_count": int(
                 (generated & ~nonoverlap).sum()
@@ -499,7 +565,7 @@ class MemoryManager:
             "eligible_nonoverlap_point_count": int(eligible.sum()),
         })
         candidate.quality_metrics.update(metrics)
-        return True, metrics
+        return bool(eligible.any()), metrics
 
     @staticmethod
     def _point_field(node, name, count, *, dtype=None, fill=0):
@@ -774,10 +840,14 @@ class MemoryManager:
                 self.buffer.can_attempt(candidate_created_frame)):
             candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)
-            if not accepted:
-                raise RuntimeError("readiness-qualified candidate must be accepted")
             event.update(candidate_id=candidate.node_id, accepted=accepted, metrics=metrics)
-            if defer_candidate_promotion:
+            if not accepted:
+                self.buffer.reject(
+                    candidate_created_frame,
+                    "no generated point passed three-frame depth consistency",
+                )
+                self.state = self.TRANSITION
+            elif defer_candidate_promotion:
                 shadow = self.prepare_shadow(active_node, candidate)
                 event.update(
                     shadow_node=shadow,

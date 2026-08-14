@@ -20,6 +20,7 @@ from long_video.training.geotoken import (
     phase_for_step,
 )
 from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider
+from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
 
 
 def test_temporal_layout_and_invalid_geometry_are_exact_zero():
@@ -120,3 +121,15 @@ def test_phase_b_random_streams_are_independent():
     assert not np.array_equal(point_dropout, confidence_dropout)
     assert not np.array_equal(jitter_x, jitter_y)
     assert not np.array_equal(jitter_y, jitter_z)
+
+
+def test_recal3r_backend_reset_clears_trajectory_state_without_loading_model():
+    backend = ReCal3RGeometryBackend("unused", "unused", "cpu")
+    backend._frames = [object()]
+    backend._state_args = object()
+    backend._last_predictions = [object()]
+    backend._sequence_version = 3
+    backend.reset()
+    assert backend.get_state()["frame_count"] == 0
+    assert backend.get_state()["has_recurrent_state"] is False
+    assert backend.get_state()["sequence_version"] == 0

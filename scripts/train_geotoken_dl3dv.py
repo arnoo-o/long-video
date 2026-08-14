@@ -27,6 +27,8 @@ def parse_args():
     parser.add_argument("--initial-world-cache-root", type=Path, required=True)
     parser.add_argument("--pi3-repo", type=Path, required=True)
     parser.add_argument("--pi3-checkpoint", type=Path, required=True)
+    parser.add_argument("--recal3r-repo", type=Path, required=True)
+    parser.add_argument("--recal3r-checkpoint", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--total-steps", type=int, default=2000)
@@ -331,12 +333,10 @@ def main():
         source = read_rgb(args.dataset_root / record["source"])
         data_load_seconds = time.time() - total_started
         if phase == "C" and geometry_backend is None:
-            from long_video.initialization.geometry_backend import Pi3GeometryBackend
-            geometry_backend = Pi3GeometryBackend(args.pi3_checkpoint, args.pi3_repo, args.device)
-            pi3_model = getattr(geometry_backend, "model", None)
-            if pi3_model is not None and hasattr(pi3_model, "parameters"):
-                for parameter in pi3_model.parameters():
-                    parameter.requires_grad_(False)
+            from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
+            geometry_backend = ReCal3RGeometryBackend(
+                args.recal3r_checkpoint, args.recal3r_repo, args.device,
+            )
         source_center = arrays["c2w"][0, :3, 3]
         # ReCal3R normalization is confined to the offline A/B phases.
         bootstrap_online = None

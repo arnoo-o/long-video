@@ -15,6 +15,7 @@ def main():
     p=argparse.ArgumentParser(); p.add_argument('--wah-root',type=Path,required=True); p.add_argument('--model',type=Path,required=True)
     p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--pi3-repo',type=Path,required=True)
     p.add_argument('--pi3-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
+    p.add_argument('--wpf-adaptation-checkpoint',type=Path)
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
     from long_video.config import load_yaml
@@ -43,6 +44,24 @@ def main():
     pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
+    adaptation_step=None
+    if a.wpf_adaptation_checkpoint is not None:
+        from long_video.training.wpf_adaptation import (
+            adaptation_parameter_items, configure_trainable_wpf_adapter,
+        )
+        configure_trainable_wpf_adapter(pipe)
+        checkpoint=torch.load(a.wpf_adaptation_checkpoint,map_location='cpu',weights_only=False)
+        state=checkpoint.get('wpf_adaptation')
+        if not isinstance(state,dict):
+            raise RuntimeError('checkpoint does not contain wpf_adaptation state')
+        current=dict(pipe.transformer.named_parameters())
+        expected={name for name,_ in adaptation_parameter_items(pipe.transformer)}
+        if set(state)!=expected:
+            raise RuntimeError('checkpoint wpf_adaptation keys do not match the inference adapter')
+        with torch.no_grad():
+            for name,value in state.items():
+                current[name].copy_(value.to(device=current[name].device,dtype=current[name].dtype))
+        adaptation_step=int(checkpoint.get('global_step',-1))
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
     geo=Pi3GeometryBackend(a.pi3_checkpoint,a.pi3_repo,a.device); manager=MemoryManager.from_config(load_yaml('configs/online_memory.yaml'),geometry_backend=geo)
@@ -56,6 +75,6 @@ def main():
         video,_,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width); g=u8(video); w=u8(warp.rgb); v=np.asarray(warp.visibility)
         offset=0 if not generated else 1; generated.extend(g[offset:]); warps.extend(w[offset:])
         masked=w.copy(); masked[~v]=0; panel=np.concatenate([g,w,masked],axis=2); panels.extend(panel[offset:]); reports.append(report)
-    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':True,'chunks':reports},indent=2,default=str))
+    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':True,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'chunks':reports},indent=2,default=str))
 if __name__=='__main__': main()
 

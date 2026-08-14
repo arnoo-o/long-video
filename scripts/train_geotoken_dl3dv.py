@@ -247,6 +247,9 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         losses.append(loss)
         stage_stats[f"stage{stage_id}_flow_mse"] = float(loss.detach())
         (loss / len(targets)).backward()
+        # A later stage can share a token-grid resolution with an earlier
+        # history branch. Do not retain an already-backpropagated encoder graph.
+        provider._cache.clear()
         broken = [
             name for name, parameter in pipe.transformer.named_parameters()
             if "geotoken." in name and parameter.grad is not None

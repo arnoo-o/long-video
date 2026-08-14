@@ -254,12 +254,19 @@ def main():
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     manifest = json.loads((args.dataset_root / "dl3dv_24fps_manifest.json").read_text())
-    records = select_balanced_training_records(manifest["records"], args.record_count)
-    missing = [record["trajectory_id"] for record in records if not (
+    selected_records = select_balanced_training_records(manifest["records"], args.record_count)
+    missing = [record["trajectory_id"] for record in selected_records if not (
         args.recal3r_root / record["trajectory_id"] / "metadata.json"
     ).is_file()]
     if missing:
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
+    records = [record for record in selected_records if json.loads(
+        (args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text()
+    ).get("valid", False)]
+    if len(records) < 90:
+        raise RuntimeError(
+            f"only {len(records)}/{len(selected_records)} selected ReCal3R trajectories are valid"
+        )
 
     pipe = WarpAsHistoryPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(args.device)
     if not hasattr(pipe.transformer.config, "image_dim"):
@@ -368,6 +375,8 @@ def main():
             conditioner.clear_active()
         metrics = {
             "global_step": int(step), "total_steps": 2000, "phase": phase,
+            "selected_trajectory_count": len(selected_records),
+            "valid_geometry_trajectory_count": len(records),
             "trajectory_id": record["trajectory_id"], "rollout_length": rollout_length,
             "supervision_chunk": rollout_length - 1, "flow_loss": float(loss.detach()),
             "grad_norm": float(grad_norm), "learning_rate": optimizer.param_groups[0]["lr"],

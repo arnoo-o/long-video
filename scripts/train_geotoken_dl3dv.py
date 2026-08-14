@@ -168,51 +168,47 @@ def build_online(args, pipe, record, source, geometry_backend=None):
 
 
 class ForwardCapture:
-    def __init__(self):
+    def __init__(self, pipe):
+        self.pipe = pipe
         self.by_shape = {}
 
     def __call__(self, _module, args, kwargs):
         hidden = kwargs.get("hidden_states")
         if torch.is_tensor(hidden):
             key = tuple(hidden.shape[-3:])
-            self.by_shape.setdefault(key, {
+            if key in self.by_shape:
+                return args, kwargs
+            self.by_shape[key] = {
                 name: value for name, value in kwargs.items()
                 if name != "hidden_states"
-            })
+            }
+            self.by_shape[key]["sample"] = hidden.detach()
+            sigmas = getattr(self.pipe.scheduler, "sigmas", None)
+            if sigmas is None or not len(sigmas):
+                raise RuntimeError("formal Helios scheduler did not expose sigma")
+            self.by_shape[key]["sigma"] = torch.as_tensor(sigmas[0]).detach()
         return args, kwargs
 
 
-def training_exact_args():
-    return SimpleNamespace(
-        pyramid_num_inference_steps_list=[2, 2, 2],
-        flow_matching_stage_sampling="fixed",
-        flow_matching_stage_id=-1,
-        flow_matching_train_exact_timestep_sampling="training_density",
-        # The formal inference transformer consumes discrete scheduler
-        # timesteps. Keep train_exact on that same native scheduler domain.
-        flow_matching_use_dynamic_shifting="off",
-        weighting_scheme="none",
-        is_amplify_first_chunk=False,
-    )
-
-
 def native_flow_backward(pipe, z_gt, capture, provider):
-    from warp_as_history.training.core import (
-        compute_loss_weighting_for_sd3, flow_matching_train_exact_items,
-    )
-    items = flow_matching_train_exact_items(pipe, z_gt, training_exact_args(), z_gt.device)
+    from warp_as_history.training.core import training_exact_pyramid_latents
+    targets = training_exact_pyramid_latents(z_gt, 3)
     losses, stage_stats = [], {}
-    for item in items:
-        stage_id = int(item["stage_id"])
-        key = tuple(item["noisy_latents"].shape[-3:])
+    for stage_id, z_gt_stage in enumerate(targets):
+        key = tuple(z_gt_stage.shape[-3:])
         if key not in capture.by_shape:
             raise RuntimeError(f"formal inference did not capture Stage{stage_id} shape {key}")
         kwargs = dict(capture.by_shape[key])
-        kwargs["hidden_states"] = (
-            item["noisy_latents"].to(dtype=pipe.transformer.dtype).detach().requires_grad_(True)
-        )
-        kwargs["timestep"] = item["timesteps"]
+        x_t = kwargs.pop("sample").to(device=z_gt.device, dtype=pipe.transformer.dtype)
+        sigma = kwargs.pop("sigma").to(device=z_gt.device, dtype=torch.float32)
+        if not bool(torch.isfinite(sigma)) or float(sigma) <= 0:
+            raise RuntimeError(f"Stage{stage_id} formal scheduler sigma must be positive and finite")
+        kwargs["hidden_states"] = x_t.detach().requires_grad_(True)
+        kwargs["timestep"] = kwargs["timestep"].to(device=z_gt.device)
         kwargs["return_dict"] = False
+        target = (x_t.float() - z_gt_stage.to(device=z_gt.device).float()) / sigma
+        if target.shape != x_t.shape:
+            raise RuntimeError(f"Stage{stage_id} real state/GT pyramid mismatch")
         if stage_id == 0:
             pipe._set_wah_lora_enabled(True)
         else:
@@ -222,10 +218,10 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         for name, parameter in pipe.transformer.named_parameters():
             parameter.requires_grad_("geotoken." in name)
         finite_inputs = {
-            "noisy_latents": bool(torch.isfinite(kwargs["hidden_states"]).all()),
-            "target": bool(torch.isfinite(item["target"]).all()),
-            "timesteps": bool(torch.isfinite(item["timesteps"]).all()),
-            "sigmas": bool(torch.isfinite(item["sigmas"]).all()),
+            "x_t": bool(torch.isfinite(kwargs["hidden_states"]).all()),
+            "target": bool(torch.isfinite(target).all()),
+            "timesteps": bool(torch.isfinite(kwargs["timestep"]).all()),
+            "sigma": bool(torch.isfinite(sigma)),
             "prompt": bool(torch.isfinite(kwargs["encoder_hidden_states"]).all()),
         }
         for name in ("latents_history_short", "latents_history_mid", "latents_history_long"):
@@ -242,17 +238,15 @@ def native_flow_backward(pipe, z_gt, capture, provider):
                 f"Stage{stage_id} GeoToken prediction invalid: requires_grad={prediction.requires_grad}, "
                 f"finite={bool(torch.isfinite(prediction).all())}, inputs={finite_inputs}, geotoken={geo_state}"
             )
-        sigma = item["sigmas"]
-        weighting = compute_loss_weighting_for_sd3("none", sigma)
         loss = torch.mean(
-            (weighting.float() * (prediction.float() - item["target"].float()).square())
+            (prediction.float() - target.float()).square()
             .reshape(prediction.shape[0], -1), dim=1,
         ).mean()
         if not bool(torch.isfinite(loss)):
             raise RuntimeError(f"Stage{stage_id} native flow loss is non-finite")
         losses.append(loss)
         stage_stats[f"stage{stage_id}_flow_mse"] = float(loss.detach())
-        (loss / len(items)).backward()
+        (loss / len(targets)).backward()
         broken = [
             name for name, parameter in pipe.transformer.named_parameters()
             if "geotoken." in name and parameter.grad is not None
@@ -366,7 +360,7 @@ def main():
         )
         provider.attach(pipe.transformer)
         history_cameras = [(np.repeat(arrays["c2w"][:1], 33, 0), np.repeat(arrays["k"][:1], 33, 0))]
-        capture = ForwardCapture()
+        capture = ForwardCapture(pipe)
         capture_handle = pipe.transformer.register_forward_pre_hook(capture, with_kwargs=True)
         step_started = time.time()
         try:

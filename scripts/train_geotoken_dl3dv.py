@@ -194,7 +194,7 @@ def training_exact_args():
     )
 
 
-def native_flow_loss(pipe, z_gt, capture, provider):
+def native_flow_backward(pipe, z_gt, capture, provider):
     from warp_as_history.training.core import (
         compute_loss_weighting_for_sd3, flow_matching_train_exact_items,
     )
@@ -222,7 +222,8 @@ def native_flow_loss(pipe, z_gt, capture, provider):
         ).mean()
         losses.append(loss)
         stage_stats[f"stage{stage_id}_flow_mse"] = float(loss.detach())
-    return torch.stack(losses).mean(), stage_stats
+        (loss / len(items)).backward()
+    return torch.stack([loss.detach() for loss in losses]).mean(), stage_stats
 
 
 def lr_scale(step, total, warmup):
@@ -357,8 +358,7 @@ def main():
                 z_gt = deterministic_latent(pipe, gt, args.device)
             optimizer.zero_grad(set_to_none=True)
             with torch.enable_grad():
-                loss, stage_stats = native_flow_loss(pipe, z_gt, capture, provider)
-                loss.backward()
+                loss, stage_stats = native_flow_backward(pipe, z_gt, capture, provider)
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [parameter for _, parameter in trainable], args.max_grad_norm,
             )

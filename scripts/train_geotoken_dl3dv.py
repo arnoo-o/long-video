@@ -215,9 +215,26 @@ def native_flow_backward(pipe, z_gt, capture, provider):
             pipe._set_wah_lora_enabled(True)
         else:
             pipe._set_wah_lora_enabled(False)
+        finite_inputs = {
+            "noisy_latents": bool(torch.isfinite(kwargs["hidden_states"]).all()),
+            "target": bool(torch.isfinite(item["target"]).all()),
+            "timesteps": bool(torch.isfinite(item["timesteps"]).all()),
+            "prompt": bool(torch.isfinite(kwargs["encoder_hidden_states"]).all()),
+        }
+        for name in ("latents_history_short", "latents_history_mid", "latents_history_long"):
+            value = kwargs.get(name)
+            if value is not None:
+                finite_inputs[name] = bool(torch.isfinite(value).all())
         prediction = pipe.transformer(**kwargs)[0]
         if not prediction.requires_grad or not bool(torch.isfinite(prediction).all()):
-            raise RuntimeError(f"Stage{stage_id} GeoToken prediction is non-finite or detached")
+            geo_state = {
+                name: (parameter.requires_grad, bool(torch.isfinite(parameter).all()))
+                for name, parameter in pipe.transformer.named_parameters() if "geotoken." in name
+            }
+            raise RuntimeError(
+                f"Stage{stage_id} GeoToken prediction invalid: requires_grad={prediction.requires_grad}, "
+                f"finite={bool(torch.isfinite(prediction).all())}, inputs={finite_inputs}, geotoken={geo_state}"
+            )
         sigma = item["sigmas"]
         weighting = compute_loss_weighting_for_sd3("none", sigma)
         loss = torch.mean(

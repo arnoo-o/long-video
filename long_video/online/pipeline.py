@@ -171,7 +171,7 @@ class OnlineSpatialHistoryPipeline:
                 self.wah_pipeline.clear_world_projection_context()
         # Geometry history follows the same autoregressive-state ownership as
         # WAH latents.  The hook captures the pre-render active world and each
-        # snapshot is detached by the provider before any Pi3/world mutation.
+        # snapshot is detached by the provider before any ReCal3R/world mutation.
         if isinstance(pre_render_snapshot, dict):
             freeze = pre_render_snapshot.get("freeze_history")
             if freeze is not None:

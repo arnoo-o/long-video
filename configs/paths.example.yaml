@@ -2,8 +2,8 @@ project_root: null
 data_root: null
 wah_path: null
 helios_path: null
-pi3_repo_path: null
-pi3_checkpoint: null
+recal3r_repo_path: null
+recal3r_checkpoint: null
 habitat_environment: null
 replicacad_root: null
 outputs_root: null

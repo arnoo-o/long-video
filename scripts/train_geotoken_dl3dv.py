@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train geometry-only GeoTokens with clean, partial, and online Pi3 worlds."""
+"""Train geometry-only GeoTokens with clean, partial, and online ReCal3R worlds."""
 from __future__ import annotations
 
 import argparse
@@ -24,9 +24,7 @@ def parse_args():
     parser.add_argument("--recal3r-root", type=Path, required=True)
     parser.add_argument("--causal-world-cache-root", type=Path, required=True)
     parser.add_argument("--gt-latent-cache-root", type=Path, required=True)
-    parser.add_argument("--initial-world-cache-root", type=Path, required=True)
-    parser.add_argument("--pi3-repo", type=Path, required=True)
-    parser.add_argument("--pi3-checkpoint", type=Path, required=True)
+    parser.add_argument("--initial-recal3r-world-cache-root", type=Path, required=True)
     parser.add_argument("--recal3r-repo", type=Path, required=True)
     parser.add_argument("--recal3r-checkpoint", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -115,7 +113,7 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
 
-    cache = args.initial_world_cache_root / record["trajectory_id"]
+    cache = args.initial_recal3r_world_cache_root / record["trajectory_id"]
     node = NodeStore(cache).load("node_000")
     manager = None
     if geometry_backend is not None:

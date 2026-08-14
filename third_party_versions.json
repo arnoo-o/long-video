@@ -11,7 +11,7 @@
                    "path":  "/ephemeral/mdu/long-video-assets/helios-distilled",
                    "model":  "BestWishYsh/Helios-Distilled"
                },
-    "pi3":  {
+    "recal3r":  {
                 "repo_path": null,
                 "checkpoint": null,
                 "view_count": 8,
@@ -28,7 +28,7 @@
                                 "habitat_sim":  "0.3.3"
                             },
     "causal_world": {
-                         "geometry": "pi3_8view",
+                         "geometry": "recal3r",
                          "activation_delay_chunks": 2,
                          "parent_first_rendering": true,
                          "uses_future_gt": false

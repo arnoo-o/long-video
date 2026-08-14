@@ -243,7 +243,7 @@ class PointWorldGeoTokenProvider:
 
 
 def source_scene_scale_from_active_node(node, source_c2w, intrinsics, *, device, height=384, width=640):
-    """Median visible source-camera depth for causal Pi3/world normalization.
+    """Median visible source-camera depth for causal ReCal3R/world normalization.
 
     This is intentionally independent of ReCal3R and is shared by Phase C and
     formal GeoToken inference callers.
@@ -260,8 +260,8 @@ def source_scene_scale_from_active_node(node, source_c2w, intrinsics, *, device,
     )
     values = depth[visibility & torch.isfinite(depth) & (depth > 0)]
     if not len(values):
-        raise RuntimeError("initial Pi3 active node has no valid source-visible depth")
+        raise RuntimeError("initial ReCal3R active node has no valid source-visible depth")
     scale = float(values.median().item())
     if not np.isfinite(scale) or scale <= 0:
-        raise RuntimeError("initial Pi3 source scene scale is invalid")
+        raise RuntimeError("initial ReCal3R source scene scale is invalid")
     return scale

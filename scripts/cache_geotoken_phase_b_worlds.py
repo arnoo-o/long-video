@@ -39,7 +39,7 @@ def main():
     parser.add_argument("--recal3r-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--trajectory-ids-json", type=Path, required=True)
-    parser.add_argument("--voxel-size", type=float, default=0.02)
+    parser.add_argument("--voxel-size", type=float, default=0.008)
     args = parser.parse_args()
     trajectory_ids = json.loads(args.trajectory_ids_json.read_text())
     for trajectory_id in trajectory_ids:

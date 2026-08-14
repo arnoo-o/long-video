@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--recal3r-reset-interval", type=int, default=64)
     parser.add_argument("--confidence-threshold", type=float, default=1.5)
-    parser.add_argument("--voxel-size", type=float, default=0.02)
+    parser.add_argument("--voxel-size", type=float, default=0.008)
     parser.add_argument("--max-camera-alignment-error-ratio", type=float, default=0.15)
     parser.add_argument("--max-median-rotation-error-degrees", type=float, default=45.0)
     parser.add_argument("--limit", type=int)

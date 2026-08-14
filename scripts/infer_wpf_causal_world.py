@@ -13,34 +13,21 @@ def u8(value):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--wah-root',type=Path,required=True); p.add_argument('--model',type=Path,required=True)
-    p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--pi3-repo',type=Path,required=True)
-    p.add_argument('--pi3-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
+    p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--recal3r-repo',type=Path,required=True)
+    p.add_argument('--recal3r-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
     p.add_argument('--wpf-adaptation-checkpoint',type=Path)
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
     from long_video.config import load_yaml
     from long_video.data.camera import resize_intrinsics
-    from long_video.initialization.geometry_backend import Pi3GeometryBackend
+    from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
     from long_video.memory.memory_manager import MemoryManager
     from long_video.memory.node_store import NodeStore
-    from long_video.memory.node_builder import build_from_views
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.wah.world_projected_pipeline import PYRAMID_INFERENCE_STEPS, WorldProjectedWarpAsHistoryPipeline
     from long_video.types import ViewSet
     stored_node=NodeStore(a.session).load('node_000')
-    source_views=ViewSet(
-        rgb=stored_node.view_rgb,depth=stored_node.view_depth,
-        depth_confidence=stored_node.view_depth_confidence,
-        c2w=stored_node.view_c2w,intrinsics=stored_node.view_intrinsics,
-        source=stored_node.view_source,image_confidence=stored_node.view_image_confidence,
-        depth_convention=stored_node.depth_convention,
-    )
-    node=build_from_views(
-        source_views,node_id='node_000',center_c2w=stored_node.center_c2w,
-        created_frame=stored_node.created_frame,voxel_size=0.02,status='active',
-    )
-    node.scale=stored_node.scale; node.model_versions=stored_node.model_versions
-    node.quality_metrics.update(stored_node.quality_metrics,source_voxel_size=0.02)
+    node=stored_node
     pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
@@ -64,7 +51,7 @@ def main():
         adaptation_step=int(checkpoint.get('global_step',-1))
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
-    geo=Pi3GeometryBackend(a.pi3_checkpoint,a.pi3_repo,a.device); manager=MemoryManager.from_config(load_yaml('configs/online_memory.yaml'),geometry_backend=geo)
+    geo=ReCal3RGeometryBackend(a.recal3r_checkpoint,a.recal3r_repo,a.device); manager=MemoryManager.from_config(load_yaml('configs/online_memory.yaml'),geometry_backend=geo)
     online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=manager,prompt=a.prompt,renderer_kwargs={'device':a.device},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
     online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(PYRAMID_INFERENCE_STEPS))
     online.autoregressive_state['is_amplify_first_chunk']=False

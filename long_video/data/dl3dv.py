@@ -2,7 +2,7 @@
 
 This module never consumes COLMAP point clouds.  Camera poses are read only to
 select trajectories and to condition the model; persistent geometry is built
-at runtime from the source image and causally generated history through Pi3.
+at runtime from the source image and causally generated history through ReCal3R.
 """
 from __future__ import annotations
 

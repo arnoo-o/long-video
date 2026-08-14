@@ -13,7 +13,7 @@ def attach_warp_provenance(warp, node):
     depth_origin = np.full(source.shape, "", dtype="U24")
     role = np.full(source.shape, "", dtype="U24")
     rgb_origin[parent] = depth_origin[parent] = "oracle_source"
-    rgb_origin[generated], depth_origin[generated] = "model_generated", "pi3_prediction"
+    rgb_origin[generated], depth_origin[generated] = "model_generated", "recal3r_prediction"
     role[visible] = "direct_source" if node.parent_id is None else "parent_warp"
     role[generated] = "current_generation"
     warp.rgb_content_origin, warp.depth_content_origin = rgb_origin, depth_origin

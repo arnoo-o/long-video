@@ -29,5 +29,5 @@ def validate_content_labels(rgb_origin, depth_origin, rgb_evidence_role, depth_e
         raise ValueError("ground-truth supervision cannot enter a SpatialNode")
     if np.any((rgb_role == "current_generation") & (rgb != "model_generated")):
         raise ValueError("current_generation RGB must be model-generated")
-    if np.any((depth_role == "geometry_prediction") & (depth != "pi3_prediction")):
-        raise ValueError("geometry_prediction depth must come from Pi3")
+    if np.any((depth_role == "geometry_prediction") & (depth != "recal3r_prediction")):
+        raise ValueError("geometry_prediction depth must come from ReCal3R")

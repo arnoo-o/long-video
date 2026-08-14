@@ -8,7 +8,7 @@ import yaml
 REQUIRED={
     "confidence":("source_prior","token_visible_threshold","token_confidence_threshold","lambda_confidence"),
     "wah":("conditioning_type","warp_history_downsample_mode","rope_alignment"),
-    "pi3":("checkpoint","repo_path","device","input_size"),
+    "recal3r":("checkpoint","repo_path","device"),
     "online_memory":("min_transition_frames","keyframe_count","heldout_count",
                      "coverage_threshold","voxel_size"),
 }

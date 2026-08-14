@@ -94,7 +94,7 @@ def test_depth_anchor_failure_retries_unanchored_only_when_depth_rejection_is_ig
     assert len(backend.calls) == 2
     assert backend.calls[1]["known_depth"] is None
     assert prediction.diagnostics["depth_anchor_fallback"] is True
-    assert prediction.scale_info["anchor_source"] == "unanchored_pi3_mandatory_promotion"
+    assert prediction.scale_info["anchor_source"] == "unanchored_recal3r_mandatory_promotion"
 
 
 def test_generated_points_keep_nine_pixels_from_parent_interior_except_boundary():

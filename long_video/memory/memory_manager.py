@@ -41,7 +41,7 @@ class MemoryManager:
         max_overlap_depth_error=0.5,
         generated_confidence=0.25,
         keyframe_count=8,
-        voxel_size=0.02,
+        voxel_size=0.008,
         heldout_count=4,
         max_buffer_length=96,
         max_age_frames=240,
@@ -179,7 +179,7 @@ class MemoryManager:
                 ),
                 old_node_warp_depth_content_origin=np.asarray(
                     warp.depth_content_origin[index] if warp.depth_content_origin is not None
-                    else np.where(warp.source[index] == 0, "oracle_source", "pi3_prediction")
+                    else np.where(warp.source[index] == 0, "oracle_source", "recal3r_prediction")
                 ),
                 old_node_warp_evidence_role=np.asarray(
                     warp.evidence_role[index] if warp.evidence_role is not None
@@ -239,7 +239,7 @@ class MemoryManager:
             )
             prediction.diagnostics["depth_anchor_fallback"] = True
             prediction.diagnostics["depth_anchor_failure"] = str(error)
-            prediction.scale_info["anchor_source"] = "unanchored_pi3_mandatory_promotion"
+            prediction.scale_info["anchor_source"] = "unanchored_recal3r_mandatory_promotion"
             return prediction
 
     def build_candidate(self, active_node, created_frame):
@@ -358,7 +358,7 @@ class MemoryManager:
                      "model_generated") for frame in frames])
         view_depth_origin=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_depth_content_origin,
-                     "pi3_prediction") for frame in frames])
+                     "recal3r_prediction") for frame in frames])
         view_rgb_evidence=np.stack([
             np.where(frame.warp_visibility,"parent_warp","current_generation")
             for frame in frames])
@@ -374,7 +374,7 @@ class MemoryManager:
         candidate.points_rgb_content_origin=np.where(
             generated_points,"model_generated","oracle_source").astype("U24")
         candidate.points_depth_content_origin=np.where(
-            generated_points,"pi3_prediction","oracle_source").astype("U24")
+            generated_points,"recal3r_prediction","oracle_source").astype("U24")
         candidate.points_rgb_evidence_role=np.where(
             generated_points,"current_generation","parent_warp").astype("U24")
         candidate.points_depth_evidence_role=np.where(
@@ -412,10 +412,10 @@ class MemoryManager:
 
     @staticmethod
     def _canonical_surface_views(views, boundary_mapping_position):
-        """Keep all views for Pi3 evidence but emit points only at the boundary."""
+        """Keep all views for ReCal3R evidence but emit points only at the boundary."""
         index = int(boundary_mapping_position)
         if not 0 <= index < len(views.rgb):
-            raise IndexError("boundary mapping position is outside the Pi3 view set")
+            raise IndexError("boundary mapping position is outside the ReCal3R view set")
         selection = slice(index, index + 1)
         return ViewSet(
             rgb=np.asarray(views.rgb)[selection],

@@ -2,7 +2,7 @@
 
 Causal long-video inference uses one compact path:
 
-1. Pi3 builds and grows the causal point-cloud world from the source and prior generated chunks.
+1. ReCal3R builds and grows the causal point-cloud world from the source and prior generated chunks.
 2. Parent-First renderer produces aligned warp RGB, binary visibility, and confidence.
 3. Pinned original Warp-as-History consumes the rendered warp as history conditioning.
 4. Helios samples three pyramid stages with `[2, 2, 4]` scheduler updates.

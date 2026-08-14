@@ -53,9 +53,9 @@ def main():
         alpha = np.array([x["alpha"] for x in sources], np.float64)
         dense_k = np.stack([(1-a)*resized_k[l] + a*resized_k[r]
                             for l, r, a in zip(left, right, alpha)]).astype(np.float32)
-        pi3_indices = np.load(base / "pi3_initial_real_frame_indices.npy")
-        pi3_k = resized_k[pi3_indices].astype(np.float32)
-        if not valid_k(dense_k) or not valid_k(pi3_k):
+        initial_indices = np.load(base / "initial_causal_real_frame_indices.npy")
+        initial_k = resized_k[initial_indices].astype(np.float32)
+        if not valid_k(dense_k) or not valid_k(initial_k):
             totals["invalid"] += 1
             raise ValueError(f"invalid 384x640 intrinsics: {record['trajectory_id']}")
 
@@ -86,7 +86,7 @@ def main():
                 totals["rife"] += 1
 
         atomic_npy(base / "intrinsics.npy", dense_k)
-        atomic_npy(base / "pi3_initial_intrinsics.npy", pi3_k)
+        atomic_npy(base / "initial_causal_intrinsics.npy", initial_k)
         frame_temp = base / "frame_sources.json.tmp"
         frame_temp.write_text(json.dumps(sources, indent=2)); frame_temp.replace(base / "frame_sources.json")
         validation_path = base / "validation.json"

@@ -70,7 +70,7 @@ def build_boundary_states_once(record, source_state, rollout_no_grad, *, model_f
     """One no-grad AR pass, caching the state before every trainable chunk.
 
     ``rollout_no_grad(chunk_index, state)`` receives no target GT.  It must use
-    normal inference generation and causal Pi3 world updates, then return the
+    normal inference generation and causal ReCal3R world updates, then return the
     next boundary state.  The current/future RGB arrays are intentionally not
     arguments to this API.
     """

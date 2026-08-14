@@ -78,8 +78,8 @@ def main():
    'target_c2w_local':rel(final/'target_c2w_local.npy'),'intrinsics':rel(final/'intrinsics.npy'),
    'timestamps':rel(final/'timestamps.npy'),'frame_sources':rel(final/'frame_sources.json'),
    'source_frame_indices':rel(final/'source_frame_indices.npy'),'real_keyframe_indices':rel(final/'real_keyframe_indices.npy'),
-   'pi3_initial_rgb_dir':rel(final/'pi3_initial_real'),'pi3_initial_c2w_local':rel(final/'pi3_initial_c2w_local.npy'),
-   'pi3_initial_intrinsics':rel(final/'pi3_initial_intrinsics.npy'),'pi3_initial_real_frame_indices':rel(final/'pi3_initial_real_frame_indices.npy'),
+   'initial_causal_rgb_dir':rel(final/'initial_causal_real'),'initial_causal_c2w_local':rel(final/'initial_causal_c2w_local.npy'),
+   'initial_causal_intrinsics':rel(final/'initial_causal_intrinsics.npy'),'initial_causal_real_frame_indices':rel(final/'initial_causal_real_frame_indices.npy'),
    'chunk_frame_indices':[list(range(k*32,k*32+33)) for k in range(CHUNKS)],'trainable_chunk_indices':list(range(CHUNKS)),'uses_future_gt':False,'old_trajectory_id':item['old_trajectory_id']}
   records.append(record); write_manifest(a.output_root,records,failures)
   print(json.dumps({'index':ordinal+1,'total':len(selected),'status':status,'trajectory_id':tid,'elapsed_sec':round(time.time()-started,1)}),flush=True)

@@ -9,7 +9,7 @@ RGB_CONTENT_ORIGINS = {
     "oracle_source", "model_generated", "ground_truth_supervision_only"
 }
 DEPTH_CONTENT_ORIGINS = {
-    "oracle_source", "pi3_prediction", "model_generated_geometry",
+    "oracle_source", "recal3r_prediction", "model_generated_geometry",
     "ground_truth_supervision_only",
 }
 EVIDENCE_ROLES = {

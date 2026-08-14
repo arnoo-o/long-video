@@ -34,7 +34,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     rgb_dir = args.output / "rgb_24fps"; rgb_dir.mkdir(exist_ok=True)
     source_dir = args.output / "source"; source_dir.mkdir(exist_ok=True)
-    pi3_dir = args.output / "pi3_initial_real"; pi3_dir.mkdir(exist_ok=True)
+    initial_dir = args.output / "initial_causal_real"; initial_dir.mkdir(exist_ok=True)
     sys.path.insert(0, str(args.rife_root.resolve()))
     sys.path.insert(0, str(args.rife_checkpoint.resolve()))
     from train_log.RIFE_HDv3 import Model
@@ -72,16 +72,16 @@ def main():
                 "rgb_real_index": int(real_index) if real else None})
     Image.fromarray(image(timeline["left_real_indices"][0])).save(source_dir / "source.png")
     source_real = int(timeline["left_real_indices"][0])
-    pi3_indices = np.arange(max(0, source_real - 7), source_real + 1, dtype=np.int64)
-    for slot, real_index in enumerate(pi3_indices):
-        Image.fromarray(image(real_index)).save(pi3_dir / f"{slot:02d}.jpg",
+    initial_indices = np.arange(max(0, source_real - 7), source_real + 1, dtype=np.int64)
+    for slot, real_index in enumerate(initial_indices):
+        Image.fromarray(image(real_index)).save(initial_dir / f"{slot:02d}.jpg",
                                                 quality=args.jpeg_quality, subsampling=0)
-    np.save(args.output / "pi3_initial_real_frame_indices.npy", pi3_indices)
+    np.save(args.output / "initial_causal_real_frame_indices.npy", initial_indices)
     source_world = scene.c2w_opencv[source_real]
-    pi3_local = np.linalg.inv(source_world) @ scene.c2w_opencv[pi3_indices]
-    pi3_local[:, 3] = np.array([0, 0, 0, 1], np.float32)
-    np.save(args.output / "pi3_initial_c2w_local.npy", pi3_local.astype(np.float32))
-    np.save(args.output / "pi3_initial_intrinsics.npy", resized_k[pi3_indices].astype(np.float32))
+    initial_local = np.linalg.inv(source_world) @ scene.c2w_opencv[initial_indices]
+    initial_local[:, 3] = np.array([0, 0, 0, 1], np.float32)
+    np.save(args.output / "initial_causal_c2w_local.npy", initial_local.astype(np.float32))
+    np.save(args.output / "initial_causal_intrinsics.npy", resized_k[initial_indices].astype(np.float32))
     intrinsics = np.stack([(1-a)*resized_k[l] + a*resized_k[r] for l,r,a in zip(
         timeline["left_real_indices"], timeline["right_real_indices"], timeline["alpha"])]).astype(np.float32)
     fx, fy, cx, cy = (intrinsics[:, 0, 0], intrinsics[:, 1, 1],
@@ -113,7 +113,7 @@ def main():
             "fy": [float(fy.min()), float(fy.max())],
             "cx": [float(cx.min()), float(cx.max())],
             "cy": [float(cy.min()), float(cy.max())]},
-        "pi3_initial_views_are_real": True, "pi3_initial_uses_future_gt": False}
+        "initial_causal_views_are_real": True, "initial_causal_uses_future_gt": False}
     (args.output / "validation.json").write_text(json.dumps(validation, indent=2))
     print(json.dumps(validation, indent=2))
 if __name__ == "__main__": main()

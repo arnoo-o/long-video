@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda:1")
     parser.add_argument("--record-count", type=int, default=100)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--recal3r-reset-interval", type=int, default=64)
     parser.add_argument("--confidence-threshold", type=float, default=1.5)
     parser.add_argument("--voxel-size", type=float, default=0.02)
@@ -53,7 +55,10 @@ def parse_args():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--min-free-gb", type=float, default=8.0)
     parser.add_argument("--fail-fast", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
+        parser.error("--shard-index must satisfy 0 <= index < --shard-count")
+    return args
 
 
 def prepare_views(frame_paths, load_images, reset_interval):
@@ -292,7 +297,14 @@ def main():
         },
     }
     write_json(args.output_root / "selection_manifest.json", selection)
-    records = selected[:args.limit] if args.limit else selected
+    records = selected[args.shard_index::args.shard_count]
+    if args.limit:
+        records = records[:args.limit]
+    summary_name = (
+        "build_summary.json"
+        if args.shard_count == 1
+        else f"build_summary_shard_{args.shard_index:02d}.json"
+    )
 
     random.seed(0); np.random.seed(0); torch.manual_seed(0)
     if torch.cuda.is_available():
@@ -304,7 +316,7 @@ def main():
             raise RuntimeError(f"free disk below {args.min_free_gb} GiB; refusing to start another trajectory")
         print(f"[{index + 1}/{len(records)}] {record['trajectory_id']} free={free_gb(args.output_root):.1f} GiB")
         results.append(process_record(record, args, model_bundle))
-        write_json(args.output_root / "build_summary.json", {
+        write_json(args.output_root / summary_name, {
             "requested": len(records), "completed": len(results),
             "valid": sum(bool(item.get("valid")) for item in results),
             "invalid": sum(not bool(item.get("valid")) for item in results),

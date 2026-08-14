@@ -13,6 +13,8 @@ from long_video.geometry.geotoken import (
 from long_video.training.geotoken import (
     BalancedRolloutSampler,
     augment_partial_voxels,
+    stable_voxel_hash,
+    voxel_uniform_stream,
     checkpoint_names,
     max_chunks_for_step,
     phase_for_step,
@@ -105,3 +107,16 @@ def test_phase_b_voxel_corruption_is_rollout_consistent():
     first = augment_partial_voxels(points, confidence, keys, source_center=np.zeros(3), scene_scale=2, args=Args(), seed=9)
     second = augment_partial_voxels(points, confidence, keys, source_center=np.zeros(3), scene_scale=2, args=Args(), seed=9)
     assert all(np.array_equal(a, b) for a, b in zip(first, second))
+
+
+def test_phase_b_random_streams_are_independent():
+    keys = np.arange(24, dtype=np.int64).reshape(8, 3)
+    base = stable_voxel_hash(17, keys)
+    point_dropout = voxel_uniform_stream(base, 1)
+    confidence_dropout = voxel_uniform_stream(base, 2)
+    jitter_x = voxel_uniform_stream(base, 3)
+    jitter_y = voxel_uniform_stream(base, 5)
+    jitter_z = voxel_uniform_stream(base, 7)
+    assert not np.array_equal(point_dropout, confidence_dropout)
+    assert not np.array_equal(jitter_x, jitter_y)
+    assert not np.array_equal(jitter_y, jitter_z)

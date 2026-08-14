@@ -64,14 +64,27 @@ def load_arrays(root, record):
     }
 
 
-def cached_gt_latent(root, trajectory_id, chunk_index, device):
+def latent_cache_identities(pipe, model):
+    import hashlib
+    vae_identity = hashlib.sha256(
+        json.dumps(dict(pipe.vae.config), sort_keys=True, default=str).encode()
+    ).hexdigest()
+    model_identity = hashlib.sha256((str(Path(model).resolve()) + ":" + vae_identity).encode()).hexdigest()
+    return vae_identity, model_identity
+
+
+def cached_gt_latent(root, trajectory_id, chunk_index, device, *, expected_shape, vae_identity, model_identity):
     path = Path(root) / trajectory_id / f"chunk_{int(chunk_index):02d}.pt"
     if not path.is_file():
         raise FileNotFoundError(f"frozen GT latent cache is required: {path}")
     payload = torch.load(path, map_location=device, weights_only=False)
     latent = payload.get("latent")
-    if not torch.is_tensor(latent) or latent.ndim != 5:
+    if not torch.is_tensor(latent) or tuple(latent.shape) != tuple(expected_shape):
         raise RuntimeError(f"invalid GT latent cache: {path}")
+    if tuple(payload.get("shape", ())) != tuple(expected_shape):
+        raise RuntimeError(f"GT latent shape metadata mismatch: {path}")
+    if payload.get("vae_identity") != vae_identity or payload.get("model_identity") != model_identity:
+        raise RuntimeError(f"GT latent model identity mismatch: {path}")
     return latent.to(device=device, dtype=torch.bfloat16).detach()
 
 
@@ -277,6 +290,7 @@ def main():
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     conditioner = install_geotoken(pipe.transformer).to(device=args.device)
+    vae_identity, model_identity = latent_cache_identities(pipe, args.model)
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
     trainable = assert_geotoken_only_trainable(pipe.transformer)
@@ -335,27 +349,30 @@ def main():
             conditioner, device=args.device, source_center=source_center, scene_scale=scale,
         )
         provider.attach(pipe.transformer)
-        history_cameras = [(np.repeat(arrays["c2w"][:1], 33, 0), np.repeat(arrays["k"][:1], 33, 0))]
-        if phase == "C":
-            def pre_render_world_hook(active_node, cameras):
+        online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source)
+
+        def pre_render_world_hook(active_node, cameras):
+            if phase == "C":
                 provider.configure_active_node(active_node)
-                provider.configure_chunk(cameras.c2w, cameras.intrinsics, history_cameras)
-                return {"world_version": provider.world_version}
-            bootstrap_online.pre_render_world_hook = pre_render_world_hook
-            online = bootstrap_online
-        else:
-            online = build_online(args, pipe, record, source)
+            provider.configure_chunk(
+                cameras.c2w, cameras.intrinsics,
+                online.autoregressive_state.get("_geotoken_history_snapshots", ()),
+            )
+            return {"world_version": provider.world_version, "freeze_history": provider.freeze_current_snapshot}
+
+        online.pre_render_world_hook = pre_render_world_hook
         capture = ForwardCapture(pipe)
         capture_handle = pipe.transformer.register_forward_pre_hook(capture, with_kwargs=True)
         prefix_rollout_seconds = 0.0
         gt_latent_seconds = 0.0
         try:
             corruption_seed = (int(args.seed) << 32) ^ int(step)
+            phase_a_world = full_scene_points(geometry_root) if phase == "A" else None
             for chunk_index in range(rollout_length):
                 frame_slice = slice(chunk_index * 32, chunk_index * 32 + 33)
                 poses, intrinsics = arrays["c2w"][frame_slice], arrays["k"][frame_slice]
                 if phase == "A":
-                    points, confidence = full_scene_points(geometry_root)
+                    points, confidence = phase_a_world
                 elif phase == "B":
                     points, confidence, voxel_keys = load_causal_world_cache(
                         args.causal_world_cache_root / record["trajectory_id"], chunk_index * 32,
@@ -370,16 +387,15 @@ def main():
                         if phase == "A" else ("B", record["trajectory_id"], chunk_index)
                     )
                     provider.configure_world(points, confidence, world_version=world_version)
-                    provider.configure_chunk(poses, intrinsics, history_cameras)
                 capture.by_shape.clear()
                 rollout_started = time.time()
                 with torch.no_grad():
                     online.generate_chunk_at_cameras(poses, intrinsics, 384, 640)
                 prefix_rollout_seconds += time.time() - rollout_started
-                history_cameras.append((poses, intrinsics))
             gt_started = time.time()
             z_gt = cached_gt_latent(
                 args.gt_latent_cache_root, record["trajectory_id"], rollout_length - 1, args.device,
+                expected_shape=(1, 16, 9, 48, 80), vae_identity=vae_identity, model_identity=model_identity,
             )
             gt_latent_seconds = time.time() - gt_started
             optimizer.zero_grad(set_to_none=True)
@@ -418,7 +434,7 @@ def main():
                 key: float(value.detach()) for key, value in conditioner.injection_gates.items()
             },
             "data_load_seconds": data_load_seconds,
-            "point_render_seconds": provider.render_seconds,
+            "point_render_seconds": provider.point_render_seconds(),
             "prefix_rollout_seconds": prefix_rollout_seconds,
             "gt_latent_seconds": gt_latent_seconds,
             "training_forward_backward_seconds": training_forward_backward_seconds,

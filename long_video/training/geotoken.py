@@ -113,40 +113,52 @@ def apply_partial_geometry_augmentation(
     return result * valid
 
 
+def splitmix64(value: np.ndarray) -> np.ndarray:
+    """Full uint64 avalanche used for every deterministic random stream."""
+    value = np.asarray(value, np.uint64) + np.uint64(0x9E3779B97F4A7C15)
+    value = (value ^ (value >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return value ^ (value >> np.uint64(31))
+
+
 def stable_voxel_hash(seed: int, voxel_keys: np.ndarray) -> np.ndarray:
-    """Stable uint64 hashes, one per fused voxel, independent of chunk index."""
+    """Base identity = hash(step_seed, voxel_key), independent of chunk index."""
     keys = np.asarray(voxel_keys, np.int64)
     if keys.ndim != 2 or keys.shape[1] != 3:
         raise ValueError("voxel_keys must be [N,3]")
     value = np.full(len(keys), np.uint64(int(seed) & ((1 << 64) - 1)), dtype=np.uint64)
     for column, multiplier in enumerate((0x9E3779B185EBCA87, 0xC2B2AE3D27D4EB4F, 0x165667B19E3779F9)):
         value ^= np.asarray(keys[:, column], np.uint64) * np.uint64(multiplier)
-        value ^= value >> np.uint64(30)
-        value *= np.uint64(0xBF58476D1CE4E5B9)
-        value ^= value >> np.uint64(27)
-    return value ^ (value >> np.uint64(31))
+        value = splitmix64(value)
+    return splitmix64(value)
+
+
+def voxel_uniform_stream(base_hash: np.ndarray, stream_id: int) -> np.ndarray:
+    """Independent [0,1) stream after a fresh full avalanche."""
+    value = splitmix64(np.asarray(base_hash, np.uint64) ^ np.uint64(stream_id))
+    return (value >> np.uint64(11)).astype(np.float64) / float(1 << 53)
 
 
 def augment_partial_voxels(points, confidence, voxel_keys, *, source_center, scene_scale, args, seed):
     """Apply Phase-B corruption deterministically per physical fused voxel."""
     points = np.asarray(points, np.float32).copy()
     confidence = np.asarray(confidence, np.float32).copy()
-    hashes = stable_voxel_hash(seed, voxel_keys)
-    uniform = lambda salt: ((hashes ^ np.uint64(salt)) >> np.uint64(11)).astype(np.float64) / float(1 << 53)
-    keep = uniform(0xA4) >= float(args.point_dropout)
-    confidence[uniform(0xB7) < float(args.confidence_dropout)] = 0
+    base_hash = stable_voxel_hash(seed, voxel_keys)
+    uniform = lambda stream: voxel_uniform_stream(base_hash, stream)
+    keep = uniform(1) >= float(args.point_dropout)
+    confidence[uniform(2) < float(args.confidence_dropout)] = 0
     # Deterministic Box-Muller pairs seeded entirely by voxel identity.
     def normal(salt_a, salt_b):
         u1 = np.maximum(uniform(salt_a), 1e-8)
         u2 = uniform(salt_b)
         return (np.sqrt(-2.0 * np.log(u1)) * np.cos(2.0 * np.pi * u2)).astype(np.float32)
     if float(args.xyz_jitter) > 0:
-        jitter = np.stack([normal(0x11, 0x21), normal(0x12, 0x22), normal(0x13, 0x23)], 1)
+        jitter = np.stack([normal(3, 4), normal(5, 6), normal(7, 8)], 1)
         points += jitter * float(args.xyz_jitter) * float(scene_scale)
     if float(args.depth_noise) > 0:
         ray = points - np.asarray(source_center, np.float32)
         ray /= np.linalg.norm(ray, axis=1, keepdims=True).clip(1e-8)
-        points += ray * normal(0x31, 0x41)[:, None] * float(args.depth_noise) * float(scene_scale)
+        points += ray * normal(9, 10)[:, None] * float(args.depth_noise) * float(scene_scale)
     valid = keep & np.isfinite(points).all(1) & np.isfinite(confidence) & (confidence > 0)
     return points[valid], confidence[valid]
 

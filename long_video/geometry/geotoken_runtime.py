@@ -1,7 +1,7 @@
 """Runtime alignment of point-world geometry with Helios current/history tokens."""
 from __future__ import annotations
 
-import time
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -20,6 +20,19 @@ def _pad_pool(value: torch.Tensor, kernel: tuple[int, int, int]) -> torch.Tensor
     return F.avg_pool3d(value, kernel, kernel)
 
 
+@dataclass(frozen=True)
+class FrozenGeometrySnapshot:
+    """Detached geometry rendered by the active world for one generated chunk."""
+
+    chunk_index: int
+    frame_start: int
+    world_version: object
+    c2w: np.ndarray
+    source_center: np.ndarray
+    scene_scale: float
+    grids: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
 class PointWorldGeoTokenProvider:
     """Render one causal point source directly at every requested token grid."""
 
@@ -34,11 +47,11 @@ class PointWorldGeoTokenProvider:
         self.world_version = None
         self.current_c2w = None
         self.current_k = None
-        self.history_camera_chunks: list[tuple[np.ndarray, np.ndarray]] = []
+        self.history_snapshots: list[FrozenGeometrySnapshot] = []
         self._handle = None
         self._render_cache = {}
         self._feature_cache = {}
-        self.render_seconds = 0.0
+        self._render_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 
     def attach(self, transformer):
         if self._handle is None:
@@ -71,13 +84,10 @@ class PointWorldGeoTokenProvider:
         """Release autograd graphs after one stage backward, not raw z-buffers."""
         self._feature_cache.clear()
 
-    def configure_chunk(self, c2w, intrinsics, history_camera_chunks):
+    def configure_chunk(self, c2w, intrinsics, history_snapshots=()):
         self.current_c2w = np.asarray(c2w, np.float32)
         self.current_k = np.asarray(intrinsics, np.float32)
-        self.history_camera_chunks = [
-            (np.asarray(poses, np.float32), np.asarray(k, np.float32))
-            for poses, k in history_camera_chunks
-        ]
+        self.history_snapshots = list(history_snapshots)
         # Camera changes invalidate only its keyed render entries; retaining
         # matching history/current camera renders avoids rerasterizing a world.
 
@@ -88,12 +98,15 @@ class PointWorldGeoTokenProvider:
         cameras = CameraBatch(c2w, scaled, int(height), int(width))
         cache_key = (self.world_version, id(c2w), id(intrinsics), int(height), int(width))
         if cache_key not in self._render_cache:
-            started = time.perf_counter()
+            started = torch.cuda.Event(enable_timing=True)
+            finished = torch.cuda.Event(enable_timing=True)
+            started.record(self.device)
             self._render_cache[cache_key] = render_geometry_cuda(
                 self.points_xyz, self.points_confidence, cameras,
                 parent_point_count=self.parent_point_count,
             )
-            self.render_seconds += time.perf_counter() - started
+            finished.record(self.device)
+            self._render_events.append((started, finished))
         xyz, depth, visibility, confidence = self._render_cache[cache_key]
         channels = geometry_channels_from_cuda_render(
             xyz, depth, visibility, confidence, c2w, self.source_center, self.scene_scale,
@@ -108,10 +121,47 @@ class PointWorldGeoTokenProvider:
             self._feature_cache[key] = (features, support)
         return self._feature_cache[key]
 
+    def point_render_seconds(self):
+        if not self._render_events:
+            return 0.0
+        torch.cuda.synchronize(self.device)
+        return sum(start.elapsed_time(end) for start, end in self._render_events) / 1000.0
+
+    def freeze_current_snapshot(self, *, chunk_index, frame_start, **_ignored):
+        """Freeze actual current-world renders after the formal Helios call."""
+        grids = {}
+        for key, value in self._render_cache.items():
+            version, c2w_id, _k_id, height, width = key
+            if version == self.world_version and c2w_id == id(self.current_c2w):
+                grids[(int(height), int(width))] = tuple(item.detach().clone() for item in value)
+        if not grids:
+            raise RuntimeError("GeoToken current chunk produced no geometry render to freeze")
+        return FrozenGeometrySnapshot(
+            chunk_index=int(chunk_index), frame_start=int(frame_start), world_version=self.world_version,
+            c2w=self.current_c2w.copy(),
+            source_center=self.source_center.copy(), scene_scale=self.scene_scale, grids=grids,
+        )
+
+    def _encode_snapshot(self, snapshot, height, width):
+        if snapshot.scene_scale != self.scene_scale or not np.array_equal(snapshot.source_center, self.source_center):
+            raise RuntimeError("history snapshot normalization does not match this trajectory")
+        grid = snapshot.grids.get((int(height), int(width)))
+        if grid is None:
+            raise RuntimeError(
+                f"frozen geometry snapshot {snapshot.chunk_index} lacks requested token grid {(height, width)}"
+            )
+        key = ("snapshot", snapshot.chunk_index, id(snapshot), int(height), int(width), torch.is_grad_enabled())
+        if key not in self._feature_cache:
+            xyz, depth, visibility, confidence = grid
+            channels = geometry_channels_from_cuda_render(
+                xyz, depth, visibility, confidence, snapshot.c2w,
+                snapshot.source_center, snapshot.scene_scale,
+            ).permute(3, 0, 1, 2).unsqueeze(0)
+            self._feature_cache[key] = self.conditioner.tokenizer(channels)
+        return self._feature_cache[key]
+
     def _history_slots(self, length, height, width):
-        chunks = []
-        for poses, intrinsics in self.history_camera_chunks:
-            chunks.append(self._encode_chunk(poses, intrinsics, height, width))
+        chunks = [self._encode_snapshot(snapshot, height, width) for snapshot in self.history_snapshots]
         if not chunks:
             feature = torch.zeros(
                 1, self.conditioner.tokenizer.inner_dim, length, height, width, device=self.device,

@@ -169,6 +169,14 @@ class OnlineSpatialHistoryPipeline:
             world_projection_diagnostics = list(context.diagnostics) if context is not None else []
             if hasattr(self.wah_pipeline, "clear_world_projection_context"):
                 self.wah_pipeline.clear_world_projection_context()
+        # Geometry history follows the same autoregressive-state ownership as
+        # WAH latents.  The hook captures the pre-render active world and each
+        # snapshot is detached by the provider before any Pi3/world mutation.
+        if isinstance(pre_render_snapshot, dict):
+            freeze = pre_render_snapshot.get("freeze_history")
+            if freeze is not None:
+                history = self.autoregressive_state.setdefault("_geotoken_history_snapshots", [])
+                history.append(freeze(chunk_index=self.chunk_index, frame_start=self.frame_index))
         generated_chunk = self._decode_last_latent_chunk()
         self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):

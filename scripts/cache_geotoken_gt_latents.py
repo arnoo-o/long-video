@@ -36,7 +36,10 @@ def main():
 
     pipe = WarpAsHistoryPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(args.device)
     pipe.vae.eval()
-    identity = hashlib.sha256(json.dumps(dict(pipe.vae.config), sort_keys=True, default=str).encode()).hexdigest()
+    vae_identity = hashlib.sha256(json.dumps(dict(pipe.vae.config), sort_keys=True, default=str).encode()).hexdigest()
+    model_identity = hashlib.sha256(
+        (str(args.model.resolve()) + ":" + vae_identity).encode()
+    ).hexdigest()
     manifest = json.loads((args.dataset_root / "dl3dv_24fps_manifest.json").read_text())
     wanted = set(json.loads(args.trajectory_ids_json.read_text()))
     for record in manifest["records"]:
@@ -45,7 +48,9 @@ def main():
             continue
         target = args.output_root / trajectory_id
         target.mkdir(parents=True, exist_ok=True)
-        rgb_paths = [args.dataset_root / path for path in record["rgb_paths"]]
+        rgb_paths = sorted(path for path in (args.dataset_root / record["rgb_dir"]).glob("*") if path.is_file())
+        if len(rgb_paths) != 193:
+            raise RuntimeError(f"{trajectory_id} must contain exactly 193 RGB frames, got {len(rgb_paths)}")
         for chunk_index in range(6):
             output = target / f"chunk_{chunk_index:02d}.pt"
             if output.exists():
@@ -56,8 +61,13 @@ def main():
                 raise RuntimeError(f"{trajectory_id} lacks chunk {chunk_index}")
             with torch.no_grad():
                 latent = deterministic_latent(pipe, frames, args.device)
-            torch.save({"latent": latent, "vae_identity": identity, "shape": tuple(latent.shape)}, output)
-        (target / "metadata.json").write_text(json.dumps({"vae_identity": identity, "model": str(args.model)}))
+            torch.save({
+                "latent": latent, "shape": tuple(latent.shape),
+                "vae_identity": vae_identity, "model_identity": model_identity,
+            }, output)
+        (target / "metadata.json").write_text(json.dumps({
+            "vae_identity": vae_identity, "model_identity": model_identity, "model": str(args.model),
+        }))
 
 
 if __name__ == "__main__":

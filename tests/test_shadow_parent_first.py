@@ -7,7 +7,7 @@ from long_video.geometry.point_renderer import render
 from long_video.memory.memory_manager import MemoryManager
 from long_video.online.transition_buffer import TransitionBuffer
 from long_video.online.causal_renderer import CausalActiveNodeRenderer
-from long_video.types import CameraBatch, Z_DEPTH
+from long_video.types import CameraBatch, ViewSet, Z_DEPTH
 from long_video.online.delayed_activation import DelayedNodeActivationQueue
 
 
@@ -75,6 +75,28 @@ def test_boundary_is_mapping_and_previous_four_are_held_out():
     assert all(index <= 192 for index in mapping_indices)
     assert heldout_indices == [188, 189, 190, 191]
     assert 192 not in heldout_indices
+
+
+def test_canonical_surface_commit_selects_only_boundary_view_for_points():
+    shape = (8, 2, 3)
+    views = ViewSet(
+        rgb=np.arange(8 * 2 * 3 * 3, dtype=np.uint8).reshape(8, 2, 3, 3),
+        depth=np.arange(8 * 2 * 3, dtype=np.float32).reshape(shape) + 1,
+        depth_confidence=np.ones(shape, np.float32),
+        c2w=np.repeat(np.eye(4, dtype=np.float32)[None], 8, axis=0),
+        intrinsics=np.repeat(np.eye(3, dtype=np.float32)[None], 8, axis=0),
+        source=np.full(shape, 2, np.int8),
+        image_confidence=np.ones(shape, np.float32),
+        depth_convention=Z_DEPTH,
+    )
+
+    surface = MemoryManager._canonical_surface_views(views, 7)
+
+    assert len(surface.rgb) == 1
+    np.testing.assert_array_equal(surface.rgb[0], views.rgb[7])
+    np.testing.assert_array_equal(surface.depth[0], views.depth[7])
+    np.testing.assert_array_equal(surface.source[0], views.source[7])
+    assert surface.depth_convention == Z_DEPTH
 
 
 def test_shadow_freezes_hash_and_commits_only_when_due():

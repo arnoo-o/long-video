@@ -318,9 +318,10 @@ class MemoryManager:
             depth_convention=prediction.depth_convention or Z_DEPTH,
         )
         boundary_mapping_position = mapping_indices.index(created_frame)
+        surface_views = self._canonical_surface_views(views, boundary_mapping_position)
         node_index = max([int(key.split("_")[-1]) for key in self.nodes] + [0]) + 1
         candidate = build_from_views(
-            views,
+            surface_views,
             node_id=f"node_{node_index:03d}",
             center_c2w=c2w[boundary_mapping_position],
             created_frame=created_frame,
@@ -335,16 +336,22 @@ class MemoryManager:
         candidate.view_source = np.asarray(views.source)
         candidate.view_image_confidence = np.asarray(views.image_confidence)
         candidate.view_depth_confidence = np.asarray(views.depth_confidence)
+        candidate.point_view_mask = np.full(
+            len(candidate.points_xyz),
+            np.uint64(1) << np.uint64(boundary_mapping_position),
+            dtype=np.uint64,
+        )
         candidate.quality_metrics.update({
             "shadow_boundary_frame": int(created_frame),
             "shadow_mapping_frame_indices": mapping_indices,
             "shadow_heldout_frame_indices": heldout_indices,
-            "canonical_surface_commit": False,
-            "multi_view_surface_commit": True,
+            "canonical_surface_commit": True,
+            "multi_view_surface_commit": False,
             "geometry_input_view_count": int(len(frames)),
-            "persistent_surface_view_count": int(len(frames)),
-            "persistent_surface_mapping_positions": list(range(len(frames))),
-            "persistent_surface_global_frames": mapping_indices,
+            "persistent_surface_view_count": 1,
+            "persistent_surface_mapping_positions": [int(boundary_mapping_position)],
+            "persistent_surface_global_frames": [int(created_frame)],
+            "persistent_surface_point_count": int(len(candidate.points_xyz)),
         })
         view_rgb_origin=np.stack([
             np.where(frame.warp_visibility,frame.old_node_warp_rgb_content_origin,
@@ -402,6 +409,24 @@ class MemoryManager:
         )
         self.state = self.CANDIDATE
         return candidate, frames, heldout
+
+    @staticmethod
+    def _canonical_surface_views(views, boundary_mapping_position):
+        """Keep all views for Pi3 evidence but emit points only at the boundary."""
+        index = int(boundary_mapping_position)
+        if not 0 <= index < len(views.rgb):
+            raise IndexError("boundary mapping position is outside the Pi3 view set")
+        selection = slice(index, index + 1)
+        return ViewSet(
+            rgb=np.asarray(views.rgb)[selection],
+            depth=np.asarray(views.depth)[selection],
+            depth_confidence=np.asarray(views.depth_confidence)[selection],
+            c2w=np.asarray(views.c2w)[selection],
+            intrinsics=np.asarray(views.intrinsics)[selection],
+            source=np.asarray(views.source)[selection],
+            image_confidence=np.asarray(views.image_confidence)[selection],
+            depth_convention=views.depth_convention,
+        )
 
     @classmethod
     def _parent_projection_exclusion_mask(cls, parent_visible):

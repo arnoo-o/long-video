@@ -136,7 +136,7 @@ class PointWorldGeoTokenProvider:
         hidden = kwargs.get("hidden_states")
         if isinstance(hidden, list):
             raise RuntimeError("GeoToken runtime expects one real Helios stage per forward")
-        patch = tuple(int(value) for value in getattr(kwargs.pop("_geotoken_patch_size", (1, 2, 2))))
+        patch = tuple(int(value) for value in kwargs.pop("_geotoken_patch_size", (1, 2, 2)))
         current_h = int(hidden.shape[-2]) // patch[1]
         current_w = int(hidden.shape[-1]) // patch[2]
         current_feature, current_support = self._encode_chunk(

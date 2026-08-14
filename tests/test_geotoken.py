@@ -16,6 +16,7 @@ from long_video.training.geotoken import (
     max_chunks_for_step,
     phase_for_step,
 )
+from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider
 
 
 def test_temporal_layout_and_invalid_geometry_are_exact_zero():
@@ -73,3 +74,19 @@ def test_curriculum_balances_lengths_and_checkpoint_boundaries():
     assert set(checkpoint_names(2000)) == {
         "checkpoint_step_2000.pt", "phase_c_final_step_2000.pt",
     }
+
+
+def test_runtime_reads_actual_patch_grid_without_hardcoding():
+    provider = object.__new__(PointWorldGeoTokenProvider)
+    provider.current_c2w = np.eye(4, dtype=np.float32)[None].repeat(33, 0)
+    provider.current_k = np.eye(3, dtype=np.float32)[None].repeat(33, 0)
+    provider._encode_chunk = lambda _c2w, _k, h, w: (
+        torch.zeros(1, 16, 9, h, w), torch.zeros(1, 1, 9, h, w),
+    )
+    provider._history_part = lambda *_args: None
+    current, history, support = provider._build({
+        "hidden_states": torch.zeros(1, 16, 9, 24, 40),
+        "_geotoken_patch_size": (1, 2, 2),
+    })
+    assert current.tokens.shape == (1, 9 * 12 * 20, 16)
+    assert history is None and support is None

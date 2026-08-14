@@ -215,10 +215,15 @@ def native_flow_backward(pipe, z_gt, capture, provider):
             pipe._set_wah_lora_enabled(True)
         else:
             pipe._set_wah_lora_enabled(False)
+        # PEFT's adapter toggles recursively clear requires_grad on modules
+        # outside the adapter too. Restore the sole permitted trainable set.
+        for name, parameter in pipe.transformer.named_parameters():
+            parameter.requires_grad_("geotoken." in name)
         finite_inputs = {
             "noisy_latents": bool(torch.isfinite(kwargs["hidden_states"]).all()),
             "target": bool(torch.isfinite(item["target"]).all()),
             "timesteps": bool(torch.isfinite(item["timesteps"]).all()),
+            "sigmas": bool(torch.isfinite(item["sigmas"]).all()),
             "prompt": bool(torch.isfinite(kwargs["encoder_hidden_states"]).all()),
         }
         for name in ("latents_history_short", "latents_history_mid", "latents_history_long"):

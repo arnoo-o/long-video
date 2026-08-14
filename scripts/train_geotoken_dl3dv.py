@@ -216,17 +216,26 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         else:
             pipe._set_wah_lora_enabled(False)
         prediction = pipe.transformer(**kwargs)[0]
-        if not prediction.requires_grad:
-            raise RuntimeError("GeoToken prediction lost its gradient graph")
+        if not prediction.requires_grad or not bool(torch.isfinite(prediction).all()):
+            raise RuntimeError(f"Stage{stage_id} GeoToken prediction is non-finite or detached")
         sigma = item["sigmas"]
         weighting = compute_loss_weighting_for_sd3("none", sigma)
         loss = torch.mean(
             (weighting.float() * (prediction.float() - item["target"].float()).square())
             .reshape(prediction.shape[0], -1), dim=1,
         ).mean()
+        if not bool(torch.isfinite(loss)):
+            raise RuntimeError(f"Stage{stage_id} native flow loss is non-finite")
         losses.append(loss)
         stage_stats[f"stage{stage_id}_flow_mse"] = float(loss.detach())
         (loss / len(items)).backward()
+        broken = [
+            name for name, parameter in pipe.transformer.named_parameters()
+            if "geotoken." in name and parameter.grad is not None
+            and not bool(torch.isfinite(parameter.grad).all())
+        ]
+        if broken:
+            raise RuntimeError(f"Stage{stage_id} produced non-finite GeoToken gradients: {broken}")
     return torch.stack([loss.detach() for loss in losses]).mean(), stage_stats
 
 

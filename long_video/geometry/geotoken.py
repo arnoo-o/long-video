@@ -197,8 +197,14 @@ def geometry_channels_from_render(
     """Build the geometry-only 12-channel input from final z-buffer winners."""
     xyz = np.asarray(winning_xyz_world, np.float32)
     depth = np.asarray(depth, np.float32)
-    valid = np.asarray(visibility, bool) & np.isfinite(depth) & (depth > 0)
+    valid = (
+        np.asarray(visibility, bool)
+        & np.isfinite(depth)
+        & (depth > 0)
+        & np.isfinite(xyz).all(axis=-1)
+    )
     confidence = np.asarray(confidence, np.float32)
+    valid &= np.isfinite(confidence)
     poses = np.asarray(c2w, np.float32)
     c0 = np.asarray(source_center, np.float32).reshape(3)
     scale = float(scene_scale)

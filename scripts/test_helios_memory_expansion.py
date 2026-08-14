@@ -66,7 +66,7 @@ def main():
         np.clip(m0_prediction.depth_confidence*0.5,0,1),
         m0_prediction.depth_convention,
     )
-    m0=build_from_views(m0_views,node_id="node_000",voxel_size=0.02,status="active")
+    m0=build_from_views(m0_views,node_id="node_000",voxel_size=0.2,status="active")
     transition_rgb=rgb[8:20]
     cameras=CameraBatch(poses[8:20],k[8:20],args.size,args.size)
     warp=render(m0,cameras,near=0.02,far=8.0,point_radius=0,device=args.device,chunk_points=100000)
@@ -75,7 +75,7 @@ def main():
         geometry_backend=backend,coverage_threshold=min(0.99,mean_coverage+0.05),
         low_coverage_chunks=1,min_transition_frames=12,keyframe_count=8,heldout_count=4,
         min_translation_baseline=2.5,min_view_diversity=float(np.deg2rad(25.0)),
-        min_new_area_ratio=0.15,max_world_overlap=0.20,
+        min_new_area_ratio=0.15,max_world_overlap=0.08,
         max_overlap_rgb_error=0.5,max_overlap_depth_error=1.0,
         reactivation_hysteresis=0.0,
     )

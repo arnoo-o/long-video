@@ -34,7 +34,7 @@ def main():
         intrinsics=k8[:1],source=np.zeros((1,384,640),np.int8),
         image_confidence=np.ones((1,384,640),np.float32),depth_convention=Z_DEPTH)
     node=build_from_views(views,node_id='node_000',center_c2w=np.eye(4,dtype=np.float32),
-        created_frame=0,voxel_size=.02,status='active')
+        created_frame=0,voxel_size=.2,status='active')
     cameras=CameraBatch(c2w=poses,intrinsics=intrinsics,height=384,width=640)
     result=CausalActiveNodeRenderer(node,renderer_kwargs={'device':a.device}).render(
         cameras,frame_start=0,allow_reactivation=False)

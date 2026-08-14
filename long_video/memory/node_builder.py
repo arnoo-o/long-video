@@ -5,7 +5,7 @@ from ..data.camera import rgb_to_uint8
 from ..geometry.confidence import point_confidence
 
 def build_from_views(view_set:ViewSet,node_id="node_000",center_c2w=None,created_frame=0,
-                     voxel_size=.008,status="active",parent_id=None,source_priors=None):
+                     voxel_size=.2,status="active",parent_id=None,source_priors=None):
     center=np.eye(4,dtype=np.float32) if center_c2w is None else np.asarray(center_c2w,np.float32)
     clouds=[]
     for i in range(len(view_set.rgb)):

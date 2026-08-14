@@ -14,7 +14,7 @@ except ImportError:
 
 
 PYRAMID_INFERENCE_STEPS = (2, 2, 2)
-WPF_LAMBDAS = ((0.00, 0.10), (0.20, 0.25), (0.35, 0.40))
+WPF_LAMBDAS = ((0.00, 0.05), (0.15, 0.20), (0.25, 0.30))
 
 
 def posterior_mode_or_mean(posterior: Any) -> torch.Tensor:

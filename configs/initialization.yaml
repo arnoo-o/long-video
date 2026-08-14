@@ -4,7 +4,7 @@ view_count: 8
 fov_degrees: 90
 height: 512
 width: 512
-voxel_size: 0.008
+voxel_size: 0.2
 scale:
   same_center_mode: relative
   relative_median_world_units: 1.0

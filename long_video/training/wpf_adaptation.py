@@ -161,17 +161,21 @@ class WPFAdaptationObserver:
         if z_gt.shape != x_t.shape:
             raise RuntimeError(f"Stage{stage_id} GT/state shape mismatch: {z_gt.shape} != {x_t.shape}")
         sigma = self._sigma(step_id, event["dmd_sigmas"], device=x_t.device, dtype=x_t.dtype)
-        x0_pred = x_t.detach().float() - sigma.float() * prediction.float()
-        x0_base = x_t.detach().float() - sigma.float() * base.detach().float()
-        mask = renderer_visibility_to_latent_mask(
-            event["point_visibility"], z_gt.shape[2:], device=x_t.device,
-        ).detach()
-        loss_fill = weighted_mse(x0_pred, z_gt.float(), 1.0 - mask)
-        loss_keep = weighted_mse(x0_pred, x0_base, mask)
-        loss = loss_fill + self.lambda_keep * loss_keep
-        if not all(bool(torch.isfinite(value)) for value in (loss, loss_fill, loss_keep)):
-            raise RuntimeError("non-finite WPF adaptation loss")
-        loss.backward()
+        # The public autoregressive entry point is no_grad. The selected
+        # transformer output still carries its local graph, so explicitly
+        # enable clean-space loss construction without opening scheduler/WPF.
+        with torch.enable_grad():
+            x0_pred = x_t.detach().float() - sigma.float() * prediction.float()
+            x0_base = x_t.detach().float() - sigma.float() * base.detach().float()
+            mask = renderer_visibility_to_latent_mask(
+                event["point_visibility"], z_gt.shape[2:], device=x_t.device,
+            ).detach()
+            loss_fill = weighted_mse(x0_pred, z_gt.float(), 1.0 - mask)
+            loss_keep = weighted_mse(x0_pred, x0_base, mask)
+            loss = loss_fill + self.lambda_keep * loss_keep
+            if not all(bool(torch.isfinite(value)) for value in (loss, loss_fill, loss_keep)):
+                raise RuntimeError("non-finite WPF adaptation loss")
+            loss.backward()
         self.losses[(stage_id, step_id)] = {
             "total": float(loss.detach()),
             "fill": float(loss_fill.detach()),

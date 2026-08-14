@@ -100,12 +100,13 @@ class PointWorldGeoTokenProvider:
         if cache_key not in self._render_cache:
             started = torch.cuda.Event(enable_timing=True)
             finished = torch.cuda.Event(enable_timing=True)
-            started.record(self.device)
-            self._render_cache[cache_key] = render_geometry_cuda(
-                self.points_xyz, self.points_confidence, cameras,
-                parent_point_count=self.parent_point_count,
-            )
-            finished.record(self.device)
+            with torch.cuda.device(self.device):
+                started.record()
+                self._render_cache[cache_key] = render_geometry_cuda(
+                    self.points_xyz, self.points_confidence, cameras,
+                    parent_point_count=self.parent_point_count,
+                )
+                finished.record()
             self._render_events.append((started, finished))
         xyz, depth, visibility, confidence = self._render_cache[cache_key]
         channels = geometry_channels_from_cuda_render(

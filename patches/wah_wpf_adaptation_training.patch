@@ -10,7 +10,7 @@ diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
                      if i_s == 0:
                          current_indices_hidden_states = pyramid_base_histories["indices_hidden_states"]
                          current_indices_latents_history_short = pyramid_base_histories[
-@@ -2658,7 +2659,18 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+@@ -2658,7 +2659,20 @@ class WarpAsHistoryPipeline(HeliosPipeline):
                          i_s == 2 and stage2_observer is not None
                          and stage2_observer.should_train_step(idx)
                      )
@@ -26,6 +26,8 @@ diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
 +                    ):
 +                        raise RuntimeError("pyramid training adapter is not active at selected step")
 +                    training_enabled = stage2_training or pyramid_training
++                    if pyramid_training:
++                        model_latents = model_latents.detach().requires_grad_(True)
 +                    if (stage2_training and completion_active) or pyramid_training:
                          # Compute the frozen-Helios preservation target first,
                          # using the exact real x_t/timestep/conditioning.

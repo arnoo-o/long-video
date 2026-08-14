@@ -55,6 +55,8 @@ class GeometryTokenizer(nn.Module):
         valid = x[..., 10:11].clamp(0, 1)
         confidence = x[..., 11:12].clamp(0, 1) * valid
         encoded = self.frame_encoder(x) * valid
+        if not bool(torch.isfinite(encoded).all()):
+            raise RuntimeError("GeometryTokenizer received non-finite normalized geometry")
         pooled, supports = [], []
         for group in TEMPORAL_GROUPS:
             index = torch.as_tensor(group, device=x.device)
@@ -219,15 +221,19 @@ def geometry_channels_from_render(
     output = np.zeros((len(poses), h, w, GEOTOKEN_CHANNELS), np.float32)
     for frame, pose in enumerate(poses):
         origin = pose[:3, 3]
-        direction = xyz[frame] - origin
+        frame_valid = valid[frame]
+        frame_xyz = np.where(frame_valid[..., None], xyz[frame], origin)
+        frame_depth = np.where(frame_valid, depth[frame], scale)
+        frame_confidence = np.where(frame_valid, confidence[frame], 0)
+        direction = frame_xyz - origin
         norm = np.linalg.norm(direction, axis=-1, keepdims=True)
         direction = direction / np.maximum(norm, 1e-8)
-        output[frame, ..., 0:3] = (xyz[frame] - c0) / scale
-        output[frame, ..., 3:6] = (origin - c0) / scale
-        output[frame, ..., 6:9] = direction
-        output[frame, ..., 9] = np.log(np.maximum(depth[frame] / scale, 1e-6))
-        output[frame, ..., 10] = valid[frame]
-        output[frame, ..., 11] = np.clip(confidence[frame], 0, 1) * valid[frame]
+        output[frame, ..., 0:3] = np.clip((frame_xyz - c0) / scale, -64, 64)
+        output[frame, ..., 3:6] = np.clip((origin - c0) / scale, -64, 64)
+        output[frame, ..., 6:9] = np.clip(direction, -1, 1)
+        output[frame, ..., 9] = np.clip(np.log(np.maximum(frame_depth / scale, 1e-6)), -16, 16)
+        output[frame, ..., 10] = frame_valid
+        output[frame, ..., 11] = np.clip(frame_confidence, 0, 1)
     output *= valid[..., None]
     return output
 

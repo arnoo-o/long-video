@@ -24,7 +24,7 @@ def test_any_readiness_requires_twelve_frames_then_accepts_one_condition():
         min_translation_baseline=2.5,
         min_view_diversity=0.4363323129985824,
         min_new_area_ratio=0.15,
-        max_world_overlap=0.02,
+        max_world_overlap=0.08,
     )
     manager.buffer = _ReadinessBuffer(11, translation=3.0, view_change=0.0, new_area=0.0)
     assert not manager._ready(0.01)

@@ -188,7 +188,9 @@ def training_exact_args():
         flow_matching_stage_sampling="fixed",
         flow_matching_stage_id=-1,
         flow_matching_train_exact_timestep_sampling="training_density",
-        flow_matching_use_dynamic_shifting="auto",
+        # The formal inference transformer consumes discrete scheduler
+        # timesteps. Keep train_exact on that same native scheduler domain.
+        flow_matching_use_dynamic_shifting="off",
         weighting_scheme="none",
         is_amplify_first_chunk=False,
     )

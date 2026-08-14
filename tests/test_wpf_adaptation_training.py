@@ -47,7 +47,7 @@ def test_clean_space_observer_backprops_once_and_detaches_scheduler_state():
             result = observer({
                 "stage_id": stage, "step_id": step,
                 "model_output": prediction, "base_model_output": torch.zeros_like(prediction),
-                "sample": sample, "dmd_sigmas": torch.tensor([0.5, 0.0]),
+                "sample": sample, "dmd_sigmas": torch.tensor([1.0, 0.5, 0.0]),
                 "point_visibility": visibility,
             })
             if (stage, step) == (1, 1):

@@ -30,16 +30,19 @@ def main():
     parser.add_argument("--trajectory-ids-json", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
     sys.path.insert(0, str(args.wah_root))
     from warp_as_history import WarpAsHistoryPipeline
 
     pipe = WarpAsHistoryPipeline.from_pretrained(args.model, torch_dtype=torch.bfloat16).to(args.device)
     pipe.vae.eval()
-    vae_identity = hashlib.sha256(json.dumps(dict(pipe.vae.config), sort_keys=True, default=str).encode()).hexdigest()
-    model_identity = hashlib.sha256(
-        (str(args.model.resolve()) + ":" + vae_identity).encode()
-    ).hexdigest()
+    vae_identity = hashlib.sha256(json.dumps({
+        "class": type(pipe.vae).__qualname__,
+        "latents_mean": [float(value) for value in pipe.vae.config.latents_mean],
+        "latents_std": [float(value) for value in pipe.vae.config.latents_std],
+    }, sort_keys=True).encode()).hexdigest()
+    model_identity = hashlib.sha256(str(args.model.resolve()).encode()).hexdigest()
     manifest = json.loads((args.dataset_root / "dl3dv_24fps_manifest.json").read_text())
     wanted = set(json.loads(args.trajectory_ids_json.read_text()))
     for record in manifest["records"]:
@@ -53,7 +56,7 @@ def main():
             raise RuntimeError(f"{trajectory_id} must contain exactly 193 RGB frames, got {len(rgb_paths)}")
         for chunk_index in range(6):
             output = target / f"chunk_{chunk_index:02d}.pt"
-            if output.exists():
+            if output.exists() and not args.overwrite:
                 continue
             start = chunk_index * 32
             frames = [np.asarray(Image.open(path).convert("RGB"), np.uint8) for path in rgb_paths[start:start + 33]]

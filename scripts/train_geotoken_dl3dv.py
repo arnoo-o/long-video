@@ -66,10 +66,12 @@ def load_arrays(root, record):
 
 def latent_cache_identities(pipe, model):
     import hashlib
-    vae_identity = hashlib.sha256(
-        json.dumps(dict(pipe.vae.config), sort_keys=True, default=str).encode()
-    ).hexdigest()
-    model_identity = hashlib.sha256((str(Path(model).resolve()) + ":" + vae_identity).encode()).hexdigest()
+    vae_identity = hashlib.sha256(json.dumps({
+        "class": type(pipe.vae).__qualname__,
+        "latents_mean": [float(value) for value in pipe.vae.config.latents_mean],
+        "latents_std": [float(value) for value in pipe.vae.config.latents_std],
+    }, sort_keys=True).encode()).hexdigest()
+    model_identity = hashlib.sha256(str(Path(model).resolve()).encode()).hexdigest()
     return vae_identity, model_identity
 
 

@@ -22,6 +22,7 @@ class OnlineSpatialHistoryPipeline:
         renderer_kwargs=None,
         control_kwargs=None,
         wah_state_kwargs=None,
+        pre_render_world_hook=None,
     ):
         self.wah_pipeline = wah_pipeline
         self.wah_adapter = WAHAdapter(wah_pipeline) if wah_pipeline is not None else None
@@ -33,6 +34,7 @@ class OnlineSpatialHistoryPipeline:
         self.renderer_kwargs = {"device":"cpu",**dict(renderer_kwargs or {})}
         self.control_kwargs = dict(control_kwargs or {})
         self.wah_state_kwargs = dict(wah_state_kwargs or {})
+        self.pre_render_world_hook = pre_render_world_hook
         self.current_camera_c2w = (
             active_node.center_c2w.copy() if active_node is not None else np.eye(4, dtype=np.float32)
         )
@@ -139,7 +141,20 @@ class OnlineSpatialHistoryPipeline:
         if self.memory_manager is not None:
             self.active_node,reactivation_event=self.memory_manager.maybe_reactivate(
                 self.active_node,cameras)
+        # Consumers that build conditioning from the point world must observe
+        # exactly the snapshot that WAH is about to render, after all delayed
+        # activation and reactivation decisions for this chunk.
+        pre_render_snapshot = None
+        if self.pre_render_world_hook is not None:
+            pre_render_snapshot = self.pre_render_world_hook(self.active_node, cameras)
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
+        if pre_render_snapshot is not None:
+            expected = getattr(self.active_node, "node_id", id(self.active_node))
+            observed = pre_render_snapshot.get("world_version") if isinstance(pre_render_snapshot, dict) else pre_render_snapshot
+            if observed != expected:
+                raise RuntimeError(
+                    f"pre-render conditioning world mismatch: {observed!r} != {expected!r}"
+                )
         if hasattr(self.wah_pipeline, "set_world_projection_from_renderer"):
             self.wah_pipeline.set_world_projection_from_renderer(
                 warp.rgb, warp.visibility, warp.confidence,

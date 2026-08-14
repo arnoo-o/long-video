@@ -1,28 +1,15 @@
 """Runtime alignment of point-world geometry with Helios current/history tokens."""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
+import time
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from ..data.camera import resize_intrinsics
 from ..types import CameraBatch
-from .geotoken import GeometryTokenBatch, geometry_channels_from_render
-from .point_renderer import render
-
-
-def _node(points_xyz, points_confidence):
-    count = len(points_xyz)
-    return SimpleNamespace(
-        points_xyz=np.asarray(points_xyz, np.float32),
-        points_rgb=np.zeros((count, 3), np.uint8),
-        points_confidence=np.asarray(points_confidence, np.float32),
-        points_source=np.zeros(count, np.int8),
-        parent_point_count=None,
-        quality_metrics={},
-    )
+from .geotoken import GeometryTokenBatch, geometry_channels_from_cuda_render
+from .point_renderer import render_geometry_cuda
 
 
 def _pad_pool(value: torch.Tensor, kernel: tuple[int, int, int]) -> torch.Tensor:
@@ -41,22 +28,48 @@ class PointWorldGeoTokenProvider:
         self.device = torch.device(device)
         self.source_center = np.asarray(source_center, np.float32)
         self.scene_scale = float(scene_scale)
-        self.points_xyz = None
-        self.points_confidence = None
+        self.points_xyz: torch.Tensor | None = None
+        self.points_confidence: torch.Tensor | None = None
+        self.parent_point_count = None
+        self.world_version = None
         self.current_c2w = None
         self.current_k = None
         self.history_camera_chunks: list[tuple[np.ndarray, np.ndarray]] = []
         self._handle = None
-        self._cache = {}
+        self._render_cache = {}
+        self._feature_cache = {}
+        self.render_seconds = 0.0
 
     def attach(self, transformer):
         if self._handle is None:
             self._handle = transformer.register_forward_pre_hook(self._pre_forward, with_kwargs=True)
 
-    def configure_world(self, points_xyz, points_confidence):
-        self.points_xyz = np.asarray(points_xyz, np.float32)
-        self.points_confidence = np.asarray(points_confidence, np.float32)
-        self._cache.clear()
+    def configure_world(self, points_xyz, points_confidence, *, world_version=None, parent_point_count=None):
+        """Upload a point-world once; invalidate only on world-version changes."""
+        version = world_version if world_version is not None else id(points_xyz)
+        if version == self.world_version:
+            return
+        self.points_xyz = torch.as_tensor(points_xyz, dtype=torch.float32, device=self.device).contiguous()
+        self.points_confidence = torch.as_tensor(points_confidence, dtype=torch.float32, device=self.device).contiguous()
+        self.parent_point_count = parent_point_count
+        self.world_version = version
+        self.clear_world_cache()
+
+    def configure_active_node(self, node):
+        version = getattr(node, "node_id", id(node))
+        self.configure_world(
+            node.points_xyz, node.points_confidence, world_version=version,
+            parent_point_count=getattr(node, "parent_point_count", None),
+        )
+        return {"world_version": version}
+
+    def clear_world_cache(self):
+        self._render_cache.clear()
+        self._feature_cache.clear()
+
+    def clear_feature_cache(self):
+        """Release autograd graphs after one stage backward, not raw z-buffers."""
+        self._feature_cache.clear()
 
     def configure_chunk(self, c2w, intrinsics, history_camera_chunks):
         self.current_c2w = np.asarray(c2w, np.float32)
@@ -65,30 +78,35 @@ class PointWorldGeoTokenProvider:
             (np.asarray(poses, np.float32), np.asarray(k, np.float32))
             for poses, k in history_camera_chunks
         ]
-        self._cache.clear()
+        # Camera changes invalidate only its keyed render entries; retaining
+        # matching history/current camera renders avoids rerasterizing a world.
 
     def _render_channels(self, c2w, intrinsics, height, width):
         if self.points_xyz is None:
             raise RuntimeError("GeoToken provider has no available scene geometry")
         scaled = resize_intrinsics(intrinsics, (384, 640), (int(height), int(width)))
         cameras = CameraBatch(c2w, scaled, int(height), int(width))
-        warp = render(
-            _node(self.points_xyz, self.points_confidence), cameras,
-            device=str(self.device), point_radius=0,
+        cache_key = (self.world_version, id(c2w), id(intrinsics), int(height), int(width))
+        if cache_key not in self._render_cache:
+            started = time.perf_counter()
+            self._render_cache[cache_key] = render_geometry_cuda(
+                self.points_xyz, self.points_confidence, cameras,
+                parent_point_count=self.parent_point_count,
+            )
+            self.render_seconds += time.perf_counter() - started
+        xyz, depth, visibility, confidence = self._render_cache[cache_key]
+        channels = geometry_channels_from_cuda_render(
+            xyz, depth, visibility, confidence, c2w, self.source_center, self.scene_scale,
         )
-        channels = geometry_channels_from_render(
-            warp.winning_xyz_world, warp.depth, warp.visibility, warp.confidence,
-            c2w, self.source_center, self.scene_scale,
-        )
-        return torch.from_numpy(channels).permute(3, 0, 1, 2).unsqueeze(0).to(self.device)
+        return channels.permute(3, 0, 1, 2).unsqueeze(0)
 
     def _encode_chunk(self, c2w, intrinsics, height, width):
-        key = (id(c2w), int(height), int(width), torch.is_grad_enabled())
-        if key not in self._cache:
+        key = (self.world_version, id(c2w), id(intrinsics), int(height), int(width), torch.is_grad_enabled())
+        if key not in self._feature_cache:
             channels = self._render_channels(c2w, intrinsics, height, width)
             features, support = self.conditioner.tokenizer(channels)
-            self._cache[key] = (features, support)
-        return self._cache[key]
+            self._feature_cache[key] = (features, support)
+        return self._feature_cache[key]
 
     def _history_slots(self, length, height, width):
         chunks = []
@@ -171,3 +189,28 @@ class PointWorldGeoTokenProvider:
             history_support,
         )
         return args, kwargs
+
+
+def source_scene_scale_from_active_node(node, source_c2w, intrinsics, *, device, height=384, width=640):
+    """Median visible source-camera depth for causal Pi3/world normalization.
+
+    This is intentionally independent of ReCal3R and is shared by Phase C and
+    formal GeoToken inference callers.
+    """
+    cameras = CameraBatch(
+        np.asarray(source_c2w, np.float32)[None], np.asarray(intrinsics, np.float32)[None],
+        int(height), int(width),
+    )
+    xyz = torch.as_tensor(node.points_xyz, dtype=torch.float32, device=device)
+    confidence = torch.as_tensor(node.points_confidence, dtype=torch.float32, device=device)
+    _, depth, visibility, _ = render_geometry_cuda(
+        xyz, confidence, cameras,
+        parent_point_count=getattr(node, "parent_point_count", None),
+    )
+    values = depth[visibility & torch.isfinite(depth) & (depth > 0)]
+    if not len(values):
+        raise RuntimeError("initial Pi3 active node has no valid source-visible depth")
+    scale = float(values.median().item())
+    if not np.isfinite(scale) or scale <= 0:
+        raise RuntimeError("initial Pi3 source scene scale is invalid")
+    return scale

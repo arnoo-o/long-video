@@ -308,3 +308,96 @@ def render(
         point_radius, depth_epsilon, device, chunk_points,
     )
     return _compose_parent_first(parent, delta, node, cameras, near, far)
+
+
+def _render_geometry_cuda_single(
+    points_xyz, points_confidence, cameras, *, near=.05, far=100.,
+    depth_epsilon=1e-5, chunk_points=1_000_000,
+):
+    """CUDA-only z-buffer for GeoToken conditioning.
+
+    This deliberately omits RGB, source labels, point indices, and coverage.
+    Inputs remain CUDA tensors and the result never crosses the CPU boundary.
+    """
+    import torch
+
+    if points_xyz.device.type != "cuda" or points_confidence.device != points_xyz.device:
+        raise ValueError("geometry renderer requires aligned CUDA point tensors")
+    dev = points_xyz.device
+    xyz = points_xyz.float()
+    confidence = points_confidence.float()
+    poses = torch.as_tensor(cameras.c2w, dtype=torch.float32, device=dev)
+    intrinsics = torch.as_tensor(cameras.intrinsics, dtype=torch.float32, device=dev)
+    t, h, w = len(cameras.c2w), cameras.height, cameras.width
+    outputs = []
+    for frame in range(t):
+        inverse = torch.linalg.inv(poses[frame])
+        zbuf = torch.full((h * w,), float("inf"), device=dev)
+        best = torch.full((h * w,), len(xyz), dtype=torch.long, device=dev)
+        for start in range(0, len(xyz), int(chunk_points)):
+            stop = min(start + int(chunk_points), len(xyz))
+            camera_xyz = xyz[start:stop] @ inverse[:3, :3].T + inverse[:3, 3]
+            depth = camera_xyz[:, 2]
+            uv = camera_xyz @ intrinsics[frame].T
+            uv = uv[:, :2] / depth[:, None].clamp_min(1e-8)
+            x, y = torch.round(uv[:, 0]).long(), torch.round(uv[:, 1]).long()
+            valid = (depth > near) & (depth < far) & (x >= 0) & (x < w) & (y >= 0) & (y < h)
+            index = torch.nonzero(valid).flatten()
+            if len(index):
+                zbuf.scatter_reduce_(0, y[index] * w + x[index], depth[index], reduce="amin", include_self=True)
+        for start in range(0, len(xyz), int(chunk_points)):
+            stop = min(start + int(chunk_points), len(xyz))
+            camera_xyz = xyz[start:stop] @ inverse[:3, :3].T + inverse[:3, 3]
+            depth = camera_xyz[:, 2]
+            uv = camera_xyz @ intrinsics[frame].T
+            uv = uv[:, :2] / depth[:, None].clamp_min(1e-8)
+            x, y = torch.round(uv[:, 0]).long(), torch.round(uv[:, 1]).long()
+            valid = (depth > near) & (depth < far) & (x >= 0) & (x < w) & (y >= 0) & (y < h)
+            index = torch.nonzero(valid).flatten()
+            if len(index):
+                flat = y[index] * w + x[index]
+                selected = index[depth[index] <= zbuf[flat] + depth_epsilon]
+                if len(selected):
+                    best.scatter_reduce_(0, y[selected] * w + x[selected], selected + start, reduce="amin", include_self=True)
+        visible = best < len(xyz)
+        winning_xyz = torch.zeros((h * w, 3), dtype=torch.float32, device=dev)
+        winning_confidence = torch.zeros(h * w, dtype=torch.float32, device=dev)
+        winning_xyz[visible] = xyz[best[visible]]
+        winning_confidence[visible] = confidence[best[visible]]
+        outputs.append((
+            winning_xyz.reshape(h, w, 3), zbuf.reshape(h, w),
+            visible.reshape(h, w), winning_confidence.reshape(h, w),
+        ))
+    return tuple(torch.stack(parts) for parts in zip(*outputs))
+
+
+def render_geometry_cuda(
+    points_xyz, points_confidence, cameras, *, parent_point_count=None,
+    near=.05, far=100., depth_epsilon=1e-5, chunk_points=1_000_000,
+):
+    """Render final GeoToken geometry on CUDA, including Parent-First exclusion."""
+    import torch
+
+    if parent_point_count is None or not 0 < int(parent_point_count) < len(points_xyz):
+        return _render_geometry_cuda_single(
+            points_xyz, points_confidence, cameras, near=near, far=far,
+            depth_epsilon=depth_epsilon, chunk_points=chunk_points,
+        )
+    split = int(parent_point_count)
+    parent = _render_geometry_cuda_single(
+        points_xyz[:split], points_confidence[:split], cameras, near=near, far=far,
+        depth_epsilon=depth_epsilon, chunk_points=chunk_points,
+    )
+    delta = _render_geometry_cuda_single(
+        points_xyz[split:], points_confidence[split:], cameras, near=near, far=far,
+        depth_epsilon=depth_epsilon, chunk_points=chunk_points,
+    )
+    parent_xyz, parent_depth, parent_visible, parent_confidence = parent
+    delta_xyz, delta_depth, delta_visible, delta_confidence = delta
+    allowed = delta_visible & ~parent_visible
+    return (
+        torch.where(allowed[..., None], delta_xyz, parent_xyz),
+        torch.where(allowed, delta_depth, parent_depth),
+        parent_visible | allowed,
+        torch.where(allowed, delta_confidence, parent_confidence),
+    )

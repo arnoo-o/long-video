@@ -238,6 +238,34 @@ def geometry_channels_from_render(
     return output
 
 
+def geometry_channels_from_cuda_render(
+    xyz: torch.Tensor, depth: torch.Tensor, visibility: torch.Tensor, confidence: torch.Tensor,
+    c2w, source_center, scene_scale: float,
+) -> torch.Tensor:
+    """CUDA equivalent of ``geometry_channels_from_render`` without CPU copies."""
+    if not np.isfinite(scene_scale) or float(scene_scale) <= 0:
+        raise ValueError("trajectory scene_scale must be finite and positive")
+    device = xyz.device
+    poses = torch.as_tensor(c2w, dtype=torch.float32, device=device)
+    c0 = torch.as_tensor(source_center, dtype=torch.float32, device=device).reshape(3)
+    valid = visibility.bool() & torch.isfinite(depth) & (depth > 0) & torch.isfinite(xyz).all(-1)
+    valid &= torch.isfinite(confidence)
+    origins = poses[:, None, None, :3, 3]
+    scale = float(scene_scale)
+    safe_xyz = torch.where(valid[..., None], xyz, origins)
+    direction = safe_xyz - origins
+    direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(1e-8)
+    safe_depth = torch.where(valid, depth, torch.full_like(depth, scale))
+    output = torch.zeros((*depth.shape, GEOTOKEN_CHANNELS), dtype=torch.float32, device=device)
+    output[..., 0:3] = ((safe_xyz - c0) / scale).clamp(-64, 64)
+    output[..., 3:6] = ((origins - c0) / scale).clamp(-64, 64)
+    output[..., 6:9] = direction.clamp(-1, 1)
+    output[..., 9] = torch.log((safe_depth / scale).clamp_min(1e-6)).clamp(-16, 16)
+    output[..., 10] = valid
+    output[..., 11] = torch.where(valid, confidence, torch.zeros_like(confidence)).clamp(0, 1)
+    return output * valid[..., None]
+
+
 def source_scene_scale(depth, visibility) -> float:
     depth = np.asarray(depth, np.float32)
     valid = np.asarray(visibility, bool) & np.isfinite(depth) & (depth > 0)

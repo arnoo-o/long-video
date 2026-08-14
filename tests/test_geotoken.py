@@ -12,6 +12,7 @@ from long_video.geometry.geotoken import (
 )
 from long_video.training.geotoken import (
     BalancedRolloutSampler,
+    augment_partial_voxels,
     checkpoint_names,
     max_chunks_for_step,
     phase_for_step,
@@ -90,3 +91,17 @@ def test_runtime_reads_actual_patch_grid_without_hardcoding():
     })
     assert current.tokens.shape == (1, 9 * 12 * 20, 16)
     assert history is None and support is None
+
+
+def test_phase_b_voxel_corruption_is_rollout_consistent():
+    class Args:
+        point_dropout = 0.2
+        confidence_dropout = 0.1
+        depth_noise = 0.01
+        xyz_jitter = 0.005
+    points = np.array([[1, 0, 2], [2, 0, 3], [3, 0, 4]], np.float32)
+    confidence = np.ones(3, np.float32)
+    keys = np.array([[1, 0, 2], [2, 0, 3], [3, 0, 4]], np.int64)
+    first = augment_partial_voxels(points, confidence, keys, source_center=np.zeros(3), scene_scale=2, args=Args(), seed=9)
+    second = augment_partial_voxels(points, confidence, keys, source_center=np.zeros(3), scene_scale=2, args=Args(), seed=9)
+    assert all(np.array_equal(a, b) for a, b in zip(first, second))

@@ -22,6 +22,8 @@ def parse_args():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--recal3r-root", type=Path, required=True)
+    parser.add_argument("--causal-world-cache-root", type=Path, required=True)
+    parser.add_argument("--gt-latent-cache-root", type=Path, required=True)
     parser.add_argument("--initial-world-cache-root", type=Path, required=True)
     parser.add_argument("--pi3-repo", type=Path, required=True)
     parser.add_argument("--pi3-checkpoint", type=Path, required=True)
@@ -41,6 +43,7 @@ def parse_args():
     parser.add_argument("--prompt", default="A stable realistic view of the same scene.")
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--smoke-only", action="store_true")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     return parser.parse_args()
 
 
@@ -61,17 +64,15 @@ def load_arrays(root, record):
     }
 
 
-def deterministic_latent(pipe, frames, device):
-    tensor = pipe._coerce_warp_video_tensor(
-        np.asarray(frames), height=384, width=640, device=torch.device(device),
-    ).to(dtype=pipe.vae.dtype)
-    posterior = pipe.vae.encode(tensor)
-    posterior = getattr(posterior, "latent_dist", posterior)
-    mode = getattr(posterior, "mode", None)
-    clean = mode() if callable(mode) else posterior.mean
-    mean = torch.tensor(pipe.vae.config.latents_mean, device=device, dtype=clean.dtype).view(1, -1, 1, 1, 1)
-    std = 1 / torch.tensor(pipe.vae.config.latents_std, device=device, dtype=clean.dtype).view(1, -1, 1, 1, 1)
-    return ((clean - mean) * std).detach()
+def cached_gt_latent(root, trajectory_id, chunk_index, device):
+    path = Path(root) / trajectory_id / f"chunk_{int(chunk_index):02d}.pt"
+    if not path.is_file():
+        raise FileNotFoundError(f"frozen GT latent cache is required: {path}")
+    payload = torch.load(path, map_location=device, weights_only=False)
+    latent = payload.get("latent")
+    if not torch.is_tensor(latent) or latent.ndim != 5:
+        raise RuntimeError(f"invalid GT latent cache: {path}")
+    return latent.to(device=device, dtype=torch.bfloat16).detach()
 
 
 def scene_scale_from_recal(root, c2w):
@@ -91,50 +92,7 @@ def full_scene_points(root):
     return value["points_xyz"].astype(np.float32), value["points_confidence"].astype(np.float32)
 
 
-def causal_partial_points(root, frame_limit, voxel_size=0.02):
-    xyz = np.load(root / "xyz_world.npy", mmap_mode="r")[: int(frame_limit) + 1]
-    valid = np.load(root / "valid.npy", mmap_mode="r")[: int(frame_limit) + 1].astype(bool)
-    confidence = np.load(root / "confidence.npy", mmap_mode="r")[: int(frame_limit) + 1]
-    points = np.asarray(xyz[valid], np.float32)
-    weights = np.asarray(confidence[valid], np.float32)
-    finite = np.isfinite(points).all(1) & np.isfinite(weights) & (weights > 0)
-    points, weights = points[finite], weights[finite]
-    if not len(points):
-        raise RuntimeError("causal ReCal3R subset contains no valid observations")
-    voxels = np.floor(points / float(voxel_size)).astype(np.int64)
-    _, first, inverse = np.unique(voxels, axis=0, return_index=True, return_inverse=True)
-    sums = np.zeros((len(first), 3), np.float64)
-    sum_weights = np.zeros(len(first), np.float64)
-    np.add.at(sums, inverse, points * weights[:, None])
-    np.add.at(sum_weights, inverse, weights)
-    fused = (sums / np.maximum(sum_weights[:, None], 1e-8)).astype(np.float32)
-    fused_confidence = np.minimum(1.0, sum_weights / np.maximum(1, np.bincount(inverse))).astype(np.float32)
-    return fused, fused_confidence
-
-
-def augment_partial_point_world(points, confidence, *, source_center, scene_scale, args, seed):
-    """Apply one trajectory-consistent perturbation before all camera renders."""
-    rng = np.random.default_rng(int(seed))
-    keep = rng.random(len(points)) >= float(args.point_dropout)
-    points = np.asarray(points, np.float32)[keep].copy()
-    confidence = np.asarray(confidence, np.float32)[keep].copy()
-    confidence[rng.random(len(confidence)) < float(args.confidence_dropout)] = 0
-    if args.xyz_jitter > 0:
-        points += rng.normal(
-            0, float(args.xyz_jitter) * float(scene_scale), points.shape,
-        ).astype(np.float32)
-    if args.depth_noise > 0:
-        ray = points - np.asarray(source_center, np.float32)
-        ray /= np.maximum(np.linalg.norm(ray, axis=1, keepdims=True), 1e-8)
-        offset = rng.normal(
-            0, float(args.depth_noise) * float(scene_scale), (len(points), 1),
-        ).astype(np.float32)
-        points += ray * offset
-    valid = np.isfinite(points).all(1) & np.isfinite(confidence) & (confidence > 0)
-    return points[valid], confidence[valid]
-
-
-def build_online(args, pipe, record, source, geometry_backend=None):
+def build_online(args, pipe, record, source, geometry_backend=None, pre_render_world_hook=None):
     from long_video.config import load_yaml
     from long_video.memory.memory_manager import MemoryManager
     from long_video.memory.node_store import NodeStore
@@ -154,6 +112,7 @@ def build_online(args, pipe, record, source, geometry_backend=None):
             "height": 384, "width": 640, "num_frames": 33, "output_type": "np",
             "pyramid_num_inference_steps_list": [2, 2, 2],
         },
+        pre_render_world_hook=pre_render_world_hook,
     )
     online.wah_fill_frame = source.copy()
     online.autoregressive_state = pipe.init_autoregressive_state(
@@ -203,7 +162,7 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         sigma = kwargs.pop("sigma").to(device=z_gt.device, dtype=torch.float32)
         if not bool(torch.isfinite(sigma)) or float(sigma) <= 0:
             raise RuntimeError(f"Stage{stage_id} formal scheduler sigma must be positive and finite")
-        kwargs["hidden_states"] = x_t.detach().requires_grad_(True)
+        kwargs["hidden_states"] = x_t.detach()
         kwargs["timestep"] = kwargs["timestep"].to(device=z_gt.device)
         kwargs["return_dict"] = False
         target = (x_t.float() - z_gt_stage.to(device=z_gt.device).float()) / sigma
@@ -249,7 +208,9 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         (loss / len(targets)).backward()
         # A later stage can share a token-grid resolution with an earlier
         # history branch. Do not retain an already-backpropagated encoder graph.
-        provider._cache.clear()
+        if kwargs["hidden_states"].requires_grad or kwargs["hidden_states"].grad is not None:
+            raise RuntimeError("native_flow_backward must not build gradients for x_t")
+        provider.clear_feature_cache()
         broken = [
             name for name, parameter in pipe.transformer.named_parameters()
             if "geotoken." in name and parameter.grad is not None
@@ -274,10 +235,13 @@ def main():
     sys.path.insert(0, str(args.wah_root))
     from warp_as_history import WarpAsHistoryPipeline
     from long_video.geometry.geotoken import assert_geotoken_only_trainable, install_geotoken
-    from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider
+    from long_video.geometry.geotoken_runtime import (
+        PointWorldGeoTokenProvider, source_scene_scale_from_active_node,
+    )
     from long_video.training.geotoken import (
         BalancedRolloutSampler, checkpoint_names, load_geotoken_checkpoint,
-        phase_for_step, save_geotoken_checkpoint,
+        phase_for_step, save_geotoken_checkpoint, load_causal_world_cache,
+        augment_partial_voxels,
     )
     from long_video.training.wpf_adaptation import select_balanced_training_records
 
@@ -313,7 +277,7 @@ def main():
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     conditioner = install_geotoken(pipe.transformer).to(device=args.device)
-    if hasattr(pipe.transformer, "enable_gradient_checkpointing"):
+    if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
     trainable = assert_geotoken_only_trainable(pipe.transformer)
     if hasattr(pipe, "_world_projection_context") or hasattr(pipe, "_pyramid_training_adapter_name"):
@@ -339,6 +303,7 @@ def main():
     run_started = time.time()
     steps_to_run = [start_step + 1] if args.smoke_only else range(start_step + 1, 2001)
     for step in steps_to_run:
+        total_started = time.time()
         phase = phase_for_step(step)
         record = sampler.choose_record(records, step)
         rollout_length = 1 if args.smoke_only else sampler.choose_length(step)
@@ -348,6 +313,7 @@ def main():
         if not metadata.get("valid", False):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(args.dataset_root / record["source"])
+        data_load_seconds = time.time() - total_started
         if phase == "C" and geometry_backend is None:
             from long_video.initialization.geometry_backend import Pi3GeometryBackend
             geometry_backend = Pi3GeometryBackend(args.pi3_checkpoint, args.pi3_repo, args.device)
@@ -355,44 +321,73 @@ def main():
             if pi3_model is not None and hasattr(pi3_model, "parameters"):
                 for parameter in pi3_model.parameters():
                     parameter.requires_grad_(False)
-        online = build_online(args, pipe, record, source, geometry_backend if phase == "C" else None)
         source_center = arrays["c2w"][0, :3, 3]
-        scale = scene_scale_from_recal(geometry_root, arrays["c2w"])
+        # ReCal3R normalization is confined to the offline A/B phases.
+        bootstrap_online = None
+        if phase == "C":
+            bootstrap_online = build_online(args, pipe, record, source, geometry_backend)
+            scale = source_scene_scale_from_active_node(
+                bootstrap_online.active_node, arrays["c2w"][0], arrays["k"][0], device=args.device,
+            )
+        else:
+            scale = scene_scale_from_recal(geometry_root, arrays["c2w"])
         provider = PointWorldGeoTokenProvider(
             conditioner, device=args.device, source_center=source_center, scene_scale=scale,
         )
         provider.attach(pipe.transformer)
         history_cameras = [(np.repeat(arrays["c2w"][:1], 33, 0), np.repeat(arrays["k"][:1], 33, 0))]
+        if phase == "C":
+            def pre_render_world_hook(active_node, cameras):
+                provider.configure_active_node(active_node)
+                provider.configure_chunk(cameras.c2w, cameras.intrinsics, history_cameras)
+                return {"world_version": provider.world_version}
+            bootstrap_online.pre_render_world_hook = pre_render_world_hook
+            online = bootstrap_online
+        else:
+            online = build_online(args, pipe, record, source)
         capture = ForwardCapture(pipe)
         capture_handle = pipe.transformer.register_forward_pre_hook(capture, with_kwargs=True)
-        step_started = time.time()
+        prefix_rollout_seconds = 0.0
+        gt_latent_seconds = 0.0
         try:
+            corruption_seed = (int(args.seed) << 32) ^ int(step)
             for chunk_index in range(rollout_length):
                 frame_slice = slice(chunk_index * 32, chunk_index * 32 + 33)
                 poses, intrinsics = arrays["c2w"][frame_slice], arrays["k"][frame_slice]
                 if phase == "A":
                     points, confidence = full_scene_points(geometry_root)
                 elif phase == "B":
-                    points, confidence = causal_partial_points(geometry_root, chunk_index * 32)
-                    points, confidence = augment_partial_point_world(
-                        points, confidence, source_center=source_center, scene_scale=scale,
-                        args=args, seed=args.seed + step * 17 + chunk_index,
+                    points, confidence, voxel_keys = load_causal_world_cache(
+                        args.causal_world_cache_root / record["trajectory_id"], chunk_index * 32,
                     )
-                else:
-                    points = np.asarray(online.active_node.points_xyz, np.float32).copy()
-                    confidence = np.asarray(online.active_node.points_confidence, np.float32).copy()
-                provider.configure_world(points, confidence)
-                provider.configure_chunk(poses, intrinsics, history_cameras)
+                    points, confidence = augment_partial_voxels(
+                        points, confidence, voxel_keys, source_center=source_center, scene_scale=scale,
+                        args=args, seed=corruption_seed,
+                    )
+                if phase != "C":
+                    world_version = (
+                        ("A", record["trajectory_id"])
+                        if phase == "A" else ("B", record["trajectory_id"], chunk_index)
+                    )
+                    provider.configure_world(points, confidence, world_version=world_version)
+                    provider.configure_chunk(poses, intrinsics, history_cameras)
                 capture.by_shape.clear()
+                rollout_started = time.time()
                 with torch.no_grad():
                     online.generate_chunk_at_cameras(poses, intrinsics, 384, 640)
+                prefix_rollout_seconds += time.time() - rollout_started
                 history_cameras.append((poses, intrinsics))
-            gt = [read_rgb(path) for path in arrays["rgb_paths"][frame_slice]]
-            with torch.no_grad():
-                z_gt = deterministic_latent(pipe, gt, args.device)
+            gt_started = time.time()
+            z_gt = cached_gt_latent(
+                args.gt_latent_cache_root, record["trajectory_id"], rollout_length - 1, args.device,
+            )
+            gt_latent_seconds = time.time() - gt_started
             optimizer.zero_grad(set_to_none=True)
+            train_started = time.time()
             with torch.enable_grad():
                 loss, stage_stats = native_flow_backward(pipe, z_gt, capture, provider)
+            training_forward_backward_seconds = time.time() - train_started
+            optimizer_started = time.time()
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [parameter for _, parameter in trainable], args.max_grad_norm,
             )
@@ -400,6 +395,7 @@ def main():
                 raise RuntimeError("non-finite GeoToken loss/gradient")
             before = {name: value.detach().clone() for name, value in trainable}
             optimizer.step(); scheduler.step()
+            optimizer_seconds = time.time() - optimizer_started
             changed = [name for name, value in trainable if not torch.equal(before[name], value.detach())]
             if not changed:
                 raise RuntimeError("optimizer step did not update GeoToken")
@@ -421,7 +417,13 @@ def main():
             "injection_gates": {
                 key: float(value.detach()) for key, value in conditioner.injection_gates.items()
             },
-            "optimizer_step_seconds": time.time() - step_started,
+            "data_load_seconds": data_load_seconds,
+            "point_render_seconds": provider.render_seconds,
+            "prefix_rollout_seconds": prefix_rollout_seconds,
+            "gt_latent_seconds": gt_latent_seconds,
+            "training_forward_backward_seconds": training_forward_backward_seconds,
+            "optimizer_seconds": optimizer_seconds,
+            "total_step_seconds": time.time() - total_started,
             "elapsed_seconds": time.time() - run_started,
             "uses_future_gt": False,
             **stage_stats,

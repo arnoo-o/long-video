@@ -57,6 +57,37 @@ diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
                              noise_uncond = self.transformer(
                                  hidden_states=model_latents,
                                  timestep=timestep,
+@@ -2781,5 +2798,6 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                             )[0]
+ 
++                        noise_pred_text = noise_pred
+                         if self.config.is_cfg_zero_star:
+                             noise_pred_text = noise_pred
+                             positive_flat = noise_pred_text.view(batch_size, -1)
+@@ -2796,6 +2814,23 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         else:
+                             noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
++                        if training_enabled:
++                            # The public AR entry point is no_grad. Rebuild the
++                            # exact CFG combination inside the selected step's
++                            # local grad context so LoRA gradients survive.
++                            with torch.enable_grad():
++                                if self.config.is_cfg_zero_star:
++                                    positive_flat = noise_pred_text.view(batch_size, -1)
++                                    negative_flat = noise_uncond.view(batch_size, -1)
++                                    train_alpha = optimized_scale(positive_flat, negative_flat)
++                                    train_alpha = train_alpha.view(
++                                        batch_size, *([1] * (len(noise_pred_text.shape) - 1))
++                                    ).to(noise_pred_text.dtype)
++                                    noise_pred = noise_uncond * train_alpha + guidance_scale * (
++                                        noise_pred_text - noise_uncond * train_alpha)
++                                else:
++                                    noise_pred = noise_uncond + guidance_scale * (
++                                        noise_pred_text - noise_uncond)
+ 
+                     latents = self.scheduler.step(
+                         noise_pred,
+                         t,
 @@ -2814,6 +2831,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
              self._unfuse_wah_lora()
              self._stage2_completion_step_active = False

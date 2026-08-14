@@ -206,7 +206,9 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         if key not in capture.by_shape:
             raise RuntimeError(f"formal inference did not capture Stage{stage_id} shape {key}")
         kwargs = dict(capture.by_shape[key])
-        kwargs["hidden_states"] = item["noisy_latents"].to(dtype=pipe.transformer.dtype)
+        kwargs["hidden_states"] = (
+            item["noisy_latents"].to(dtype=pipe.transformer.dtype).detach().requires_grad_(True)
+        )
         kwargs["timestep"] = item["timesteps"]
         kwargs["return_dict"] = False
         if stage_id == 0:
@@ -214,6 +216,8 @@ def native_flow_backward(pipe, z_gt, capture, provider):
         else:
             pipe._set_wah_lora_enabled(False)
         prediction = pipe.transformer(**kwargs)[0]
+        if not prediction.requires_grad:
+            raise RuntimeError("GeoToken prediction lost its gradient graph")
         sigma = item["sigmas"]
         weighting = compute_loss_weighting_for_sd3("none", sigma)
         loss = torch.mean(

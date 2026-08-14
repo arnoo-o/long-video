@@ -358,7 +358,10 @@ def main():
                 cameras.c2w, cameras.intrinsics,
                 online.autoregressive_state.get("_geotoken_history_snapshots", ()),
             )
-            return {"world_version": provider.world_version, "freeze_history": provider.freeze_current_snapshot}
+            return {
+                "world_version": getattr(active_node, "node_id", id(active_node)),
+                "freeze_history": provider.freeze_current_snapshot,
+            }
 
         online.pre_render_world_hook = pre_render_world_hook
         capture = ForwardCapture(pipe)

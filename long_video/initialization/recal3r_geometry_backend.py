@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sys
+import hashlib
 
 import numpy as np
 
@@ -65,6 +66,8 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._frames: list[_Frame] = []
         self._state_args = None
         self._last_predictions = []
+        self._results = {}
+        self._seen = set()
         self._sequence_version = 0
 
     def initialize(self, rgb, c2w, intrinsics, **_kwargs):
@@ -104,35 +107,42 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         rgb, c2w, intrinsics = np.asarray(rgb), np.asarray(c2w, np.float32), np.asarray(intrinsics, np.float32)
         if len(rgb) != len(c2w) or len(rgb) != len(intrinsics):
             raise ValueError("ReCal3R RGB/camera/intrinsics must align")
+        keys = [hashlib.sha256(np.asarray(image, np.uint8).tobytes()).hexdigest() for image in rgb]
         self._frames.extend(_Frame(np.asarray(image, np.uint8).copy(), pose.copy(), k.copy())
-                            for image, pose, k in zip(rgb, c2w, intrinsics))
+                            for image, pose, k in zip(rgb, c2w, intrinsics) if
+                            hashlib.sha256(np.asarray(image, np.uint8).tobytes()).hexdigest() not in self._seen)
+        self._seen.update(keys)
+        if not self._frames:
+            return self._prediction_for_keys(keys)
         self._load()
         views = [self._view(frame, index) for index, frame in enumerate(self._frames)]
         outputs, state_args = self._inference(views, self._model, self.device, verbose=False)
         self._state_args = state_args[-1] if state_args else None
         self._last_predictions = outputs["pred"]
         self._sequence_version += 1
-        return self.get_current_geometry(len(rgb))
+        self._cache_all_results()
+        return self._prediction_for_keys(keys)
 
-    def get_current_geometry(self, count=None):
-        if not self._last_predictions:
-            raise RuntimeError("ReCal3R state is empty")
-        count = len(self._last_predictions) if count is None else int(count)
-        frames, predictions = self._frames[-count:], self._last_predictions[-count:]
-        depths, confidences, point_maps = [], [], []
-        for frame, prediction in zip(frames, predictions):
-            points = prediction["pts3d_in_self_view"].detach().cpu().numpy()[0]
-            confidence = prediction["conf_self"].detach().cpu().numpy()[0]
-            transform = official_resize_crop(*frame.rgb.shape[:2], 512)
-            local, inside = remap_model_map(points, transform, interpolation=1)
-            conf, _ = remap_model_map(confidence.astype(np.float32), transform, interpolation=1)
-            depth = local[..., 2].astype(np.float32)
-            valid = inside & np.isfinite(depth) & (depth > 0) & np.isfinite(conf) & (conf >= self.confidence_threshold)
-            depth[~valid] = np.nan; conf = np.where(valid, conf, 0).astype(np.float32)
-            depths.append(depth); confidences.append(conf)
-            camera = backproject_z_depth(depth, frame.intrinsics)
-            point_maps.append(camera @ frame.c2w[:3, :3].T + frame.c2w[:3, 3])
-        depth, confidence, point_maps = map(np.stack, (depths, confidences, point_maps))
+    def _cache_all_results(self):
+        for frame, prediction in zip(self._frames, self._last_predictions):
+            key = hashlib.sha256(frame.rgb.tobytes()).hexdigest()
+            self._results[key] = self._geometry_for(frame, prediction)
+
+    def _geometry_for(self, frame, prediction):
+        points = prediction["pts3d_in_self_view"].detach().cpu().numpy()[0]
+        confidence = prediction["conf_self"].detach().cpu().numpy()[0]
+        transform = official_resize_crop(*frame.rgb.shape[:2], 512)
+        local, inside = remap_model_map(points, transform, interpolation=1)
+        conf, _ = remap_model_map(confidence.astype(np.float32), transform, interpolation=1)
+        depth = local[..., 2].astype(np.float32)
+        valid = inside & np.isfinite(depth) & (depth > 0) & np.isfinite(conf) & (conf >= self.confidence_threshold)
+        depth[~valid] = np.nan; conf = np.where(valid, conf, 0).astype(np.float32)
+        camera = backproject_z_depth(depth, frame.intrinsics)
+        return depth, conf, camera @ frame.c2w[:3, :3].T + frame.c2w[:3, 3]
+
+    def _prediction_for_keys(self, keys):
+        values = [self._results[key] for key in keys]
+        depth, confidence, point_maps = map(np.stack, zip(*values))
         return GeometryPrediction(
             depth=depth, depth_confidence=confidence, point_maps=point_maps,
             geometry_confidence=confidence, depth_convention=Z_DEPTH,
@@ -141,6 +151,13 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             diagnostics={"backend": "official_recal3r_recurrent", **self.get_state(),
                          "valid_ratio": float(np.isfinite(depth).mean())},
         )
+
+    def get_current_geometry(self, count=None):
+        if not self._last_predictions:
+            raise RuntimeError("ReCal3R state is empty")
+        count = len(self._last_predictions) if count is None else int(count)
+        keys = [hashlib.sha256(frame.rgb.tobytes()).hexdigest() for frame in self._frames[-count:]]
+        return self._prediction_for_keys(keys)
 
     def predict(self, view_rgb, view_c2w, intrinsics, **_kwargs):
         return self.update(view_rgb, view_c2w, intrinsics)

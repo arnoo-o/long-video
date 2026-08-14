@@ -200,6 +200,11 @@ class OnlineSpatialHistoryPipeline:
         self.recent_video_history = self.recent_video_history[-2:]
         memory_event = None
         if self.memory_manager is not None:
+            backend = self.memory_manager.geometry_backend
+            if backend is not None and hasattr(backend, "update"):
+                # Advance a recurrent geometry backend on every causal
+                # generated chunk before candidate selection/promotion.
+                backend.update(generated, memory_cameras.c2w, memory_cameras.intrinsics)
             self.active_node, memory_event = self.memory_manager.process_chunk(
                 self.active_node, generated_rgb_for_memory=generated,
                 cameras=memory_cameras, warp=memory_warp,

@@ -17,7 +17,15 @@ def main():
         raise SystemExit("no GeoToken metrics have been written")
     latest = json.loads(metrics[-1].read_text())
     recent = [json.loads(path.read_text()) for path in metrics[-20:]]
-    average = sum(item["optimizer_step_seconds"] for item in recent) / len(recent)
+    def step_seconds(item):
+        # Current runs report complete wall-clock time; retain compatibility
+        # with earlier GeoToken metrics that only had optimizer_step_seconds.
+        value = item.get("total_step_seconds")
+        if value is None:
+            value = item["optimizer_step_seconds"]
+        return float(value)
+
+    average = sum(step_seconds(item) for item in recent) / len(recent)
     remaining = max(0, 2000 - int(latest["global_step"])) * average
     print(json.dumps({
         "global_step": f"{latest['global_step']}/2000",

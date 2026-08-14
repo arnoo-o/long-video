@@ -99,7 +99,7 @@ def main():
         store = NodeStore(target)
         initialize_spatial_node(
             views, backend,
-            {"voxel_size": 0.2, "node_store": store,
+            {"voxel_size": 0.02, "node_store": store,
              "view_frame_indices": padded_indices,
              "target_frame_start": int(record["source_global_frame"]) + 1},
         )
@@ -111,7 +111,7 @@ def main():
             "pi3_effective_view_frame_indices": padded_indices,
             "causal_view_padding_count": padding,
             "pi3_checkpoint": str(args.pi3_checkpoint.resolve()),
-            "voxel_size": 0.2, "uses_future_gt": False,
+            "voxel_size": 0.02, "uses_future_gt": False,
         }
         (target / "cache_metadata.json").write_text(json.dumps(metadata, indent=2))
         built += 1

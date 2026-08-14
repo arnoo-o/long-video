@@ -66,7 +66,7 @@ def main():
         np.clip(m0_prediction.depth_confidence*0.5,0,1),
         m0_prediction.depth_convention,
     )
-    m0=build_from_views(m0_views,node_id="node_000",voxel_size=0.2,status="active")
+    m0=build_from_views(m0_views,node_id="node_000",voxel_size=0.02,status="active")
     transition_rgb=rgb[8:20]
     cameras=CameraBatch(poses[8:20],k[8:20],args.size,args.size)
     warp=render(m0,cameras,near=0.02,far=8.0,point_radius=0,device=args.device,chunk_points=100000)

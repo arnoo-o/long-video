@@ -203,7 +203,7 @@ def main():
         BalancedChunkSampler, configure_trainable_completion_adapter,
         select_balanced_training_records,
     )
-    from long_video.wah.rgb_clamp_pipeline import RGBClampWarpAsHistoryPipeline
+    from long_video.training.legacy_rgb_clamp_pipeline import RGBClampWarpAsHistoryPipeline
 
     if args.run_dir.exists() and any(args.run_dir.iterdir()):
         raise FileExistsError(f"run directory must be new: {args.run_dir}")

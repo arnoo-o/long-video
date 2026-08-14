@@ -140,17 +140,20 @@ class OnlineSpatialHistoryPipeline:
             self.active_node,reactivation_event=self.memory_manager.maybe_reactivate(
                 self.active_node,cameras)
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
-        if hasattr(self.wah_pipeline, "set_rgb_clamp_context"):
-            self.wah_pipeline.set_rgb_clamp_context(
-                warp.rgb, warp.visibility, height=cameras.height, width=cameras.width,
+        if hasattr(self.wah_pipeline, "set_world_projection_from_renderer"):
+            self.wah_pipeline.set_world_projection_from_renderer(
+                warp.rgb, warp.visibility, warp.confidence,
+                height=cameras.height, width=cameras.width,
             )
         try:
             _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
                 self.autoregressive_state, warp, output_type="np", fill_frame=self.wah_fill_frame,
             )
         finally:
-            if hasattr(self.wah_pipeline, "clear_rgb_clamp_context"):
-                self.wah_pipeline.clear_rgb_clamp_context()
+            context = getattr(self.wah_pipeline, "_world_projection_context", None)
+            world_projection_diagnostics = list(context.diagnostics) if context is not None else []
+            if hasattr(self.wah_pipeline, "clear_world_projection_context"):
+                self.wah_pipeline.clear_world_projection_context()
         generated_chunk = self._decode_last_latent_chunk()
         self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):
@@ -201,7 +204,7 @@ class OnlineSpatialHistoryPipeline:
             "active_node_id": self.active_node.node_id,
             "memory_event": memory_event,
             "chunk_index": self.chunk_index,
-            "rgb_clamp_diagnostics": list(getattr(self.wah_pipeline, "_rgb_clamp_diagnostics", [])),
+            "world_projection_diagnostics": world_projection_diagnostics,
             "uses_future_gt": False,
         }
         self.chunk_index += 1

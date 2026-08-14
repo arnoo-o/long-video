@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run causal point world -> renderer -> original WAH -> Stage2 RGB clamp."""
+"""Run causal point world -> renderer -> original WAH + WPF."""
 import argparse, json, sys
 from pathlib import Path
 import imageio.v2 as imageio
@@ -15,7 +15,6 @@ def main():
     p=argparse.ArgumentParser(); p.add_argument('--wah-root',type=Path,required=True); p.add_argument('--model',type=Path,required=True)
     p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--pi3-repo',type=Path,required=True)
     p.add_argument('--pi3-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
-    p.add_argument('--stage2-completion-checkpoint',type=Path)
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
     from long_video.config import load_yaml
@@ -25,7 +24,7 @@ def main():
     from long_video.memory.node_store import NodeStore
     from long_video.memory.node_builder import build_from_views
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
-    from long_video.wah.rgb_clamp_pipeline import PYRAMID_INFERENCE_STEPS, RGBClampWarpAsHistoryPipeline
+    from long_video.wah.world_projected_pipeline import PYRAMID_INFERENCE_STEPS, WorldProjectedWarpAsHistoryPipeline
     from long_video.types import ViewSet
     stored_node=NodeStore(a.session).load('node_000')
     source_views=ViewSet(
@@ -41,20 +40,9 @@ def main():
     )
     node.scale=stored_node.scale; node.model_versions=stored_node.model_versions
     node.quality_metrics.update(stored_node.quality_metrics,source_voxel_size=0.02)
-    pipe=RGBClampWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
+    pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
-    if a.stage2_completion_checkpoint is not None:
-        from long_video.training.stage2_cleanup import configure_trainable_completion_adapter
-        trainable=configure_trainable_completion_adapter(pipe)
-        checkpoint=torch.load(a.stage2_completion_checkpoint,map_location='cpu',weights_only=False)
-        state=checkpoint['stage2_completion']; named=dict(pipe.transformer.named_parameters())
-        if set(state)!=set(name for name,_ in trainable):
-            raise RuntimeError('Stage2 completion checkpoint does not match the configured adapter')
-        with torch.no_grad():
-            for name,value in state.items():
-                named[name].copy_(value.to(device=named[name].device,dtype=named[name].dtype))
-        pipe._stage2_completion_checkpoint=str(a.stage2_completion_checkpoint)
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
     geo=Pi3GeometryBackend(a.pi3_checkpoint,a.pi3_repo,a.device); manager=MemoryManager.from_config(load_yaml('configs/online_memory.yaml'),geometry_backend=geo)
@@ -68,6 +56,6 @@ def main():
         video,_,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width); g=u8(video); w=u8(warp.rgb); v=np.asarray(warp.visibility)
         offset=0 if not generated else 1; generated.extend(g[offset:]); warps.extend(w[offset:])
         masked=w.copy(); masked[~v]=0; panel=np.concatenate([g,w,masked],axis=2); panels.extend(panel[offset:]); reports.append(report)
-    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'stage2_completion_checkpoint':str(a.stage2_completion_checkpoint) if a.stage2_completion_checkpoint else None,'chunks':reports},indent=2,default=str))
+    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':True,'chunks':reports},indent=2,default=str))
 if __name__=='__main__': main()
 

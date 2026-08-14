@@ -1,4 +1,4 @@
-"""Original WAH plus Stage2-only renderer RGB consistency clamp."""
+"""Training-only legacy Stage2 RGB clamp retained for old experiments."""
 from __future__ import annotations
 from typing import Any
 import torch

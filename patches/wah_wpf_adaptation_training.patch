@@ -1,0 +1,65 @@
+diff --git a/warp_as_history/pipeline.py b/warp_as_history/pipeline.py
+--- a/warp_as_history/pipeline.py
++++ b/warp_as_history/pipeline.py
+@@ -2613,7 +2613,8 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         else:
+                             self.transformer.disable_adapters()
+                     self._stage2_completion_step_active = completion_active
+                     self._stage2_base_model_output = None
++                    self._pyramid_base_model_output = None
+                     if i_s == 0:
+                         current_indices_hidden_states = pyramid_base_histories["indices_hidden_states"]
+                         current_indices_latents_history_short = pyramid_base_histories[
+@@ -2658,7 +2659,18 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         i_s == 2 and stage2_observer is not None
+                         and stage2_observer.should_train_step(idx)
+                     )
+-                    if stage2_training and completion_active:
++                    pyramid_observer = getattr(self, "_pyramid_training_observer", None)
++                    pyramid_training = bool(
++                        pyramid_observer is not None
++                        and pyramid_observer.should_train_step(i_s, idx)
++                    )
++                    pyramid_training_name = getattr(self, "_pyramid_training_adapter_name", None)
++                    if pyramid_training and (
++                        i_s not in (1, 2) or adapter_name != pyramid_training_name
++                    ):
++                        raise RuntimeError("pyramid training adapter is not active at selected step")
++                    training_enabled = stage2_training or pyramid_training
++                    if (stage2_training and completion_active) or pyramid_training:
+                         # Compute the frozen-Helios preservation target first,
+                         # using the exact real x_t/timestep/conditioning.
+                         self.transformer.disable_adapters()
+@@ -2713,9 +2724,13 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                             else:
+                                 base_pred = base_uncond + guidance_scale * (base_pred - base_uncond)
+                         self._stage2_base_model_output = base_pred.detach()
+-                        self.transformer.set_adapter(completion_name)
++                        self._pyramid_base_model_output = base_pred.detach()
++                        active_training_name = (
++                            pyramid_training_name if pyramid_training else completion_name
++                        )
++                        self.transformer.set_adapter(active_training_name)
+                         self.transformer.enable_adapters()
+-                    with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("cond"):
++                    with torch.set_grad_enabled(training_enabled), self.transformer.cache_context("cond"):
+                         noise_pred = self.transformer(
+                             hidden_states=model_latents,
+                             timestep=timestep,
+@@ -2738,7 +2755,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+                         )[0]
+ 
+                     if self.do_classifier_free_guidance:
+-                        with torch.set_grad_enabled(stage2_training), self.transformer.cache_context("uncond"):
++                        with torch.set_grad_enabled(training_enabled), self.transformer.cache_context("uncond"):
+                             noise_uncond = self.transformer(
+                                 hidden_states=model_latents,
+                                 timestep=timestep,
+@@ -2814,6 +2831,7 @@ class WarpAsHistoryPipeline(HeliosPipeline):
+             self._unfuse_wah_lora()
+             self._stage2_completion_step_active = False
+             self._stage2_base_model_output = None
++            self._pyramid_base_model_output = None
+             if getattr(self, "_pyramid_adapter_names", None) is not None:
+                 self.transformer.set_adapter(self._wah_adapter_name)
+                 for parameter_name, parameter in self.transformer.named_parameters():

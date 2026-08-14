@@ -113,6 +113,7 @@ class WorldProjectionContext:
     endpoints: list[torch.Tensor]
     visibility: list[torch.Tensor]
     confidence: list[torch.Tensor]
+    raw_visibility: torch.Tensor | None = None
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -158,6 +159,7 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
         ]
         self._world_projection_context = WorldProjectionContext(
             endpoints=endpoints, visibility=visibility_pyramid, confidence=confidence_pyramid,
+            raw_visibility=mask.detach(),
         )
 
     def clear_world_projection_context(self) -> None:
@@ -181,6 +183,23 @@ class WorldProjectedWarpAsHistoryPipeline(WarpAsHistoryPipeline):
             if step_id == 0:
                 stage_id += 1
                 stage_start = sample.detach().clone()
+            observer = getattr(self, "_pyramid_training_observer", None)
+            if observer is not None:
+                observed = observer({
+                    "stage_id": stage_id,
+                    "step_id": step_id,
+                    "model_output": model_output,
+                    "base_model_output": getattr(self, "_pyramid_base_model_output", None),
+                    "sample": sample,
+                    "timestep": timestep,
+                    "dmd_sigmas": step_kwargs.get("dmd_sigmas", getattr(scheduler, "sigmas", None)),
+                    "dmd_timesteps": step_kwargs.get(
+                        "dmd_timesteps", getattr(scheduler, "timesteps", None),
+                    ),
+                    "point_visibility": context.raw_visibility,
+                })
+                if observed is not None:
+                    model_output, sample = observed
             result = original_step(model_output, timestep, sample, *step_args, **step_kwargs)
             z_raw = result[0]
             sigmas = step_kwargs.get("dmd_sigmas", getattr(scheduler, "sigmas", None))

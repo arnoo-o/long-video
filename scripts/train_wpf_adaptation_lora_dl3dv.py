@@ -238,6 +238,9 @@ def main():
     for module in (pipe.vae, pipe.text_encoder):
         for parameter in module.parameters():
             parameter.requires_grad_(False)
+    if not hasattr(pipe.transformer, "enable_gradient_checkpointing"):
+        raise RuntimeError("WPF adaptation training requires transformer gradient checkpointing")
+    pipe.transformer.enable_gradient_checkpointing()
     optimizer_parameters = [parameter for _, parameter in trainable]
     if {id(value) for value in optimizer_parameters} != {
         id(value) for value in pipe.transformer.parameters() if value.requires_grad
@@ -261,7 +264,7 @@ def main():
         "checkpoint_dir": str(checkpoints_dir),
         "state": "smoke" if args.smoke_only else "training",
         "training_record_count": len(records), "official_wah_frozen": True,
-        "gradient_checkpointing": False,
+        "gradient_checkpointing": True,
     }
     (args.run_dir / "status.json").write_text(json.dumps(status, indent=2))
 

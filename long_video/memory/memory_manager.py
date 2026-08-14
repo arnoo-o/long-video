@@ -41,7 +41,7 @@ class MemoryManager:
         max_overlap_depth_error=0.5,
         generated_confidence=0.25,
         keyframe_count=8,
-        voxel_size=0.02,
+        voxel_size=0.008,
         heldout_count=4,
         max_buffer_length=96,
         max_age_frames=240,

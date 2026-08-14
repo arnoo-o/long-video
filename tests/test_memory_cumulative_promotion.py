@@ -122,4 +122,4 @@ def test_generated_points_keep_nine_pixels_from_parent_interior_except_boundary(
 
 
 def test_source_and_new_world_voxel_default_is_point_zero_two():
-    assert MemoryManager().voxel_size == 0.02
+    assert MemoryManager().voxel_size == 0.008

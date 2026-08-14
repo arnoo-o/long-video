@@ -37,10 +37,10 @@ def main():
     )
     node=build_from_views(
         source_views,node_id='node_000',center_c2w=stored_node.center_c2w,
-        created_frame=stored_node.created_frame,voxel_size=0.02,status='active',
+        created_frame=stored_node.created_frame,voxel_size=0.008,status='active',
     )
     node.scale=stored_node.scale; node.model_versions=stored_node.model_versions
-    node.quality_metrics.update(stored_node.quality_metrics,source_voxel_size=0.02)
+    node.quality_metrics.update(stored_node.quality_metrics,source_voxel_size=0.008)
     pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))

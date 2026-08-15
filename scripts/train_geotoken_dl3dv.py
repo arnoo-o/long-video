@@ -413,11 +413,12 @@ def main():
                 prefix_rollout_seconds += time.time() - rollout_started
             if phase == "C":
                 final_recal_state = geometry_backend.get_state()
-                # The online pipeline advances ReCal3R with the 32 newly
-                # generated (non-boundary) frames per chunk. Candidate
-                # validation may re-evaluate existing frames but cannot add
-                # observations beyond this trajectory's generated prefix.
-                if not 0 < int(final_recal_state.get("frame_count", 0)) <= 32 * rollout_length:
+                # The first chunk contributes all 33 frames; subsequent
+                # chunks contribute 32 because their boundary is shared.
+                # Candidate validation may re-evaluate existing frames but
+                # cannot add observations beyond this trajectory's prefix.
+                expected_recal_frames = 33 + 32 * (rollout_length - 1)
+                if int(final_recal_state.get("frame_count", 0)) != expected_recal_frames:
                     raise RuntimeError(
                         f"Phase C ReCal3R state leaked observations at step {step}: "
                         f"{final_recal_state}, rollout_length={rollout_length}"

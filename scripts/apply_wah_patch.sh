@@ -19,6 +19,11 @@ else
   git -C "${WAH_ROOT}" apply "${PATCH}"
   echo "Applied WAH confidence patch to ${WAH_ROOT}"
 fi
+if ! git -C "${WAH_ROOT}" apply --reverse --check "${GEOTOKEN_QK_PATCH}" 2>/dev/null; then
+  git -C "${WAH_ROOT}" apply --check "${GEOTOKEN_QK_PATCH}"
+  git -C "${WAH_ROOT}" apply "${GEOTOKEN_QK_PATCH}"
+fi
+echo "Applied WAH GeoToken Q/K binding patch to ${WAH_ROOT}"
 if ! git -C "${WAH_ROOT}" apply --reverse --check "${TRAINING_PATCH}" 2>/dev/null; then
   git -C "${WAH_ROOT}" apply --check "${TRAINING_PATCH}"
   git -C "${WAH_ROOT}" apply "${TRAINING_PATCH}"
@@ -29,8 +34,3 @@ if ! git -C "${WAH_ROOT}" apply --reverse --check "${WPF_TRAINING_PATCH}" 2>/dev
   git -C "${WAH_ROOT}" apply "${WPF_TRAINING_PATCH}"
 fi
 echo "Applied WAH WPF-adaptation training patch to ${WAH_ROOT}"
-if ! git -C "${WAH_ROOT}" apply --reverse --check "${GEOTOKEN_QK_PATCH}" 2>/dev/null; then
-  git -C "${WAH_ROOT}" apply --check "${GEOTOKEN_QK_PATCH}"
-  git -C "${WAH_ROOT}" apply "${GEOTOKEN_QK_PATCH}"
-fi
-echo "Applied WAH GeoToken Q/K binding patch to ${WAH_ROOT}"

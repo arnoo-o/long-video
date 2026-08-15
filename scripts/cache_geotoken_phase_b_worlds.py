@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +28,7 @@ def fuse(root: Path, dataset_root: Path, frame_limit: int, voxel_size: float):
     points, weights, colors = np.asarray(xyz[valid], np.float32), np.asarray(confidence[valid], np.float32), np.asarray(rgb[valid], np.uint8)
     frame_ids = np.broadcast_to(np.arange(frame_limit + 1, dtype=np.int32)[:, None, None], valid.shape)[valid]
     finite = np.isfinite(points).all(1) & np.isfinite(weights) & (weights > 0)
-    points, weights = points[finite], weights[finite]
+    points, weights, colors, frame_ids = points[finite], weights[finite], colors[finite], frame_ids[finite]
     if not len(points):
         raise RuntimeError(f"no geometry at causal frame limit {frame_limit}")
     keys = np.floor(points / voxel_size).astype(np.int64)
@@ -53,8 +55,11 @@ def main():
                 or float(metadata.get("voxel_size", -1)) != 0.02):
             raise RuntimeError(f"stale Phase A ReCal cache: {source}")
         target = args.output_root / trajectory_id
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "cache_metadata.json").write_text(json.dumps({
+        temporary = args.output_root / f".{trajectory_id}.tmp-{os.getpid()}"
+        if temporary.exists(): shutil.rmtree(temporary)
+        temporary.mkdir(parents=True, exist_ok=True)
+        built=[]
+        (temporary / "cache_metadata.json").write_text(json.dumps({
             "schema_version": 3, "geometry_implementation_version": GEOMETRY_CACHE_VERSION,
             "source_recal_metadata": metadata, "voxel_size": float(args.voxel_size),
             "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
@@ -63,10 +68,16 @@ def main():
             keys, points, rgb, confidence, observation_count, max_frame = fuse(source, args.dataset_root, frame_limit, args.voxel_size)
             if int(max_frame.max()) > frame_limit: raise RuntimeError("future observation leaked into causal cache")
             np.savez_compressed(
-                target / f"frame_{frame_limit:03d}.npz", voxel_keys=keys,
+            temporary / f"frame_{frame_limit:03d}.npz", voxel_keys=keys,
                 points_xyz=points, points_rgb=rgb, points_confidence=confidence,
                 observation_count=observation_count, max_observation_frame=max_frame,
-            )
+            ); built.append(frame_limit)
+        if tuple(built) != FRAME_LIMITS: raise RuntimeError("incomplete Phase B cache build")
+        backup = args.output_root / f".{trajectory_id}.old-{os.getpid()}"
+        if backup.exists(): shutil.rmtree(backup)
+        if target.exists(): target.replace(backup)
+        temporary.replace(target)
+        if backup.exists(): shutil.rmtree(backup)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
@@ -52,6 +53,12 @@ def parse_args():
 
 def read_rgb(path):
     return np.asarray(Image.open(path).convert("RGB"), np.uint8)
+
+def file_sha256(path):
+    digest=hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for block in iter(lambda: handle.read(1024*1024),b''): digest.update(block)
+    return digest.hexdigest()
 
 
 def load_arrays(root, record):
@@ -140,6 +147,13 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
         if (metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "pi3x-source-only-official-resize-v3"
             or not metadata.get("uses_only_source") or float(metadata.get("voxel_size", -1)) != 0.02):
             raise RuntimeError(f"stale or non-source-only Pi3X initial-world cache: {cache}")
+        source_path=sorted((args.dataset_root / record["rgb_dir"]).glob("*"))[0]
+        current_repo_commit=__import__('subprocess').check_output(['git','-C',str(args.pi3x_repo),'rev-parse','HEAD'],text=True).strip()
+        if (metadata.get('trajectory_id') != record['trajectory_id'] or metadata.get('source_frame_index') != 0
+                or metadata.get('source_rgb_sha256') != file_sha256(source_path)
+                or metadata.get('pi3x_repo_commit') != current_repo_commit
+                or metadata.get('pi3x_checkpoint_sha256') != file_sha256(args.pi3x_checkpoint)):
+            raise RuntimeError(f"stale Pi3X W0 provenance: {cache}")
         node = NodeStore(cache).load("node_000")
     accumulator = None
     if geometry_backend is not None:
@@ -324,6 +338,7 @@ def main():
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     conditioner = install_geotoken(pipe.transformer).to(device=args.device)
+    conditioner.set_strength(args.geotoken_strength)
     vae_identity, model_identity = latent_cache_identities(pipe, args.model)
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
@@ -361,7 +376,7 @@ def main():
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
                 or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v3"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
-        source = read_rgb(args.dataset_root / record["source"])
+        source = read_rgb(arrays["rgb_paths"][0])
         data_load_seconds = time.time() - total_started
         if phase == "C" and geometry_backend is None:
             from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
@@ -397,7 +412,7 @@ def main():
                 if int(b_max.max()) > 0: raise RuntimeError("Phase B initial world leaks future observations")
                 teacher_node = teacher_world_node(source, arrays["c2w"], arrays["k"], b_xyz, b_rgb, b_conf, b_obs)
         provider = PointWorldGeoTokenProvider(
-            conditioner, device=args.device, source_center=source_center, scene_scale=scale,
+            conditioner, device=args.device, source_center=source_center, scene_scale=scale, render_height=384, render_width=640,
         )
         provider.attach(pipe.transformer)
         online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source, initial_node=teacher_node)

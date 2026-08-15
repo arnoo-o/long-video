@@ -72,6 +72,12 @@ def main():
         conditioner=install_geotoken(pipe.transformer).to(device=a.device)
         conditioner.set_strength(a.geotoken_strength)
         checkpoint=torch.load(a.geotoken_checkpoint,map_location='cpu',weights_only=False)
+        from long_video.training.geotoken import TRAINING_SEMANTICS_VERSION, GEOMETRY_SCHEMA_VERSION, GEOMETRY_IMPLEMENTATION_VERSION, WAH_RUNTIME_FINGERPRINT
+        if (checkpoint.get('training_semantics_version') != TRAINING_SEMANTICS_VERSION
+                or checkpoint.get('geometry_schema_version') != GEOMETRY_SCHEMA_VERSION
+                or checkpoint.get('geometry_implementation_version') != GEOMETRY_IMPLEMENTATION_VERSION):
+            raise RuntimeError('GeoToken checkpoint has stale training/world-binding semantics')
+        if checkpoint.get('wah_runtime_fingerprint') != WAH_RUNTIME_FINGERPRINT: raise RuntimeError('GeoToken checkpoint WAH runtime fingerprint mismatch')
         state=checkpoint.get('geotoken')
         named=dict(pipe.transformer.named_parameters())
         expected={name for name in named if 'geotoken.' in name}
@@ -93,7 +99,7 @@ def main():
     if a.geotoken_checkpoint is not None:
         source_c2w=np.asarray(node.view_c2w[0],np.float32)
         scene_scale=source_scene_scale_from_active_node(node,source_c2w,K,device=a.device,height=a.height,width=a.width)
-        provider=PointWorldGeoTokenProvider(conditioner,device=a.device,source_center=source_c2w[:3,3],scene_scale=scene_scale)
+        provider=PointWorldGeoTokenProvider(conditioner,device=a.device,source_center=source_c2w[:3,3],scene_scale=scene_scale,render_height=a.height,render_width=a.width)
         provider.attach(pipe.transformer)
         def pre_render_world_hook(active_node,cameras):
             active_world=provider.configure_active_node(active_node)

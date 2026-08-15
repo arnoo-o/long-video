@@ -28,7 +28,7 @@ def main():
     commit=subprocess.check_output(['git','-C',str(a.pi3x_repo),'rev-parse','HEAD'],text=True).strip()
     for record in records:
         paths=sorted((a.dataset_root/record['rgb_dir']).glob('*'))
-        source_index=int(record.get('source_frame_index',0)); source_path=paths[source_index]
+        source_index=0; source_path=paths[0]
         c2w=np.load(a.dataset_root/record['target_c2w_local']).astype(np.float32)[source_index]
         k=np.load(a.dataset_root/record['intrinsics']).astype(np.float32); k=k[source_index] if k.ndim==3 else k
         rgb=np.asarray(Image.open(source_path).convert('RGB'),np.uint8)

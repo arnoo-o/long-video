@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import random
 from dataclasses import dataclass, field
@@ -14,9 +15,10 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-geotoken-world-binding-v3"
-GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-pi3x-w0-prefix-replay-v3"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-geotoken-world-binding-v4"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-pi3x-w0-prefix-replay-v4"
 GEOMETRY_SCHEMA_VERSION = 3
+WAH_RUNTIME_FINGERPRINT = hashlib.sha256(b"wah-09aa646-confidence-patch-preserved").hexdigest()
 PHASE_BOUNDARIES = {500: "phase_a_final", 1100: "phase_b_final", 2000: "phase_c_final"}
 
 
@@ -208,6 +210,7 @@ def save_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
         "training_semantics_version": TRAINING_SEMANTICS_VERSION,
         "geometry_schema_version": GEOMETRY_SCHEMA_VERSION,
         "geometry_implementation_version": GEOMETRY_IMPLEMENTATION_VERSION,
+        "wah_runtime_fingerprint": WAH_RUNTIME_FINGERPRINT,
         "geotoken": state,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
@@ -229,6 +232,8 @@ def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
             or payload.get("geometry_schema_version") != GEOMETRY_SCHEMA_VERSION
             or payload.get("geometry_implementation_version") != GEOMETRY_IMPLEMENTATION_VERSION):
         raise RuntimeError("GeoToken checkpoint uses stale geometry/training semantics; resume is forbidden")
+    if payload.get("wah_runtime_fingerprint") != WAH_RUNTIME_FINGERPRINT:
+        raise RuntimeError("GeoToken checkpoint WAH runtime fingerprint mismatch")
     named = dict(transformer.named_parameters())
     if set(payload["geotoken"]) != {name for name in named if "geotoken." in name}:
         raise RuntimeError("GeoToken checkpoint parameter set does not match the model")

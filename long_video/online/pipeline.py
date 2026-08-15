@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
-import hashlib
 import numpy as np
 
 from ..data.controls import integrate_controls
@@ -10,21 +9,10 @@ from ..geometry.point_renderer import render
 from ..initialization.initial_node_pipeline import initialize_spatial_node
 from ..types import CameraBatch
 from ..wah.adapter import WAHAdapter
+from ..geometry.world_identity import point_world_snapshot_identity
 from .delayed_activation import DelayedNodeActivationQueue
 
 
-def point_world_snapshot_identity(node):
-    """Stable immutable identity for all data consumed by WAH/GeoToken."""
-    digest = hashlib.sha256()
-    digest.update(str(node.node_id).encode())
-    digest.update(str(int(getattr(node, "quality_metrics", {}).get("recal3r_world_version", 0))).encode())
-    for value in (node.points_xyz, node.points_rgb, node.points_confidence):
-        array = np.ascontiguousarray(value)
-        digest.update(str(array.dtype).encode()); digest.update(np.asarray(array.shape, np.int64).tobytes()); digest.update(array.tobytes())
-    xyz = np.asarray(node.points_xyz, np.float32)
-    digest.update(np.floor(xyz / 0.02).astype(np.int64).tobytes())
-    digest.update(np.rint(xyz * 1e5).astype(np.int64).tobytes())
-    return (node.node_id, int(len(xyz)), digest.hexdigest())
 
 
 class OnlineSpatialHistoryPipeline:

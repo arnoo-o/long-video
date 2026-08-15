@@ -11,6 +11,7 @@ from ..data.camera import resize_intrinsics
 from ..types import CameraBatch
 from .geotoken import GeometryTokenBatch, geometry_channels_from_cuda_render
 from .point_renderer import render_geometry_cuda
+from .world_identity import point_world_snapshot_identity
 
 
 def _pad_pool(value: torch.Tensor, kernel: tuple[int, int, int]) -> torch.Tensor:
@@ -37,11 +38,12 @@ class FrozenGeometrySnapshot:
 class PointWorldGeoTokenProvider:
     """Render one causal point source directly at every requested token grid."""
 
-    def __init__(self, conditioner, *, device, source_center, scene_scale):
+    def __init__(self, conditioner, *, device, source_center, scene_scale, render_height=384, render_width=640):
         self.conditioner = conditioner
         self.device = torch.device(device)
         self.source_center = np.asarray(source_center, np.float32)
         self.scene_scale = float(scene_scale)
+        self.render_resolution=(int(render_height),int(render_width))
         self.points_xyz: torch.Tensor | None = None
         self.points_confidence: torch.Tensor | None = None
         self.parent_point_count = None
@@ -72,14 +74,7 @@ class PointWorldGeoTokenProvider:
         self.clear_world_cache()
 
     def configure_active_node(self, node):
-        xyz = np.asarray(node.points_xyz, np.float32)
-        keys = np.floor(xyz / 0.02).astype(np.int64)
-        fingerprint = hashlib.sha256(np.ascontiguousarray(keys).tobytes()).hexdigest()[:16]
-        version = (
-            getattr(node, "node_id", id(node)),
-            int(getattr(node, "quality_metrics", {}).get("recal3r_world_version", 0)),
-            int(len(xyz)), fingerprint,
-        )
+        version = point_world_snapshot_identity(node)
         self.configure_world(
             node.points_xyz, node.points_confidence, world_version=version,
             parent_point_count=getattr(node, "parent_point_count", None),
@@ -107,9 +102,10 @@ class PointWorldGeoTokenProvider:
     def _render_channels(self, c2w, intrinsics, height, width):
         if self.points_xyz is None:
             raise RuntimeError("GeoToken provider has no available scene geometry")
-        scaled = resize_intrinsics(intrinsics, (384, 640), (int(height), int(width)))
+        scaled = resize_intrinsics(intrinsics, self.render_resolution, (int(height), int(width)))
         cameras = CameraBatch(c2w, scaled, int(height), int(width))
-        cache_key = (self.world_version, id(c2w), id(intrinsics), int(height), int(width))
+        camera_id = self._camera_identity(c2w, intrinsics)
+        cache_key = (self.world_version, camera_id, int(height), int(width))
         if cache_key not in self._render_cache:
             started = torch.cuda.Event(enable_timing=True)
             finished = torch.cuda.Event(enable_timing=True)
@@ -128,12 +124,19 @@ class PointWorldGeoTokenProvider:
         return channels.permute(3, 0, 1, 2).unsqueeze(0)
 
     def _encode_chunk(self, c2w, intrinsics, height, width):
-        key = (self.world_version, id(c2w), id(intrinsics), int(height), int(width), torch.is_grad_enabled())
+        key = (self.world_version, self._camera_identity(c2w, intrinsics), int(height), int(width), torch.is_grad_enabled())
         if key not in self._feature_cache:
             channels = self._render_channels(c2w, intrinsics, height, width)
             features, support = self.conditioner.tokenizer(channels)
             self._feature_cache[key] = (features, support)
         return self._feature_cache[key]
+
+    @staticmethod
+    def _camera_identity(c2w, intrinsics):
+        digest=hashlib.sha256()
+        for value in (np.asarray(c2w,np.float32),np.asarray(intrinsics,np.float32)):
+            value=np.ascontiguousarray(value); digest.update(np.asarray(value.shape,np.int64).tobytes()); digest.update(value.tobytes())
+        return digest.hexdigest()
 
     def point_render_seconds(self):
         if not self._render_events:
@@ -145,8 +148,8 @@ class PointWorldGeoTokenProvider:
         """Freeze actual current-world renders after the formal Helios call."""
         grids = {}
         for key, value in self._render_cache.items():
-            version, c2w_id, _k_id, height, width = key
-            if version == self.world_version and c2w_id == id(self.current_c2w):
+            version, camera_id, height, width = key
+            if version == self.world_version and camera_id == self._camera_identity(self.current_c2w,self.current_k):
                 grids[(int(height), int(width))] = tuple(item.detach().clone() for item in value)
         if not grids:
             raise RuntimeError("GeoToken current chunk produced no geometry render to freeze")

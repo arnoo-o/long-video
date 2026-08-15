@@ -31,6 +31,8 @@ class ReCal3RWorldAccumulator:
         self._weight = (np.asarray(node.points_confidence, np.float32).clip(1e-6)
                         * self._observations.astype(np.float32))
         self._seen_frame_ids = set()
+        self._fused_frame_ids = set()
+        self._pending_frame_ids = set()
         self._replay_rgb = [np.asarray(node.view_rgb[0], np.uint8).copy()]
         self._replay_c2w = [np.asarray(node.view_c2w[0], np.float32).copy()]
         self._replay_k = [np.asarray(node.view_intrinsics[0], np.float32).copy()]
@@ -61,6 +63,10 @@ class ReCal3RWorldAccumulator:
         self._node.quality_metrics.update({"recal3r_world_version": self._version, "voxel_size": self.voxel_size,
                                            "accumulator_points": int(len(xyz)),
                                            "fusion_weight_sum": float(weight.sum())})
+        # Persist only canonical fused voxels, never every raw pixel sample.
+        self._xyz, self._rgb = xyz.copy(), rgb.copy()
+        self._observations = observations.astype(np.int32, copy=True)
+        self._weight = confidence * self._observations.astype(np.float32)
 
 
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
@@ -79,15 +85,21 @@ class ReCal3RWorldAccumulator:
         self._replay_k.extend(np.asarray(k, np.float32).copy() for k in intrinsics)
         replay = self.backend.replay_prefix(np.stack(self._replay_rgb), np.stack(self._replay_c2w), np.stack(self._replay_k),
                                             trajectory_id=self.trajectory_id, global_frame_indices=range(len(self._replay_rgb)))
-        # source prediction initializes ReCal only; only this newly generated
-        # tail may enter W0, and it may do so exactly once globally.
-        predictions = replay[-len(indices):]
+        # Source initializes/alines ReCal only. Pending tails are revisited
+        # after the first successful alignment, but every global frame commits once.
+        candidates = sorted(self._pending_frame_ids | set(indices))
         point_parts=[]; confidence_parts=[]; color_parts=[]
-        for image, pose, k, index, prediction in zip(rgb, c2w, intrinsics, indices, predictions):
+        for index in candidates:
+            if index == 0 or index in self._fused_frame_ids: continue
+            prediction = replay[index]
+            image = self._replay_rgb[index]
             xyz = np.asarray(prediction.point_maps[0], np.float32)
             confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
             valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)
+            if not bool(valid.any()):
+                self._pending_frame_ids.add(index); continue
             point_parts.append(xyz[valid]); confidence_parts.append(confidence[valid]); color_parts.append(np.asarray(image, np.uint8)[valid])
+            self._pending_frame_ids.discard(index); self._fused_frame_ids.add(index)
         points = np.concatenate(point_parts) if point_parts else np.empty((0,3),np.float32)
         conf = np.concatenate(confidence_parts) if confidence_parts else np.empty(0,np.float32)
         colors = np.concatenate(color_parts) if color_parts else np.empty((0,3),np.uint8)
@@ -95,25 +107,6 @@ class ReCal3RWorldAccumulator:
             self._xyz = np.concatenate([self._xyz, points]); self._rgb = np.concatenate([self._rgb, colors])
             self._weight = np.concatenate([self._weight, conf]); self._observations = np.concatenate([self._observations, np.ones(len(points), np.int32)])
         self._seen_frame_ids.update(identities); self._version += 1; self._publish()
-        return self._node
-
-    def _legacy_update_frame(self, rgb, c2w, intrinsics, global_frame_index):
-        identity = (self.trajectory_id, int(global_frame_index))
-        if identity in self._seen_frame_ids:
-            raise RuntimeError(f"ReCal3R frame processed twice: {identity}")
-        prediction = self.backend.update_frame(rgb, c2w, intrinsics, trajectory_id=self.trajectory_id,
-                                               global_frame_index=int(global_frame_index))
-        self._maybe_lock_scale_anchor(rgb, c2w, intrinsics, int(global_frame_index))
-        xyz = np.asarray(prediction.point_maps[0], np.float32)
-        confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
-        valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)
-        points, conf, colors = xyz[valid], confidence[valid], np.asarray(rgb, np.uint8)[valid]
-        if len(points):
-            self._xyz = np.concatenate([self._xyz, points])
-            self._rgb = np.concatenate([self._rgb, colors])
-            self._weight = np.concatenate([self._weight, conf])
-            self._observations = np.concatenate([self._observations, np.ones(len(points), np.int16)])
-        self._seen_frame_ids.add(identity); self._version += 1; self._publish()
         return self._node
 
     def get_point_world(self):

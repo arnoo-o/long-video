@@ -48,6 +48,8 @@ class PointWorldGeoTokenProvider:
         self.current_c2w = None
         self.current_k = None
         self.history_snapshots: list[FrozenGeometrySnapshot] = []
+        self.history_window = []
+        self.source_geometry = None
         self._handle = None
         self._render_cache = {}
         self._feature_cache = {}
@@ -69,7 +71,10 @@ class PointWorldGeoTokenProvider:
         self.clear_world_cache()
 
     def configure_active_node(self, node):
-        version = getattr(node, "node_id", id(node))
+        version = (
+            getattr(node, "node_id", id(node)),
+            int(getattr(node, "quality_metrics", {}).get("recal3r_world_version", 0)),
+        )
         self.configure_world(
             node.points_xyz, node.points_confidence, world_version=version,
             parent_point_count=getattr(node, "parent_point_count", None),
@@ -84,10 +89,12 @@ class PointWorldGeoTokenProvider:
         """Release autograd graphs after one stage backward, not raw z-buffers."""
         self._feature_cache.clear()
 
-    def configure_chunk(self, c2w, intrinsics, history_snapshots=()):
+    def configure_chunk(self, c2w, intrinsics, history_snapshots=(), *, history_window=(), source_geometry=None):
         self.current_c2w = np.asarray(c2w, np.float32)
         self.current_k = np.asarray(intrinsics, np.float32)
         self.history_snapshots = list(history_snapshots)
+        self.history_window = list(history_window)
+        self.source_geometry = source_geometry
         # Camera changes invalidate only its keyed render entries; retaining
         # matching history/current camera renders avoids rerasterizing a world.
 
@@ -161,7 +168,12 @@ class PointWorldGeoTokenProvider:
             self._feature_cache[key] = self.conditioner.tokenizer(channels)
         return self._feature_cache[key]
 
-    def _history_by_indices(self, indices, height, width):
+    def _slot_from_snapshot(self, item, height, width):
+        snapshot, local_slot = item
+        feature, support = self._encode_snapshot(snapshot, height, width)
+        return feature[:, :, local_slot:local_slot + 1], support[:, :, local_slot:local_slot + 1]
+
+    def _history_by_indices(self, indices, height, width, current_feature, current_support):
         """Select frozen 9-slot chunks by the exact official WAH indices.
 
         WAH short mode uses a source-prefix slot followed by previous
@@ -172,24 +184,30 @@ class PointWorldGeoTokenProvider:
         if indices is None:
             raise RuntimeError("WAH history latent was supplied without temporal indices")
         flat = torch.as_tensor(indices).reshape(-1).detach().cpu().tolist()
-        slots = {}
-        for snapshot in self.history_snapshots:
-            feature, support = self._encode_snapshot(snapshot, height, width)
-            # The 33-frame VAE layout is [frame0, frames1..4, ..., frames29..32].
-            # Chunks advance by 32 RGB frames, i.e. eight latent slots.
-            base = int(snapshot.frame_start) // 4
-            for local_slot in range(feature.shape[2]):
-                slots[base + local_slot] = (feature[:, :, local_slot:local_slot + 1],
-                                            support[:, :, local_slot:local_slot + 1])
         feature_parts, support_parts = [], []
         zero_feature = torch.zeros(1, self.conditioner.tokenizer.inner_dim, 1, height, width, device=self.device)
         zero_support = torch.zeros(1, 1, 1, height, width, device=self.device)
         for index in flat:
-            feature, support = slots.get(int(index), (zero_feature, zero_support))
+            index = int(index)
+            if index == 0:
+                # The source prefix is a persistent geometry slot. Before the
+                # first chunk has frozen, its current slot-0 is the same
+                # source view and is therefore the exact causal fallback.
+                feature, support = (
+                    self._slot_from_snapshot(self.source_geometry, height, width)
+                    if self.source_geometry is not None else
+                    (current_feature[:, :, :1], current_support[:, :, :1])
+                )
+            elif 1 <= index <= 19 and index - 1 < len(self.history_window):
+                feature, support = self._slot_from_snapshot(self.history_window[index - 1], height, width)
+            elif 20 <= index <= 28:
+                feature, support = current_feature[:, :, index - 20:index - 19], current_support[:, :, index - 20:index - 19]
+            else:
+                feature, support = zero_feature, zero_support
             feature_parts.append(feature); support_parts.append(support)
         return torch.cat(feature_parts, 2), torch.cat(support_parts, 2)
 
-    def _history_part(self, kwargs, name, kernel):
+    def _history_part(self, kwargs, name, kernel, current_feature, current_support):
         latent = kwargs.get(f"latents_history_{name}")
         indices = kwargs.get(f"indices_latents_history_{name}")
         if latent is None or indices is None or latent.shape[2] == 0:
@@ -197,7 +215,11 @@ class PointWorldGeoTokenProvider:
         kt, kh, kw = kernel
         out_h = (latent.shape[-2] + kh - 1) // kh
         out_w = (latent.shape[-1] + kw - 1) // kw
-        feature, support = self._history_by_indices(indices, out_h, out_w)
+        # Resize the current live geometry only through the same stage grid
+        # requested by Helios; previous slots stay frozen snapshots.
+        if current_feature.shape[-2:] != (out_h, out_w):
+            current_feature, current_support = self._encode_chunk(self.current_c2w, self.current_k, out_h, out_w)
+        feature, support = self._history_by_indices(indices, out_h, out_w, current_feature, current_support)
         if feature.shape[2] != latent.shape[2]:
             raise RuntimeError("GeoToken temporal history must match official WAH history slots")
         if kt > 1:
@@ -207,9 +229,13 @@ class PointWorldGeoTokenProvider:
             support = denominator
         tokens = feature.flatten(2).transpose(1, 2)
         weights = support.flatten(2).transpose(1, 2)
-        expected_raw_tokens = int(latent.shape[2] * out_h * out_w)
-        if tokens.shape[1] != expected_raw_tokens:
-            raise RuntimeError(f"GeoToken raw {name} token count mismatch with WAH: {tokens.shape[1]} != {expected_raw_tokens}")
+        expected_tokens = int(
+            ((int(latent.shape[2]) + kt - 1) // kt)
+            * ((int(latent.shape[-2]) + kh - 1) // kh)
+            * ((int(latent.shape[-1]) + kw - 1) // kw)
+        )
+        if tokens.shape[1] != expected_tokens:
+            raise RuntimeError(f"GeoToken pooled {name} token count mismatch with WAH: {tokens.shape[1]} != {expected_tokens}")
         mask = kwargs.get(f"history_visible_mask_{name}")
         attention = kwargs.get("attention_kwargs") or {}
         if mask is not None and str(attention.get("history_visible_token_mode", "drop")) == "drop":
@@ -238,7 +264,7 @@ class PointWorldGeoTokenProvider:
         )
         parts = []
         for name, kernel in (("long", (4, 8, 8)), ("mid", (2, 4, 4)), ("short", (1, 2, 2))):
-            part = self._history_part(kwargs, name, kernel)
+            part = self._history_part(kwargs, name, kernel, current_feature, current_support)
             if part is not None:
                 parts.append(part)
         if parts:

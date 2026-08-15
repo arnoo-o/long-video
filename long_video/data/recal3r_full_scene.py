@@ -9,6 +9,14 @@ import cv2
 import numpy as np
 
 
+def calibrate_recal3r_confidence(confidence, threshold=1.5, temperature=0.35):
+    """Map native ReCal confidence to an ordered, bounded fusion weight."""
+    if temperature <= 0:
+        raise ValueError("ReCal3R confidence temperature must be positive")
+    value = np.asarray(confidence, np.float32)
+    return (1.0 / (1.0 + np.exp(-np.clip((value - float(threshold)) / float(temperature), -60.0, 60.0)))).astype(np.float32)
+
+
 @dataclass(frozen=True)
 class Sim3Alignment:
     scale: float

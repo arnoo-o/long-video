@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from long_video.data.recal3r_full_scene import (
     apply_sim3_c2w,
     apply_sim3_points,
+    calibrate_recal3r_confidence,
     estimate_camera_sim3,
     fuse_voxel_observations,
     list_rgb_frames,
@@ -209,9 +210,10 @@ def process_record(record, args, model_bundle):
             point_recal_world = point_self @ pose[:3, :3].T + pose[:3, 3]
             point_target_world = apply_sim3_points(point_recal_world, alignment).astype(np.float32)
             xyz, inside = remap_model_map(point_target_world, transform, cv2.INTER_LINEAR)
-            conf, _ = remap_model_map(confidence.astype(np.float32), transform, cv2.INTER_LINEAR)
+            raw_conf, _ = remap_model_map(confidence.astype(np.float32), transform, cv2.INTER_LINEAR)
+            conf = calibrate_recal3r_confidence(raw_conf, args.confidence_threshold)
             finite = np.isfinite(xyz).all(axis=-1) & np.isfinite(conf)
-            valid = inside & finite & (conf >= args.confidence_threshold)
+            valid = inside & finite & (raw_conf >= args.confidence_threshold)
             xyz[~valid] = 0
             conf = np.where(np.isfinite(conf), conf, 0).astype(np.float32)
             xyz_maps[frame_index] = xyz
@@ -248,6 +250,7 @@ def process_record(record, args, model_bundle):
             "height": height,
             "width": width,
             "confidence_threshold": args.confidence_threshold,
+            "confidence_calibration": {"kind": "sigmoid", "temperature": 0.35},
             "voxel_size": args.voxel_size,
             "valid_pixel_ratio": valid_pixels / (193 * height * width),
             "scene_point_count": int(len(scene["points_xyz"])),

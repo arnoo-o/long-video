@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import replace
 import numpy as np
 
+from ..geometry.point_renderer import render
+from ..types import CameraBatch
 from ..types import ScaleMetadata
 
 
@@ -24,8 +26,11 @@ class ReCal3RWorldAccumulator:
         node = self.initial_node
         self._xyz = np.asarray(node.points_xyz, np.float32).copy()
         self._rgb = np.asarray(node.points_rgb, np.uint8).copy()
-        self._weight = np.asarray(node.points_confidence, np.float32).clip(1e-6).copy()
-        self._observations = np.asarray(node.observation_count, np.int16).copy()
+        self._observations = np.asarray(node.observation_count, np.int32).clip(1).copy()
+        # Stored node confidence is an observation mean, not a total fusion
+        # weight.  Preserve that meaning across accumulator reset/publish.
+        self._weight = (np.asarray(node.points_confidence, np.float32).clip(1e-6)
+                        * self._observations.astype(np.float32))
         self._seen_frame_ids = set()
         self._version = 0
         self._scale_anchor = None
@@ -42,7 +47,7 @@ class ReCal3RWorldAccumulator:
         xyz = np.zeros((count, 3), np.float32); rgb = np.zeros((count, 3), np.float32)
         np.add.at(xyz, inverse, self._xyz * self._weight[:, None])
         np.add.at(rgb, inverse, self._rgb.astype(np.float32) * self._weight[:, None])
-        observations = np.bincount(inverse, weights=self._observations, minlength=count).astype(np.int16)
+        observations = np.bincount(inverse, weights=self._observations, minlength=count).astype(np.int32)
         xyz /= weight[:, None].clip(1e-8); rgb = np.clip(rgb / weight[:, None].clip(1e-8), 0, 255).astype(np.uint8)
         bmin = xyz.min(0) if len(xyz) else np.zeros(3, np.float32)
         bmax = xyz.max(0) if len(xyz) else np.zeros(3, np.float32)
@@ -55,12 +60,40 @@ class ReCal3RWorldAccumulator:
         self._node.points_xyz = xyz; self._node.points_rgb = rgb
         self._node.points_confidence = np.clip(weight / np.maximum(observations, 1), 0, 1).astype(np.float32)
         self._node.points_source = np.full(len(xyz), 2, np.int8)
-        self._node.observation_count = observations
+        self._node.observation_count = np.minimum(observations, np.iinfo(np.uint16).max).astype(np.uint16)
         self._node.bbox_min = bmin.astype(np.float32); self._node.bbox_max = bmax.astype(np.float32)
         self._node.coverage_radius = float(np.linalg.norm(bmax - bmin) * 0.5)
         self._node.scale = scale
         self._node.quality_metrics.update({"recal3r_world_version": self._version, "voxel_size": self.voxel_size,
-                                           "accumulator_points": int(len(xyz)), "scale_uncertainty": float(self._scale_uncertainty)})
+                                           "accumulator_points": int(len(xyz)), "scale_uncertainty": float(self._scale_uncertainty),
+                                           "fusion_weight_sum": float(weight.sum())})
+
+    def _maybe_lock_scale_anchor(self, rgb, c2w, intrinsics, global_frame_index):
+        """Use only current causal overlap, never a future/offline depth map."""
+        if self._scale_anchor is not None or len(self._xyz) == 0:
+            return
+        height, width = map(int, np.asarray(rgb).shape[:2])
+        # Rendering the existing world at the current observed camera yields
+        # the causal overlap map at the exact ReCal input resolution.
+        camera = CameraBatch(np.asarray(c2w, np.float32)[None], np.asarray(intrinsics, np.float32)[None], height, width)
+        old = render(self._node, camera, device="cpu")
+        old_depth = np.asarray(old.depth[0], np.float32)
+        recal_depth = self.backend.raw_recal_depth(self.trajectory_id, global_frame_index)
+        valid = (np.isfinite(old_depth) & (old_depth > 0) & np.isfinite(recal_depth) & (recal_depth > 0))
+        if int(valid.sum()) < 256:
+            return
+        ratios = old_depth[valid] / recal_depth[valid]
+        scale = float(np.median(ratios))
+        mad = float(np.median(np.abs(ratios - scale)))
+        if not np.isfinite(scale) or not 1e-4 < scale < 1e4:
+            return
+        self._scale_anchor = scale
+        self._scale_uncertainty = float(min(1.0, mad / max(abs(scale), 1e-8)))
+        self._node.quality_metrics.update({
+            "recal3r_scale_anchor_frame": int(global_frame_index),
+            "recal3r_scale_anchor_mad": mad,
+            "recal3r_scale_anchor_overlap": int(valid.sum()),
+        })
 
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
         identity = (self.trajectory_id, int(global_frame_index))
@@ -68,6 +101,7 @@ class ReCal3RWorldAccumulator:
             raise RuntimeError(f"ReCal3R frame processed twice: {identity}")
         prediction = self.backend.update_frame(rgb, c2w, intrinsics, trajectory_id=self.trajectory_id,
                                                global_frame_index=int(global_frame_index))
+        self._maybe_lock_scale_anchor(rgb, c2w, intrinsics, int(global_frame_index))
         xyz = np.asarray(prediction.point_maps[0], np.float32)
         confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
         valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)

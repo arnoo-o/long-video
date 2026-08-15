@@ -377,13 +377,18 @@ def main():
 
         def pre_render_world_hook(active_node, cameras):
             if phase == "C":
-                provider.configure_active_node(active_node)
+                active_world = provider.configure_active_node(active_node)
             provider.configure_chunk(
                 cameras.c2w, cameras.intrinsics,
                 online.autoregressive_state.get("_geotoken_history_snapshots", ()),
+                history_window=online.autoregressive_state.get("_geotoken_prev_history_window", ()),
+                source_geometry=online.autoregressive_state.get("_geotoken_source_geometry"),
             )
             return {
-                "world_version": getattr(active_node, "node_id", id(active_node)),
+                "world_version": (
+                    active_world["world_version"] if phase == "C"
+                    else getattr(active_node, "node_id", id(active_node))
+                ),
                 "freeze_history": provider.freeze_current_snapshot,
             }
 
@@ -447,8 +452,8 @@ def main():
                     flow_matching_stage_sampling="all",
                     flow_matching_stage_id=0,
                     flow_matching_train_exact_timestep_sampling="training_density",
-                    flow_matching_use_dynamic_shifting="auto",
-                    weighting_scheme="logit_normal",
+                    flow_matching_use_dynamic_shifting="off",
+                    weighting_scheme="none",
                     is_amplify_first_chunk=False,
                 )
                 loss, stage_stats = native_flow_backward(pipe, z_gt, capture, provider, exact_args)

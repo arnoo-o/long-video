@@ -7,8 +7,9 @@ import sys
 
 import numpy as np
 
-from ..data.recal3r_full_scene import official_resize_crop, remap_model_map
-from ..geometry.backprojection import backproject_z_depth
+from ..data.recal3r_full_scene import (
+    apply_sim3_points, calibrate_recal3r_confidence, estimate_camera_sim3, official_resize_crop, remap_model_map,
+)
 from ..types import Z_DEPTH
 from .geometry_backend import GeometryPrediction, MultiViewGeometryBackend
 
@@ -31,11 +32,14 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
     included, and the resulting state metadata is persistent across chunks.
     """
 
-    def __init__(self, checkpoint, repo_path, device, confidence_threshold=1.5):
+    def __init__(self, checkpoint, repo_path, device, confidence_threshold=1.5,
+                 confidence_temperature=0.35, min_alignment_frames=3):
         self.checkpoint = str(checkpoint)
         self.repo_path = str(repo_path)
         self.device = str(device)
         self.confidence_threshold = float(confidence_threshold)
+        self.confidence_temperature = float(confidence_temperature)
+        self.min_alignment_frames = int(min_alignment_frames)
         self._model = None
         self._inference = None
         self._pose = None
@@ -67,8 +71,11 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._state_args = None
         self._last_predictions = []
         self._results = {}
+        self._raw_depth = {}
         self._seen = set()
         self._sequence_version = 0
+        self._alignment = None
+        self._alignment_metadata = {"status": "pending"}
 
     def initialize(self, rgb, c2w, intrinsics, **_kwargs):
         self.reset()
@@ -152,20 +159,70 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         return [self._prediction_for_keys([key]) for key in keys]
 
     def _cache_all_results(self):
-        for frame, prediction in zip(self._frames, self._last_predictions):
-            self._results[frame.identity] = self._geometry_for(frame, prediction)
+        # ReCal predictions are in a recurrent reconstruction coordinate
+        # system.  Lock one Sim(3) using only the prefix seen so far, then
+        # transform both points and ReCal cameras into the project world.
+        recal_poses = [self._recal_c2w(prediction) for prediction in self._last_predictions]
+        if self._alignment is None and len(recal_poses) >= self.min_alignment_frames:
+            try:
+                self._alignment = estimate_camera_sim3(
+                    np.stack(recal_poses), np.stack([frame.c2w for frame in self._frames]),
+                )
+                self._alignment_metadata = {
+                    "status": "locked", "scale": float(self._alignment.scale),
+                    "camera_alignment_error": float(self._alignment.camera_alignment_error),
+                    "camera_alignment_error_ratio": float(self._alignment.camera_alignment_error_ratio),
+                    "anchor_frame": len(self._frames) - 1,
+                }
+            except ValueError as error:
+                self._alignment_metadata = {"status": "pending", "reason": str(error)}
+        for frame, prediction, recal_c2w in zip(self._frames, self._last_predictions, recal_poses):
+            result, raw_depth = self._geometry_for(frame, prediction, recal_c2w)
+            self._results[frame.identity] = result
+            self._raw_depth[frame.identity] = raw_depth
 
-    def _geometry_for(self, frame, prediction):
+    def _recal_c2w(self, prediction):
+        # Official CUT3R stores poses in its compact encoding.  Decode with
+        # the same helper used by the offline full-scene builder.
+        from src.dust3r.utils.camera import pose_encoding_to_camera
+        pose = pose_encoding_to_camera(prediction["camera_pose"].clone())
+        return pose.detach().cpu().numpy()[0].astype(np.float32)
+
+    def _geometry_for(self, frame, prediction, recal_c2w):
         points = prediction["pts3d_in_self_view"].detach().cpu().numpy()[0]
-        confidence = prediction["conf_self"].detach().cpu().numpy()[0]
+        raw_confidence = prediction["conf_self"].detach().cpu().numpy()[0]
         transform = official_resize_crop(*frame.rgb.shape[:2], 512)
-        local, inside = remap_model_map(points, transform, interpolation=1)
-        conf, _ = remap_model_map(confidence.astype(np.float32), transform, interpolation=1)
+        # First enter ReCal's predicted world, then the trajectory-fixed
+        # causal Sim(3).  Never reinterpret self-view z as target-camera z.
+        recal_world = points @ recal_c2w[:3, :3].T + recal_c2w[:3, 3]
+        if self._alignment is None:
+            world = np.full_like(recal_world, np.nan, dtype=np.float32)
+        else:
+            world = apply_sim3_points(recal_world, self._alignment).astype(np.float32)
+        mapped, inside = remap_model_map(world, transform, interpolation=1)
+        raw_conf, _ = remap_model_map(raw_confidence.astype(np.float32), transform, interpolation=1)
+        calibrated = calibrate_recal3r_confidence(
+            raw_conf, self.confidence_threshold, self.confidence_temperature,
+        )
+        # z-depth is measured after world alignment in the known target camera.
+        local = (mapped - frame.c2w[:3, 3]) @ frame.c2w[:3, :3]
         depth = local[..., 2].astype(np.float32)
-        valid = inside & np.isfinite(depth) & (depth > 0) & np.isfinite(conf) & (conf >= self.confidence_threshold)
-        depth[~valid] = np.nan; conf = np.where(valid, conf, 0).astype(np.float32)
-        camera = backproject_z_depth(depth, frame.intrinsics)
-        return depth, conf, camera @ frame.c2w[:3, :3].T + frame.c2w[:3, 3]
+        valid = (inside & np.isfinite(mapped).all(-1) & np.isfinite(depth) & (depth > 0)
+                 & np.isfinite(calibrated) & (raw_conf >= self.confidence_threshold))
+        mapped[~valid] = np.nan
+        depth[~valid] = np.nan
+        calibrated = np.where(valid, calibrated, 0).astype(np.float32)
+        return (depth, calibrated, mapped), np.asarray(points[..., 2], np.float32)
+
+    def raw_recal_depth(self, trajectory_id, global_frame_index):
+        """Causal self-view z for the accumulator's one-time overlap anchor."""
+        identity = f"{trajectory_id}:{int(global_frame_index)}"
+        value = self._raw_depth.get(identity)
+        if value is None:
+            raise RuntimeError(f"missing ReCal raw depth for {identity}")
+        frame = next(frame for frame in self._frames if frame.identity == identity)
+        depth, _ = remap_model_map(value, official_resize_crop(*frame.rgb.shape[:2], 512), interpolation=1)
+        return depth.astype(np.float32)
 
     def _prediction_for_keys(self, keys):
         values = [self._results[key] for key in keys]
@@ -175,9 +232,12 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             geometry_confidence=confidence, depth_convention=Z_DEPTH,
             # ReCal3R has arbitrary reconstruction scale until a causal
             # overlap anchor is measured by the world accumulator.
-            scale_info={"mode": "relative", "meters_per_world_unit": None,
-                        "uncertainty": 1.0, "anchor_source": "causal_overlap_pending"},
+            scale_info={"mode": "relative" if self._alignment is None else "dataset_calibrated",
+                        "meters_per_world_unit": None if self._alignment is None else float(self._alignment.scale),
+                        "uncertainty": 1.0 if self._alignment is None else float(min(1.0, self._alignment.camera_alignment_error_ratio)),
+                        "anchor_source": "causal_camera_sim3" if self._alignment is not None else "causal_overlap_pending"},
             diagnostics={"backend": "official_recal3r_recurrent", **self.get_state(),
+                         "alignment": dict(self._alignment_metadata),
                          "valid_ratio": float(np.isfinite(depth).mean())},
         )
 

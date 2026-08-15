@@ -22,10 +22,9 @@ def main():
                    choices=(0.0,0.25,0.5,1.0))
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
-    from long_video.config import load_yaml
     from long_video.data.camera import resize_intrinsics
     from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
-    from long_video.memory.memory_manager import MemoryManager
+    from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.wah.world_projected_pipeline import PYRAMID_INFERENCE_STEPS, WorldProjectedWarpAsHistoryPipeline
@@ -76,8 +75,13 @@ def main():
         geotoken_step=int(checkpoint.get('global_step',-1))
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
-    geo=ReCal3RGeometryBackend(a.recal3r_checkpoint,a.recal3r_repo,a.device); manager=MemoryManager.from_config(load_yaml('configs/online_memory.yaml'),geometry_backend=geo)
-    online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=manager,prompt=a.prompt,renderer_kwargs={'device':a.device, 'point_radius':0},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
+    geo=ReCal3RGeometryBackend(a.recal3r_checkpoint,a.recal3r_repo,a.device)
+    trajectory_id=f"inference:{a.session.resolve()}"
+    accumulator=ReCal3RWorldAccumulator(geo,node,trajectory_id=trajectory_id,voxel_size=0.02)
+    # node_000 already contains this source observation; prime only ReCal3R's
+    # recurrent state under a disjoint causal frame id.
+    geo.update_frame(node.view_rgb[0],node.view_c2w[0],node.view_intrinsics[0],trajectory_id=trajectory_id,global_frame_index=-1)
+    online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=None,world_accumulator=accumulator,prompt=a.prompt,renderer_kwargs={'device':a.device, 'point_radius':0},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
     online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(PYRAMID_INFERENCE_STEPS))
     online.autoregressive_state['is_amplify_first_chunk']=False
     online.wah_adapter.configure_state(online.autoregressive_state); controls=json.loads(a.controls.read_text()); K=resize_intrinsics(node.view_intrinsics[0],node.view_rgb.shape[1:3],(a.height,a.width))
@@ -87,9 +91,13 @@ def main():
         provider=PointWorldGeoTokenProvider(conditioner,device=a.device,source_center=source_c2w[:3,3],scene_scale=scene_scale)
         provider.attach(pipe.transformer)
         def pre_render_world_hook(active_node,cameras):
-            provider.configure_active_node(active_node)
-            provider.configure_chunk(cameras.c2w,cameras.intrinsics,online.autoregressive_state.get('_geotoken_history_snapshots',()))
-            return {'world_version':getattr(active_node,'node_id',id(active_node)),'freeze_history':provider.freeze_current_snapshot}
+            active_world=provider.configure_active_node(active_node)
+            provider.configure_chunk(
+                cameras.c2w,cameras.intrinsics,online.autoregressive_state.get('_geotoken_history_snapshots',()),
+                history_window=online.autoregressive_state.get('_geotoken_prev_history_window',()),
+                source_geometry=online.autoregressive_state.get('_geotoken_source_geometry'),
+            )
+            return {'world_version':active_world['world_version'],'freeze_history':provider.freeze_current_snapshot}
         online.pre_render_world_hook=pre_render_world_hook
     generated=[]; warps=[]; panels=[]; reports=[]
     with torch.inference_mode():

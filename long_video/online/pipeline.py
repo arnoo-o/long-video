@@ -153,9 +153,14 @@ class OnlineSpatialHistoryPipeline:
             pre_render_snapshot = self.pre_render_world_hook(self.active_node, cameras)
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
         if pre_render_snapshot is not None:
-            expected = getattr(self.active_node, "node_id", id(self.active_node))
+            expected = (
+                getattr(self.active_node, "node_id", id(self.active_node)),
+                int(getattr(self.active_node, "quality_metrics", {}).get("recal3r_world_version", 0)),
+            )
             observed = pre_render_snapshot.get("world_version") if isinstance(pre_render_snapshot, dict) else pre_render_snapshot
-            if observed != expected:
+            # Legacy non-accumulator hooks returned a node id; ReCal worlds
+            # additionally carry the monotonically changing accumulator version.
+            if observed != expected and observed != expected[0]:
                 raise RuntimeError(
                     f"pre-render conditioning world mismatch: {observed!r} != {expected!r}"
                 )
@@ -181,6 +186,15 @@ class OnlineSpatialHistoryPipeline:
             if freeze is not None:
                 history = self.autoregressive_state.setdefault("_geotoken_history_snapshots", [])
                 history.append(freeze(chunk_index=self.chunk_index, frame_start=self.frame_index))
+                snapshot = history[-1]
+                source_slot = self.autoregressive_state.setdefault(
+                    "_geotoken_source_geometry", (snapshot, 0),
+                )
+                del source_slot  # state ownership documents the immutable source slot.
+                previous = self.autoregressive_state.setdefault("_geotoken_prev_history_window", [])
+                previous.extend((snapshot, slot) for slot in range(9))
+                # Match official WAH prev_history_latent_window exactly: 16+2+1.
+                self.autoregressive_state["_geotoken_prev_history_window"] = previous[-19:]
         generated_chunk = self._decode_last_latent_chunk()
         self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):

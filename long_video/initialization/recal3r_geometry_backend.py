@@ -66,7 +66,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             parameter.requires_grad_(False)
         self._model, self._inference, self._img_norm = model, inference_recurrent, ImgNorm
 
-    def reset(self):
+    def reset(self, *, preserve_alignment=False):
         self._frames: list[_Frame] = []
         self._state_args = None
         self._last_predictions = []
@@ -74,8 +74,9 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._raw_depth = {}
         self._seen = set()
         self._sequence_version = 0
-        self._alignment = None
-        self._alignment_metadata = {"status": "pending"}
+        if not preserve_alignment:
+            self._alignment = None
+            self._alignment_metadata = {"status": "pending"}
 
     def initialize(self, rgb, c2w, intrinsics, **_kwargs):
         self.reset()
@@ -129,6 +130,16 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         return self._update_frames([(np.asarray(image, np.uint8), np.asarray(pose, np.float32), np.asarray(k, np.float32),
                                     f"{trajectory_id}:{index}")
                                    for image, pose, k, index in zip(rgb, c2w, intrinsics, ids)])
+
+    def replay_prefix(self, rgb, c2w, intrinsics, *, trajectory_id, global_frame_indices):
+        """Official full-prefix replay from a fresh recurrent state per chunk."""
+        ids = [int(value) for value in global_frame_indices]
+        if not ids or ids[0] != 0 or ids != list(range(len(ids))):
+            raise ValueError("ReCal full replay must be source global frame 0 plus contiguous unique frames")
+        self.reset(preserve_alignment=True)
+        frames = [(np.asarray(image, np.uint8), np.asarray(pose, np.float32), np.asarray(k, np.float32),
+                   f"{trajectory_id}:{index}") for image, pose, k, index in zip(rgb, c2w, intrinsics, ids)]
+        return self._update_frames(frames)
 
     def update(self, rgb, c2w, intrinsics, **_kwargs):
         rgb, c2w, intrinsics = np.asarray(rgb), np.asarray(c2w, np.float32), np.asarray(intrinsics, np.float32)

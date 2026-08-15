@@ -120,7 +120,7 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     if not metadata_path.is_file():
         raise FileNotFoundError(f"ReCal3R initial world cache is required: {metadata_path}")
     metadata = json.loads(metadata_path.read_text())
-    if (metadata.get("schema_version") != 2 or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-chunk-v1"
+    if (metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-prefix-replay-v2"
             or not metadata.get("uses_only_source") or float(metadata.get("voxel_size", -1)) != 0.02):
         raise RuntimeError(f"stale or non-source-only Pi3X initial-world cache: {cache}")
     node = NodeStore(cache).load("node_000")
@@ -128,12 +128,6 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     if geometry_backend is not None:
         accumulator = ReCal3RWorldAccumulator(
             geometry_backend, node, trajectory_id=record["trajectory_id"], voxel_size=0.02,
-        )
-        # Prime the recurrent model with exactly the WAH/Pi3X source. It is not
-        # fused again: node_000 already represents this source observation.
-        geometry_backend.update_frame(
-            source, node.view_c2w[0], node.view_intrinsics[0],
-            trajectory_id=record["trajectory_id"], global_frame_index=-1,
         )
     online = OnlineSpatialHistoryPipeline(
         wah_pipeline=pipe, active_node=node, memory_manager=None, world_accumulator=accumulator, prompt=args.prompt,
@@ -262,6 +256,8 @@ def lr_scale(step, total, warmup):
 
 def main():
     args = parse_args()
+    from long_video.wah.upstream import assert_wah_upstream
+    assert_wah_upstream(args.wah_root)
     if args.total_steps != 2000 and not args.smoke_only:
         raise ValueError("formal GeoToken training is strictly 2000 optimizer steps")
     sys.path.insert(0, str(args.wah_root))
@@ -293,8 +289,8 @@ def main():
     if missing:
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
     records = [record for record in selected_records if (
-        (lambda m: m.get("valid", False) and m.get("schema_version") == 2
-         and m.get("geometry_implementation_version") == "pi3x-w0-recal-chunk-v1")(
+        (lambda m: m.get("valid", False) and m.get("schema_version") == 3
+         and m.get("geometry_implementation_version") == "recal-full-teacher-world-v2")(
             json.loads((args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text())
         ))]
     if len(records) < 90:
@@ -345,8 +341,8 @@ def main():
         arrays = load_arrays(args.dataset_root, record)
         geometry_root = args.recal3r_root / record["trajectory_id"]
         metadata = json.loads((geometry_root / "metadata.json").read_text())
-        if (not metadata.get("valid", False) or metadata.get("schema_version") != 2
-                or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-chunk-v1"):
+        if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v2"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(args.dataset_root / record["source"])
         data_load_seconds = time.time() - total_started
@@ -438,7 +434,7 @@ def main():
                 # cannot add observations beyond this trajectory's prefix.
                 # One source-only recurrent priming observation plus each
                 # generated frame (shared chunk boundaries are not replayed).
-                expected_recal_frames = 1 + 33 + 32 * (rollout_length - 1)
+                expected_recal_frames = 1 + 32 * rollout_length
                 if int(final_recal_state.get("frame_count", 0)) != expected_recal_frames:
                     raise RuntimeError(
                         f"Phase C ReCal3R state leaked observations at step {step}: "

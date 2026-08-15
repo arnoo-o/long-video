@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-GEOMETRY_SCHEMA_VERSION = 2
-GEOMETRY_IMPLEMENTATION_VERSION = "pi3x-w0-recal-chunk-v1"
+GEOMETRY_SCHEMA_VERSION = 3
+GEOMETRY_IMPLEMENTATION_VERSION = "pi3x-w0-recal-prefix-replay-v2"
 
 def identity(path):
     digest = hashlib.sha256()
@@ -38,6 +38,6 @@ def main():
               'trajectory_id':record['trajectory_id'],'source_frame_index':source_index,'source_rgb_sha256':identity(source_path),
               'pi3x_repo_commit':commit,'pi3x_checkpoint_sha256':identity(a.pi3x_checkpoint),'recal3r_checkpoint_identity':None,
               'confidence_calibration':{'pi3x':'native_sigmoid','recal3r':'sigmoid_threshold_1.5_temperature_0.35'},
-              'voxel_size':0.02,'alignment_version':'recal_to_pi3x_w0_v1','uses_only_source':True}
+              'voxel_size':0.02,'alignment_version':'recal_to_pi3x_w0_source-anchored-v2','uses_only_source':True}
         (target/'cache_metadata.json').write_text(json.dumps(meta,indent=2)); print(json.dumps({'trajectory_id':record['trajectory_id'],'status':'rebuilt'}),flush=True)
 if __name__=='__main__': main()

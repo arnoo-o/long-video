@@ -241,9 +241,9 @@ def process_record(record, args, model_bundle):
                  rotation=alignment.rotation, translation=alignment.translation,
                  camera_alignment_error=np.float64(alignment.camera_alignment_error))
         metadata = {
-            "schema_version": 2,
-            "geometry_implementation_version": "pi3x-w0-recal-chunk-v1",
-            "alignment_version": "recal_to_pi3x_w0_v1",
+            "schema_version": 3,
+            "geometry_implementation_version": "recal-full-teacher-world-v2",
+            "alignment_version": "offline-full-trajectory-recal-to-dataset-v2",
             "confidence_calibration": {"kind": "sigmoid", "threshold": args.confidence_threshold, "temperature": 0.35},
             "trajectory_id": trajectory_id,
             "scene_hash": record.get("scene_hash"),

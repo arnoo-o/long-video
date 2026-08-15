@@ -23,6 +23,8 @@ def main():
                    choices=(0.0,0.25,0.5,1.0))
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
+    from long_video.wah.upstream import assert_wah_upstream
+    assert_wah_upstream(a.wah_root)
     from long_video.data.camera import resize_intrinsics
     from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
     from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
@@ -84,9 +86,6 @@ def main():
     geo=ReCal3RGeometryBackend(a.recal3r_checkpoint,a.recal3r_repo,a.device)
     trajectory_id=f"inference:{a.session.resolve()}"
     accumulator=ReCal3RWorldAccumulator(geo,node,trajectory_id=trajectory_id,voxel_size=0.02)
-    # node_000 already contains this source observation; prime only ReCal3R's
-    # recurrent state under a disjoint causal frame id.
-    geo.update_frame(node.view_rgb[0],node.view_c2w[0],node.view_intrinsics[0],trajectory_id=trajectory_id,global_frame_index=-1)
     online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=None,world_accumulator=accumulator,prompt=a.prompt,renderer_kwargs={'device':a.device, 'point_radius':0},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
     online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(PYRAMID_INFERENCE_STEPS))
     online.autoregressive_state['is_amplify_first_chunk']=False

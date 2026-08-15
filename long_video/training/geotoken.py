@@ -14,6 +14,9 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-geotoken-world-binding-v2"
+GEOMETRY_IMPLEMENTATION_VERSION = "pi3x-w0-recal-prefix-replay-v2"
+GEOMETRY_SCHEMA_VERSION = 3
 PHASE_BOUNDARIES = {500: "phase_a_final", 1100: "phase_b_final", 2000: "phase_c_final"}
 
 
@@ -169,7 +172,7 @@ def load_causal_world_cache(root: Path, frame_limit: int):
     if not metadata_path.is_file():
         raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 2 or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-chunk-v1":
+    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v2":
         raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():
@@ -195,6 +198,9 @@ def save_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
     if not state:
         raise RuntimeError("GeoToken checkpoint has no trainable module state")
     payload = {
+        "training_semantics_version": TRAINING_SEMANTICS_VERSION,
+        "geometry_schema_version": GEOMETRY_SCHEMA_VERSION,
+        "geometry_implementation_version": GEOMETRY_IMPLEMENTATION_VERSION,
         "geotoken": state,
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
@@ -212,6 +218,10 @@ def save_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
 
 def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler, sampler) -> int:
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if (payload.get("training_semantics_version") != TRAINING_SEMANTICS_VERSION
+            or payload.get("geometry_schema_version") != GEOMETRY_SCHEMA_VERSION
+            or payload.get("geometry_implementation_version") != GEOMETRY_IMPLEMENTATION_VERSION):
+        raise RuntimeError("GeoToken checkpoint uses stale geometry/training semantics; resume is forbidden")
     named = dict(transformer.named_parameters())
     if set(payload["geotoken"]) != {name for name in named if "geotoken." in name}:
         raise RuntimeError("GeoToken checkpoint parameter set does not match the model")

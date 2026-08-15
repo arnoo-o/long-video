@@ -4,9 +4,7 @@ from __future__ import annotations
 from dataclasses import replace
 import numpy as np
 
-from ..geometry.point_renderer import render
 from ..geometry.voxel_fusion import fuse_voxels
-from ..types import CameraBatch
 from ..types import ScaleMetadata
 
 
@@ -33,9 +31,11 @@ class ReCal3RWorldAccumulator:
         self._weight = (np.asarray(node.points_confidence, np.float32).clip(1e-6)
                         * self._observations.astype(np.float32))
         self._seen_frame_ids = set()
+        self._replay_rgb = [np.asarray(node.view_rgb[0], np.uint8).copy()]
+        self._replay_c2w = [np.asarray(node.view_c2w[0], np.float32).copy()]
+        self._replay_k = [np.asarray(node.view_intrinsics[0], np.float32).copy()]
         self._version = 0
-        self._scale_anchor = None
-        self._scale_uncertainty = 1.0
+        self._alignment = None
         self._node = replace(node)
         self._publish()
 
@@ -49,12 +49,8 @@ class ReCal3RWorldAccumulator:
         weight = confidence * observations.astype(np.float32)
         bmin = xyz.min(0) if len(xyz) else np.zeros(3, np.float32)
         bmax = xyz.max(0) if len(xyz) else np.zeros(3, np.float32)
-        scale = ScaleMetadata(
-            mode="relative" if self._scale_anchor is None else "metric_anchor",
-            meters_per_world_unit=self._scale_anchor,
-            uncertainty=float(self._scale_uncertainty),
-            anchor_source="causal_camera_depth_overlap" if self._scale_anchor is not None else "causal_overlap_not_yet_available",
-        )
+        scale = ScaleMetadata(mode="relative", meters_per_world_unit=None, uncertainty=1.0,
+                              anchor_source="pi3x_w0_recal_relative_alignment")
         self._node.points_xyz = xyz; self._node.points_rgb = rgb
         self._node.points_confidence = confidence
         self._node.points_source = np.full(len(xyz), 2, np.int8)
@@ -63,35 +59,9 @@ class ReCal3RWorldAccumulator:
         self._node.coverage_radius = float(np.linalg.norm(bmax - bmin) * 0.5)
         self._node.scale = scale
         self._node.quality_metrics.update({"recal3r_world_version": self._version, "voxel_size": self.voxel_size,
-                                           "accumulator_points": int(len(xyz)), "scale_uncertainty": float(self._scale_uncertainty),
+                                           "accumulator_points": int(len(xyz)),
                                            "fusion_weight_sum": float(weight.sum())})
 
-    def _maybe_lock_scale_anchor(self, rgb, c2w, intrinsics, global_frame_index):
-        """Use only current causal overlap, never a future/offline depth map."""
-        if self._scale_anchor is not None or len(self._xyz) == 0:
-            return
-        height, width = map(int, np.asarray(rgb).shape[:2])
-        # Rendering the existing world at the current observed camera yields
-        # the causal overlap map at the exact ReCal input resolution.
-        camera = CameraBatch(np.asarray(c2w, np.float32)[None], np.asarray(intrinsics, np.float32)[None], height, width)
-        old = render(self._node, camera, device="cpu")
-        old_depth = np.asarray(old.depth[0], np.float32)
-        recal_depth = self.backend.raw_recal_depth(self.trajectory_id, global_frame_index)
-        valid = (np.isfinite(old_depth) & (old_depth > 0) & np.isfinite(recal_depth) & (recal_depth > 0))
-        if int(valid.sum()) < 256:
-            return
-        ratios = old_depth[valid] / recal_depth[valid]
-        scale = float(np.median(ratios))
-        mad = float(np.median(np.abs(ratios - scale)))
-        if not np.isfinite(scale) or not 1e-4 < scale < 1e4:
-            return
-        self._scale_anchor = scale
-        self._scale_uncertainty = float(min(1.0, mad / max(abs(scale), 1e-8)))
-        self._node.quality_metrics.update({
-            "recal3r_scale_anchor_frame": int(global_frame_index),
-            "recal3r_scale_anchor_mad": mad,
-            "recal3r_scale_anchor_overlap": int(valid.sum()),
-        })
 
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
         return self.update_chunk(np.asarray(rgb)[None], np.asarray(c2w)[None], np.asarray(intrinsics)[None], [global_frame_index])
@@ -102,11 +72,18 @@ class ReCal3RWorldAccumulator:
         identities = [(self.trajectory_id, index) for index in indices]
         if any(identity in self._seen_frame_ids for identity in identities):
             raise RuntimeError("ReCal3R frame processed twice")
-        predictions = self.backend.update_chunk(rgb, c2w, intrinsics, trajectory_id=self.trajectory_id,
-                                                global_frame_indices=indices)
+        if not indices or indices[0] != len(self._replay_rgb):
+            raise RuntimeError("ReCal chunk must append exactly after the previous unique global frame")
+        self._replay_rgb.extend(np.asarray(image, np.uint8).copy() for image in rgb)
+        self._replay_c2w.extend(np.asarray(pose, np.float32).copy() for pose in c2w)
+        self._replay_k.extend(np.asarray(k, np.float32).copy() for k in intrinsics)
+        replay = self.backend.replay_prefix(np.stack(self._replay_rgb), np.stack(self._replay_c2w), np.stack(self._replay_k),
+                                            trajectory_id=self.trajectory_id, global_frame_indices=range(len(self._replay_rgb)))
+        # source prediction initializes ReCal only; only this newly generated
+        # tail may enter W0, and it may do so exactly once globally.
+        predictions = replay[-len(indices):]
         point_parts=[]; confidence_parts=[]; color_parts=[]
         for image, pose, k, index, prediction in zip(rgb, c2w, intrinsics, indices, predictions):
-            self._maybe_lock_scale_anchor(image, pose, k, index)
             xyz = np.asarray(prediction.point_maps[0], np.float32)
             confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
             valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)

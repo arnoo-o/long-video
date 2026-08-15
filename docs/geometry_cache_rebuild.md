@@ -1,6 +1,6 @@
 # Geometry Cache Rebuild
 
-All geometry caches from before `pi3x-w0-recal-chunk-v1` are stale by design.
+All geometry caches from before `pi3x-w0-recal-prefix-replay-v2` are stale by design.
 Rebuild the full ReCal cache, Phase-B causal cache, then source-only Pi3X W0:
 
 ```bash

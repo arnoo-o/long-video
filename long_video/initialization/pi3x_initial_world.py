@@ -8,8 +8,9 @@ from ..types import ScaleMetadata, SpatialNode
 
 def build_pi3x_source_world(rgb, c2w, intrinsics, backend, *, node_id="node_000", voxel_size=0.02):
     prediction = backend.predict_source(rgb, c2w, intrinsics)
+    colors = prediction.diagnostics.pop("source_rgb_resized")
     xyz, colors, confidence, observations, _ = fuse_voxels(
-        prediction.point_maps[0].reshape(-1, 3), np.asarray(rgb, np.uint8).reshape(-1, 3),
+        prediction.point_maps[0].reshape(-1, 3), colors.reshape(-1, 3),
         prediction.geometry_confidence[0].reshape(-1), voxel_size=voxel_size,
     )
     if not len(xyz):

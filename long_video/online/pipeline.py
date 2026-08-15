@@ -199,7 +199,9 @@ class OnlineSpatialHistoryPipeline:
         self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):
             raise ValueError("current WAH latent chunk and target cameras must both contain 33 frames")
-        frame_offset = 0 if self.chunk_index == 0 else 1
+        # P0 is the shared source/boundary pose.  W0 already owns source
+        # geometry, so ReCal fusion always receives only P1..P32.
+        frame_offset = 1
         generated = generated_chunk[frame_offset:]
         memory_cameras = cameras
         memory_warp = warp
@@ -279,12 +281,16 @@ class OnlineSpatialHistoryPipeline:
         return self._generate_cameras(CameraBatch(poses, intrinsics, int(height), int(width)))
 
     def generate_chunk(self, controls, intrinsics, height, width):
-        poses = integrate_controls(
+        start = self.current_camera_c2w.copy()
+        advanced = integrate_controls(
             self.current_camera_c2w, controls,
-            scale=self.active_node.scale, **self.control_kwargs,
+            # PointWorld is deliberately relative; control speed is never
+            # rescaled by ReCal alignment metadata.
+            scale=None, **self.control_kwargs,
         )
-        if not len(poses):
-            raise ValueError("controls must contain at least one output frame")
+        if len(advanced) != 32:
+            raise ValueError("one 33-frame chunk requires exactly 32 controls")
+        poses = np.concatenate([start[None], advanced], axis=0)
         intrinsics = np.asarray(intrinsics, np.float32)
         if intrinsics.ndim == 2:
             intrinsics = np.repeat(intrinsics[None], len(poses), axis=0)

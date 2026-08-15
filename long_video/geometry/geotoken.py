@@ -231,7 +231,10 @@ class GeoTokenConditioner(nn.Module):
             def cap_delta(delta, base):
                 ratio = delta.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
                 capped = delta * (cap / ratio.clamp_min(cap)).to(delta.dtype)
-                post = capped.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
+                # ``capped`` is exactly scaled by cap / max(ratio, cap), so
+                # its RMS ratio is min(ratio, cap). Reusing the already
+                # materialized pre-cap ratio avoids a second full FP32 tensor.
+                post = ratio.clamp(max=cap)
                 return capped, ratio.max(), post.max()
             delta_q, q_pre, q_post = cap_delta(delta_q, query)
             delta_k, k_pre, k_post = cap_delta(delta_k, key)

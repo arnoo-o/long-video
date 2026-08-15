@@ -354,7 +354,10 @@ def native_flow_backward(pipe, z_gt, capture, provider, exact_args):
         gradients = [parameter.grad for name, parameter in pipe.transformer.named_parameters()
                      if "geotoken." in name and parameter.grad is not None]
         if not tensors_all_finite(gradients):
-            raise RuntimeError(f"Stage{stage_id} produced non-finite GeoToken gradients")
+            broken = [name for name, parameter in pipe.transformer.named_parameters()
+                      if "geotoken." in name and parameter.grad is not None
+                      and not tensors_all_finite((parameter.grad,))]
+            raise RuntimeError(f"Stage{stage_id} produced non-finite GeoToken gradients: {broken}")
     return torch.stack([loss.detach() for loss in losses]).mean(), stage_stats
 
 

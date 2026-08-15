@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -71,9 +72,13 @@ class PointWorldGeoTokenProvider:
         self.clear_world_cache()
 
     def configure_active_node(self, node):
+        xyz = np.asarray(node.points_xyz, np.float32)
+        keys = np.floor(xyz / 0.02).astype(np.int64)
+        fingerprint = hashlib.sha256(np.ascontiguousarray(keys).tobytes()).hexdigest()[:16]
         version = (
             getattr(node, "node_id", id(node)),
             int(getattr(node, "quality_metrics", {}).get("recal3r_world_version", 0)),
+            int(len(xyz)), fingerprint,
         )
         self.configure_world(
             node.points_xyz, node.points_confidence, world_version=version,
@@ -94,7 +99,8 @@ class PointWorldGeoTokenProvider:
         self.current_k = np.asarray(intrinsics, np.float32)
         self.history_snapshots = list(history_snapshots)
         self.history_window = list(history_window)
-        self.source_geometry = source_geometry
+        if source_geometry is not None:
+            self.source_geometry = source_geometry
         # Camera changes invalidate only its keyed render entries; retaining
         # matching history/current camera renders avoids rerasterizing a world.
 
@@ -150,6 +156,20 @@ class PointWorldGeoTokenProvider:
             source_center=self.source_center.copy(), scene_scale=self.scene_scale, grids=grids,
         )
 
+    def ensure_source_geometry(self, source_c2w, source_intrinsics):
+        """Freeze W0 at source pose before the first transformer forward."""
+        if self.source_geometry is not None:
+            return self.source_geometry
+        original_c2w, original_k = self.current_c2w, self.current_k
+        self.current_c2w, self.current_k = np.asarray(source_c2w, np.float32)[None], np.asarray(source_intrinsics, np.float32)[None]
+        # All pyramid token grids that may be requested by WAH history.
+        for height, width in ((12, 20), (24, 40), (48, 80)):
+            self._render_channels(self.current_c2w, self.current_k, height, width)
+        snapshot = self.freeze_current_snapshot(chunk_index=-1, frame_start=0)
+        self.source_geometry = (snapshot, 0)
+        self.current_c2w, self.current_k = original_c2w, original_k
+        return self.source_geometry
+
     def _encode_snapshot(self, snapshot, height, width):
         if snapshot.scene_scale != self.scene_scale or not np.array_equal(snapshot.source_center, self.source_center):
             raise RuntimeError("history snapshot normalization does not match this trajectory")
@@ -193,13 +213,15 @@ class PointWorldGeoTokenProvider:
                 # The source prefix is a persistent geometry slot. Before the
                 # first chunk has frozen, its current slot-0 is the same
                 # source view and is therefore the exact causal fallback.
-                feature, support = (
-                    self._slot_from_snapshot(self.source_geometry, height, width)
-                    if self.source_geometry is not None else
-                    (current_feature[:, :, :1], current_support[:, :, :1])
-                )
+                if self.source_geometry is None:
+                    raise RuntimeError("source geometry snapshot must exist before first GeoToken forward")
+                feature, support = self._slot_from_snapshot(self.source_geometry, height, width)
             elif 1 <= index <= 19 and index - 1 < len(self.history_window):
                 feature, support = self._slot_from_snapshot(self.history_window[index - 1], height, width)
+            elif index == 19 and not self.history_window:
+                # Official WAH fake-short slot in chunk0 is derived from the
+                # source prefix, so it is the same frozen source geometry.
+                feature, support = self._slot_from_snapshot(self.source_geometry, height, width)
             elif 20 <= index <= 28:
                 feature, support = current_feature[:, :, index - 20:index - 19], current_support[:, :, index - 20:index - 19]
             else:

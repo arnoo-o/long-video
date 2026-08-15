@@ -56,7 +56,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         for root in (repo, repo / "src"):
             if str(root) not in sys.path:
                 sys.path.insert(0, str(root))
-        from src.dust3r.inference import inference_recurrent
+        from src.dust3r.inference import inference_recurrent_lighter
         from src.dust3r.model import ARCroco3DStereo
         from src.dust3r.utils.image import ImgNorm
         model = ARCroco3DStereo.from_pretrained(self.checkpoint).to(self.device).eval()
@@ -64,7 +64,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         model.beta_base = model.config.beta_base = 0.1
         for parameter in model.parameters():
             parameter.requires_grad_(False)
-        self._model, self._inference, self._img_norm = model, inference_recurrent, ImgNorm
+        self._model, self._inference, self._img_norm = model, inference_recurrent_lighter, ImgNorm
 
     def reset(self, *, preserve_alignment=False):
         self._frames: list[_Frame] = []
@@ -278,10 +278,9 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             geometry_confidence=confidence, depth_convention=Z_DEPTH,
             # ReCal3R has arbitrary reconstruction scale until a causal
             # overlap anchor is measured by the world accumulator.
-            scale_info={"mode": "relative" if self._alignment is None else "dataset_calibrated",
-                        "meters_per_world_unit": None if self._alignment is None else float(self._alignment.scale),
-                        "uncertainty": 1.0 if self._alignment is None else float(min(1.0, self._alignment.camera_alignment_error_ratio)),
-                        "anchor_source": "causal_camera_sim3" if self._alignment is not None else "causal_overlap_pending"},
+            scale_info={"mode": "relative", "meters_per_world_unit": None,
+                        "uncertainty": 1.0,
+                        "anchor_source": "recal_to_pointworld_relative_alignment"},
             diagnostics={"backend": "official_recal3r_recurrent", **self.get_state(),
                          "alignment": dict(self._alignment_metadata),
                          "valid_ratio": float(np.isfinite(depth).mean())},

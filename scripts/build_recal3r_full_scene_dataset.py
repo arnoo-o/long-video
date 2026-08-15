@@ -24,7 +24,6 @@ from long_video.data.recal3r_full_scene import (
     apply_sim3_points,
     calibrate_recal3r_confidence,
     estimate_camera_sim3,
-    fuse_voxel_observations,
     list_rgb_frames,
     official_resize_crop,
     remap_model_map,
@@ -34,6 +33,7 @@ from long_video.data.recal3r_full_scene import (
     validate_c2w,
     write_json,
 )
+from long_video.geometry.voxel_fusion import fuse_voxels
 from long_video.training.stage2_cleanup import select_balanced_training_records
 
 
@@ -231,7 +231,15 @@ def process_record(record, args, model_bundle):
                 print(f"  maps {frame_index + 1}/193")
 
         xyz_maps.flush(); valid_maps.flush(); confidence_maps.flush()
-        scene = fuse_voxel_observations(observations, args.voxel_size)
+        if observations:
+            all_xyz, all_rgb, all_conf = map(np.concatenate, zip(*observations))
+            points_xyz, points_rgb, points_confidence, observation_count, _ = fuse_voxels(
+                all_xyz, all_rgb, all_conf, voxel_size=args.voxel_size)
+            scene = {"points_xyz": points_xyz, "points_rgb": points_rgb,
+                     "points_confidence": points_confidence, "observation_count": observation_count}
+        else:
+            scene = {"points_xyz": np.empty((0,3),np.float32), "points_rgb": np.empty((0,3),np.uint8),
+                     "points_confidence": np.empty(0,np.float32), "observation_count": np.empty(0,np.uint16)}
         np.savez_compressed(temporary / "scene_points.npz", **scene)
         np.save(temporary / "recal3r_c2w_aligned.npy", aligned_c2w)
         np.save(temporary / "target_c2w_local.npy", target_c2w.astype(np.float32))
@@ -246,6 +254,7 @@ def process_record(record, args, model_bundle):
             "alignment_version": "offline-full-trajectory-recal-to-dataset-v2",
             "confidence_calibration": {"kind": "sigmoid", "threshold": args.confidence_threshold, "temperature": 0.35},
             "trajectory_id": trajectory_id,
+            "rgb_dir": record["rgb_dir"],
             "scene_hash": record.get("scene_hash"),
             "split": record.get("split"),
             "environment": record.get("environment"),

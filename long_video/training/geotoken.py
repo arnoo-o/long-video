@@ -14,8 +14,8 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-geotoken-world-binding-v2"
-GEOMETRY_IMPLEMENTATION_VERSION = "pi3x-w0-recal-prefix-replay-v2"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-geotoken-world-binding-v3"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-pi3x-w0-prefix-replay-v3"
 GEOMETRY_SCHEMA_VERSION = 3
 PHASE_BOUNDARIES = {500: "phase_a_final", 1100: "phase_b_final", 2000: "phase_c_final"}
 
@@ -143,7 +143,7 @@ def voxel_uniform_stream(base_hash: np.ndarray, stream_id: int) -> np.ndarray:
     return (value >> np.uint64(11)).astype(np.float64) / float(1 << 53)
 
 
-def augment_partial_voxels(points, confidence, voxel_keys, *, source_center, scene_scale, args, seed):
+def augment_partial_voxels(points, confidence, voxel_keys, *, source_center, scene_scale, args, seed, return_indices=False):
     """Apply Phase-B corruption deterministically per physical fused voxel."""
     points = np.asarray(points, np.float32).copy()
     confidence = np.asarray(confidence, np.float32).copy()
@@ -164,6 +164,8 @@ def augment_partial_voxels(points, confidence, voxel_keys, *, source_center, sce
         ray /= np.linalg.norm(ray, axis=1, keepdims=True).clip(1e-8)
         points += ray * normal(9, 10)[:, None] * float(args.depth_noise) * float(scene_scale)
     valid = keep & np.isfinite(points).all(1) & np.isfinite(confidence) & (confidence > 0)
+    if return_indices:
+        return points[valid], confidence[valid], np.flatnonzero(valid)
     return points[valid], confidence[valid]
 
 
@@ -172,13 +174,18 @@ def load_causal_world_cache(root: Path, frame_limit: int):
     if not metadata_path.is_file():
         raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v2":
+    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v3":
         raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():
         raise FileNotFoundError(f"missing precomputed causal geometry cache: {path}")
     payload = np.load(path)
-    return payload["points_xyz"].astype(np.float32), payload["points_confidence"].astype(np.float32), payload["voxel_keys"].astype(np.int64)
+    required = ("points_xyz", "points_rgb", "points_confidence", "observation_count", "voxel_keys", "max_observation_frame")
+    if any(name not in payload for name in required):
+        raise RuntimeError(f"stale causal cache layout: {path}")
+    return (payload["points_xyz"].astype(np.float32), payload["points_rgb"].astype(np.uint8),
+            payload["points_confidence"].astype(np.float32), payload["observation_count"].astype(np.uint16),
+            payload["voxel_keys"].astype(np.int64), payload["max_observation_frame"].astype(np.int32))
 
 
 def concatenate_conditioning(parts: list[GeometryTokenBatch]) -> GeometryTokenBatch:

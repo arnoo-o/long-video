@@ -97,9 +97,10 @@ def main():
         provider.attach(pipe.transformer)
         def pre_render_world_hook(active_node,cameras):
             active_world=provider.configure_active_node(active_node)
+            provider.ensure_source_geometry(source_c2w, K)
             provider.configure_chunk(
                 cameras.c2w,cameras.intrinsics,online.autoregressive_state.get('_geotoken_history_snapshots',()),
-                history_window=online.autoregressive_state.get('_geotoken_prev_history_window',()),
+                history_window=online.autoregressive_state.get('_wah_geometry_slot_refs',()),
                 source_geometry=online.autoregressive_state.get('_geotoken_source_geometry'),
             )
             return {'world_version':active_world['world_version'],'freeze_history':provider.freeze_current_snapshot}

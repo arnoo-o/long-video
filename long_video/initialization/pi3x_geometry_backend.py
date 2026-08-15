@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import math
 import numpy as np
 
 from ..types import Z_DEPTH
@@ -45,10 +46,16 @@ class Pi3XGeometryBackend(MultiViewGeometryBackend):
         height, width = rgb.shape[:2]
         # Official Pi3X operates on a patch-14 aligned grid.  RGB and K are
         # transformed together; colors are sampled from this exact grid.
-        out_h = max(14, int(round(height / 14.0)) * 14)
-        out_w = max(14, int(round(width / 14.0)) * 14)
-        image = torch.from_numpy(rgb).to(self.device).permute(2, 0, 1).float().div(255)[None]
-        image = F.interpolate(image, (out_h, out_w), mode="bilinear", align_corners=False)
+        scale = math.sqrt(255000 / (width * height)) if width * height else 1.0
+        target_w, target_h = width * scale, height * scale
+        k, m = round(target_w / 14), round(target_h / 14)
+        while (k * 14) * (m * 14) > 255000:
+            if k / max(m, 1) > target_w / max(target_h, 1): k -= 1
+            else: m -= 1
+        out_w, out_h = max(1, k) * 14, max(1, m) * 14
+        from PIL import Image
+        resized_rgb = np.asarray(Image.fromarray(rgb, "RGB").resize((out_w, out_h), Image.Resampling.LANCZOS), np.uint8)
+        image = torch.from_numpy(resized_rgb).to(self.device).permute(2, 0, 1).float().div(255)[None]
         scaled_k = intrinsics.copy(); scaled_k[0] *= out_w / width; scaled_k[1] *= out_h / height
         image = image[:, None]
         pose = torch.from_numpy(c2w).to(self.device)[None, None]

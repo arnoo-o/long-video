@@ -107,23 +107,40 @@ def scene_scale_from_recal(root, c2w):
 
 def full_scene_points(root):
     value = np.load(root / "scene_points.npz")
-    return value["points_xyz"].astype(np.float32), value["points_confidence"].astype(np.float32)
+    return (value["points_xyz"].astype(np.float32), value["points_rgb"].astype(np.uint8),
+            value["points_confidence"].astype(np.float32), value["observation_count"].astype(np.uint16))
 
 
-def build_online(args, pipe, record, source, geometry_backend=None, pre_render_world_hook=None):
+def teacher_world_node(source, c2w, intrinsics, points_xyz, points_rgb, confidence, observation_count):
+    """A/B ReCal teacher world; intentionally never touches Pi3X cache."""
+    from long_video.types import ScaleMetadata, SpatialNode
+    xyz = np.asarray(points_xyz, np.float32)
+    return SpatialNode("recal_teacher_world", "active", None, np.asarray(c2w[0], np.float32), 0,
+        float(np.linalg.norm(xyz.max(0)-xyz.min(0))*0.5), xyz.min(0), xyz.max(0),
+        np.asarray(source, np.uint8)[None], np.full((1, *source.shape[:2]), np.nan, np.float32),
+        np.asarray(c2w[:1], np.float32), np.asarray(intrinsics[:1], np.float32), xyz,
+        np.asarray(points_rgb, np.uint8), np.asarray(confidence, np.float32), np.ones(len(xyz), np.int8),
+        np.asarray(observation_count, np.uint16), scale=ScaleMetadata(),
+        quality_metrics={"world_backend": "recal_teacher", "voxel_size": 0.02})
+
+
+def build_online(args, pipe, record, source, geometry_backend=None, pre_render_world_hook=None, initial_node=None):
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
 
-    cache = args.initial_pi3x_world_cache_root / record["trajectory_id"]
-    metadata_path = cache / "cache_metadata.json"
-    if not metadata_path.is_file():
-        raise FileNotFoundError(f"ReCal3R initial world cache is required: {metadata_path}")
-    metadata = json.loads(metadata_path.read_text())
-    if (metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-prefix-replay-v2"
+    if initial_node is not None:
+        node = initial_node
+    else:
+        cache = args.initial_pi3x_world_cache_root / record["trajectory_id"]
+        metadata_path = cache / "cache_metadata.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"Pi3X initial world cache is required: {metadata_path}")
+        metadata = json.loads(metadata_path.read_text())
+        if (metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "pi3x-source-only-official-resize-v3"
             or not metadata.get("uses_only_source") or float(metadata.get("voxel_size", -1)) != 0.02):
-        raise RuntimeError(f"stale or non-source-only Pi3X initial-world cache: {cache}")
-    node = NodeStore(cache).load("node_000")
+            raise RuntimeError(f"stale or non-source-only Pi3X initial-world cache: {cache}")
+        node = NodeStore(cache).load("node_000")
     accumulator = None
     if geometry_backend is not None:
         accumulator = ReCal3RWorldAccumulator(
@@ -371,26 +388,31 @@ def main():
             )
         else:
             scale = scene_scale_from_recal(geometry_root, arrays["c2w"])
+            if phase == "A":
+                a_xyz, a_rgb, a_conf, a_obs = full_scene_points(geometry_root)
+                teacher_node = teacher_world_node(source, arrays["c2w"], arrays["k"], a_xyz, a_rgb, a_conf, a_obs)
+            else:
+                b_xyz, b_rgb, b_conf, b_obs, _b_keys, b_max = load_causal_world_cache(
+                    args.causal_world_cache_root / record["trajectory_id"], 0)
+                if int(b_max.max()) > 0: raise RuntimeError("Phase B initial world leaks future observations")
+                teacher_node = teacher_world_node(source, arrays["c2w"], arrays["k"], b_xyz, b_rgb, b_conf, b_obs)
         provider = PointWorldGeoTokenProvider(
             conditioner, device=args.device, source_center=source_center, scene_scale=scale,
         )
         provider.attach(pipe.transformer)
-        online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source)
+        online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source, initial_node=teacher_node)
 
         def pre_render_world_hook(active_node, cameras):
-            if phase == "C":
-                active_world = provider.configure_active_node(active_node)
+            active_world = provider.configure_active_node(active_node)
+            provider.ensure_source_geometry(arrays["c2w"][0], arrays["k"][0])
             provider.configure_chunk(
                 cameras.c2w, cameras.intrinsics,
                 online.autoregressive_state.get("_geotoken_history_snapshots", ()),
-                history_window=online.autoregressive_state.get("_geotoken_prev_history_window", ()),
+                history_window=online.autoregressive_state.get("_wah_geometry_slot_refs", ()),
                 source_geometry=online.autoregressive_state.get("_geotoken_source_geometry"),
             )
             return {
-                "world_version": (
-                    active_world["world_version"] if phase == "C"
-                    else getattr(active_node, "node_id", id(active_node))
-                ),
+                "world_version": active_world["world_version"],
                 "freeze_history": provider.freeze_current_snapshot,
             }
 
@@ -406,16 +428,19 @@ def main():
                 frame_slice = slice(chunk_index * 32, chunk_index * 32 + 33)
                 poses, intrinsics = arrays["c2w"][frame_slice], arrays["k"][frame_slice]
                 if phase == "A":
-                    points, confidence = phase_a_world
+                    points, colors, confidence, observations = phase_a_world
                 elif phase == "B":
-                    points, confidence, voxel_keys = load_causal_world_cache(
+                    points, colors, confidence, observations, voxel_keys, max_frame = load_causal_world_cache(
                         args.causal_world_cache_root / record["trajectory_id"], chunk_index * 32,
                     )
-                    points, confidence = augment_partial_voxels(
+                    if int(max_frame.max()) > chunk_index * 32: raise RuntimeError("Phase B causal world contains future observation")
+                    points, confidence, kept = augment_partial_voxels(
                         points, confidence, voxel_keys, source_center=source_center, scene_scale=scale,
-                        args=args, seed=corruption_seed,
+                        args=args, seed=corruption_seed, return_indices=True,
                     )
+                    colors, observations = colors[kept], observations[kept]
                 if phase != "C":
+                    online.active_node = teacher_world_node(source, poses, intrinsics, points, colors, confidence, observations)
                     world_version = (
                         ("A", record["trajectory_id"])
                         if phase == "A" else ("B", record["trajectory_id"], chunk_index)

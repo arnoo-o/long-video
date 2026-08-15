@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 GEOMETRY_SCHEMA_VERSION = 3
-GEOMETRY_IMPLEMENTATION_VERSION = "pi3x-w0-recal-prefix-replay-v2"
+GEOMETRY_IMPLEMENTATION_VERSION = "pi3x-source-only-official-resize-v3"
 
 def identity(path):
     digest = hashlib.sha256()

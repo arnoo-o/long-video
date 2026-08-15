@@ -120,27 +120,17 @@ class OnlineSpatialHistoryPipeline:
             value = np.moveaxis(value, 1, -1)
         return value
 
-    def _decode_last_latent_chunk(self):
-        """Decode the exact nine-latent AR chunk to its canonical 33 frames.
-
-        The public WAH delta is cumulative-output bookkeeping and can contain
-        32 or occasionally 36 newly finalized frames.  World construction must
-        instead consume the current nine-latent chunk at its fixed 33-frame
-        camera alignment.
-        """
-        state = self.autoregressive_state
-        latents = state["last_latents"]
-        vae_dtype = self.wah_pipeline.vae.dtype
-        mean = state["latents_mean"].to(device=latents.device, dtype=vae_dtype)
-        std = state["latents_std"].to(device=latents.device, dtype=vae_dtype)
-        vae_latents = latents.to(vae_dtype) / std + mean
-        decoded = self.wah_pipeline._decode_autoregressive_latents(
-            diffusion_latents=latents, vae_latents=vae_latents,
-        )
+    def _current_history_video_chunk(self):
+        """Return WAH's already-decoded canonical current 33-frame chunk."""
+        history_video = self.autoregressive_state.get("history_video")
+        if history_video is None or history_video.ndim != 5 or history_video.shape[2] < 33:
+            shape = None if history_video is None else tuple(history_video.shape)
+            raise RuntimeError(f"WAH history_video cannot provide a 33-frame chunk: {shape}")
+        decoded = history_video[:, :, -33:]
         video = self.wah_pipeline.video_processor.postprocess_video(decoded, output_type="np")
         result = self._video_array(video)
         if len(result) != 33:
-            raise RuntimeError(f"nine WAH latents must decode to 33 frames, got {len(result)}")
+            raise RuntimeError(f"WAH current history chunk must contain 33 frames, got {len(result)}")
         return result
 
     @staticmethod
@@ -191,7 +181,7 @@ class OnlineSpatialHistoryPipeline:
             )
         try:
             _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
-                self.autoregressive_state, warp, output_type="np", fill_frame=self.wah_fill_frame,
+                self.autoregressive_state, warp, output_type="latent", fill_frame=self.wah_fill_frame,
             )
         finally:
             context = getattr(self.wah_pipeline, "_world_projection_context", None)
@@ -222,7 +212,7 @@ class OnlineSpatialHistoryPipeline:
                 self.autoregressive_state["_geotoken_history_snapshots"] = [
                     item for item in history if id(item) in retained
                 ]
-        generated_chunk = self._decode_last_latent_chunk()
+        generated_chunk = self._current_history_video_chunk()
         self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):
             raise ValueError("current WAH latent chunk and target cameras must both contain 33 frames")

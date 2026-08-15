@@ -157,6 +157,7 @@ class GeoTokenConditioner(nn.Module):
         self.world_strength = 1.0
         self.stage_index = 0
         self.denoise_progress = 0.0
+        self.diagnostics_enabled = True
         self.diagnostics: dict[int, dict] = {}
 
     def configure_strengths(self, *, geotoken: float = 1.0, camera: float = 1.0, world: float = 1.0):
@@ -168,6 +169,11 @@ class GeoTokenConditioner(nn.Module):
     def set_timing(self, *, stage_index: int = 0, denoise_progress: float = 0.0):
         self.stage_index = int(stage_index)
         self.denoise_progress = float(denoise_progress)
+
+    def set_diagnostics_enabled(self, enabled: bool):
+        self.diagnostics_enabled = bool(enabled)
+        if not self.diagnostics_enabled:
+            self.diagnostics.clear()
 
     def set_active(self, current: GeometryTokenBatch, history: GeometryTokenBatch | None = None):
         self._active, self._history = current, history
@@ -224,8 +230,9 @@ class GeoTokenConditioner(nn.Module):
                 return capped, ratio.max(), post.max()
             delta_q, q_pre, q_post = cap_delta(delta_q, query)
             delta_k, k_pre, k_post = cap_delta(delta_k, key)
-            with torch.no_grad():
-                self.diagnostics[index] = {"camera_q_gate": float(torch.tanh(self.gates[f"{index}_camera_q"])), "camera_k_gate": float(torch.tanh(self.gates[f"{index}_camera_k"])), "world_q_gate": float(torch.tanh(self.gates[f"{index}_world_q"])), "world_k_gate": float(torch.tanh(self.gates[f"{index}_world_k"])), "stage_scale": stage, "time_scale": time, "q_delta_ratio_pre_cap": float(q_pre), "k_delta_ratio_pre_cap": float(k_pre), "q_delta_ratio_post_cap": float(q_post), "k_delta_ratio_post_cap": float(k_post), "world_support_mean": float(tokens.world_support.mean())}
+            if self.diagnostics_enabled:
+                with torch.no_grad():
+                    self.diagnostics[index] = {"camera_q_gate": float(torch.tanh(self.gates[f"{index}_camera_q"])), "camera_k_gate": float(torch.tanh(self.gates[f"{index}_camera_k"])), "world_q_gate": float(torch.tanh(self.gates[f"{index}_world_q"])), "world_k_gate": float(torch.tanh(self.gates[f"{index}_world_k"])), "stage_scale": stage, "time_scale": time, "q_delta_ratio_pre_cap": float(q_pre), "k_delta_ratio_pre_cap": float(k_pre), "q_delta_ratio_post_cap": float(q_post), "k_delta_ratio_post_cap": float(k_post), "world_support_mean": float(tokens.world_support.mean())}
             return query + delta_q.to(query.dtype), key + delta_k.to(key.dtype), value
         return binding
 

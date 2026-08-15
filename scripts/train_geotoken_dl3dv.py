@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -61,6 +62,66 @@ def file_sha256(path):
     with Path(path).open('rb') as handle:
         for block in iter(lambda: handle.read(1024*1024),b''): digest.update(block)
     return digest.hexdigest()
+
+
+def build_pi3x_provenance(args):
+    """Compute static Pi3X identities once for the entire training process."""
+    return {
+        "repo_commit": subprocess.check_output(
+            ["git", "-C", str(args.pi3x_repo), "rev-parse", "HEAD"], text=True,
+        ).strip(),
+        "checkpoint_sha256": file_sha256(args.pi3x_checkpoint),
+        "source_rgb_sha256": {},
+    }
+
+
+def cached_source_rgb_sha256(cache, trajectory_id, source_path):
+    values = cache["source_rgb_sha256"]
+    trajectory_id = str(trajectory_id)
+    if trajectory_id not in values:
+        values[trajectory_id] = file_sha256(source_path)
+    return values[trajectory_id]
+
+
+def build_prompt_embedding_cache(pipe, prompt, *, negative_prompt, lora_prompt_trigger):
+    """Encode the fixed normal, negative, and WAH-LoRA prompts exactly once."""
+    device = pipe._execution_device
+    common = {
+        "negative_prompt": negative_prompt,
+        "do_classifier_free_guidance": pipe.do_classifier_free_guidance,
+        "num_videos_per_prompt": 1,
+        "max_sequence_length": 512,
+        "device": device,
+    }
+    prompt_embeds, negative_prompt_embeds = pipe.encode_prompt(prompt=prompt, **common)
+    lora_prompt = pipe._add_prompt_trigger(prompt, lora_prompt_trigger)
+    lora_prompt_embeds, _ = pipe.encode_prompt(
+        prompt=lora_prompt,
+        prompt_embeds=None,
+        negative_prompt_embeds=negative_prompt_embeds,
+        **common,
+    )
+    dtype = pipe.transformer.dtype
+    return {
+        "prompt_embeds": prompt_embeds.to(device=device, dtype=dtype).detach(),
+        "negative_prompt_embeds": None if negative_prompt_embeds is None else negative_prompt_embeds.to(
+            device=device, dtype=dtype,
+        ).detach(),
+        "lora_prompt_embeds": lora_prompt_embeds.to(device=device, dtype=dtype).detach(),
+    }
+
+
+def tensors_all_finite(values):
+    tensors = [value for value in values if torch.is_tensor(value)]
+    if not tensors:
+        return True
+    device = tensors[0].device
+    checks = [torch.isfinite(value).all().to(device=device) for value in tensors]
+    return bool(torch.stack(checks).all())
+
+
+def should_sample_diagnostics(step, checkpoint_names_for_step, *, smoke_only=False):
+    return bool(smoke_only or int(step) == 1 or int(step) % 10 == 0 or checkpoint_names_for_step)
 
 
 def load_arrays(root, record):
@@ -133,7 +194,8 @@ def teacher_world_node(source, c2w, intrinsics, points_xyz, points_rgb, confiden
         quality_metrics={"world_backend": "recal_teacher", "voxel_size": 0.02})
 
 
-def build_online(args, pipe, record, source, geometry_backend=None, pre_render_world_hook=None, initial_node=None):
+def build_online(args, pipe, record, source, *, pi3x_provenance, prompt_embedding_cache,
+                 geometry_backend=None, pre_render_world_hook=None, initial_node=None):
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
@@ -150,11 +212,11 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
             or not metadata.get("uses_only_source") or float(metadata.get("voxel_size", -1)) != 0.02):
             raise RuntimeError(f"stale or non-source-only Pi3X initial-world cache: {cache}")
         source_path=sorted((args.dataset_root / record["rgb_dir"]).glob("*"))[0]
-        current_repo_commit=__import__('subprocess').check_output(['git','-C',str(args.pi3x_repo),'rev-parse','HEAD'],text=True).strip()
         if (metadata.get('trajectory_id') != record['trajectory_id'] or metadata.get('source_frame_index') != 0
-                or metadata.get('source_rgb_sha256') != file_sha256(source_path)
-                or metadata.get('pi3x_repo_commit') != current_repo_commit
-                or metadata.get('pi3x_checkpoint_sha256') != file_sha256(args.pi3x_checkpoint)):
+                or metadata.get('source_rgb_sha256') != cached_source_rgb_sha256(
+                    pi3x_provenance, record['trajectory_id'], source_path)
+                or metadata.get('pi3x_repo_commit') != pi3x_provenance['repo_commit']
+                or metadata.get('pi3x_checkpoint_sha256') != pi3x_provenance['checkpoint_sha256']):
             raise RuntimeError(f"stale Pi3X W0 provenance: {cache}")
         node = NodeStore(cache).load("node_000")
         # Pi3X cache v3 remains valid. Appearance-anchor state is runtime
@@ -181,10 +243,11 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     )
     online.wah_fill_frame = source.copy()
     online.autoregressive_state = pipe.init_autoregressive_state(
-        prompt=args.prompt, image=Image.fromarray(source), conditioning_type="warp",
+        prompt=None, negative_prompt=None, image=Image.fromarray(source), conditioning_type="warp",
         warp_history_downsample_mode="short", rope_alignment=True,
         height=384, width=640, num_frames=33, output_type="np",
         pyramid_num_inference_steps_list=[2, 2, 2],
+        **prompt_embedding_cache,
     )
     online.wah_adapter.configure_state(online.autoregressive_state)
     online.autoregressive_state["is_amplify_first_chunk"] = False
@@ -221,6 +284,16 @@ def native_flow_backward(pipe, z_gt, capture, provider, exact_args):
     losses, stage_stats = [], {}
     if {item["stage_id"] for item in items} != {0, 1, 2}:
         raise RuntimeError("GeoToken training requires official train_exact samples for all stages")
+    static_values = []
+    seen_static = set()
+    for captured in capture.by_shape.values():
+        for name in ("encoder_hidden_states", "latents_history_short", "latents_history_mid", "latents_history_long"):
+            value = captured.get(name)
+            if torch.is_tensor(value) and id(value) not in seen_static:
+                seen_static.add(id(value))
+                static_values.append(value)
+    if not tensors_all_finite(static_values):
+        raise RuntimeError("formal WAH prompt/history conditioning contains non-finite values")
     for item in items:
         stage_id = int(item["stage_id"])
         from long_video.geometry.geotoken import progress_from_sigma
@@ -248,33 +321,24 @@ def native_flow_backward(pipe, z_gt, capture, provider, exact_args):
         # outside the adapter too. Restore the sole permitted trainable set.
         for name, parameter in pipe.transformer.named_parameters():
             parameter.requires_grad_("geotoken." in name)
-        finite_inputs = {
-            "x_t": bool(torch.isfinite(kwargs["hidden_states"]).all()),
-            "target": bool(torch.isfinite(target).all()),
-            "timesteps": bool(torch.isfinite(kwargs["timestep"]).all()),
-            "sigma": bool(torch.isfinite(item["sigmas"]).all()),
-            "prompt": bool(torch.isfinite(kwargs["encoder_hidden_states"]).all()),
-        }
-        for name in ("latents_history_short", "latents_history_mid", "latents_history_long"):
-            value = kwargs.get(name)
-            if value is not None:
-                finite_inputs[name] = bool(torch.isfinite(value).all())
         prediction = pipe.transformer(**kwargs)[0]
-        if not prediction.requires_grad or not bool(torch.isfinite(prediction).all()):
+        if not prediction.requires_grad:
+            raise RuntimeError(f"Stage{stage_id} GeoToken prediction has no autograd graph")
+        loss = torch.mean(
+            (prediction.float() - target.float()).square()
+            .reshape(prediction.shape[0], -1), dim=1,
+        ).mean()
+        dynamic_values = (
+            kwargs["hidden_states"], target, kwargs["timestep"], item["sigmas"], prediction, loss,
+        )
+        if not tensors_all_finite(dynamic_values):
             geo_state = {
                 name: (parameter.requires_grad, bool(torch.isfinite(parameter).all()))
                 for name, parameter in pipe.transformer.named_parameters() if "geotoken." in name
             }
             raise RuntimeError(
-                f"Stage{stage_id} GeoToken prediction invalid: requires_grad={prediction.requires_grad}, "
-                f"finite={bool(torch.isfinite(prediction).all())}, inputs={finite_inputs}, geotoken={geo_state}"
+                f"Stage{stage_id} GeoToken forward/loss contains non-finite values: geotoken={geo_state}"
             )
-        loss = torch.mean(
-            (prediction.float() - target.float()).square()
-            .reshape(prediction.shape[0], -1), dim=1,
-        ).mean()
-        if not bool(torch.isfinite(loss)):
-            raise RuntimeError(f"Stage{stage_id} native flow loss is non-finite")
         losses.append(loss)
         stage_stats[f"stage{stage_id}_flow_mse"] = float(loss.detach())
         (loss / len(items)).backward()
@@ -283,13 +347,10 @@ def native_flow_backward(pipe, z_gt, capture, provider, exact_args):
         if kwargs["hidden_states"].requires_grad or kwargs["hidden_states"].grad is not None:
             raise RuntimeError("native_flow_backward must not build gradients for x_t")
         provider.clear_feature_cache()
-        broken = [
-            name for name, parameter in pipe.transformer.named_parameters()
-            if "geotoken." in name and parameter.grad is not None
-            and not bool(torch.isfinite(parameter.grad).all())
-        ]
-        if broken:
-            raise RuntimeError(f"Stage{stage_id} produced non-finite GeoToken gradients: {broken}")
+        gradients = [parameter.grad for name, parameter in pipe.transformer.named_parameters()
+                     if "geotoken." in name and parameter.grad is not None]
+        if not tensors_all_finite(gradients):
+            raise RuntimeError(f"Stage{stage_id} produced non-finite GeoToken gradients")
     return torch.stack([loss.detach() for loss in losses]).mean(), stage_stats
 
 
@@ -308,6 +369,7 @@ def main():
         raise ValueError("formal GeoToken training is strictly 2000 optimizer steps")
     sys.path.insert(0, str(args.wah_root))
     from warp_as_history import WarpAsHistoryPipeline
+    from warp_as_history.pipeline import CAMERA_CONTROL_PROMPT_TRIGGER, WAH_NEGATIVE_PROMPT
     from long_video.geometry.geotoken import assert_geotoken_only_trainable, install_geotoken
     from long_video.geometry.geotoken_runtime import (
         PointWorldGeoTokenProvider, source_scene_scale_from_active_node,
@@ -356,6 +418,12 @@ def main():
     conditioner.configure_strengths(
         geotoken=args.geotoken_strength, camera=args.camera_strength, world=args.world_strength,
     )
+    prompt_embedding_cache = build_prompt_embedding_cache(
+        pipe, args.prompt,
+        negative_prompt=WAH_NEGATIVE_PROMPT,
+        lora_prompt_trigger=CAMERA_CONTROL_PROMPT_TRIGGER,
+    )
+    pi3x_provenance = build_pi3x_provenance(args)
     vae_identity, model_identity = latent_cache_identities(pipe, args.model)
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
@@ -414,7 +482,12 @@ def main():
                 raise RuntimeError(
                     f"Phase C ReCal3R state did not reset for step {step}: {initial_recal_state}"
                 )
-            bootstrap_online = build_online(args, pipe, record, source, geometry_backend)
+            bootstrap_online = build_online(
+                args, pipe, record, source,
+                pi3x_provenance=pi3x_provenance,
+                prompt_embedding_cache=prompt_embedding_cache,
+                geometry_backend=geometry_backend,
+            )
             scale = source_scene_scale_from_active_node(
                 bootstrap_online.active_node, arrays["c2w"][0], arrays["k"][0], device=args.device,
             )
@@ -437,7 +510,19 @@ def main():
         )
         provider.set_world_slot_dropout(0.15 if phase == "B" else 0.0)
         provider.attach(pipe.transformer)
-        online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source, initial_node=teacher_node)
+        online = bootstrap_online if phase == "C" else build_online(
+            args, pipe, record, source,
+            pi3x_provenance=pi3x_provenance,
+            prompt_embedding_cache=prompt_embedding_cache,
+            initial_node=teacher_node,
+        )
+
+        checkpoint_names_for_step = checkpoint_names(step)
+        sample_diagnostics = should_sample_diagnostics(
+            step, checkpoint_names_for_step, smoke_only=args.smoke_only,
+        )
+        conditioner.set_diagnostics_enabled(sample_diagnostics)
+        provider.set_timing_enabled(sample_diagnostics)
 
         def pre_render_world_hook(active_node, cameras):
             if phase == "A":
@@ -552,19 +637,27 @@ def main():
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 [parameter for _, parameter in trainable], args.max_grad_norm,
             )
-            if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+            if not tensors_all_finite((loss, grad_norm)):
                 raise RuntimeError("non-finite GeoToken loss/gradient")
-            before = {name: value.detach().clone() for name, value in trainable}
+            audit_parameter_update = bool(args.smoke_only or step == 1 or checkpoint_names_for_step)
+            before = ({name: value.detach().clone() for name, value in trainable}
+                      if audit_parameter_update else None)
             optimizer.step(); scheduler.step()
             optimizer_seconds = time.time() - optimizer_started
-            changed = [name for name, value in trainable if not torch.equal(before[name], value.detach())]
-            if not changed:
-                raise RuntimeError("optimizer step did not update GeoToken")
+            if audit_parameter_update:
+                changed = [name for name, value in trainable if not torch.equal(before[name], value.detach())]
+                if not changed:
+                    raise RuntimeError("optimizer step did not update GeoToken")
         finally:
             capture_handle.remove()
             if provider._handle is not None:
                 provider._handle.remove()
             conditioner.clear_active()
+        parameter_norm = None
+        if sample_diagnostics:
+            parameter_norm = float(torch.sqrt(sum(
+                parameter.detach().float().square().sum() for _, parameter in trainable
+            )))
         metrics = {
             "global_step": int(step), "total_steps": 2000, "phase": phase,
             "selected_trajectory_count": len(selected_records),
@@ -572,13 +665,11 @@ def main():
             "trajectory_id": record["trajectory_id"], "rollout_length": rollout_length,
             "supervision_chunk": rollout_length - 1, "flow_loss": float(loss.detach()),
             "grad_norm": float(grad_norm), "learning_rate": optimizer.param_groups[0]["lr"],
-            "geotoken_parameter_norm": float(torch.sqrt(sum(
-                parameter.detach().float().square().sum() for _, parameter in trainable
-            ))),
+            "geotoken_parameter_norm": parameter_norm,
             "camera_strength": conditioner.camera_strength, "world_strength": conditioner.world_strength,
-            "geotoken_injection": conditioner.diagnostics,
+            "geotoken_injection": dict(conditioner.diagnostics) if sample_diagnostics else None,
             "data_load_seconds": data_load_seconds,
-            "point_render_seconds": provider.point_render_seconds(),
+            "point_render_seconds": provider.point_render_seconds() if sample_diagnostics else None,
             "prefix_rollout_seconds": prefix_rollout_seconds,
             "gt_latent_seconds": gt_latent_seconds,
             "training_forward_backward_seconds": training_forward_backward_seconds,
@@ -589,7 +680,7 @@ def main():
             **stage_stats,
         }
         (metrics_dir / f"step_{step:04d}.json").write_text(json.dumps(metrics, indent=2))
-        for name in checkpoint_names(step):
+        for name in checkpoint_names_for_step:
             save_geotoken_checkpoint(
                 checkpoints_dir / name, transformer=pipe.transformer, optimizer=optimizer,
                 lr_scheduler=scheduler, step=step, sampler=sampler,

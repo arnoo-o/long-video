@@ -71,12 +71,18 @@ class PointWorldGeoTokenProvider:
         self._render_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.world_slot_dropout = 0.0
         self.timing_resolver = None
+        self.timing_enabled = True
 
     def set_world_slot_dropout(self, probability: float):
         self.world_slot_dropout = float(probability)
 
     def set_timing_resolver(self, resolver):
         self.timing_resolver = resolver
+
+    def set_timing_enabled(self, enabled: bool):
+        self.timing_enabled = bool(enabled)
+        if not self.timing_enabled:
+            self._render_events.clear()
 
     def attach(self, transformer):
         if self._handle is None:
@@ -127,16 +133,22 @@ class PointWorldGeoTokenProvider:
         camera_id = self._camera_identity(c2w, intrinsics)
         cache_key = (self.world_version, camera_id, int(height), int(width))
         if cache_key not in self._render_cache:
-            started = torch.cuda.Event(enable_timing=True)
-            finished = torch.cuda.Event(enable_timing=True)
-            with torch.cuda.device(self.device):
-                started.record()
+            if self.timing_enabled:
+                started = torch.cuda.Event(enable_timing=True)
+                finished = torch.cuda.Event(enable_timing=True)
+                with torch.cuda.device(self.device):
+                    started.record()
+                    self._render_cache[cache_key] = render_geometry_cuda(
+                        self.points_xyz, self.points_confidence, cameras,
+                        parent_point_count=self.parent_point_count,
+                    )
+                    finished.record()
+                self._render_events.append((started, finished))
+            else:
                 self._render_cache[cache_key] = render_geometry_cuda(
                     self.points_xyz, self.points_confidence, cameras,
                     parent_point_count=self.parent_point_count,
                 )
-                finished.record()
-            self._render_events.append((started, finished))
         xyz, depth, visibility, confidence = self._render_cache[cache_key]
         camera = camera_channels_from_cameras(
             c2w, scaled, self.source_center, self.scene_scale, int(height), int(width), device=self.device,

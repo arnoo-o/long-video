@@ -15,6 +15,7 @@ def main():
     p=argparse.ArgumentParser(); p.add_argument('--wah-root',type=Path,required=True); p.add_argument('--model',type=Path,required=True)
     p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--recal3r-repo',type=Path,required=True)
     p.add_argument('--recal3r-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
+    p.add_argument('--pi3x-repo',type=Path,required=True); p.add_argument('--pi3x-checkpoint',type=Path,required=True)
     p.add_argument('--wpf-adaptation-checkpoint',type=Path)
     p.add_argument('--geotoken-checkpoint',type=Path,
                    help='GeoToken training checkpoint; runs the checkpoint architecture with WPF disabled.')
@@ -29,7 +30,12 @@ def main():
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.wah.world_projected_pipeline import PYRAMID_INFERENCE_STEPS, WorldProjectedWarpAsHistoryPipeline
     stored_node=NodeStore(a.session).load('node_000')
-    node=stored_node
+    # W0 is rebuilt from this one source observation.  Never reuse a node
+    # whose point cloud could have been seeded from earlier scene frames.
+    from long_video.initialization.pi3x_geometry_backend import Pi3XGeometryBackend
+    from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
+    node=build_pi3x_source_world(stored_node.view_rgb[0], stored_node.view_c2w[0], stored_node.view_intrinsics[0],
+                                 Pi3XGeometryBackend(a.pi3x_checkpoint,a.pi3x_repo,a.device))
     if a.geotoken_checkpoint is None:
         pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     else:

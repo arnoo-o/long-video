@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -164,6 +165,12 @@ def augment_partial_voxels(points, confidence, voxel_keys, *, source_center, sce
 
 
 def load_causal_world_cache(root: Path, frame_limit: int):
+    metadata_path = Path(root) / "cache_metadata.json"
+    if not metadata_path.is_file():
+        raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
+    metadata = json.loads(metadata_path.read_text())
+    if metadata.get("schema_version") != 2 or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-chunk-v1":
+        raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():
         raise FileNotFoundError(f"missing precomputed causal geometry cache: {path}")

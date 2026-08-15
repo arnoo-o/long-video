@@ -218,12 +218,10 @@ class OnlineSpatialHistoryPipeline:
         self.recent_video_history = self.recent_video_history[-2:]
         memory_event = None
         if self.world_accumulator is not None:
-            for offset, (frame_rgb, frame_c2w, frame_k) in enumerate(zip(
+            self.active_node = self.world_accumulator.update_chunk(
                 generated, memory_cameras.c2w, memory_cameras.intrinsics,
-            )):
-                self.active_node = self.world_accumulator.update_frame(
-                    frame_rgb, frame_c2w, frame_k, frame_start + offset,
-                )
+                range(frame_start, frame_start + len(generated)),
+            )
             memory_event = {
                 "backend": "recal3r_world_accumulator",
                 "updated_frames": int(len(generated)),

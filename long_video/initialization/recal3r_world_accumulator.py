@@ -5,6 +5,7 @@ from dataclasses import replace
 import numpy as np
 
 from ..geometry.point_renderer import render
+from ..geometry.voxel_fusion import fuse_voxels
 from ..types import CameraBatch
 from ..types import ScaleMetadata
 
@@ -39,16 +40,13 @@ class ReCal3RWorldAccumulator:
         self._publish()
 
     def _publish(self):
-        keys = np.floor(self._xyz / self.voxel_size).astype(np.int64)
-        # State is already fused, but fusion remains explicit and deterministic.
-        _, inverse = np.unique(keys, axis=0, return_inverse=True)
-        count = int(inverse.max()) + 1 if len(inverse) else 0
-        weight = np.bincount(inverse, weights=self._weight, minlength=count).astype(np.float32)
-        xyz = np.zeros((count, 3), np.float32); rgb = np.zeros((count, 3), np.float32)
-        np.add.at(xyz, inverse, self._xyz * self._weight[:, None])
-        np.add.at(rgb, inverse, self._rgb.astype(np.float32) * self._weight[:, None])
-        observations = np.bincount(inverse, weights=self._observations, minlength=count).astype(np.int32)
-        xyz /= weight[:, None].clip(1e-8); rgb = np.clip(rgb / weight[:, None].clip(1e-8), 0, 255).astype(np.uint8)
+        # Convert internal total weights back to means so Pi3X and ReCal3R
+        # invoke the exact same fusion primitive.
+        means = self._weight / self._observations.clip(1)
+        xyz, rgb, confidence, observations, _ = fuse_voxels(
+            self._xyz, self._rgb, means, self._observations, self.voxel_size,
+        )
+        weight = confidence * observations.astype(np.float32)
         bmin = xyz.min(0) if len(xyz) else np.zeros(3, np.float32)
         bmax = xyz.max(0) if len(xyz) else np.zeros(3, np.float32)
         scale = ScaleMetadata(
@@ -58,7 +56,7 @@ class ReCal3RWorldAccumulator:
             anchor_source="causal_camera_depth_overlap" if self._scale_anchor is not None else "causal_overlap_not_yet_available",
         )
         self._node.points_xyz = xyz; self._node.points_rgb = rgb
-        self._node.points_confidence = np.clip(weight / np.maximum(observations, 1), 0, 1).astype(np.float32)
+        self._node.points_confidence = confidence
         self._node.points_source = np.full(len(xyz), 2, np.int8)
         self._node.observation_count = np.minimum(observations, np.iinfo(np.uint16).max).astype(np.uint16)
         self._node.bbox_min = bmin.astype(np.float32); self._node.bbox_max = bmax.astype(np.float32)
@@ -96,6 +94,33 @@ class ReCal3RWorldAccumulator:
         })
 
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
+        return self.update_chunk(np.asarray(rgb)[None], np.asarray(c2w)[None], np.asarray(intrinsics)[None], [global_frame_index])
+
+    def update_chunk(self, rgb, c2w, intrinsics, global_frame_indices):
+        """Fuse/publish once after ReCal3R has causally processed one chunk."""
+        indices = [int(value) for value in global_frame_indices]
+        identities = [(self.trajectory_id, index) for index in indices]
+        if any(identity in self._seen_frame_ids for identity in identities):
+            raise RuntimeError("ReCal3R frame processed twice")
+        predictions = self.backend.update_chunk(rgb, c2w, intrinsics, trajectory_id=self.trajectory_id,
+                                                global_frame_indices=indices)
+        point_parts=[]; confidence_parts=[]; color_parts=[]
+        for image, pose, k, index, prediction in zip(rgb, c2w, intrinsics, indices, predictions):
+            self._maybe_lock_scale_anchor(image, pose, k, index)
+            xyz = np.asarray(prediction.point_maps[0], np.float32)
+            confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
+            valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)
+            point_parts.append(xyz[valid]); confidence_parts.append(confidence[valid]); color_parts.append(np.asarray(image, np.uint8)[valid])
+        points = np.concatenate(point_parts) if point_parts else np.empty((0,3),np.float32)
+        conf = np.concatenate(confidence_parts) if confidence_parts else np.empty(0,np.float32)
+        colors = np.concatenate(color_parts) if color_parts else np.empty((0,3),np.uint8)
+        if len(points):
+            self._xyz = np.concatenate([self._xyz, points]); self._rgb = np.concatenate([self._rgb, colors])
+            self._weight = np.concatenate([self._weight, conf]); self._observations = np.concatenate([self._observations, np.ones(len(points), np.int32)])
+        self._seen_frame_ids.update(identities); self._version += 1; self._publish()
+        return self._node
+
+    def _legacy_update_frame(self, rgb, c2w, intrinsics, global_frame_index):
         identity = (self.trajectory_id, int(global_frame_index))
         if identity in self._seen_frame_ids:
             raise RuntimeError(f"ReCal3R frame processed twice: {identity}")

@@ -24,7 +24,9 @@ def parse_args():
     parser.add_argument("--recal3r-root", type=Path, required=True)
     parser.add_argument("--causal-world-cache-root", type=Path, required=True)
     parser.add_argument("--gt-latent-cache-root", type=Path, required=True)
-    parser.add_argument("--initial-recal3r-world-cache-root", type=Path, required=True)
+    parser.add_argument("--initial-pi3x-world-cache-root", type=Path, required=True)
+    parser.add_argument("--pi3x-repo", type=Path, required=True)
+    parser.add_argument("--pi3x-checkpoint", type=Path, required=True)
     parser.add_argument("--recal3r-repo", type=Path, required=True)
     parser.add_argument("--recal3r-checkpoint", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -113,20 +115,21 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
 
-    cache = args.initial_recal3r_world_cache_root / record["trajectory_id"]
+    cache = args.initial_pi3x_world_cache_root / record["trajectory_id"]
     metadata_path = cache / "cache_metadata.json"
     if not metadata_path.is_file():
         raise FileNotFoundError(f"ReCal3R initial world cache is required: {metadata_path}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("geometry_backend") != "recal3r" or float(metadata.get("voxel_size", -1)) != 0.02:
-        raise RuntimeError(f"initial world must be a ReCal3R voxel-0.02 cache: {cache}")
+    if (metadata.get("schema_version") != 2 or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-chunk-v1"
+            or not metadata.get("uses_only_source") or float(metadata.get("voxel_size", -1)) != 0.02):
+        raise RuntimeError(f"stale or non-source-only Pi3X initial-world cache: {cache}")
     node = NodeStore(cache).load("node_000")
     accumulator = None
     if geometry_backend is not None:
         accumulator = ReCal3RWorldAccumulator(
             geometry_backend, node, trajectory_id=record["trajectory_id"], voxel_size=0.02,
         )
-        # Prime the recurrent model with the causal source only.  It is not
+        # Prime the recurrent model with exactly the WAH/Pi3X source. It is not
         # fused again: node_000 already represents this source observation.
         geometry_backend.update_frame(
             source, node.view_c2w[0], node.view_intrinsics[0],
@@ -289,9 +292,11 @@ def main():
     ).is_file()]
     if missing:
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
-    records = [record for record in selected_records if json.loads(
-        (args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text()
-    ).get("valid", False)]
+    records = [record for record in selected_records if (
+        (lambda m: m.get("valid", False) and m.get("schema_version") == 2
+         and m.get("geometry_implementation_version") == "pi3x-w0-recal-chunk-v1")(
+            json.loads((args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text())
+        ))]
     if len(records) < 90:
         raise RuntimeError(
             f"only {len(records)}/{len(selected_records)} selected ReCal3R trajectories are valid"
@@ -340,7 +345,8 @@ def main():
         arrays = load_arrays(args.dataset_root, record)
         geometry_root = args.recal3r_root / record["trajectory_id"]
         metadata = json.loads((geometry_root / "metadata.json").read_text())
-        if not metadata.get("valid", False):
+        if (not metadata.get("valid", False) or metadata.get("schema_version") != 2
+                or metadata.get("geometry_implementation_version") != "pi3x-w0-recal-chunk-v1"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(args.dataset_root / record["source"])
         data_load_seconds = time.time() - total_started

@@ -10,6 +10,7 @@ import numpy as np
 
 
 FRAME_LIMITS = (0, 32, 64, 96, 128, 160)
+GEOMETRY_CACHE_VERSION = "pi3x-w0-recal-chunk-v1"
 
 
 def fuse(root: Path, frame_limit: int, voxel_size: float):
@@ -49,6 +50,11 @@ def main():
             continue
         target = args.output_root / trajectory_id
         target.mkdir(parents=True, exist_ok=True)
+        (target / "cache_metadata.json").write_text(json.dumps({
+            "schema_version": 2, "geometry_implementation_version": GEOMETRY_CACHE_VERSION,
+            "source_recal_metadata": metadata, "voxel_size": float(args.voxel_size),
+            "alignment_version": "recal_to_pi3x_w0_v1",
+        }, indent=2))
         for frame_limit in FRAME_LIMITS:
             keys, points, confidence = fuse(source, frame_limit, args.voxel_size)
             np.savez_compressed(

@@ -8,7 +8,7 @@ import sys
 import numpy as np
 
 from ..data.recal3r_full_scene import (
-    apply_sim3_points, calibrate_recal3r_confidence, estimate_camera_sim3, official_resize_crop, remap_model_map,
+    apply_sim3_points, calibrate_recal3r_confidence, official_resize_crop, remap_model_map,
 )
 from ..types import Z_DEPTH
 from .geometry_backend import GeometryPrediction, MultiViewGeometryBackend
@@ -118,6 +118,18 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         return self._update_frames([(np.asarray(rgb, np.uint8), np.asarray(c2w, np.float32),
                                      np.asarray(intrinsics, np.float32), identity)])[0]
 
+    def update_chunk(self, rgb, c2w, intrinsics, *, trajectory_id, global_frame_indices):
+        """Submit one Helios chunk once, in causal frame order."""
+        rgb, c2w, intrinsics = np.asarray(rgb), np.asarray(c2w), np.asarray(intrinsics)
+        ids = [int(value) for value in global_frame_indices]
+        if len(rgb) != len(c2w) or len(rgb) != len(intrinsics) or len(rgb) != len(ids):
+            raise ValueError("ReCal3R chunk RGB/cameras/indices must align")
+        if ids != sorted(ids) or len(set(ids)) != len(ids):
+            raise ValueError("ReCal3R chunk indices must be strictly unique and ordered")
+        return self._update_frames([(np.asarray(image, np.uint8), np.asarray(pose, np.float32), np.asarray(k, np.float32),
+                                    f"{trajectory_id}:{index}")
+                                   for image, pose, k, index in zip(rgb, c2w, intrinsics, ids)])
+
     def update(self, rgb, c2w, intrinsics, **_kwargs):
         rgb, c2w, intrinsics = np.asarray(rgb), np.asarray(c2w, np.float32), np.asarray(intrinsics, np.float32)
         if len(rgb) != len(c2w) or len(rgb) != len(intrinsics):
@@ -165,9 +177,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         recal_poses = [self._recal_c2w(prediction) for prediction in self._last_predictions]
         if self._alignment is None and len(recal_poses) >= self.min_alignment_frames:
             try:
-                self._alignment = estimate_camera_sim3(
-                    np.stack(recal_poses), np.stack([frame.c2w for frame in self._frames]),
-                )
+                self._alignment = self._lock_causal_recal_to_world(np.stack(recal_poses), np.stack([frame.c2w for frame in self._frames]))
                 self._alignment_metadata = {
                     "status": "locked", "scale": float(self._alignment.scale),
                     "camera_alignment_error": float(self._alignment.camera_alignment_error),
@@ -180,6 +190,31 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             result, raw_depth = self._geometry_for(frame, prediction, recal_c2w)
             self._results[frame.identity] = result
             self._raw_depth[frame.identity] = raw_depth
+
+    @staticmethod
+    def _lock_causal_recal_to_world(recal_c2w, target_c2w):
+        """Source-anchored causal similarity transform, never global Sim(3) fitting.
+
+        Orientation/origin come from the shared source camera; scale is a
+        robust median of already-observed camera baselines.  The accumulator
+        independently records depth-overlap residuals before accepting points.
+        """
+        from ..data.recal3r_full_scene import Sim3Alignment
+        source_recal, source_world = recal_c2w[0], target_c2w[0]
+        rotation = source_world[:3, :3] @ source_recal[:3, :3].T
+        recal_delta = recal_c2w[1:, :3, 3] - source_recal[:3, 3]
+        world_delta = target_c2w[1:, :3, 3] - source_world[:3, 3]
+        a = np.linalg.norm(recal_delta, axis=1); b = np.linalg.norm(world_delta, axis=1)
+        usable = (a > 1e-5) & (b > 1e-5)
+        if int(usable.sum()) < 2:
+            raise ValueError("insufficient causal camera baseline for ReCal-to-W0 lock")
+        ratios = b[usable] / a[usable]; scale = float(np.median(ratios))
+        translation = source_world[:3, 3] - scale * (rotation @ source_recal[:3, 3])
+        aligned = scale * (recal_c2w[:, :3, 3] @ rotation.T) + translation
+        residual = np.linalg.norm(aligned - target_c2w[:, :3, 3], axis=1)
+        extent = max(float(np.median(b[usable])), 1e-8)
+        return Sim3Alignment(scale, rotation, translation, float(np.sqrt(np.mean(residual * residual))),
+                             float(np.sqrt(np.mean(residual * residual)) / extent), 0.0, 0.0)
 
     def _recal_c2w(self, prediction):
         # Official CUT3R stores poses in its compact encoding.  Decode with

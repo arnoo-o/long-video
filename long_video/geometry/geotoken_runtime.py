@@ -29,6 +29,14 @@ def stage_for_hidden_states(hidden_states: torch.Tensor) -> int:
     return stage_for_grid(int(hidden_states.shape[-2]), int(hidden_states.shape[-1]))
 
 
+def token_grid_for_hidden_states(hidden_states: torch.Tensor, patch_size) -> tuple[int, int]:
+    patch = tuple(int(value) for value in patch_size)
+    height, width = int(hidden_states.shape[-2]), int(hidden_states.shape[-1])
+    if height % patch[1] or width % patch[2]:
+        raise RuntimeError(f"Helios grid {(height, width)} is not divisible by patch {patch[1:]}")
+    return height // patch[1], width // patch[2]
+
+
 def _pad_pool(value: torch.Tensor, kernel: tuple[int, int, int]) -> torch.Tensor:
     pt, ph, pw = kernel
     _, _, t, h, w = value.shape
@@ -318,11 +326,9 @@ class PointWorldGeoTokenProvider:
         hidden = kwargs.get("hidden_states")
         if isinstance(hidden, list):
             raise RuntimeError("GeoToken runtime expects one real Helios stage per forward")
-        # Helios hidden_states already use the latent grid. Transformer patch
-        # projection happens inside the model and must not be applied twice.
-        current_h = int(hidden.shape[-2])
-        current_w = int(hidden.shape[-1])
+        patch = kwargs.pop("_geotoken_patch_size", (1, 2, 2))
         stage = stage_for_hidden_states(hidden)
+        current_h, current_w = token_grid_for_hidden_states(hidden, patch)
         self.conditioner.set_timing(stage_index=stage, denoise_progress=self.conditioner.denoise_progress)
         current_feature = self._encode_chunk(
             self.current_c2w, self.current_k, current_h, current_w,
@@ -355,6 +361,7 @@ class PointWorldGeoTokenProvider:
                 stage_index=self.conditioner.stage_index,
                 denoise_progress=float(self.timing_resolver(local)),
             )
+        local["_geotoken_patch_size"] = tuple(module.config.patch_size)
         current, history = self._build(local)
         self.conditioner.set_active(current, history)
         return args, kwargs

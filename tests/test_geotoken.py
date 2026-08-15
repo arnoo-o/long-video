@@ -11,7 +11,9 @@ from long_video.geometry.geotoken import (
     scheduler_progress_from_timestep, time_scale_from_progress,
     world_channels_from_cuda_render,
 )
-from long_video.geometry.geotoken_runtime import stage_for_grid, stage_for_hidden_states
+from long_video.geometry.geotoken_runtime import (
+    stage_for_grid, stage_for_hidden_states, token_grid_for_hidden_states,
+)
 from long_video.geometry.voxel_fusion import _select_anchor_indices, fuse_voxels
 from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
 from long_video.online.pipeline import validate_conditioning_world_identities
@@ -50,6 +52,9 @@ def test_stage_mapping_scales_and_caps():
     assert stage_for_hidden_states(torch.zeros(1,16,9,12,20))==0
     assert stage_for_hidden_states(torch.zeros(1,16,9,24,40))==1
     assert stage_for_hidden_states(torch.zeros(1,16,9,48,80))==2
+    assert token_grid_for_hidden_states(torch.zeros(1,16,9,12,20),(1,2,2))==(6,10)
+    assert token_grid_for_hidden_states(torch.zeros(1,16,9,24,40),(1,2,2))==(12,20)
+    assert token_grid_for_hidden_states(torch.zeros(1,16,9,48,80),(1,2,2))==(24,40)
     assert STAGE_SCALES==(1.,.7,.4) and STAGE_RMS_CAPS==(.15,.10,.06)
     with pytest.raises(RuntimeError): stage_for_grid(16,24)
 

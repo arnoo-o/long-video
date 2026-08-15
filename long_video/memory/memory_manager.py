@@ -319,6 +319,12 @@ class MemoryManager:
         )
         boundary_mapping_position = mapping_indices.index(created_frame)
         surface_views = self._canonical_surface_views(views, boundary_mapping_position)
+        # ReCal3R can legitimately have no finite geometry for a generated
+        # boundary view.  Treat this as a rejected causal proposal rather
+        # than attempting voxel fusion of an empty point array.
+        if not np.any(np.isfinite(surface_views.depth) & (surface_views.depth > 0)):
+            self.state = self.TRANSITION
+            return None, frames, heldout
         node_index = max([int(key.split("_")[-1]) for key in self.nodes] + [0]) + 1
         candidate = build_from_views(
             surface_views,
@@ -864,6 +870,18 @@ class MemoryManager:
         if (allow_candidate_promotion and self.state==self.TRANSITION and readiness["ready"] and
                 self.buffer.can_attempt(candidate_created_frame)):
             candidate, frames, heldout = self.build_candidate(active_node, candidate_created_frame)
+            if candidate is None:
+                metrics = {
+                    "empty_geometry_candidate": True,
+                    "eligible_nonoverlap_point_count": 0,
+                    "depth_consistent_generated_point_count": 0,
+                }
+                event.update(candidate_id=None, accepted=False, metrics=metrics)
+                self.buffer.reject(candidate_created_frame, "ReCal3R produced no finite boundary geometry")
+                self.state = self.TRANSITION
+                event["state"] = self.state
+                self.events.append(event)
+                return active_node, event
             accepted, metrics = self.validate_candidate(candidate, frames, heldout)
             event.update(candidate_id=candidate.node_id, accepted=accepted, metrics=metrics)
             if not accepted:

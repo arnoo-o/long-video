@@ -401,7 +401,8 @@ def main():
          and m.get("geometry_implementation_version") == "recal-full-teacher-world-v4-rgb-anchor")(
             json.loads((args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text())
         ))]
-    if len(records) < 90:
+    minimum_valid_records = 1 if args.smoke_only else 90
+    if len(records) < minimum_valid_records:
         raise RuntimeError(
             f"only {len(records)}/{len(selected_records)} selected ReCal3R trajectories are valid"
         )

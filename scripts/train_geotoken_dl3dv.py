@@ -160,6 +160,7 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
         # Pi3X cache v3 remains valid. Appearance-anchor state is runtime
         # metadata and must not alter the cached source RGB values.
         node.appearance_anchors = {
+            "anchor_rgb": np.asarray(node.points_rgb, np.uint8).copy(),
             "anchor_confidence": np.asarray(node.points_confidence, np.float32).copy(),
             "anchor_frame": np.zeros(len(node.points_xyz), np.int32),
             "source_locked": np.ones(len(node.points_xyz), bool),

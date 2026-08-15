@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from pathlib import Path
+from types import SimpleNamespace
 torch = pytest.importorskip("torch")
 
 from long_video.geometry.geotoken import (
@@ -12,6 +13,7 @@ from long_video.geometry.geotoken import (
 )
 from long_video.geometry.geotoken_runtime import stage_for_grid
 from long_video.geometry.voxel_fusion import fuse_voxels
+from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
 from long_video.training.geotoken import BalancedRolloutSampler, checkpoint_names, max_chunks_for_step, phase_for_step
 
 
@@ -68,8 +70,14 @@ def test_sigma_progress_and_time_scale():
     assert progress_from_sigma(torch.tensor([.4]))==pytest.approx(.6) and time_scale_from_progress(.6)==1
     assert progress_from_sigma(torch.tensor([0.]))==1 and time_scale_from_progress(1)==pytest.approx(.25)
     class Scheduler:
-        timesteps=torch.tensor([900.,400.,0.]); sigmas=torch.tensor([1.,.4,0.])
-    assert scheduler_progress_from_timestep(Scheduler(),torch.tensor([400.]))==pytest.approx(.6)
+        timesteps=torch.tensor([999.,499.5,0.]); sigmas=torch.tensor([1.,.4,0.,0.])
+    assert scheduler_progress_from_timestep(Scheduler(),torch.tensor([499]))==pytest.approx(.6)
+    assert scheduler_progress_from_timestep(Scheduler(),torch.tensor([999]))==0
+    assert scheduler_progress_from_timestep(Scheduler(),torch.tensor([0]))==1
+    with pytest.raises(RuntimeError): scheduler_progress_from_timestep(Scheduler(),torch.tensor([123]))
+    class Ambiguous:
+        timesteps=torch.tensor([499.2,499.8,0.]); sigmas=torch.tensor([1.,.4,0.,0.])
+    with pytest.raises(RuntimeError): scheduler_progress_from_timestep(Ambiguous(),torch.tensor([499]))
 
 
 def test_qk_timing_history_and_value_semantics():
@@ -108,6 +116,29 @@ def test_rgb_anchor_is_source_locked_and_recal_formula_is_shared():
     xyz,color,confidence,count,_,anchors=fuse_voxels(points,rgb,np.array([.5,.9],np.float32),[1,1],.02,source_locked=[True,False],return_anchors=True)
     assert len(xyz)==1 and count[0]==2 and tuple(color[0])==(10,20,30) and anchors["source_locked"][0]
     assert np.allclose(xyz[0],(points[0]*.5+points[1]*.9)/1.4) and np.isclose(confidence[0],.7)
+
+
+def test_pi3x_w0_keeps_v3_weighted_rgb_then_locks_voxel_anchor():
+    class Backend:
+        def predict_source(self, _rgb, _c2w, _intrinsics):
+            return SimpleNamespace(
+                point_maps=np.array([[[[.001,0,1],[.019,0,1]]]],np.float32),
+                geometry_confidence=np.array([[[.25,.75]]],np.float32),
+                depth=np.ones((1,1,2),np.float32), depth_convention="Z_DEPTH",
+                diagnostics={"source_rgb_resized":np.array([[[10,20,30],[110,120,130]]],np.uint8)},
+            )
+    node=build_pi3x_source_world(np.zeros((1,2,3),np.uint8),np.eye(4,dtype=np.float32),np.eye(3,dtype=np.float32),Backend())
+    expected=np.rint((np.array([10,20,30])*.25+np.array([110,120,130])*.75)/1.).astype(np.uint8)
+    assert np.array_equal(node.points_rgb[0],expected)
+    assert np.array_equal(node.appearance_anchors["anchor_rgb"],node.points_rgb)
+    assert bool(node.appearance_anchors["source_locked"][0])
+    new_xyz=node.points_xyz.copy(); new_rgb=np.array([[255,0,0]],np.uint8); new_conf=np.array([10.],np.float32)
+    _,rgb,_,_,_,anchors=fuse_voxels(
+        np.concatenate([node.points_xyz,new_xyz]),np.concatenate([node.points_rgb,new_rgb]),
+        np.concatenate([node.points_confidence,new_conf]),np.concatenate([node.observation_count,[1]]),.02,
+        anchor_confidence=np.concatenate([node.appearance_anchors["anchor_confidence"],new_conf]),
+        anchor_frame=np.array([0,1],np.int32),source_locked=np.array([True,False]),return_anchors=True)
+    assert np.array_equal(rgb[0],expected) and np.array_equal(anchors["anchor_rgb"][0],expected)
 
 
 def test_curriculum_is_unchanged():

@@ -4,7 +4,8 @@ import numpy as np
 
 
 def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxel_size=0.02,
-                *, anchor_confidence=None, anchor_frame=None, source_locked=None, return_anchors=False):
+                *, anchor_confidence=None, anchor_frame=None, source_locked=None, return_anchors=False,
+                rgb_mode="anchor"):
     if float(voxel_size) != .02: raise ValueError("persistent PointWorld voxel size is exactly 0.02")
     xyz=np.asarray(points_xyz,np.float32); rgb=np.asarray(points_rgb,np.uint8); conf=np.asarray(confidence,np.float32)
     obs=np.ones(len(xyz),np.int32) if observation_count is None else np.asarray(observation_count,np.int32).clip(1)
@@ -15,10 +16,19 @@ def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxe
     xyz,rgb,conf,obs,anchor_conf,frame,locked=(x[valid] for x in (xyz,rgb,conf,obs,anchor_conf,frame,locked))
     if not len(xyz):
         empty=(np.empty((0,3),np.float32),np.empty((0,3),np.uint8),np.empty(0,np.float32),np.empty(0,np.uint16),np.empty((0,3),np.int64))
-        return (*empty, {"anchor_confidence":np.empty(0,np.float32),"anchor_frame":np.empty(0,np.int32),"source_locked":np.empty(0,bool)}) if return_anchors else empty
+        return (*empty, {"anchor_rgb":np.empty((0,3),np.uint8),"anchor_confidence":np.empty(0,np.float32),"anchor_frame":np.empty(0,np.int32),"source_locked":np.empty(0,bool)}) if return_anchors else empty
     keys=np.floor(xyz/.02).astype(np.int64); unique,inverse=np.unique(keys,axis=0,return_inverse=True)
     weight=conf*obs; total=np.bincount(inverse,weights=weight,minlength=len(unique)).astype(np.float32); count=np.bincount(inverse,weights=obs,minlength=len(unique)).astype(np.int32)
     out_xyz=np.stack([np.bincount(inverse,weights=weight*xyz[:,i],minlength=len(unique))/total for i in range(3)],1).astype(np.float32)
+    if rgb_mode == "weighted":
+        out_rgb=np.stack([np.bincount(inverse,weights=weight*rgb[:,i],minlength=len(unique))/total for i in range(3)],1)
+        result=(out_xyz,np.rint(np.clip(out_rgb,0,255)).astype(np.uint8),(total/count.clip(1)).astype(np.float32),np.minimum(count,65535).astype(np.uint16),unique)
+        if return_anchors:
+            anchors={"anchor_rgb":result[1].copy(),"anchor_confidence":result[2].copy(),"anchor_frame":np.zeros(len(unique),np.int32),"source_locked":np.ones(len(unique),bool)}
+            return (*result,anchors)
+        return result
+    if rgb_mode != "anchor":
+        raise ValueError(f"unsupported voxel RGB fusion mode: {rgb_mode}")
     # Appearance is an anchor selection, deliberately never a weighted RGB average.
     chosen=np.empty(len(unique),np.int64)
     for i in range(len(unique)):
@@ -33,6 +43,6 @@ def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxe
         for candidate in members[1:]:
             if anchor_conf[candidate] > 1.1 * anchor_conf[best]: best = candidate
         chosen[i]=best
-    anchors={"anchor_confidence":anchor_conf[chosen].astype(np.float32),"anchor_frame":frame[chosen].astype(np.int32),"source_locked":locked[chosen].astype(bool)}
+    anchors={"anchor_rgb":rgb[chosen].astype(np.uint8),"anchor_confidence":anchor_conf[chosen].astype(np.float32),"anchor_frame":frame[chosen].astype(np.int32),"source_locked":locked[chosen].astype(bool)}
     result=(out_xyz,rgb[chosen].astype(np.uint8),(total/count.clip(1)).astype(np.float32),np.minimum(count,65535).astype(np.uint16),unique)
     return (*result,anchors) if return_anchors else result

@@ -9,11 +9,12 @@ from ..types import ScaleMetadata, SpatialNode
 def build_pi3x_source_world(rgb, c2w, intrinsics, backend, *, node_id="node_000", voxel_size=0.02):
     prediction = backend.predict_source(rgb, c2w, intrinsics)
     colors = prediction.diagnostics.pop("source_rgb_resized")
-    xyz, colors, confidence, observations, _, anchors = fuse_voxels(
+    # Preserve the exact v3 W0 numeric semantics first: source RGB is a
+    # confidence-weighted voxel average, just like XYZ.
+    xyz, colors, confidence, observations, _ = fuse_voxels(
         prediction.point_maps[0].reshape(-1, 3), colors.reshape(-1, 3),
         prediction.geometry_confidence[0].reshape(-1), voxel_size=voxel_size,
-        anchor_frame=np.zeros(prediction.geometry_confidence[0].size, np.int32),
-        source_locked=np.ones(prediction.geometry_confidence[0].size, bool), return_anchors=True,
+        rgb_mode="weighted",
     )
     if not len(xyz):
         raise RuntimeError("Pi3X source reconstruction contains no valid points")
@@ -28,5 +29,12 @@ def build_pi3x_source_world(rgb, c2w, intrinsics, backend, *, node_id="node_000"
                          "pi3x_diagnostics": prediction.diagnostics, "uses_future_or_past": False},
         scale=ScaleMetadata(mode="relative", meters_per_world_unit=None, uncertainty=1.0,
                             anchor_source="pi3x_source_only"))
-    node.appearance_anchors = anchors
+    # Lock only the already-fused voxel colors. ReCal observations can never
+    # replace these source anchors, while old Pi3X cache values remain exact.
+    node.appearance_anchors = {
+        "anchor_rgb": colors.copy(),
+        "anchor_confidence": confidence.copy(),
+        "anchor_frame": np.zeros(len(xyz), np.int32),
+        "source_locked": np.ones(len(xyz), bool),
+    }
     return node

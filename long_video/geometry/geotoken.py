@@ -34,14 +34,23 @@ def effective_strengths(geotoken_strength: float, camera_strength: float, world_
 
 def scheduler_progress_from_timestep(scheduler, timestep) -> float:
     """Resolve an inference timestep through the scheduler's actual sigma table."""
-    timesteps = torch.as_tensor(getattr(scheduler, "timesteps", ()), dtype=torch.float32).flatten()
     sigmas = torch.as_tensor(getattr(scheduler, "sigmas", ()), dtype=torch.float32).flatten()
-    if not len(timesteps) or len(sigmas) < len(timesteps):
+    float_timesteps = torch.as_tensor(getattr(scheduler, "timesteps", ()), dtype=torch.float32).flatten()
+    count = len(sigmas) - 1
+    if count <= 0 or len(float_timesteps) < count:
         raise RuntimeError("Helios scheduler must expose aligned timesteps/sigmas for GeoToken timing")
-    value = torch.as_tensor(timestep, dtype=torch.float32).mean()
-    index = int(torch.argmin(torch.abs(timesteps - value)))
-    if not torch.isclose(timesteps[index], value, rtol=1e-4, atol=1e-4):
-        raise RuntimeError(f"transformer timestep {float(value)} is absent from scheduler timetable")
+    timesteps = float_timesteps[:count].to(torch.int64)
+    received = torch.as_tensor(timestep).to(torch.int64).flatten()
+    if not len(received) or not bool((received == received[0]).all()):
+        raise RuntimeError("transformer timestep must contain one unique int64 value")
+    value = received[0]
+    matches = torch.nonzero(timesteps == value, as_tuple=False).flatten()
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"transformer timestep {int(value)} must match exactly one scheduler int64 timestep; "
+            f"matched {len(matches)}"
+        )
+    index = int(matches[0])
     return progress_from_sigma(sigmas[index])
 
 

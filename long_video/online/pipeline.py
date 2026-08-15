@@ -13,6 +13,29 @@ from ..geometry.world_identity import point_world_snapshot_identity
 from .delayed_activation import DelayedNodeActivationQueue
 
 
+def validate_conditioning_world_identities(snapshot, wah_before, wah_after):
+    """Allow Phase-A geometry/appearance splitting without weakening B/C."""
+    if isinstance(snapshot, dict):
+        geo_identity = snapshot.get("world_identity")
+        allow_distinct = bool(snapshot.get("allow_distinct_worlds", False))
+        wah_expected = snapshot.get("wah_world_identity", geo_identity)
+    else:
+        geo_identity = wah_expected = snapshot
+        allow_distinct = False
+    if wah_expected != wah_before or wah_expected != wah_after:
+        raise RuntimeError(
+            "WAH PointWorld changed during one transformer chunk: "
+            f"expected={wah_expected!r}, before={wah_before!r}, after={wah_after!r}"
+        )
+    if not allow_distinct and geo_identity != wah_expected:
+        raise RuntimeError(
+            "GeoToken and WAH must consume one immutable PointWorld snapshot outside Phase A: "
+            f"geo={geo_identity!r}, wah={wah_expected!r}"
+        )
+    if allow_distinct and geo_identity is None:
+        raise RuntimeError("Phase A split conditioning requires an explicit GeoToken world identity")
+
+
 
 
 class OnlineSpatialHistoryPipeline:
@@ -158,12 +181,9 @@ class OnlineSpatialHistoryPipeline:
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
         wah_world_identity_after = point_world_snapshot_identity(self.active_node)
         if pre_render_snapshot is not None:
-            expected = pre_render_snapshot.get("world_identity") if isinstance(pre_render_snapshot, dict) else pre_render_snapshot
-            if expected != wah_world_identity_before or expected != wah_world_identity_after:
-                raise RuntimeError(
-                    "GeoToken and WAH must consume one immutable PointWorld snapshot: "
-                    f"geo={expected!r}, wah_before={wah_world_identity_before!r}, wah_after={wah_world_identity_after!r}"
-                )
+            validate_conditioning_world_identities(
+                pre_render_snapshot, wah_world_identity_before, wah_world_identity_after,
+            )
         if hasattr(self.wah_pipeline, "set_world_projection_from_renderer"):
             self.wah_pipeline.set_world_projection_from_renderer(
                 warp.rgb, warp.visibility, warp.confidence,

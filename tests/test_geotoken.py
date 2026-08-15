@@ -14,7 +14,9 @@ from long_video.geometry.geotoken import (
 from long_video.geometry.geotoken_runtime import stage_for_grid
 from long_video.geometry.voxel_fusion import fuse_voxels
 from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
-from long_video.training.geotoken import BalancedRolloutSampler, checkpoint_names, max_chunks_for_step, phase_for_step
+from long_video.online.pipeline import validate_conditioning_world_identities
+from long_video.training.geotoken import (BalancedRolloutSampler, assert_causal_world_cutoff,
+    checkpoint_names, max_chunks_for_step, phase_for_step, split_phase_a_conditioning)
 
 
 def _tokens():
@@ -63,6 +65,12 @@ def test_qk_rms_cap_for_every_stage():
         qratio=(oq-q).float().square().mean(-1).sqrt()/q.float().square().mean(-1).sqrt().clamp_min(1e-8)
         kratio=(ok-k).float().square().mean(-1).sqrt()/k.float().square().mean(-1).sqrt().clamp_min(1e-8)
         assert float(qratio.max())<=cap+1e-5 and float(kratio.max())<=cap+1e-5
+        diagnostics=module.diagnostics[8]
+        assert diagnostics["q_delta_ratio_pre_cap"]>cap
+        assert diagnostics["k_delta_ratio_pre_cap"]>cap
+        assert diagnostics["q_delta_ratio_post_cap"]<=cap+1e-5
+        assert diagnostics["k_delta_ratio_post_cap"]<=cap+1e-5
+        assert "q_delta_ratio" not in diagnostics and "k_delta_ratio" not in diagnostics
 
 
 def test_sigma_progress_and_time_scale():
@@ -98,6 +106,32 @@ def test_qk_timing_history_and_value_semantics():
 def test_wah_patch_disables_cache_only_when_qk_binding_is_installed():
     patch=(Path(__file__).parents[1]/"patches/wah_geotoken_qk_binding.patch").read_text()
     assert 'getattr(attn, "geotoken_qk_binding", None) is None' in patch
+    assert not (Path(__file__).parents[1]/"patches/wah_geotoken_kv_cache.patch").exists()
+    apply_script=(Path(__file__).parents[1]/"scripts/apply_wah_patch.sh").read_text()
+    assert "wah_geotoken_kv_cache.patch" not in apply_script
+
+
+def test_phase_a_may_split_geometry_and_appearance_but_other_phases_may_not():
+    validate_conditioning_world_identities(
+        {"world_identity":"full-geometry","wah_world_identity":"causal-rgb","allow_distinct_worlds":True},
+        "causal-rgb","causal-rgb")
+    with pytest.raises(RuntimeError):
+        validate_conditioning_world_identities(
+            {"world_identity":"full-geometry","wah_world_identity":"causal-rgb"},
+            "causal-rgb","causal-rgb")
+    with pytest.raises(RuntimeError):
+        validate_conditioning_world_identities(
+            {"world_identity":"full-geometry","wah_world_identity":"causal-rgb","allow_distinct_worlds":True},
+            "causal-rgb","mutated-rgb")
+    assert_causal_world_cutoff(np.array([0,32]),32,label="Phase A WAH appearance world")
+    with pytest.raises(RuntimeError):
+        assert_causal_world_cutoff(np.array([0,33]),32,label="Phase A WAH appearance world")
+    full=(np.array([[1,2,3]],np.float32),np.array([[255,0,0]],np.uint8),np.array([.9]),np.array([5]))
+    causal=(np.array([[4,5,6]],np.float32),np.array([[0,255,0]],np.uint8),np.array([.7]),np.array([1]),np.array([[0,0,0]]),np.array([32]))
+    geometry,appearance=split_phase_a_conditioning(full,causal,32)
+    assert np.array_equal(geometry[0],full[0]) and np.array_equal(geometry[1],full[2])
+    assert np.array_equal(appearance[1],causal[1])
+    assert not np.array_equal(appearance[1],full[1])
 
 
 def test_zero_strength_is_strict_noop_and_strength_formula_matches():

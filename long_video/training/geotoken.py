@@ -21,14 +21,28 @@ GEOMETRY_SCHEMA_VERSION = 3
 def _wah_runtime_fingerprint():
     root = Path(__file__).resolve().parents[2]
     digest = hashlib.sha256(b"wah-09aa646-confidence-patch-preserved")
-    for name in ("patches/wah_confidence.patch", "patches/wah_geotoken_qk_binding.patch",
-                 "patches/wah_geotoken_kv_cache.patch"):
+    for name in ("patches/wah_confidence.patch", "patches/wah_geotoken_qk_binding.patch"):
         digest.update((root / name).read_bytes())
     return digest.hexdigest()
 
 
 WAH_RUNTIME_FINGERPRINT = _wah_runtime_fingerprint()
 PHASE_BOUNDARIES = {500: "phase_a_final", 1100: "phase_b_final", 2000: "phase_c_final"}
+
+
+def assert_causal_world_cutoff(max_observation_frame, cutoff: int, *, label="causal world"):
+    values = np.asarray(max_observation_frame)
+    if values.size and int(values.max()) > int(cutoff):
+        raise RuntimeError(f"{label} leaks future observations beyond frame {int(cutoff)}")
+
+
+def split_phase_a_conditioning(full_scene, causal_scene, cutoff: int):
+    """Discard full-scene RGB while retaining its teacher geometry."""
+    full_xyz, _full_rgb_forbidden, full_confidence, _full_observations = full_scene
+    causal_xyz, causal_rgb, causal_confidence, causal_observations, _keys, max_frame = causal_scene
+    assert_causal_world_cutoff(max_frame, cutoff, label="Phase A WAH appearance world")
+    return ((full_xyz, full_confidence),
+            (causal_xyz, causal_rgb, causal_confidence, causal_observations))
 
 
 def phase_for_step(step: int) -> str:

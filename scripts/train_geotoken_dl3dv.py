@@ -315,7 +315,7 @@ def main():
     from long_video.training.geotoken import (
         BalancedRolloutSampler, checkpoint_names, load_geotoken_checkpoint,
         phase_for_step, save_geotoken_checkpoint, load_causal_world_cache,
-        augment_partial_voxels,
+        augment_partial_voxels, assert_causal_world_cutoff, split_phase_a_conditioning,
     )
     from long_video.training.wpf_adaptation import select_balanced_training_records
 
@@ -421,12 +421,16 @@ def main():
         else:
             scale = scene_scale_from_recal(geometry_root, arrays["c2w"])
             if phase == "A":
-                a_xyz, a_rgb, a_conf, a_obs = full_scene_points(geometry_root)
-                teacher_node = teacher_world_node(source, arrays["c2w"], arrays["k"], a_xyz, a_rgb, a_conf, a_obs)
+                # Phase A full-scene data is geometry-only conditioning. WAH
+                # appearance starts from the causal frame-0 world.
+                b_xyz, b_rgb, b_conf, b_obs, _b_keys, b_max = load_causal_world_cache(
+                    args.causal_world_cache_root / record["trajectory_id"], 0)
+                assert_causal_world_cutoff(b_max, 0, label="Phase A initial WAH appearance world")
+                teacher_node = teacher_world_node(source, arrays["c2w"], arrays["k"], b_xyz, b_rgb, b_conf, b_obs)
             else:
                 b_xyz, b_rgb, b_conf, b_obs, _b_keys, b_max = load_causal_world_cache(
                     args.causal_world_cache_root / record["trajectory_id"], 0)
-                if int(b_max.max()) > 0: raise RuntimeError("Phase B initial world leaks future observations")
+                assert_causal_world_cutoff(b_max, 0, label="Phase B initial world")
                 teacher_node = teacher_world_node(source, arrays["c2w"], arrays["k"], b_xyz, b_rgb, b_conf, b_obs)
         provider = PointWorldGeoTokenProvider(
             conditioner, device=args.device, source_center=source_center, scene_scale=scale, render_height=384, render_width=640,
@@ -436,7 +440,12 @@ def main():
         online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source, initial_node=teacher_node)
 
         def pre_render_world_hook(active_node, cameras):
-            active_world = provider.configure_active_node(active_node)
+            if phase == "A":
+                if provider.world_version is None:
+                    raise RuntimeError("Phase A full teacher geometry was not configured")
+                active_world = {"world_version": provider.world_version}
+            else:
+                active_world = provider.configure_active_node(active_node)
             source_geometry = provider.ensure_source_geometry(arrays["c2w"][0], arrays["k"][0])
             existing_source = online.autoregressive_state.setdefault("_geotoken_source_geometry", source_geometry)
             if existing_source is not source_geometry:
@@ -448,10 +457,12 @@ def main():
                 source_geometry=online.autoregressive_state["_geotoken_source_geometry"],
             )
             from long_video.online.pipeline import point_world_snapshot_identity
-            return {
-                "world_identity": point_world_snapshot_identity(active_node),
-                "freeze_history": provider.freeze_current_snapshot,
-            }
+            result = {"world_identity": active_world["world_version"],
+                      "freeze_history": provider.freeze_current_snapshot}
+            if phase == "A":
+                result.update({"allow_distinct_worlds": True,
+                               "wah_world_identity": point_world_snapshot_identity(active_node)})
+            return result
 
         online.pre_render_world_hook = pre_render_world_hook
         capture = ForwardCapture(pipe)
@@ -465,12 +476,22 @@ def main():
                 frame_slice = slice(chunk_index * 32, chunk_index * 32 + 33)
                 poses, intrinsics = arrays["c2w"][frame_slice], arrays["k"][frame_slice]
                 if phase == "A":
-                    points, colors, confidence, observations = phase_a_world
+                    geometry_world, appearance_world = split_phase_a_conditioning(
+                        phase_a_world,
+                        load_causal_world_cache(
+                            args.causal_world_cache_root / record["trajectory_id"], chunk_index * 32,
+                        ),
+                        chunk_index * 32,
+                    )
+                    full_xyz, full_conf = geometry_world
+                    points, colors, confidence, observations = appearance_world
                 elif phase == "B":
                     points, colors, confidence, observations, voxel_keys, max_frame = load_causal_world_cache(
                         args.causal_world_cache_root / record["trajectory_id"], chunk_index * 32,
                     )
-                    if int(max_frame.max()) > chunk_index * 32: raise RuntimeError("Phase B causal world contains future observation")
+                    assert_causal_world_cutoff(
+                        max_frame, chunk_index * 32, label="Phase B causal world",
+                    )
                     points, confidence, kept = augment_partial_voxels(
                         points, confidence, voxel_keys, source_center=source_center, scene_scale=scale,
                         args=args, seed=corruption_seed, return_indices=True,
@@ -478,11 +499,16 @@ def main():
                     colors, observations = colors[kept], observations[kept]
                 if phase != "C":
                     online.active_node = teacher_world_node(source, poses, intrinsics, points, colors, confidence, observations)
-                    world_version = (
-                        ("A", record["trajectory_id"])
-                        if phase == "A" else ("B", record["trajectory_id"], chunk_index)
-                    )
-                    provider.configure_world(points, confidence, world_version=world_version)
+                    if phase == "A":
+                        provider.configure_world(
+                            full_xyz, full_conf,
+                            world_version=("A-full-teacher-geometry", record["trajectory_id"]),
+                        )
+                    else:
+                        provider.configure_world(
+                            points, confidence,
+                            world_version=("B", record["trajectory_id"], chunk_index),
+                        )
                 capture.by_shape.clear()
                 rollout_started = time.time()
                 with torch.no_grad():

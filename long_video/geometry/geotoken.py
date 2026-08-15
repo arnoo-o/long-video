@@ -219,10 +219,13 @@ class GeoTokenConditioner(nn.Module):
             cap = STAGE_RMS_CAPS[self.stage_index]
             def cap_delta(delta, base):
                 ratio = delta.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
-                return delta * (cap / ratio.clamp_min(cap)).to(delta.dtype), ratio.max()
-            delta_q, q_ratio = cap_delta(delta_q, query); delta_k, k_ratio = cap_delta(delta_k, key)
+                capped = delta * (cap / ratio.clamp_min(cap)).to(delta.dtype)
+                post = capped.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
+                return capped, ratio.max(), post.max()
+            delta_q, q_pre, q_post = cap_delta(delta_q, query)
+            delta_k, k_pre, k_post = cap_delta(delta_k, key)
             with torch.no_grad():
-                self.diagnostics[index] = {"camera_q_gate": float(torch.tanh(self.gates[f"{index}_camera_q"])), "camera_k_gate": float(torch.tanh(self.gates[f"{index}_camera_k"])), "world_q_gate": float(torch.tanh(self.gates[f"{index}_world_q"])), "world_k_gate": float(torch.tanh(self.gates[f"{index}_world_k"])), "stage_scale": stage, "time_scale": time, "q_delta_ratio": float(q_ratio), "k_delta_ratio": float(k_ratio), "world_support_mean": float(tokens.world_support.mean())}
+                self.diagnostics[index] = {"camera_q_gate": float(torch.tanh(self.gates[f"{index}_camera_q"])), "camera_k_gate": float(torch.tanh(self.gates[f"{index}_camera_k"])), "world_q_gate": float(torch.tanh(self.gates[f"{index}_world_q"])), "world_k_gate": float(torch.tanh(self.gates[f"{index}_world_k"])), "stage_scale": stage, "time_scale": time, "q_delta_ratio_pre_cap": float(q_pre), "k_delta_ratio_pre_cap": float(k_pre), "q_delta_ratio_post_cap": float(q_post), "k_delta_ratio_post_cap": float(k_post), "world_support_mean": float(tokens.world_support.mean())}
             return query + delta_q.to(query.dtype), key + delta_k.to(key.dtype), value
         return binding
 

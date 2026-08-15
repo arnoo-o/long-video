@@ -432,6 +432,10 @@ def main():
         negative_prompt=WAH_NEGATIVE_PROMPT,
         lora_prompt_trigger=CAMERA_CONTROL_PROMPT_TRIGGER,
     )
+    # All later AR states receive cached embeddings, so the frozen text
+    # encoder no longer participates in training and need not occupy HBM.
+    pipe.text_encoder.to("cpu")
+    torch.cuda.empty_cache()
     pi3x_provenance = build_pi3x_provenance(args)
     vae_identity, model_identity = latent_cache_identities(pipe, args.model)
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):

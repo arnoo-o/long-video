@@ -3,6 +3,40 @@ from __future__ import annotations
 import numpy as np
 
 
+def _select_anchor_indices(inverse, anchor_confidence, source_locked, voxel_count):
+    """Select anchors with the original causal rule in near-linear time."""
+    inverse = np.asarray(inverse, np.int64)
+    anchor_confidence = np.asarray(anchor_confidence, np.float32)
+    source_locked = np.asarray(source_locked, bool)
+    observation_indices = np.arange(len(inverse), dtype=np.int64)
+    counts = np.bincount(inverse, minlength=voxel_count)
+
+    first = np.full(voxel_count, len(inverse), np.int64)
+    np.minimum.at(first, inverse, observation_indices)
+    first_locked = np.full(voxel_count, len(inverse), np.int64)
+    locked_indices = observation_indices[source_locked]
+    if len(locked_indices):
+        np.minimum.at(first_locked, inverse[source_locked], locked_indices)
+
+    chosen = first.copy()
+    has_locked = first_locked < len(inverse)
+    chosen[has_locked] = first_locked[has_locked]
+    repeated_unlocked = np.flatnonzero((counts > 1) & ~has_locked)
+    if len(repeated_unlocked):
+        order = np.argsort(inverse, kind="stable")
+        starts = np.empty(voxel_count + 1, np.int64)
+        starts[0] = 0
+        np.cumsum(counts, out=starts[1:])
+        for voxel_index in repeated_unlocked:
+            members = order[starts[voxel_index]:starts[voxel_index + 1]]
+            best = members[0]
+            for candidate in members[1:]:
+                if anchor_confidence[candidate] > 1.1 * anchor_confidence[best]:
+                    best = candidate
+            chosen[voxel_index] = best
+    return chosen
+
+
 def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxel_size=0.02,
                 *, anchor_confidence=None, anchor_frame=None, source_locked=None, return_anchors=False,
                 rgb_mode="anchor"):
@@ -30,19 +64,10 @@ def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxe
     if rgb_mode != "anchor":
         raise ValueError(f"unsupported voxel RGB fusion mode: {rgb_mode}")
     # Appearance is an anchor selection, deliberately never a weighted RGB average.
-    chosen=np.empty(len(unique),np.int64)
-    for i in range(len(unique)):
-        members=np.flatnonzero(inverse==i); locked_members=members[locked[members]]
-        if len(locked_members):
-            chosen[i] = locked_members[0]
-            continue
-        # Preserve the existing anchor unless a later observation exceeds it
-        # by the explicit 10% margin. Input order is causal: persisted fused
-        # voxels precede the new tail observations.
-        best = members[0]
-        for candidate in members[1:]:
-            if anchor_conf[candidate] > 1.1 * anchor_conf[best]: best = candidate
-        chosen[i]=best
+    # Preserve the existing anchor unless a later observation exceeds it by
+    # the explicit 10% margin. Input order remains causal: persisted fused
+    # voxels precede new tail observations.
+    chosen = _select_anchor_indices(inverse, anchor_conf, locked, len(unique))
     anchors={"anchor_rgb":rgb[chosen].astype(np.uint8),"anchor_confidence":anchor_conf[chosen].astype(np.float32),"anchor_frame":frame[chosen].astype(np.int32),"source_locked":locked[chosen].astype(bool)}
     result=(out_xyz,rgb[chosen].astype(np.uint8),(total/count.clip(1)).astype(np.float32),np.minimum(count,65535).astype(np.uint16),unique)
     return (*result,anchors) if return_anchors else result

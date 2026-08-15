@@ -12,7 +12,7 @@ from long_video.geometry.geotoken import (
     world_channels_from_cuda_render,
 )
 from long_video.geometry.geotoken_runtime import stage_for_grid
-from long_video.geometry.voxel_fusion import fuse_voxels
+from long_video.geometry.voxel_fusion import _select_anchor_indices, fuse_voxels
 from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
 from long_video.online.pipeline import validate_conditioning_world_identities
 from long_video.training.geotoken import (BalancedRolloutSampler, assert_causal_world_cutoff,
@@ -150,6 +150,28 @@ def test_rgb_anchor_is_source_locked_and_recal_formula_is_shared():
     xyz,color,confidence,count,_,anchors=fuse_voxels(points,rgb,np.array([.5,.9],np.float32),[1,1],.02,source_locked=[True,False],return_anchors=True)
     assert len(xyz)==1 and count[0]==2 and tuple(color[0])==(10,20,30) and anchors["source_locked"][0]
     assert np.allclose(xyz[0],(points[0]*.5+points[1]*.9)/1.4) and np.isclose(confidence[0],.7)
+
+
+def test_fast_anchor_selection_matches_original_causal_rule():
+    rng = np.random.default_rng(5)
+    inverse = np.repeat(np.arange(200), rng.integers(1, 12, size=200))
+    rng.shuffle(inverse)
+    confidence = rng.uniform(.01, 1., size=len(inverse)).astype(np.float32)
+    locked = rng.random(len(inverse)) < .08
+    expected = np.empty(200, np.int64)
+    for voxel_index in range(200):
+        members = np.flatnonzero(inverse == voxel_index)
+        locked_members = members[locked[members]]
+        if len(locked_members):
+            expected[voxel_index] = locked_members[0]
+            continue
+        best = members[0]
+        for candidate in members[1:]:
+            if confidence[candidate] > 1.1 * confidence[best]:
+                best = candidate
+        expected[voxel_index] = best
+    actual = _select_anchor_indices(inverse, confidence, locked, 200)
+    assert np.array_equal(actual, expected)
 
 
 def test_pi3x_w0_keeps_v3_weighted_rgb_then_locks_voxel_anchor():

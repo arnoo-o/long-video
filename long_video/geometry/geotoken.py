@@ -213,15 +213,20 @@ class GeoTokenConditioner(nn.Module):
             stage = STAGE_SCALES[self.stage_index]
             progress = min(max(self.denoise_progress, 0.), 1.)
             time = time_scale_from_progress(progress)
-            cam_q = adapters["camera_q_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_q"])
-            cam_k = adapters["camera_k_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_k"])
-            world_q = adapters["world_q_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_q"])
-            world_k = adapters["world_k_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_k"])
             scale = stage * time
+            # Materialize Q and K branches serially. The numerical expression
+            # is unchanged, but retaining all four full-sequence adapter
+            # outputs concurrently needlessly raises the frozen-backbone peak.
+            cam_q = adapters["camera_q_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_q"])
+            world_q = adapters["world_q_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_q"])
             delta_q = (self.camera_strength * cam_q + self.world_strength * tokens.world_support * world_q) * scale
-            delta_k = (self.camera_strength * cam_k + self.world_strength * tokens.world_support * world_k) * scale
+            del cam_q, world_q
             # Previous appearance history is a frozen WAH query. Its keys remain world/camera-bound.
             delta_q[:, :-current_length] = 0
+            cam_k = adapters["camera_k_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_k"])
+            world_k = adapters["world_k_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_k"])
+            delta_k = (self.camera_strength * cam_k + self.world_strength * tokens.world_support * world_k) * scale
+            del cam_k, world_k
             cap = STAGE_RMS_CAPS[self.stage_index]
             def cap_delta(delta, base):
                 ratio = delta.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)

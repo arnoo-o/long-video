@@ -23,6 +23,7 @@ class OnlineSpatialHistoryPipeline:
         control_kwargs=None,
         wah_state_kwargs=None,
         pre_render_world_hook=None,
+        world_accumulator=None,
     ):
         self.wah_pipeline = wah_pipeline
         self.wah_adapter = WAHAdapter(wah_pipeline) if wah_pipeline is not None else None
@@ -35,6 +36,7 @@ class OnlineSpatialHistoryPipeline:
         self.control_kwargs = dict(control_kwargs or {})
         self.wah_state_kwargs = dict(wah_state_kwargs or {})
         self.pre_render_world_hook = pre_render_world_hook
+        self.world_accumulator = world_accumulator
         self.current_camera_c2w = (
             active_node.center_c2w.copy() if active_node is not None else np.eye(4, dtype=np.float32)
         )
@@ -131,14 +133,16 @@ class OnlineSpatialHistoryPipeline:
         if self.wah_adapter is None or self.autoregressive_state is None:
             raise RuntimeError("A loaded patched WAH pipeline and autoregressive state are required")
         poses = np.asarray(cameras.c2w, np.float32)
-        activation = self.activation_queue.activate_due(self.chunk_index)
-        if activation is not None:
-            verified_hash = self.memory_manager.verify_shadow(activation.node)
-            self.active_node = self.memory_manager.commit_shadow(
-                self.active_node, activation.node, verified_hash=verified_hash,
-            )
+        activation = None
+        if self.world_accumulator is None:
+            activation = self.activation_queue.activate_due(self.chunk_index)
+            if activation is not None:
+                verified_hash = self.memory_manager.verify_shadow(activation.node)
+                self.active_node = self.memory_manager.commit_shadow(
+                    self.active_node, activation.node, verified_hash=verified_hash,
+                )
         reactivation_event=None
-        if self.memory_manager is not None:
+        if self.memory_manager is not None and self.world_accumulator is None:
             self.active_node,reactivation_event=self.memory_manager.maybe_reactivate(
                 self.active_node,cameras)
         # Consumers that build conditioning from the point world must observe
@@ -199,7 +203,19 @@ class OnlineSpatialHistoryPipeline:
         self.recent_video_history.append(generated_chunk)
         self.recent_video_history = self.recent_video_history[-2:]
         memory_event = None
-        if self.memory_manager is not None:
+        if self.world_accumulator is not None:
+            for offset, (frame_rgb, frame_c2w, frame_k) in enumerate(zip(
+                generated, memory_cameras.c2w, memory_cameras.intrinsics,
+            )):
+                self.active_node = self.world_accumulator.update_frame(
+                    frame_rgb, frame_c2w, frame_k, frame_start + offset,
+                )
+            memory_event = {
+                "backend": "recal3r_world_accumulator",
+                "updated_frames": int(len(generated)),
+                "world_point_count": int(len(self.active_node.points_xyz)),
+            }
+        elif self.memory_manager is not None:
             backend = self.memory_manager.geometry_backend
             if backend is not None and hasattr(backend, "update"):
                 # Advance a recurrent geometry backend on every causal

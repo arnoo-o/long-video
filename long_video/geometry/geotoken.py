@@ -96,6 +96,14 @@ class GeoTokenConditioner(nn.Module):
         self._active: GeometryTokenBatch | None = None
         self._history: GeometryTokenBatch | None = None
         self._hook_handles = []
+        self.strength = 1.0
+        self.diagnostics: dict[int, dict] = {}
+
+    def set_strength(self, strength: float) -> None:
+        value = float(strength)
+        if value not in {0.0, 0.25, 0.5, 1.0}:
+            raise ValueError("GeoToken strength must be one of 0, 0.25, 0.5, 1.0")
+        self.strength = value
 
     def set_active(
         self, tokens: torch.Tensor, support: torch.Tensor,
@@ -153,11 +161,25 @@ class GeoTokenConditioner(nn.Module):
                 tokens, support = current.tokens, current.support
             if tokens.shape != hidden.shape:
                 raise RuntimeError(f"GeoToken/Helios sequence mismatch: {tokens.shape} != {hidden.shape}")
+            gate = self.injection_gates[str(index)].to(dtype=hidden.dtype)
             update = (
-                self.injection_gates[str(index)].to(dtype=hidden.dtype)
+                gate * self.strength
                 * support.to(device=hidden.device, dtype=hidden.dtype)
                 * tokens.to(device=hidden.device, dtype=hidden.dtype)
             )
+            with torch.no_grad():
+                hidden_rms = hidden.float().square().mean().sqrt()
+                delta_rms = update.float().square().mean().sqrt()
+                self.diagnostics[index] = {
+                    "gate": float(gate.detach()),
+                    "geometry_token_rms": float(tokens.float().square().mean().sqrt()),
+                    "hidden_rms": float(hidden_rms),
+                    "delta_rms": float(delta_rms),
+                    "delta_over_hidden_rms": float(delta_rms / hidden_rms.clamp_min(1e-8)),
+                    "support_mean": float(support.float().mean()),
+                    "support_valid_ratio": float((support > 0).float().mean()),
+                    "strength": float(self.strength),
+                }
             return (hidden + update, *args[1:]), kwargs
         return hook
 

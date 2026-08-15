@@ -161,21 +161,33 @@ class PointWorldGeoTokenProvider:
             self._feature_cache[key] = self.conditioner.tokenizer(channels)
         return self._feature_cache[key]
 
-    def _history_slots(self, length, height, width):
-        chunks = [self._encode_snapshot(snapshot, height, width) for snapshot in self.history_snapshots]
-        if not chunks:
-            feature = torch.zeros(
-                1, self.conditioner.tokenizer.inner_dim, length, height, width, device=self.device,
-            )
-            support = torch.zeros(1, 1, length, height, width, device=self.device)
-            return feature, support
-        feature = torch.cat([item[0] for item in chunks], dim=2)
-        support = torch.cat([item[1] for item in chunks], dim=2)
-        if feature.shape[2] < length:
-            pad = length - feature.shape[2]
-            feature = torch.cat([torch.zeros_like(feature[:, :, :1]).expand(-1, -1, pad, -1, -1), feature], 2)
-            support = torch.cat([torch.zeros_like(support[:, :, :1]).expand(-1, -1, pad, -1, -1), support], 2)
-        return feature[:, :, -length:], support[:, :, -length:]
+    def _history_by_indices(self, indices, height, width):
+        """Select frozen 9-slot chunks by the exact official WAH indices.
+
+        WAH short mode uses a source-prefix slot followed by previous
+        long/mid/short slots.  ``indices`` is the authoritative layout: this
+        routine never derives history order from the current world or a simple
+        trailing slice.
+        """
+        if indices is None:
+            raise RuntimeError("WAH history latent was supplied without temporal indices")
+        flat = torch.as_tensor(indices).reshape(-1).detach().cpu().tolist()
+        slots = {}
+        for snapshot in self.history_snapshots:
+            feature, support = self._encode_snapshot(snapshot, height, width)
+            # The 33-frame VAE layout is [frame0, frames1..4, ..., frames29..32].
+            # Chunks advance by 32 RGB frames, i.e. eight latent slots.
+            base = int(snapshot.frame_start) // 4
+            for local_slot in range(feature.shape[2]):
+                slots[base + local_slot] = (feature[:, :, local_slot:local_slot + 1],
+                                            support[:, :, local_slot:local_slot + 1])
+        feature_parts, support_parts = [], []
+        zero_feature = torch.zeros(1, self.conditioner.tokenizer.inner_dim, 1, height, width, device=self.device)
+        zero_support = torch.zeros(1, 1, 1, height, width, device=self.device)
+        for index in flat:
+            feature, support = slots.get(int(index), (zero_feature, zero_support))
+            feature_parts.append(feature); support_parts.append(support)
+        return torch.cat(feature_parts, 2), torch.cat(support_parts, 2)
 
     def _history_part(self, kwargs, name, kernel):
         latent = kwargs.get(f"latents_history_{name}")
@@ -185,7 +197,9 @@ class PointWorldGeoTokenProvider:
         kt, kh, kw = kernel
         out_h = (latent.shape[-2] + kh - 1) // kh
         out_w = (latent.shape[-1] + kw - 1) // kw
-        feature, support = self._history_slots(int(latent.shape[2]), out_h, out_w)
+        feature, support = self._history_by_indices(indices, out_h, out_w)
+        if feature.shape[2] != latent.shape[2]:
+            raise RuntimeError("GeoToken temporal history must match official WAH history slots")
         if kt > 1:
             numerator = _pad_pool(feature * support, (kt, 1, 1))
             denominator = _pad_pool(support, (kt, 1, 1))
@@ -193,12 +207,19 @@ class PointWorldGeoTokenProvider:
             support = denominator
         tokens = feature.flatten(2).transpose(1, 2)
         weights = support.flatten(2).transpose(1, 2)
+        expected_raw_tokens = int(latent.shape[2] * out_h * out_w)
+        if tokens.shape[1] != expected_raw_tokens:
+            raise RuntimeError(f"GeoToken raw {name} token count mismatch with WAH: {tokens.shape[1]} != {expected_raw_tokens}")
         mask = kwargs.get(f"history_visible_mask_{name}")
         attention = kwargs.get("attention_kwargs") or {}
         if mask is not None and str(attention.get("history_visible_token_mode", "drop")) == "drop":
             pooled = _pad_pool(mask.float(), kernel).flatten()
             keep = pooled >= float(attention.get("history_visible_token_threshold", 0.5))
             tokens, weights = tokens[:, keep], weights[:, keep]
+        # The same visible-token filtering is applied to both appearance and
+        # geometry, leaving every retained WAH token with one geometry token.
+        if tokens.shape != weights.expand_as(tokens).shape:
+            raise RuntimeError("GeoToken history support does not align with history tokens")
         return GeometryTokenBatch(tokens, weights)
 
     def _build(self, kwargs):

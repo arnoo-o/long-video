@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import sys
-import hashlib
 
 import numpy as np
 
@@ -19,6 +18,7 @@ class _Frame:
     rgb: np.ndarray
     c2w: np.ndarray
     intrinsics: np.ndarray
+    identity: str
 
 
 class ReCal3RGeometryBackend(MultiViewGeometryBackend):
@@ -103,17 +103,45 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "update": torch.tensor([True]), "reset": torch.tensor([False]),
         }
 
+    def update_frame(self, rgb, c2w, intrinsics, *, trajectory_id, global_frame_index):
+        """Process exactly one causal frame, keyed by trajectory/frame identity."""
+        identity = f"{trajectory_id}:{int(global_frame_index)}"
+        if identity in self._seen:
+            raise RuntimeError(f"ReCal3R frame was submitted twice: {identity}")
+        return self._update_frames([(np.asarray(rgb, np.uint8), np.asarray(c2w, np.float32),
+                                     np.asarray(intrinsics, np.float32), identity)])[0]
+
     def update(self, rgb, c2w, intrinsics, **_kwargs):
         rgb, c2w, intrinsics = np.asarray(rgb), np.asarray(c2w, np.float32), np.asarray(intrinsics, np.float32)
         if len(rgb) != len(c2w) or len(rgb) != len(intrinsics):
             raise ValueError("ReCal3R RGB/camera/intrinsics must align")
-        keys = [hashlib.sha256(np.asarray(image, np.uint8).tobytes()).hexdigest() for image in rgb]
-        self._frames.extend(_Frame(np.asarray(image, np.uint8).copy(), pose.copy(), k.copy())
-                            for image, pose, k in zip(rgb, c2w, intrinsics) if
-                            hashlib.sha256(np.asarray(image, np.uint8).tobytes()).hexdigest() not in self._seen)
-        self._seen.update(keys)
+        frames = [(np.asarray(image, np.uint8), pose, k, f"legacy:{self._sequence_version}:{index}")
+                  for index, (image, pose, k) in enumerate(zip(rgb, c2w, intrinsics))]
+        values = self._update_frames(frames)
+        return self._combine_predictions(values)
+
+    @staticmethod
+    def _combine_predictions(values):
+        if not values:
+            raise ValueError("ReCal3R update requires at least one frame")
+        return GeometryPrediction(
+            depth=np.concatenate([value.depth for value in values], 0),
+            depth_confidence=np.concatenate([value.depth_confidence for value in values], 0),
+            point_maps=np.concatenate([value.point_maps for value in values], 0),
+            geometry_confidence=np.concatenate([value.geometry_confidence for value in values], 0),
+            depth_convention=Z_DEPTH,
+            scale_info=values[-1].scale_info,
+            diagnostics=values[-1].diagnostics,
+        )
+
+    def _update_frames(self, frames):
+        keys = [identity for *_values, identity in frames]
+        additions = [(image, pose, k, identity) for image, pose, k, identity in frames if identity not in self._seen]
+        self._frames.extend(_Frame(image.copy(), pose.copy(), k.copy(), identity)
+                            for image, pose, k, identity in additions)
+        self._seen.update(identity for *_values, identity in additions)
         if not self._frames:
-            return self._prediction_for_keys(keys)
+            return [self._prediction_for_keys([key]) for key in keys]
         self._load()
         views = [self._view(frame, index) for index, frame in enumerate(self._frames)]
         outputs, state_args = self._inference(views, self._model, self.device, verbose=False)
@@ -121,12 +149,11 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._last_predictions = outputs["pred"]
         self._sequence_version += 1
         self._cache_all_results()
-        return self._prediction_for_keys(keys)
+        return [self._prediction_for_keys([key]) for key in keys]
 
     def _cache_all_results(self):
         for frame, prediction in zip(self._frames, self._last_predictions):
-            key = hashlib.sha256(frame.rgb.tobytes()).hexdigest()
-            self._results[key] = self._geometry_for(frame, prediction)
+            self._results[frame.identity] = self._geometry_for(frame, prediction)
 
     def _geometry_for(self, frame, prediction):
         points = prediction["pts3d_in_self_view"].detach().cpu().numpy()[0]
@@ -146,8 +173,10 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         return GeometryPrediction(
             depth=depth, depth_confidence=confidence, point_maps=point_maps,
             geometry_confidence=confidence, depth_convention=Z_DEPTH,
-            scale_info={"mode": "dataset_calibrated", "meters_per_world_unit": 1.0,
-                        "uncertainty": 0.0, "anchor_source": "target_camera_constraint"},
+            # ReCal3R has arbitrary reconstruction scale until a causal
+            # overlap anchor is measured by the world accumulator.
+            scale_info={"mode": "relative", "meters_per_world_unit": None,
+                        "uncertainty": 1.0, "anchor_source": "causal_overlap_pending"},
             diagnostics={"backend": "official_recal3r_recurrent", **self.get_state(),
                          "valid_ratio": float(np.isfinite(depth).mean())},
         )
@@ -156,7 +185,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         if not self._last_predictions:
             raise RuntimeError("ReCal3R state is empty")
         count = len(self._last_predictions) if count is None else int(count)
-        keys = [hashlib.sha256(frame.rgb.tobytes()).hexdigest() for frame in self._frames[-count:]]
+        keys = [frame.identity for frame in self._frames[-count:]]
         return self._prediction_for_keys(keys)
 
     def predict(self, view_rgb, view_c2w, intrinsics, **_kwargs):

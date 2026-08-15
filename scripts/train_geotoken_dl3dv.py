@@ -44,6 +44,7 @@ def parse_args():
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--geotoken-strength", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -108,10 +109,9 @@ def full_scene_points(root):
 
 
 def build_online(args, pipe, record, source, geometry_backend=None, pre_render_world_hook=None):
-    from long_video.config import load_yaml
-    from long_video.memory.memory_manager import MemoryManager
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
+    from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
 
     cache = args.initial_recal3r_world_cache_root / record["trajectory_id"]
     metadata_path = cache / "cache_metadata.json"
@@ -121,13 +121,19 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
     if metadata.get("geometry_backend") != "recal3r" or float(metadata.get("voxel_size", -1)) != 0.02:
         raise RuntimeError(f"initial world must be a ReCal3R voxel-0.02 cache: {cache}")
     node = NodeStore(cache).load("node_000")
-    manager = None
+    accumulator = None
     if geometry_backend is not None:
-        manager = MemoryManager.from_config(
-            load_yaml("configs/online_memory.yaml"), geometry_backend=geometry_backend,
+        accumulator = ReCal3RWorldAccumulator(
+            geometry_backend, node, trajectory_id=record["trajectory_id"], voxel_size=0.02,
+        )
+        # Prime the recurrent model with the causal source only.  It is not
+        # fused again: node_000 already represents this source observation.
+        geometry_backend.update_frame(
+            source, node.view_c2w[0], node.view_intrinsics[0],
+            trajectory_id=record["trajectory_id"], global_frame_index=-1,
         )
     online = OnlineSpatialHistoryPipeline(
-        wah_pipeline=pipe, active_node=node, memory_manager=manager, prompt=args.prompt,
+        wah_pipeline=pipe, active_node=node, memory_manager=None, world_accumulator=accumulator, prompt=args.prompt,
         renderer_kwargs={"device": args.device, "point_radius": 0},
         wah_state_kwargs={
             "height": 384, "width": 640, "num_frames": 33, "output_type": "np",
@@ -170,25 +176,27 @@ class ForwardCapture:
         return args, kwargs
 
 
-def native_flow_backward(pipe, z_gt, capture, provider):
-    from warp_as_history.training.core import training_exact_pyramid_latents
-    targets = training_exact_pyramid_latents(z_gt, 3)
+def native_flow_backward(pipe, z_gt, capture, provider, exact_args):
+    """Use official train_exact samples; rollout supplies history only."""
+    from warp_as_history.training.core import flow_matching_train_exact_items
+    items = flow_matching_train_exact_items(pipe, z_gt, exact_args, z_gt.device)
     losses, stage_stats = [], {}
-    for stage_id, z_gt_stage in enumerate(targets):
-        key = tuple(z_gt_stage.shape[-3:])
+    if {item["stage_id"] for item in items} != {0, 1, 2}:
+        raise RuntimeError("GeoToken training requires official train_exact samples for all stages")
+    for item in items:
+        stage_id = int(item["stage_id"])
+        key = tuple(item["noisy_latents"].shape[-3:])
         if key not in capture.by_shape:
             raise RuntimeError(f"formal inference did not capture Stage{stage_id} shape {key}")
         kwargs = dict(capture.by_shape[key])
-        x_t = kwargs.pop("sample").to(device=z_gt.device, dtype=pipe.transformer.dtype)
-        sigma = kwargs.pop("sigma").to(device=z_gt.device, dtype=torch.float32)
-        if not bool(torch.isfinite(sigma)) or float(sigma) <= 0:
-            raise RuntimeError(f"Stage{stage_id} formal scheduler sigma must be positive and finite")
-        kwargs["hidden_states"] = x_t.detach()
-        kwargs["timestep"] = kwargs["timestep"].to(device=z_gt.device)
+        kwargs.pop("sample", None); kwargs.pop("sigma", None)
+        x_t = item["noisy_latents"].to(device=z_gt.device, dtype=pipe.transformer.dtype).detach()
+        kwargs["hidden_states"] = x_t
+        kwargs["timestep"] = item["timesteps"].to(device=z_gt.device)
         kwargs["return_dict"] = False
-        target = (x_t.float() - z_gt_stage.to(device=z_gt.device).float()) / sigma
+        target = item["target"].to(device=z_gt.device, dtype=torch.float32)
         if target.shape != x_t.shape:
-            raise RuntimeError(f"Stage{stage_id} real state/GT pyramid mismatch")
+            raise RuntimeError(f"Stage{stage_id} official train_exact state/target mismatch")
         if stage_id == 0:
             pipe._set_wah_lora_enabled(True)
         else:
@@ -201,7 +209,7 @@ def native_flow_backward(pipe, z_gt, capture, provider):
             "x_t": bool(torch.isfinite(kwargs["hidden_states"]).all()),
             "target": bool(torch.isfinite(target).all()),
             "timesteps": bool(torch.isfinite(kwargs["timestep"]).all()),
-            "sigma": bool(torch.isfinite(sigma)),
+            "sigma": bool(torch.isfinite(item["sigmas"]).all()),
             "prompt": bool(torch.isfinite(kwargs["encoder_hidden_states"]).all()),
         }
         for name in ("latents_history_short", "latents_history_mid", "latents_history_long"):
@@ -226,7 +234,7 @@ def native_flow_backward(pipe, z_gt, capture, provider):
             raise RuntimeError(f"Stage{stage_id} native flow loss is non-finite")
         losses.append(loss)
         stage_stats[f"stage{stage_id}_flow_mse"] = float(loss.detach())
-        (loss / len(targets)).backward()
+        (loss / len(items)).backward()
         # A later stage can share a token-grid resolution with an earlier
         # history branch. Do not retain an already-backpropagated encoder graph.
         if kwargs["hidden_states"].requires_grad or kwargs["hidden_states"].grad is not None:
@@ -417,7 +425,9 @@ def main():
                 # chunks contribute 32 because their boundary is shared.
                 # Candidate validation may re-evaluate existing frames but
                 # cannot add observations beyond this trajectory's prefix.
-                expected_recal_frames = 33 + 32 * (rollout_length - 1)
+                # One source-only recurrent priming observation plus each
+                # generated frame (shared chunk boundaries are not replayed).
+                expected_recal_frames = 1 + 33 + 32 * (rollout_length - 1)
                 if int(final_recal_state.get("frame_count", 0)) != expected_recal_frames:
                     raise RuntimeError(
                         f"Phase C ReCal3R state leaked observations at step {step}: "
@@ -432,7 +442,16 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             train_started = time.time()
             with torch.enable_grad():
-                loss, stage_stats = native_flow_backward(pipe, z_gt, capture, provider)
+                exact_args = SimpleNamespace(
+                    pyramid_num_inference_steps_list=[2, 2, 2],
+                    flow_matching_stage_sampling="all",
+                    flow_matching_stage_id=0,
+                    flow_matching_train_exact_timestep_sampling="training_density",
+                    flow_matching_use_dynamic_shifting="auto",
+                    weighting_scheme="logit_normal",
+                    is_amplify_first_chunk=False,
+                )
+                loss, stage_stats = native_flow_backward(pipe, z_gt, capture, provider, exact_args)
             training_forward_backward_seconds = time.time() - train_started
             optimizer_started = time.time()
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -464,6 +483,7 @@ def main():
             "injection_gates": {
                 key: float(value.detach()) for key, value in conditioner.injection_gates.items()
             },
+            "geotoken_injection": conditioner.diagnostics,
             "data_load_seconds": data_load_seconds,
             "point_render_seconds": provider.point_render_seconds(),
             "prefix_rollout_seconds": prefix_rollout_seconds,

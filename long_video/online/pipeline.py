@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+import hashlib
 import numpy as np
 
 from ..data.controls import integrate_controls
@@ -10,6 +11,20 @@ from ..initialization.initial_node_pipeline import initialize_spatial_node
 from ..types import CameraBatch
 from ..wah.adapter import WAHAdapter
 from .delayed_activation import DelayedNodeActivationQueue
+
+
+def point_world_snapshot_identity(node):
+    """Stable immutable identity for all data consumed by WAH/GeoToken."""
+    digest = hashlib.sha256()
+    digest.update(str(node.node_id).encode())
+    digest.update(str(int(getattr(node, "quality_metrics", {}).get("recal3r_world_version", 0))).encode())
+    for value in (node.points_xyz, node.points_rgb, node.points_confidence):
+        array = np.ascontiguousarray(value)
+        digest.update(str(array.dtype).encode()); digest.update(np.asarray(array.shape, np.int64).tobytes()); digest.update(array.tobytes())
+    xyz = np.asarray(node.points_xyz, np.float32)
+    digest.update(np.floor(xyz / 0.02).astype(np.int64).tobytes())
+    digest.update(np.rint(xyz * 1e5).astype(np.int64).tobytes())
+    return (node.node_id, int(len(xyz)), digest.hexdigest())
 
 
 class OnlineSpatialHistoryPipeline:
@@ -151,15 +166,15 @@ class OnlineSpatialHistoryPipeline:
         pre_render_snapshot = None
         if self.pre_render_world_hook is not None:
             pre_render_snapshot = self.pre_render_world_hook(self.active_node, cameras)
+        wah_world_identity_before = point_world_snapshot_identity(self.active_node)
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
+        wah_world_identity_after = point_world_snapshot_identity(self.active_node)
         if pre_render_snapshot is not None:
-            expected = pre_render_snapshot.get("world_version") if isinstance(pre_render_snapshot, dict) else pre_render_snapshot
-            observed = pre_render_snapshot.get("world_version") if isinstance(pre_render_snapshot, dict) else pre_render_snapshot
-            # Legacy non-accumulator hooks returned a node id; ReCal worlds
-            # additionally carry the monotonically changing accumulator version.
-            if observed != expected:
+            expected = pre_render_snapshot.get("world_identity") if isinstance(pre_render_snapshot, dict) else pre_render_snapshot
+            if expected != wah_world_identity_before or expected != wah_world_identity_after:
                 raise RuntimeError(
-                    f"pre-render conditioning world mismatch: {observed!r} != {expected!r}"
+                    "GeoToken and WAH must consume one immutable PointWorld snapshot: "
+                    f"geo={expected!r}, wah_before={wah_world_identity_before!r}, wah_after={wah_world_identity_after!r}"
                 )
         if hasattr(self.wah_pipeline, "set_world_projection_from_renderer"):
             self.wah_pipeline.set_world_projection_from_renderer(
@@ -196,6 +211,13 @@ class OnlineSpatialHistoryPipeline:
                 refs = refs + [(snapshot, slot) for slot in range(9)]
                 capacity = int(sum(self.autoregressive_state.get("prev_chunk_history_sizes", (16, 2, 1))))
                 self.autoregressive_state["_wah_geometry_slot_refs"] = refs[max(0, len(refs)-capacity):]
+                # Keep only snapshots still referenced by WAH plus source.
+                retained = {id(ref[0]) for ref in self.autoregressive_state["_wah_geometry_slot_refs"]}
+                source = self.autoregressive_state.get("_geotoken_source_geometry")
+                if source is not None: retained.add(id(source[0]))
+                self.autoregressive_state["_geotoken_history_snapshots"] = [
+                    item for item in history if id(item) in retained
+                ]
         generated_chunk = self._decode_last_latent_chunk()
         self.wah_fill_frame = np.asarray(generated_chunk[-1]).copy()
         if len(poses) != len(generated_chunk):

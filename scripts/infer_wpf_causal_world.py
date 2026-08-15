@@ -103,7 +103,8 @@ def main():
                 history_window=online.autoregressive_state.get('_wah_geometry_slot_refs',()),
                 source_geometry=online.autoregressive_state.get('_geotoken_source_geometry'),
             )
-            return {'world_version':active_world['world_version'],'freeze_history':provider.freeze_current_snapshot}
+            from long_video.online.pipeline import point_world_snapshot_identity
+            return {'world_identity':point_world_snapshot_identity(active_node),'freeze_history':provider.freeze_current_snapshot}
         online.pre_render_world_hook=pre_render_world_hook
     generated=[]; warps=[]; panels=[]; reports=[]
     with torch.inference_mode():

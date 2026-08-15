@@ -307,7 +307,7 @@ def main():
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
     records = [record for record in selected_records if (
         (lambda m: m.get("valid", False) and m.get("schema_version") == 3
-         and m.get("geometry_implementation_version") == "recal-full-teacher-world-v2")(
+         and m.get("geometry_implementation_version") == "recal-full-teacher-world-v3")(
             json.loads((args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text())
         ))]
     if len(records) < 90:
@@ -359,7 +359,7 @@ def main():
         geometry_root = args.recal3r_root / record["trajectory_id"]
         metadata = json.loads((geometry_root / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v2"):
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v3"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(args.dataset_root / record["source"])
         data_load_seconds = time.time() - total_started
@@ -411,8 +411,9 @@ def main():
                 history_window=online.autoregressive_state.get("_wah_geometry_slot_refs", ()),
                 source_geometry=online.autoregressive_state.get("_geotoken_source_geometry"),
             )
+            from long_video.online.pipeline import point_world_snapshot_identity
             return {
-                "world_version": active_world["world_version"],
+                "world_identity": point_world_snapshot_identity(active_node),
                 "freeze_history": provider.freeze_current_snapshot,
             }
 

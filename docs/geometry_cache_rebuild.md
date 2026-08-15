@@ -1,6 +1,6 @@
 # Geometry Cache Rebuild
 
-All geometry caches from before the v3 ReCal-teacher/Pi3X-source-only layouts are stale by design.
+All geometry caches before `recal-full-teacher-world-v3` / `recal-causal-teacher-world-v3` are stale by design.
 Rebuild the full ReCal cache, Phase-B causal cache, then source-only Pi3X W0:
 
 ```bash

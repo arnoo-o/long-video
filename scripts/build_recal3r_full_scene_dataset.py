@@ -250,8 +250,8 @@ def process_record(record, args, model_bundle):
                  camera_alignment_error=np.float64(alignment.camera_alignment_error))
         metadata = {
             "schema_version": 3,
-            "geometry_implementation_version": "recal-full-teacher-world-v2",
-            "alignment_version": "offline-full-trajectory-recal-to-dataset-v2",
+            "geometry_implementation_version": "recal-full-teacher-world-v3",
+            "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
             "confidence_calibration": {"kind": "sigmoid", "threshold": args.confidence_threshold, "temperature": 0.35},
             "trajectory_id": trajectory_id,
             "rgb_dir": record["rgb_dir"],

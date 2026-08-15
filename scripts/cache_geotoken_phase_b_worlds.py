@@ -55,7 +55,7 @@ def main():
         (target / "cache_metadata.json").write_text(json.dumps({
             "schema_version": 3, "geometry_implementation_version": GEOMETRY_CACHE_VERSION,
             "source_recal_metadata": metadata, "voxel_size": float(args.voxel_size),
-            "alignment_version": "recal_to_pi3x_w0_v1",
+            "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
         }, indent=2))
         for frame_limit in FRAME_LIMITS:
             keys, points, rgb, confidence, observation_count, max_frame = fuse(source, args.dataset_root, frame_limit, args.voxel_size)

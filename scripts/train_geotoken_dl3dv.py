@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import math
@@ -434,7 +435,11 @@ def main():
     )
     # All later AR states receive cached embeddings, so the frozen text
     # encoder no longer participates in training and need not occupy HBM.
-    pipe.text_encoder.to("cpu")
+    frozen_text_encoder = pipe.text_encoder
+    frozen_text_encoder.to("cpu")
+    pipe.text_encoder = None
+    del frozen_text_encoder
+    gc.collect()
     torch.cuda.empty_cache()
     pi3x_provenance = build_pi3x_provenance(args)
     vae_identity, model_identity = latent_cache_identities(pipe, args.model)
@@ -443,9 +448,9 @@ def main():
     trainable = assert_geotoken_only_trainable(pipe.transformer)
     if hasattr(pipe, "_world_projection_context") or hasattr(pipe, "_pyramid_training_adapter_name"):
         raise RuntimeError("GeoToken training requires WPF and wpf_adaptation to be absent")
-    for module in (pipe.vae, pipe.text_encoder):
+    for module in (pipe.vae,):
         if any(parameter.requires_grad for parameter in module.parameters()):
-            raise RuntimeError("VAE/text encoder must remain frozen")
+            raise RuntimeError("VAE must remain frozen")
     optimizer = torch.optim.AdamW(
         [parameter for _, parameter in trainable], lr=args.learning_rate,
         weight_decay=args.weight_decay,

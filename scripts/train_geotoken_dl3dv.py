@@ -86,6 +86,9 @@ def cached_source_rgb_sha256(cache, trajectory_id, source_path):
 def build_prompt_embedding_cache(pipe, prompt, *, negative_prompt, lora_prompt_trigger):
     """Encode the fixed normal, negative, and WAH-LoRA prompts exactly once."""
     device = pipe._execution_device
+    # Match init_autoregressive_state() ordering before querying the derived
+    # classifier-free-guidance property.
+    pipe._guidance_scale = 1.0
     common = {
         "negative_prompt": negative_prompt,
         "do_classifier_free_guidance": pipe.do_classifier_free_guidance,

@@ -211,7 +211,7 @@ def camera_channels_from_cameras(c2w, intrinsics, source_center, scene_scale, he
     pix = torch.stack((x.float(), y.float(), torch.ones_like(x, dtype=torch.float32)), -1)
     ray_cam = torch.einsum("tij,hwj->thwi", torch.linalg.inv(k), pix); ray_cam = ray_cam / torch.linalg.vector_norm(ray_cam, dim=-1, keepdim=True).clamp_min(1e-8)
     direction = torch.einsum("tij,thwj->thwi", poses[:, :3, :3], ray_cam)
-    origin = (poses[:, :3, 3] - torch.as_tensor(source_center, device=device)) / float(scene_scale)
+    origin = (poses[:, :3, 3] - torch.as_tensor(source_center, dtype=torch.float32, device=device)) / float(scene_scale)
     moment = torch.cross(origin[:, None, None].expand_as(direction), direction, dim=-1)
     return torch.cat((direction, moment), -1)
 
@@ -221,7 +221,7 @@ def world_channels_from_cuda_render(xyz, depth, visibility, confidence, c2w, sou
     valid = visibility.bool() & torch.isfinite(xyz).all(-1) & torch.isfinite(depth) & (depth > 0) & torch.isfinite(confidence)
     safe = torch.where(valid[..., None], xyz, origin); direction = safe-origin; direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(1e-8)
     result = torch.zeros((*depth.shape, 7), dtype=torch.float32, device=device)
-    result[..., :3] = ((safe - torch.as_tensor(source_center, device=device)) / float(scene_scale)).clamp(-64, 64)
+    result[..., :3] = ((safe - torch.as_tensor(source_center, dtype=torch.float32, device=device)) / float(scene_scale)).clamp(-64, 64)
     result[..., 3:6] = direction
     # Compact contract: XYZ, ray, log-depth, visibility, confidence.
     result[..., 6] = torch.log(torch.where(valid, depth / float(scene_scale), torch.ones_like(depth)).clamp_min(1e-6)).clamp(-16,16)

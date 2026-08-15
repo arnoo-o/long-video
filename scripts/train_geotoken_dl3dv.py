@@ -394,7 +394,7 @@ def main():
     missing = [record["trajectory_id"] for record in selected_records if not (
         args.recal3r_root / record["trajectory_id"] / "metadata.json"
     ).is_file()]
-    if missing:
+    if missing and not args.smoke_only:
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
     records = [record for record in selected_records if (
         (lambda m: m.get("valid", False) and m.get("schema_version") == 3

@@ -345,6 +345,16 @@ def main():
         # ReCal3R normalization is confined to the offline A/B phases.
         bootstrap_online = None
         if phase == "C":
+            # The model weights may persist, but recurrent observations are
+            # trajectory-owned and must never cross an optimizer step.
+            geometry_backend.reset()
+            initial_recal_state = geometry_backend.get_state()
+            if (initial_recal_state.get("frame_count") != 0
+                    or initial_recal_state.get("sequence_version") != 0
+                    or initial_recal_state.get("has_recurrent_state")):
+                raise RuntimeError(
+                    f"Phase C ReCal3R state did not reset for step {step}: {initial_recal_state}"
+                )
             bootstrap_online = build_online(args, pipe, record, source, geometry_backend)
             scale = source_scene_scale_from_active_node(
                 bootstrap_online.active_node, arrays["c2w"][0], arrays["k"][0], device=args.device,
@@ -401,6 +411,17 @@ def main():
                 with torch.no_grad():
                     online.generate_chunk_at_cameras(poses, intrinsics, 384, 640)
                 prefix_rollout_seconds += time.time() - rollout_started
+            if phase == "C":
+                final_recal_state = geometry_backend.get_state()
+                # The online pipeline advances ReCal3R with the 32 newly
+                # generated (non-boundary) frames per chunk. Candidate
+                # validation may re-evaluate existing frames but cannot add
+                # observations beyond this trajectory's generated prefix.
+                if not 0 < int(final_recal_state.get("frame_count", 0)) <= 32 * rollout_length:
+                    raise RuntimeError(
+                        f"Phase C ReCal3R state leaked observations at step {step}: "
+                        f"{final_recal_state}, rollout_length={rollout_length}"
+                    )
             gt_started = time.time()
             z_gt = cached_gt_latent(
                 args.gt_latent_cache_root, record["trajectory_id"], rollout_length - 1, args.device,

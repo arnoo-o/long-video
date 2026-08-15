@@ -199,10 +199,6 @@ class OnlineSpatialHistoryPipeline:
                 history = self.autoregressive_state.setdefault("_geotoken_history_snapshots", [])
                 history.append(freeze(chunk_index=self.chunk_index, frame_start=self.frame_index))
                 snapshot = history[-1]
-                source_slot = self.autoregressive_state.setdefault(
-                    "_geotoken_source_geometry", (snapshot, 0),
-                )
-                del source_slot  # state ownership documents the immutable source slot.
                 # Explicit WAH slot identities, not a separate GeoToken
                 # eviction policy.  The official state declares its retained
                 # 16+2+1 history capacity; these identities are only the

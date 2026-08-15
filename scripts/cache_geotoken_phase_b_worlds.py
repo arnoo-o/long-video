@@ -48,8 +48,10 @@ def main():
     for trajectory_id in trajectory_ids:
         source = args.recal3r_root / trajectory_id
         metadata = json.loads((source / "metadata.json").read_text())
-        if not metadata.get("valid", False):
-            continue
+        if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v3"
+                or float(metadata.get("voxel_size", -1)) != 0.02):
+            raise RuntimeError(f"stale Phase A ReCal cache: {source}")
         target = args.output_root / trajectory_id
         target.mkdir(parents=True, exist_ok=True)
         (target / "cache_metadata.json").write_text(json.dumps({

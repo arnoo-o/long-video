@@ -404,12 +404,15 @@ def main():
 
         def pre_render_world_hook(active_node, cameras):
             active_world = provider.configure_active_node(active_node)
-            provider.ensure_source_geometry(arrays["c2w"][0], arrays["k"][0])
+            source_geometry = provider.ensure_source_geometry(arrays["c2w"][0], arrays["k"][0])
+            existing_source = online.autoregressive_state.setdefault("_geotoken_source_geometry", source_geometry)
+            if existing_source is not source_geometry:
+                raise RuntimeError("GeoToken source geometry changed within one trajectory")
             provider.configure_chunk(
                 cameras.c2w, cameras.intrinsics,
                 online.autoregressive_state.get("_geotoken_history_snapshots", ()),
                 history_window=online.autoregressive_state.get("_wah_geometry_slot_refs", ()),
-                source_geometry=online.autoregressive_state.get("_geotoken_source_geometry"),
+                source_geometry=online.autoregressive_state["_geotoken_source_geometry"],
             )
             from long_video.online.pipeline import point_world_snapshot_identity
             return {

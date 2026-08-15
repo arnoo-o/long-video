@@ -161,7 +161,8 @@ def process_record(record, args, model_bundle):
     destination = args.output_root / trajectory_id
     if args.resume and (destination / "metadata.json").exists():
         metadata = json.loads((destination / "metadata.json").read_text())
-        if metadata.get("valid"):
+        if (metadata.get("valid") and
+                metadata.get("geometry_implementation_version") == "recal-full-teacher-world-v3"):
             print(f"[skip] {trajectory_id}")
             return metadata
 

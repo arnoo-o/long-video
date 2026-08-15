@@ -1,6 +1,8 @@
 # Geometry Cache Rebuild
 
-All geometry caches before `recal-full-teacher-world-v3` / `recal-causal-teacher-world-v3` are stale by design.
+All geometry caches before `recal-full-teacher-world-v4-rgb-anchor` /
+`recal-causal-teacher-world-v4-rgb-anchor` are stale by design. These builds
+use persistent RGB appearance anchors instead of confidence-averaged colors.
 Rebuild the full ReCal cache, Phase-B causal cache, then source-only Pi3X W0:
 
 ```bash

@@ -1,6 +1,7 @@
-"""Geometry-only conditioning tokens for frozen Helios transformers."""
+"""Camera/world Q/K-only conditioning for frozen Helios attention."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -9,289 +10,219 @@ import torch
 from torch import nn
 
 
-GEOTOKEN_CHANNELS = 12
 GEOTOKEN_BLOCKS = (8, 12, 16, 20, 24, 28)
 TEMPORAL_GROUPS = ((0,),) + tuple(tuple(range(start, start + 4)) for start in range(1, 33, 4))
+CAMERA_CHANNELS = 6
+WORLD_BASE_CHANNELS = 9  # XYZ, ray, log-depth, visibility, confidence
+WORLD_CHANNELS = WORLD_BASE_CHANNELS + 3 * 2 * 4
 
 
 @dataclass
 class GeometryTokenBatch:
-    """Encoded geometry aligned with an already-patched Helios sequence."""
+    """Parallel CameraRay and WorldGeo token streams aligned to Helios."""
 
-    tokens: torch.Tensor
-    support: torch.Tensor
+    camera: torch.Tensor
+    world: torch.Tensor
+    world_support: torch.Tensor
 
     def __post_init__(self):
-        if self.tokens.ndim != 3:
-            raise ValueError("geometry tokens must be [B,N,D]")
-        if self.support.shape != self.tokens.shape[:2] + (1,):
-            raise ValueError("geometry support must be [B,N,1]")
+        if self.camera.ndim != 3 or self.world.shape != self.camera.shape:
+            raise ValueError("camera/world GeoTokens must both be [B,N,256]")
+        if self.world_support.shape != self.camera.shape[:2] + (1,):
+            raise ValueError("world support must be [B,N,1]")
+
+
+class _FrameTokenizer(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.encoder = nn.Sequential(nn.Linear(channels, 128), nn.SiLU(), nn.Linear(128, 256), nn.SiLU())
+        self.score = nn.Linear(256, 1)
+
+    def forward(self, values: torch.Tensor, weights: torch.Tensor):
+        # [B,T,H,W,C], [B,T,H,W,1] -> [B,256,9,H,W], [B,1,9,H,W]
+        encoded = self.encoder(values.float())
+        pooled, supports = [], []
+        for group in TEMPORAL_GROUPS:
+            index = torch.as_tensor(group, device=values.device)
+            feature = encoded.index_select(1, index)
+            weight = weights.index_select(1, index).clamp_min(0)
+            present = weight.sum(1) > 0
+            logits = self.score(feature).masked_fill(weight <= 0, -torch.inf)
+            logits = torch.where(present[:, None], logits, torch.zeros_like(logits))
+            attention = torch.softmax(logits, 1) * weight
+            attention = attention / attention.sum(1, keepdim=True).clamp_min(1e-8)
+            item = (feature * attention).sum(1)
+            pooled.append(torch.where(present, item, torch.zeros_like(item)))
+            supports.append(weight.mean(1))
+        return (torch.stack(pooled, 1).permute(0, 4, 1, 2, 3).contiguous(),
+                torch.stack(supports, 1).permute(0, 4, 1, 2, 3).contiguous())
 
 
 class GeometryTokenizer(nn.Module):
-    """Encode 12-channel pixels and attention-pool 33 frames into 9 slots."""
-
+    """Separate camera-ray and world-geometry encoders; both retain 33 -> 9 slots."""
     def __init__(self, inner_dim: int):
         super().__init__()
         self.inner_dim = int(inner_dim)
-        if self.inner_dim <= 0:
-            raise ValueError("inner_dim must be positive")
-        self.frame_encoder = nn.Sequential(
-            nn.Linear(GEOTOKEN_CHANNELS, 128),
-            nn.SiLU(),
-            nn.Linear(128, 256),
-            nn.SiLU(),
-        )
-        self.temporal_score = nn.Linear(256, 1)
-        self.geometry_projection = nn.Linear(256, self.inner_dim)
+        self.camera = _FrameTokenizer(CAMERA_CHANNELS)
+        self.world = _FrameTokenizer(WORLD_CHANNELS)
 
-    def forward(self, geometry: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return `[B,D,9,H,W]` features and `[B,1,9,H,W]` support."""
-        if geometry.ndim != 5 or geometry.shape[1] != GEOTOKEN_CHANNELS:
-            raise ValueError(f"geometry must be [B,12,33,H,W], got {tuple(geometry.shape)}")
-        if geometry.shape[2] != 33:
-            raise ValueError("GeoToken requires the Helios 33-frame layout")
-        x = geometry.permute(0, 2, 3, 4, 1).float()
-        valid = x[..., 10:11].clamp(0, 1)
-        confidence = x[..., 11:12].clamp(0, 1) * valid
-        encoded = self.frame_encoder(x) * valid
-        if not bool(torch.isfinite(encoded).all()):
-            raise RuntimeError("GeometryTokenizer received non-finite normalized geometry")
-        pooled, supports = [], []
-        for group in TEMPORAL_GROUPS:
-            index = torch.as_tensor(group, device=x.device)
-            group_features = encoded.index_select(1, index)
-            group_weights = confidence.index_select(1, index)
-            logits = self.temporal_score(group_features).float()
-            logits = logits.masked_fill(group_weights <= 0, -torch.inf)
-            any_valid = group_weights.sum(dim=1) > 0
-            safe_logits = torch.where(any_valid[:, None], logits, torch.zeros_like(logits))
-            weights = torch.softmax(safe_logits, dim=1) * group_weights
-            weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
-            feature = (group_features.float() * weights).sum(dim=1)
-            feature = torch.where(any_valid, feature, torch.zeros_like(feature))
-            pooled.append(feature)
-            supports.append(group_weights.mean(dim=1))
-        pooled = torch.stack(pooled, dim=1)
-        support = torch.stack(supports, dim=1).clamp(0, 1)
-        projected = self.geometry_projection(pooled) * (support > 0)
-        projected = projected.permute(0, 4, 1, 2, 3).contiguous()
-        support = support.permute(0, 4, 1, 2, 3).contiguous()
-        return projected, support
+    @staticmethod
+    def _world_features(world: torch.Tensor):
+        xyz = world[..., :3]
+        features = [world[..., :WORLD_BASE_CHANNELS]]
+        for frequency in (1.0, 2.0, 4.0, 8.0):
+            features.extend((torch.sin(math.pi * frequency * xyz), torch.cos(math.pi * frequency * xyz)))
+        return torch.cat(features, -1)
+
+    def forward(self, camera: torch.Tensor, world: torch.Tensor):
+        if camera.ndim != 5 or camera.shape[1:3] != (CAMERA_CHANNELS, 33):
+            raise ValueError(f"camera must be [B,6,33,H,W], got {tuple(camera.shape)}")
+        if world.ndim != 5 or world.shape[1:3] != (WORLD_BASE_CHANNELS, 33):
+            raise ValueError(f"world must be [B,8,33,H,W], got {tuple(world.shape)}")
+        camera_values = camera.permute(0, 2, 3, 4, 1)
+        world_values = world.permute(0, 2, 3, 4, 1)
+        camera_feature, _ = self.camera(camera_values, torch.ones_like(camera_values[..., :1]))
+        world_support = (world_values[..., 6:7].clamp(0, 1) * world_values[..., 7:8].clamp(0, 1))
+        world_feature, world_support = self.world(self._world_features(world_values), world_support)
+        return camera_feature, world_feature, world_support
+
+
+class _QKAdapter(nn.Module):
+    def __init__(self, inner_dim: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(256)
+        self.down = nn.Linear(256, 64, bias=False)
+        self.act = nn.SiLU()
+        self.up = nn.Linear(64, inner_dim, bias=False)
+        nn.init.normal_(self.up.weight, std=1e-3)
+
+    def forward(self, value):
+        return self.up(self.act(self.down(self.norm(value))))
 
 
 class GeoTokenConditioner(nn.Module):
-    """Inject aligned geometry after patch embedding at selected blocks."""
-
+    """Build Q/K deltas only. Values, hidden states and FFNs are untouched."""
     def __init__(self, inner_dim: int, block_indices: Iterable[int] = GEOTOKEN_BLOCKS):
         super().__init__()
         self.tokenizer = GeometryTokenizer(inner_dim)
-        self.block_indices = tuple(int(value) for value in block_indices)
+        self.block_indices = tuple(map(int, block_indices))
         if self.block_indices != GEOTOKEN_BLOCKS:
             raise ValueError(f"GeoToken block indices must be {GEOTOKEN_BLOCKS}")
-        self.injection_gates = nn.ParameterDict({
-            str(index): nn.Parameter(torch.zeros((), dtype=torch.float32))
-            for index in self.block_indices
-        })
+        self.adapters = nn.ModuleDict({str(i): nn.ModuleDict({
+            "camera_q_adapter": _QKAdapter(inner_dim), "camera_k_adapter": _QKAdapter(inner_dim),
+            "world_q_adapter": _QKAdapter(inner_dim), "world_k_adapter": _QKAdapter(inner_dim),
+        }) for i in self.block_indices})
+        self.gates = nn.ParameterDict({f"{i}_{kind}": nn.Parameter(torch.zeros(()))
+            for i in self.block_indices for kind in ("camera_q", "camera_k", "world_q", "world_k")})
         self._active: GeometryTokenBatch | None = None
         self._history: GeometryTokenBatch | None = None
-        self._hook_handles = []
-        self.strength = 1.0
+        self.camera_strength = 1.0
+        self.world_strength = 1.0
+        self.stage_index = 0
+        self.denoise_progress = 0.0
         self.diagnostics: dict[int, dict] = {}
 
-    def set_strength(self, strength: float) -> None:
-        value = float(strength)
-        if value not in {0.0, 0.25, 0.5, 1.0}:
-            raise ValueError("GeoToken strength must be one of 0, 0.25, 0.5, 1.0")
-        self.strength = value
+    def set_strength(self, strength: float):
+        self.set_strengths(camera=float(strength), world=float(strength))
 
-    def set_active(
-        self, tokens: torch.Tensor, support: torch.Tensor,
-        history_tokens: torch.Tensor | None = None, history_support: torch.Tensor | None = None,
-    ) -> None:
-        self._active = GeometryTokenBatch(tokens=tokens, support=support)
-        self._history = (
-            None if history_tokens is None
-            else GeometryTokenBatch(tokens=history_tokens, support=history_support)
-        )
+    def set_strengths(self, *, camera: float = 1.0, world: float = 1.0):
+        if camera < 0 or world < 0:
+            raise ValueError("GeoToken strengths must be non-negative")
+        self.camera_strength, self.world_strength = float(camera), float(world)
 
-    def clear_active(self) -> None:
-        self._active = None
-        self._history = None
+    def set_timing(self, *, stage_index: int = 0, denoise_progress: float = 0.0):
+        self.stage_index = int(stage_index)
+        self.denoise_progress = float(denoise_progress)
 
-    def attach(self, transformer: nn.Module) -> None:
-        if self._hook_handles:
-            return
+    def set_active(self, current: GeometryTokenBatch, history: GeometryTokenBatch | None = None):
+        self._active, self._history = current, history
+
+    def clear_active(self): self._active = self._history = None
+
+    def attach(self, transformer: nn.Module):
         blocks = getattr(transformer, "blocks", None)
-        if blocks is None:
-            raise TypeError("Helios transformer must expose blocks")
-        if max(self.block_indices) >= len(blocks):
-            raise ValueError("GeoToken injection block is outside transformer depth")
+        if blocks is None or max(self.block_indices) >= len(blocks):
+            raise TypeError("patched Helios transformer blocks are unavailable")
         for index in self.block_indices:
-            self._hook_handles.append(blocks[index].register_forward_pre_hook(
-                self._make_hook(index), with_kwargs=True,
-            ))
+            # The WAH patch invokes this callable after Q/K/V projection and before norm_q/norm_k.
+            blocks[index].attn1.geotoken_qk_binding = self._make_qk_binding(index)
 
-    def _make_hook(self, index: int):
-        def hook(_module, args, kwargs):
-            if self._active is None:
-                return args, kwargs
-            if not args:
-                raise RuntimeError("Helios block did not receive hidden_states positionally")
-            hidden = args[0]
-            current = self._active
-            current_length = int(args[4]) if len(args) > 4 else current.tokens.shape[1]
-            if current.tokens.shape[1] != current_length:
-                raise RuntimeError(
-                    f"GeoToken current length mismatch: {current.tokens.shape[1]} != {current_length}"
-                )
-            history_length = hidden.shape[1] - current_length
-            if history_length < 0:
-                raise RuntimeError("Helios original_context_length exceeds sequence length")
-            if history_length:
-                if self._history is None or self._history.tokens.shape[1] != history_length:
-                    raise RuntimeError(
-                        "history geometry must align one-to-one with patched WAH history tokens: "
-                        f"expected {history_length}, got "
-                        f"{None if self._history is None else self._history.tokens.shape[1]}"
-                    )
-                tokens = torch.cat([self._history.tokens, current.tokens], dim=1)
-                support = torch.cat([self._history.support, current.support], dim=1)
-            else:
-                tokens, support = current.tokens, current.support
-            if tokens.shape != hidden.shape:
-                raise RuntimeError(f"GeoToken/Helios sequence mismatch: {tokens.shape} != {hidden.shape}")
-            gate = self.injection_gates[str(index)].to(dtype=hidden.dtype)
-            update = (
-                gate * self.strength
-                * support.to(device=hidden.device, dtype=hidden.dtype)
-                * tokens.to(device=hidden.device, dtype=hidden.dtype)
-            )
+    def _joined(self, total_length: int, current_length: int):
+        if self._active is None: return None
+        if self._active.camera.shape[1] != current_length:
+            raise RuntimeError("GeoToken current token count differs from Helios current sequence")
+        history_length = total_length - current_length
+        if history_length:
+            if self._history is None or self._history.camera.shape[1] != history_length:
+                raise RuntimeError("GeoToken and WAH history tokens are not one-to-one")
+            return GeometryTokenBatch(torch.cat((self._history.camera, self._active.camera), 1),
+                torch.cat((self._history.world, self._active.world), 1),
+                torch.cat((self._history.world_support, self._active.world_support), 1))
+        return self._active
+
+    def _make_qk_binding(self, index):
+        def binding(query, key, value, original_context_length=None, **_):
+            if self._active is None: return query, key, value
+            current_length = int(original_context_length or self._active.camera.shape[1])
+            tokens = self._joined(query.shape[1], current_length)
+            if tokens is None: return query, key, value
+            adapters = self.adapters[str(index)]
+            stage = (1.0, .7, .4)[min(max(self.stage_index, 0), 2)]
+            progress = min(max(self.denoise_progress, 0.), 1.)
+            time = 1.0 if progress <= .6 else .25 + .75 * .5 * (1 + math.cos(math.pi * (progress - .6) / .4))
+            cam_q = adapters["camera_q_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_q"])
+            cam_k = adapters["camera_k_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_k"])
+            world_q = adapters["world_q_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_q"])
+            world_k = adapters["world_k_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_k"])
+            scale = stage * time
+            delta_q = (self.camera_strength * cam_q + self.world_strength * tokens.world_support * world_q) * scale
+            delta_k = (self.camera_strength * cam_k + self.world_strength * tokens.world_support * world_k) * scale
+            # Previous appearance history is a frozen WAH query. Its keys remain world/camera-bound.
+            delta_q[:, :-current_length] = 0
+            cap = (.15, .10, .06)[min(max(self.stage_index, 0), 2)]
+            def cap_delta(delta, base):
+                ratio = delta.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
+                return delta * (cap / ratio.clamp_min(cap)).to(delta.dtype), ratio.max()
+            delta_q, q_ratio = cap_delta(delta_q, query); delta_k, k_ratio = cap_delta(delta_k, key)
             with torch.no_grad():
-                hidden_rms = hidden.float().square().mean().sqrt()
-                delta_rms = update.float().square().mean().sqrt()
-                self.diagnostics[index] = {
-                    "gate": float(gate.detach()),
-                    "geometry_token_rms": float(tokens.float().square().mean().sqrt()),
-                    "hidden_rms": float(hidden_rms),
-                    "delta_rms": float(delta_rms),
-                    "delta_over_hidden_rms": float(delta_rms / hidden_rms.clamp_min(1e-8)),
-                    "support_mean": float(support.float().mean()),
-                    "support_valid_ratio": float((support > 0).float().mean()),
-                    "strength": float(self.strength),
-                }
-            return (hidden + update, *args[1:]), kwargs
-        return hook
+                self.diagnostics[index] = {"camera_q_gate": float(torch.tanh(self.gates[f"{index}_camera_q"])), "camera_k_gate": float(torch.tanh(self.gates[f"{index}_camera_k"])), "world_q_gate": float(torch.tanh(self.gates[f"{index}_world_q"])), "world_k_gate": float(torch.tanh(self.gates[f"{index}_world_k"])), "stage_scale": stage, "time_scale": time, "q_delta_ratio": float(q_ratio), "k_delta_ratio": float(k_ratio), "world_support_mean": float(tokens.world_support.mean())}
+            return query + delta_q.to(query.dtype), key + delta_k.to(key.dtype), value
+        return binding
 
 
 def install_geotoken(transformer: nn.Module) -> GeoTokenConditioner:
-    """Register GeoToken on a transformer and freeze every non-GeoToken parameter."""
     existing = getattr(transformer, "geotoken", None)
-    if existing is not None:
-        return existing
-    inner_dim = int(getattr(transformer, "inner_dim"))
-    for parameter in transformer.parameters():
-        parameter.requires_grad_(False)
-    module = GeoTokenConditioner(inner_dim)
-    transformer.add_module("geotoken", module)
-    module.attach(transformer)
-    for parameter in module.parameters():
-        parameter.requires_grad_(True)
-    assert_geotoken_only_trainable(transformer)
-    return module
+    if existing is not None: return existing
+    for parameter in transformer.parameters(): parameter.requires_grad_(False)
+    module = GeoTokenConditioner(int(transformer.inner_dim)); transformer.add_module("geotoken", module); module.attach(transformer)
+    for parameter in module.parameters(): parameter.requires_grad_(True)
+    assert_geotoken_only_trainable(transformer); return module
 
 
-def assert_geotoken_only_trainable(transformer: nn.Module) -> list[tuple[str, nn.Parameter]]:
-    items = [(name, value) for name, value in transformer.named_parameters() if value.requires_grad]
-    if not items or any("geotoken." not in name for name, _ in items):
-        raise RuntimeError(f"only GeoToken parameters may train: {[name for name, _ in items]}")
+def assert_geotoken_only_trainable(transformer):
+    items = [(n, p) for n, p in transformer.named_parameters() if p.requires_grad]
+    if not items or any("geotoken." not in n for n, _ in items): raise RuntimeError("only GeoToken parameters may train")
     return items
 
 
-def flatten_geometry_tokens(features: torch.Tensor, support: torch.Tensor) -> GeometryTokenBatch:
-    """Flatten `[B,D,T,H,W]` in the same order as Helios patch tokens."""
-    tokens = features.flatten(2).transpose(1, 2)
-    weights = support.flatten(2).transpose(1, 2)
-    return GeometryTokenBatch(tokens=tokens, support=weights)
+def camera_channels_from_cameras(c2w, intrinsics, source_center, scene_scale, height, width, *, device):
+    poses = torch.as_tensor(c2w, dtype=torch.float32, device=device); k = torch.as_tensor(intrinsics, dtype=torch.float32, device=device)
+    y, x = torch.meshgrid(torch.arange(height, device=device), torch.arange(width, device=device), indexing="ij")
+    pix = torch.stack((x.float(), y.float(), torch.ones_like(x, dtype=torch.float32)), -1)
+    ray_cam = torch.einsum("tij,hwj->thwi", torch.linalg.inv(k), pix); ray_cam = ray_cam / torch.linalg.vector_norm(ray_cam, dim=-1, keepdim=True).clamp_min(1e-8)
+    direction = torch.einsum("tij,thwj->thwi", poses[:, :3, :3], ray_cam)
+    origin = (poses[:, :3, 3] - torch.as_tensor(source_center, device=device)) / float(scene_scale)
+    moment = torch.cross(origin[:, None, None].expand_as(direction), direction, dim=-1)
+    return torch.cat((direction, moment), -1)
 
 
-def geometry_channels_from_render(
-    winning_xyz_world, depth, visibility, confidence, c2w, source_center, scene_scale,
-) -> np.ndarray:
-    """Build the geometry-only 12-channel input from final z-buffer winners."""
-    xyz = np.asarray(winning_xyz_world, np.float32)
-    depth = np.asarray(depth, np.float32)
-    valid = (
-        np.asarray(visibility, bool)
-        & np.isfinite(depth)
-        & (depth > 0)
-        & np.isfinite(xyz).all(axis=-1)
-    )
-    confidence = np.asarray(confidence, np.float32)
-    valid &= np.isfinite(confidence)
-    poses = np.asarray(c2w, np.float32)
-    c0 = np.asarray(source_center, np.float32).reshape(3)
-    scale = float(scene_scale)
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError("trajectory scene_scale must be finite and positive")
-    if xyz.shape[:3] != valid.shape or xyz.shape[-1] != 3:
-        raise ValueError("winning XYZ and visibility shapes do not align")
-    if poses.shape != (xyz.shape[0], 4, 4):
-        raise ValueError("one target camera is required for every geometry frame")
-    h, w = valid.shape[-2:]
-    yy, xx = np.meshgrid(np.arange(h, dtype=np.float32), np.arange(w, dtype=np.float32), indexing="ij")
-    output = np.zeros((len(poses), h, w, GEOTOKEN_CHANNELS), np.float32)
-    for frame, pose in enumerate(poses):
-        origin = pose[:3, 3]
-        frame_valid = valid[frame]
-        frame_xyz = np.where(frame_valid[..., None], xyz[frame], origin)
-        frame_depth = np.where(frame_valid, depth[frame], scale)
-        frame_confidence = np.where(frame_valid, confidence[frame], 0)
-        direction = frame_xyz - origin
-        norm = np.linalg.norm(direction, axis=-1, keepdims=True)
-        direction = direction / np.maximum(norm, 1e-8)
-        output[frame, ..., 0:3] = np.clip((frame_xyz - c0) / scale, -64, 64)
-        output[frame, ..., 3:6] = np.clip((origin - c0) / scale, -64, 64)
-        output[frame, ..., 6:9] = np.clip(direction, -1, 1)
-        output[frame, ..., 9] = np.clip(np.log(np.maximum(frame_depth / scale, 1e-6)), -16, 16)
-        output[frame, ..., 10] = frame_valid
-        output[frame, ..., 11] = np.clip(frame_confidence, 0, 1)
-    output *= valid[..., None]
-    return output
-
-
-def geometry_channels_from_cuda_render(
-    xyz: torch.Tensor, depth: torch.Tensor, visibility: torch.Tensor, confidence: torch.Tensor,
-    c2w, source_center, scene_scale: float,
-) -> torch.Tensor:
-    """CUDA equivalent of ``geometry_channels_from_render`` without CPU copies."""
-    if not np.isfinite(scene_scale) or float(scene_scale) <= 0:
-        raise ValueError("trajectory scene_scale must be finite and positive")
-    device = xyz.device
-    poses = torch.as_tensor(c2w, dtype=torch.float32, device=device)
-    c0 = torch.as_tensor(source_center, dtype=torch.float32, device=device).reshape(3)
-    valid = visibility.bool() & torch.isfinite(depth) & (depth > 0) & torch.isfinite(xyz).all(-1)
-    valid &= torch.isfinite(confidence)
-    origins = poses[:, None, None, :3, 3]
-    scale = float(scene_scale)
-    safe_xyz = torch.where(valid[..., None], xyz, origins)
-    direction = safe_xyz - origins
-    direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(1e-8)
-    safe_depth = torch.where(valid, depth, torch.full_like(depth, scale))
-    output = torch.zeros((*depth.shape, GEOTOKEN_CHANNELS), dtype=torch.float32, device=device)
-    output[..., 0:3] = ((safe_xyz - c0) / scale).clamp(-64, 64)
-    output[..., 3:6] = ((origins - c0) / scale).clamp(-64, 64)
-    output[..., 6:9] = direction.clamp(-1, 1)
-    output[..., 9] = torch.log((safe_depth / scale).clamp_min(1e-6)).clamp(-16, 16)
-    output[..., 10] = valid
-    output[..., 11] = torch.where(valid, confidence, torch.zeros_like(confidence)).clamp(0, 1)
-    return output * valid[..., None]
-
-
-def source_scene_scale(depth, visibility) -> float:
-    depth = np.asarray(depth, np.float32)
-    valid = np.asarray(visibility, bool) & np.isfinite(depth) & (depth > 0)
-    values = depth[valid]
-    if not len(values):
-        raise ValueError("source view has no valid geometry depth")
-    return float(np.median(values))
+def world_channels_from_cuda_render(xyz, depth, visibility, confidence, c2w, source_center, scene_scale):
+    device = xyz.device; poses = torch.as_tensor(c2w, dtype=torch.float32, device=device); origin = poses[:, None, None, :3, 3]
+    valid = visibility.bool() & torch.isfinite(xyz).all(-1) & torch.isfinite(depth) & (depth > 0) & torch.isfinite(confidence)
+    safe = torch.where(valid[..., None], xyz, origin); direction = safe-origin; direction = direction / torch.linalg.vector_norm(direction, dim=-1, keepdim=True).clamp_min(1e-8)
+    result = torch.zeros((*depth.shape, 7), dtype=torch.float32, device=device)
+    result[..., :3] = ((safe - torch.as_tensor(source_center, device=device)) / float(scene_scale)).clamp(-64, 64)
+    result[..., 3:6] = direction
+    # Compact contract: XYZ, ray, log-depth, visibility, confidence.
+    result[..., 6] = torch.log(torch.where(valid, depth / float(scene_scale), torch.ones_like(depth)).clamp_min(1e-6)).clamp(-16,16)
+    return torch.cat((result[..., :7], valid[..., None].float(), torch.where(valid, confidence, torch.zeros_like(confidence))[..., None].clamp(0,1)), -1)

@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--geotoken-strength", type=float, default=1.0)
+    parser.add_argument("--camera-strength", type=float, default=1.0)
+    parser.add_argument("--world-strength", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -321,7 +323,7 @@ def main():
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
     records = [record for record in selected_records if (
         (lambda m: m.get("valid", False) and m.get("schema_version") == 3
-         and m.get("geometry_implementation_version") == "recal-full-teacher-world-v3")(
+         and m.get("geometry_implementation_version") == "recal-full-teacher-world-v4-rgb-anchor")(
             json.loads((args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text())
         ))]
     if len(records) < 90:
@@ -339,6 +341,7 @@ def main():
             parameter.requires_grad_(False)
     conditioner = install_geotoken(pipe.transformer).to(device=args.device)
     conditioner.set_strength(args.geotoken_strength)
+    conditioner.set_strengths(camera=args.camera_strength, world=args.world_strength)
     vae_identity, model_identity = latent_cache_identities(pipe, args.model)
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()
@@ -374,7 +377,7 @@ def main():
         geometry_root = args.recal3r_root / record["trajectory_id"]
         metadata = json.loads((geometry_root / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v3"):
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v4-rgb-anchor"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(arrays["rgb_paths"][0])
         data_load_seconds = time.time() - total_started
@@ -414,6 +417,7 @@ def main():
         provider = PointWorldGeoTokenProvider(
             conditioner, device=args.device, source_center=source_center, scene_scale=scale, render_height=384, render_width=640,
         )
+        provider.set_world_slot_dropout(0.15 if phase == "B" else 0.0)
         provider.attach(pipe.transformer)
         online = bootstrap_online if phase == "C" else build_online(args, pipe, record, source, initial_node=teacher_node)
 
@@ -531,9 +535,7 @@ def main():
             "geotoken_parameter_norm": float(torch.sqrt(sum(
                 parameter.detach().float().square().sum() for _, parameter in trainable
             ))),
-            "injection_gates": {
-                key: float(value.detach()) for key, value in conditioner.injection_gates.items()
-            },
+            "camera_strength": conditioner.camera_strength, "world_strength": conditioner.world_strength,
             "geotoken_injection": conditioner.diagnostics,
             "data_load_seconds": data_load_seconds,
             "point_render_seconds": provider.point_render_seconds(),

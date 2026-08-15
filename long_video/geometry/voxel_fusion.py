@@ -1,32 +1,38 @@
-"""One canonical 0.02 world-unit voxel fusion implementation."""
+"""Canonical PointWorld fusion with stable per-voxel appearance anchors."""
 from __future__ import annotations
-
 import numpy as np
 
 
-def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxel_size=0.02):
-    """Fuse observations with weight_sum=confidence_mean*observation_count.
-
-    This is deliberately shared by Pi3X initialization and ReCal3R publishing:
-    a point entering the same world-space voxel follows exactly the same rule.
-    """
-    if float(voxel_size) != 0.02:
-        raise ValueError("persistent PointWorld voxel size is exactly 0.02")
-    xyz = np.asarray(points_xyz, np.float32)
-    rgb = np.asarray(points_rgb, np.uint8)
-    conf = np.asarray(confidence, np.float32)
-    obs = np.ones(len(xyz), np.int32) if observation_count is None else np.asarray(observation_count, np.int32).clip(1)
-    valid = np.isfinite(xyz).all(1) & np.isfinite(conf) & (conf > 0)
-    xyz, rgb, conf, obs = xyz[valid], rgb[valid], conf[valid], obs[valid]
+def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxel_size=0.02,
+                *, anchor_confidence=None, anchor_frame=None, source_locked=None, return_anchors=False):
+    if float(voxel_size) != .02: raise ValueError("persistent PointWorld voxel size is exactly 0.02")
+    xyz=np.asarray(points_xyz,np.float32); rgb=np.asarray(points_rgb,np.uint8); conf=np.asarray(confidence,np.float32)
+    obs=np.ones(len(xyz),np.int32) if observation_count is None else np.asarray(observation_count,np.int32).clip(1)
+    anchor_conf=np.asarray(conf if anchor_confidence is None else anchor_confidence,np.float32)
+    frame=np.full(len(xyz),-1,np.int32) if anchor_frame is None else np.asarray(anchor_frame,np.int32)
+    locked=np.zeros(len(xyz),bool) if source_locked is None else np.asarray(source_locked,bool)
+    valid=np.isfinite(xyz).all(1)&np.isfinite(conf)&(conf>0)&np.isfinite(anchor_conf)
+    xyz,rgb,conf,obs,anchor_conf,frame,locked=(x[valid] for x in (xyz,rgb,conf,obs,anchor_conf,frame,locked))
     if not len(xyz):
-        return (np.empty((0, 3), np.float32), np.empty((0, 3), np.uint8),
-                np.empty(0, np.float32), np.empty(0, np.uint16), np.empty((0, 3), np.int64))
-    keys = np.floor(xyz / float(voxel_size)).astype(np.int64)
-    unique, inverse = np.unique(keys, axis=0, return_inverse=True)
-    weight_sum = conf * obs.astype(np.float32)
-    total = np.bincount(inverse, weights=weight_sum, minlength=len(unique)).astype(np.float32)
-    count = np.bincount(inverse, weights=obs, minlength=len(unique)).astype(np.int32)
-    out_xyz = np.stack([np.bincount(inverse, weights=weight_sum * xyz[:, axis], minlength=len(unique)) / total for axis in range(3)], 1)
-    out_rgb = np.stack([np.bincount(inverse, weights=weight_sum * rgb[:, axis], minlength=len(unique)) / total for axis in range(3)], 1)
-    return (out_xyz.astype(np.float32), np.rint(np.clip(out_rgb, 0, 255)).astype(np.uint8),
-            (total / count.clip(1)).astype(np.float32), np.minimum(count, 65535).astype(np.uint16), unique)
+        empty=(np.empty((0,3),np.float32),np.empty((0,3),np.uint8),np.empty(0,np.float32),np.empty(0,np.uint16),np.empty((0,3),np.int64))
+        return (*empty, {"anchor_confidence":np.empty(0,np.float32),"anchor_frame":np.empty(0,np.int32),"source_locked":np.empty(0,bool)}) if return_anchors else empty
+    keys=np.floor(xyz/.02).astype(np.int64); unique,inverse=np.unique(keys,axis=0,return_inverse=True)
+    weight=conf*obs; total=np.bincount(inverse,weights=weight,minlength=len(unique)).astype(np.float32); count=np.bincount(inverse,weights=obs,minlength=len(unique)).astype(np.int32)
+    out_xyz=np.stack([np.bincount(inverse,weights=weight*xyz[:,i],minlength=len(unique))/total for i in range(3)],1).astype(np.float32)
+    # Appearance is an anchor selection, deliberately never a weighted RGB average.
+    chosen=np.empty(len(unique),np.int64)
+    for i in range(len(unique)):
+        members=np.flatnonzero(inverse==i); locked_members=members[locked[members]]
+        if len(locked_members):
+            chosen[i] = locked_members[0]
+            continue
+        # Preserve the existing anchor unless a later observation exceeds it
+        # by the explicit 10% margin. Input order is causal: persisted fused
+        # voxels precede the new tail observations.
+        best = members[0]
+        for candidate in members[1:]:
+            if anchor_conf[candidate] > 1.1 * anchor_conf[best]: best = candidate
+        chosen[i]=best
+    anchors={"anchor_confidence":anchor_conf[chosen].astype(np.float32),"anchor_frame":frame[chosen].astype(np.int32),"source_locked":locked[chosen].astype(bool)}
+    result=(out_xyz,rgb[chosen].astype(np.uint8),(total/count.clip(1)).astype(np.float32),np.minimum(count,65535).astype(np.uint16),unique)
+    return (*result,anchors) if return_anchors else result

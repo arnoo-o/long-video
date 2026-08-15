@@ -9,7 +9,8 @@ import torch.nn.functional as F
 
 from ..data.camera import resize_intrinsics
 from ..types import CameraBatch
-from .geotoken import GeometryTokenBatch, geometry_channels_from_cuda_render
+from .geotoken import (GeometryTokenBatch, camera_channels_from_cameras,
+                       world_channels_from_cuda_render)
 from .point_renderer import render_geometry_cuda
 from .world_identity import point_world_snapshot_identity
 
@@ -30,6 +31,7 @@ class FrozenGeometrySnapshot:
     frame_start: int
     world_version: object
     c2w: np.ndarray
+    intrinsics: np.ndarray
     source_center: np.ndarray
     scene_scale: float
     grids: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
@@ -57,6 +59,10 @@ class PointWorldGeoTokenProvider:
         self._render_cache = {}
         self._feature_cache = {}
         self._render_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self.world_slot_dropout = 0.0
+
+    def set_world_slot_dropout(self, probability: float):
+        self.world_slot_dropout = float(probability)
 
     def attach(self, transformer):
         if self._handle is None:
@@ -99,7 +105,7 @@ class PointWorldGeoTokenProvider:
         # Camera changes invalidate only its keyed render entries; retaining
         # matching history/current camera renders avoids rerasterizing a world.
 
-    def _render_channels(self, c2w, intrinsics, height, width):
+    def _render_inputs(self, c2w, intrinsics, height, width):
         if self.points_xyz is None:
             raise RuntimeError("GeoToken provider has no available scene geometry")
         scaled = resize_intrinsics(intrinsics, self.render_resolution, (int(height), int(width)))
@@ -118,17 +124,19 @@ class PointWorldGeoTokenProvider:
                 finished.record()
             self._render_events.append((started, finished))
         xyz, depth, visibility, confidence = self._render_cache[cache_key]
-        channels = geometry_channels_from_cuda_render(
+        camera = camera_channels_from_cameras(
+            c2w, scaled, self.source_center, self.scene_scale, int(height), int(width), device=self.device,
+        )
+        world = world_channels_from_cuda_render(
             xyz, depth, visibility, confidence, c2w, self.source_center, self.scene_scale,
         )
-        return channels.permute(3, 0, 1, 2).unsqueeze(0)
+        return camera.permute(3, 0, 1, 2).unsqueeze(0), world.permute(3, 0, 1, 2).unsqueeze(0)
 
     def _encode_chunk(self, c2w, intrinsics, height, width):
         key = (self.world_version, self._camera_identity(c2w, intrinsics), int(height), int(width), torch.is_grad_enabled())
         if key not in self._feature_cache:
-            channels = self._render_channels(c2w, intrinsics, height, width)
-            features, support = self.conditioner.tokenizer(channels)
-            self._feature_cache[key] = (features, support)
+            camera, world = self._render_inputs(c2w, intrinsics, height, width)
+            self._feature_cache[key] = self.conditioner.tokenizer(camera, world)
         return self._feature_cache[key]
 
     @staticmethod
@@ -156,6 +164,7 @@ class PointWorldGeoTokenProvider:
         return FrozenGeometrySnapshot(
             chunk_index=int(chunk_index), frame_start=int(frame_start), world_version=self.world_version,
             c2w=self.current_c2w.copy(),
+            intrinsics=self.current_k.copy(),
             source_center=self.source_center.copy(), scene_scale=self.scene_scale, grids=grids,
         )
 
@@ -164,10 +173,11 @@ class PointWorldGeoTokenProvider:
         if self.source_geometry is not None:
             return self.source_geometry
         original_c2w, original_k = self.current_c2w, self.current_k
-        self.current_c2w, self.current_k = np.asarray(source_c2w, np.float32)[None], np.asarray(source_intrinsics, np.float32)[None]
+        self.current_c2w = np.repeat(np.asarray(source_c2w, np.float32)[None], 33, 0)
+        self.current_k = np.repeat(np.asarray(source_intrinsics, np.float32)[None], 33, 0)
         # All pyramid token grids that may be requested by WAH history.
         for height, width in ((12, 20), (24, 40), (48, 80)):
-            self._render_channels(self.current_c2w, self.current_k, height, width)
+            self._render_inputs(self.current_c2w, self.current_k, height, width)
         snapshot = self.freeze_current_snapshot(chunk_index=-1, frame_start=0)
         self.source_geometry = (snapshot, 0)
         self.current_c2w, self.current_k = original_c2w, original_k
@@ -184,17 +194,15 @@ class PointWorldGeoTokenProvider:
         key = ("snapshot", snapshot.chunk_index, id(snapshot), int(height), int(width), torch.is_grad_enabled())
         if key not in self._feature_cache:
             xyz, depth, visibility, confidence = grid
-            channels = geometry_channels_from_cuda_render(
-                xyz, depth, visibility, confidence, snapshot.c2w,
-                snapshot.source_center, snapshot.scene_scale,
-            ).permute(3, 0, 1, 2).unsqueeze(0)
-            self._feature_cache[key] = self.conditioner.tokenizer(channels)
+            camera = camera_channels_from_cameras(snapshot.c2w, resize_intrinsics(snapshot.intrinsics, self.render_resolution, (int(height), int(width))), snapshot.source_center, snapshot.scene_scale, int(height), int(width), device=self.device)
+            world = world_channels_from_cuda_render(xyz, depth, visibility, confidence, snapshot.c2w, snapshot.source_center, snapshot.scene_scale)
+            self._feature_cache[key] = self.conditioner.tokenizer(camera.permute(3,0,1,2).unsqueeze(0), world.permute(3,0,1,2).unsqueeze(0))
         return self._feature_cache[key]
 
     def _slot_from_snapshot(self, item, height, width):
         snapshot, local_slot = item
-        feature, support = self._encode_snapshot(snapshot, height, width)
-        return feature[:, :, local_slot:local_slot + 1], support[:, :, local_slot:local_slot + 1]
+        camera, world, support = self._encode_snapshot(snapshot, height, width)
+        return camera[:, :, local_slot:local_slot + 1], world[:, :, local_slot:local_slot + 1], support[:, :, local_slot:local_slot + 1]
 
     def _history_by_indices(self, indices, height, width, current_feature, current_support):
         """Select frozen 9-slot chunks by the exact official WAH indices.
@@ -207,8 +215,8 @@ class PointWorldGeoTokenProvider:
         if indices is None:
             raise RuntimeError("WAH history latent was supplied without temporal indices")
         flat = torch.as_tensor(indices).reshape(-1).detach().cpu().tolist()
-        feature_parts, support_parts = [], []
-        zero_feature = torch.zeros(1, self.conditioner.tokenizer.inner_dim, 1, height, width, device=self.device)
+        camera_parts, world_parts, support_parts = [], [], []
+        zero_feature = torch.zeros(1, 256, 1, height, width, device=self.device)
         zero_support = torch.zeros(1, 1, 1, height, width, device=self.device)
         for index in flat:
             index = int(index)
@@ -218,19 +226,19 @@ class PointWorldGeoTokenProvider:
                 # source view and is therefore the exact causal fallback.
                 if self.source_geometry is None:
                     raise RuntimeError("source geometry snapshot must exist before first GeoToken forward")
-                feature, support = self._slot_from_snapshot(self.source_geometry, height, width)
+                camera, world, support = self._slot_from_snapshot(self.source_geometry, height, width)
             elif 1 <= index <= 19 and index - 1 < len(self.history_window):
-                feature, support = self._slot_from_snapshot(self.history_window[index - 1], height, width)
+                camera, world, support = self._slot_from_snapshot(self.history_window[index - 1], height, width)
             elif index == 19 and not self.history_window:
                 # Official WAH fake-short slot in chunk0 is derived from the
                 # source prefix, so it is the same frozen source geometry.
-                feature, support = self._slot_from_snapshot(self.source_geometry, height, width)
+                camera, world, support = self._slot_from_snapshot(self.source_geometry, height, width)
             elif 20 <= index <= 28:
-                feature, support = current_feature[:, :, index - 20:index - 19], current_support[:, :, index - 20:index - 19]
+                camera, world, support = (current_feature[0][:, :, index - 20:index - 19], current_feature[1][:, :, index - 20:index - 19], current_feature[2][:, :, index - 20:index - 19])
             else:
-                feature, support = zero_feature, zero_support
-            feature_parts.append(feature); support_parts.append(support)
-        return torch.cat(feature_parts, 2), torch.cat(support_parts, 2)
+                camera, world, support = zero_feature, zero_feature, zero_support
+            camera_parts.append(camera); world_parts.append(world); support_parts.append(support)
+        return torch.cat(camera_parts, 2), torch.cat(world_parts, 2), torch.cat(support_parts, 2)
 
     def _history_part(self, kwargs, name, kernel, current_feature, current_support):
         latent = kwargs.get(f"latents_history_{name}")
@@ -242,9 +250,10 @@ class PointWorldGeoTokenProvider:
         out_w = (latent.shape[-1] + kw - 1) // kw
         # Resize the current live geometry only through the same stage grid
         # requested by Helios; previous slots stay frozen snapshots.
-        if current_feature.shape[-2:] != (out_h, out_w):
-            current_feature, current_support = self._encode_chunk(self.current_c2w, self.current_k, out_h, out_w)
-        feature, support = self._history_by_indices(indices, out_h, out_w, current_feature, current_support)
+        if current_feature[0].shape[-2:] != (out_h, out_w):
+            current_feature = self._encode_chunk(self.current_c2w, self.current_k, out_h, out_w)
+            current_support = current_feature[2]
+        camera, feature, support = self._history_by_indices(indices, out_h, out_w, current_feature, current_support)
         if feature.shape[2] != latent.shape[2]:
             raise RuntimeError("GeoToken temporal history must match official WAH history slots")
         if kt > 1:
@@ -252,6 +261,8 @@ class PointWorldGeoTokenProvider:
             denominator = _pad_pool(support, (kt, 1, 1))
             feature = numerator / denominator.clamp_min(1e-8)
             support = denominator
+            camera = _pad_pool(camera, (kt, 1, 1))
+        camera_tokens = camera.flatten(2).transpose(1, 2)
         tokens = feature.flatten(2).transpose(1, 2)
         weights = support.flatten(2).transpose(1, 2)
         expected_tokens = int(
@@ -266,12 +277,12 @@ class PointWorldGeoTokenProvider:
         if mask is not None and str(attention.get("history_visible_token_mode", "drop")) == "drop":
             pooled = _pad_pool(mask.float(), kernel).flatten()
             keep = pooled >= float(attention.get("history_visible_token_threshold", 0.5))
-            tokens, weights = tokens[:, keep], weights[:, keep]
+            camera_tokens, tokens, weights = camera_tokens[:, keep], tokens[:, keep], weights[:, keep]
         # The same visible-token filtering is applied to both appearance and
         # geometry, leaving every retained WAH token with one geometry token.
         if tokens.shape != weights.expand_as(tokens).shape:
             raise RuntimeError("GeoToken history support does not align with history tokens")
-        return GeometryTokenBatch(tokens, weights)
+        return GeometryTokenBatch(camera_tokens, tokens, weights)
 
     def _build(self, kwargs):
         hidden = kwargs.get("hidden_states")
@@ -280,24 +291,35 @@ class PointWorldGeoTokenProvider:
         patch = tuple(int(value) for value in kwargs.pop("_geotoken_patch_size", (1, 2, 2)))
         current_h = int(hidden.shape[-2]) // patch[1]
         current_w = int(hidden.shape[-1]) // patch[2]
-        current_feature, current_support = self._encode_chunk(
+        # Pyramid grids are 48/80, 24/40 and 12/20 after patching.  Pass the
+        # real stage to the Q/K cap rather than hard-coding a transformer block.
+        stage = 0 if current_h >= 48 else (1 if current_h >= 24 else 2)
+        timestep = kwargs.get("timestep", 0.0)
+        try:
+            progress = float(torch.as_tensor(timestep).float().mean().detach().cpu())
+        except (TypeError, ValueError):
+            progress = 0.0
+        self.conditioner.set_timing(stage_index=stage, denoise_progress=progress if 0.0 <= progress <= 1.0 else 0.0)
+        current_feature = self._encode_chunk(
             self.current_c2w, self.current_k, current_h, current_w,
         )
+        if self.world_slot_dropout and self.conditioner.training:
+            drop = torch.rand((current_feature[2].shape[0], 1, current_feature[2].shape[2], 1, 1), device=self.device) < self.world_slot_dropout
+            current_feature = (current_feature[0], current_feature[1], current_feature[2].masked_fill(drop, 0))
         current = GeometryTokenBatch(
-            current_feature.flatten(2).transpose(1, 2),
-            current_support.flatten(2).transpose(1, 2),
+            current_feature[0].flatten(2).transpose(1, 2), current_feature[1].flatten(2).transpose(1, 2),
+            current_feature[2].flatten(2).transpose(1, 2),
         )
         parts = []
         for name, kernel in (("long", (4, 8, 8)), ("mid", (2, 4, 4)), ("short", (1, 2, 2))):
-            part = self._history_part(kwargs, name, kernel, current_feature, current_support)
+            part = self._history_part(kwargs, name, kernel, current_feature, current_feature[2])
             if part is not None:
                 parts.append(part)
         if parts:
-            history_tokens = torch.cat([part.tokens for part in parts], 1)
-            history_support = torch.cat([part.support for part in parts], 1)
+            history = GeometryTokenBatch(torch.cat([part.camera for part in parts],1), torch.cat([part.world for part in parts],1), torch.cat([part.world_support for part in parts],1))
         else:
-            history_tokens = history_support = None
-        return current, history_tokens, history_support
+            history = None
+        return current, history
 
     def _pre_forward(self, module, args, kwargs):
         if self.current_c2w is None:
@@ -305,12 +327,8 @@ class PointWorldGeoTokenProvider:
             return args, kwargs
         local = dict(kwargs)
         local["_geotoken_patch_size"] = tuple(module.config.patch_size)
-        current, history, history_support = self._build(local)
-        self.conditioner.set_active(
-            current.tokens, current.support,
-            None if history is None else history,
-            history_support,
-        )
+        current, history = self._build(local)
+        self.conditioner.set_active(current, history)
         return args, kwargs
 
 

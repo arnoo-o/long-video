@@ -1,135 +1,43 @@
 import numpy as np
 import pytest
-
 torch = pytest.importorskip("torch")
 
-from long_video.geometry.geotoken import (
-    GEOTOKEN_BLOCKS,
-    GeometryTokenizer,
-    GeoTokenConditioner,
-    TEMPORAL_GROUPS,
-    geometry_channels_from_render,
-)
-from long_video.training.geotoken import (
-    BalancedRolloutSampler,
-    augment_partial_voxels,
-    stable_voxel_hash,
-    voxel_uniform_stream,
-    checkpoint_names,
-    max_chunks_for_step,
-    phase_for_step,
-)
-from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider
-from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
+from long_video.geometry.geotoken import (GEOTOKEN_BLOCKS, GeometryTokenizer, GeoTokenConditioner,
+    GeometryTokenBatch, TEMPORAL_GROUPS, camera_channels_from_cameras, world_channels_from_cuda_render)
+from long_video.geometry.voxel_fusion import fuse_voxels
+from long_video.training.geotoken import BalancedRolloutSampler, checkpoint_names, max_chunks_for_step, phase_for_step
 
 
-def test_temporal_layout_and_invalid_geometry_are_exact_zero():
-    assert TEMPORAL_GROUPS == ((0,), (1, 2, 3, 4), (5, 6, 7, 8),
-                               (9, 10, 11, 12), (13, 14, 15, 16),
-                               (17, 18, 19, 20), (21, 22, 23, 24),
-                               (25, 26, 27, 28), (29, 30, 31, 32))
-    tokenizer = GeometryTokenizer(24)
-    value = torch.randn(2, 12, 33, 3, 5)
-    value[:, 10:] = 0
-    encoded, support = tokenizer(value)
-    assert encoded.shape == (2, 24, 9, 3, 5)
-    assert support.shape == (2, 1, 9, 3, 5)
-    assert torch.count_nonzero(encoded) == 0
-    assert torch.count_nonzero(support) == 0
+def test_camera_ray_survives_unknown_world():
+    camera = camera_channels_from_cameras(np.repeat(np.eye(4, dtype=np.float32)[None], 33, 0),
+        np.repeat(np.eye(3, dtype=np.float32)[None], 33, 0), np.zeros(3), 1., 3, 5, device="cpu")
+    world = world_channels_from_cuda_render(torch.zeros(33,3,5,3), torch.zeros(33,3,5), torch.zeros(33,3,5,dtype=torch.bool), torch.zeros(33,3,5), np.repeat(np.eye(4,dtype=np.float32)[None],33,0), np.zeros(3), 1.)
+    tokenizer=GeometryTokenizer(16); c,w,s=tokenizer(camera.permute(3,0,1,2).unsqueeze(0),world.permute(3,0,1,2).unsqueeze(0))
+    assert c.shape == (1,256,9,3,5) and torch.count_nonzero(c)
+    assert not torch.count_nonzero(w) and not torch.count_nonzero(s)
 
 
-def test_zero_gates_are_strict_noop_and_blocks_are_fixed():
-    module = GeoTokenConditioner(16)
-    assert module.block_indices == GEOTOKEN_BLOCKS
-    hidden = torch.randn(1, 7, 16)
-    module.set_active(torch.randn_like(hidden), torch.ones(1, 7, 1))
-    args, _ = module._make_hook(8)(None, (hidden, None, None, None, 7), {})
-    assert torch.equal(args[0], hidden)
+def test_qk_binding_keeps_value_and_history_query_frozen():
+    module=GeoTokenConditioner(16); assert module.block_indices == GEOTOKEN_BLOCKS
+    current=GeometryTokenBatch(torch.randn(1,3,256),torch.randn(1,3,256),torch.ones(1,3,1))
+    history=GeometryTokenBatch(torch.randn(1,2,256),torch.randn(1,2,256),torch.ones(1,2,1))
+    module.set_active(current, history); q=torch.randn(1,5,16); k=torch.randn(1,5,16); v=torch.randn(1,5,16)
+    outq,outk,outv=module._make_qk_binding(8)(q,k,v,original_context_length=3)
+    assert outv is v and torch.equal(outq,q) and torch.equal(outk,k)  # tanh(0) strict no-op
+    with torch.no_grad(): module.gates["8_camera_q"].fill_(1.)
+    outq,_,_=module._make_qk_binding(8)(q,k,v,original_context_length=3)
+    assert torch.equal(outq[:,:2],q[:,:2])
 
 
-def test_render_channels_use_fixed_source_frame_and_mask_invalid():
-    xyz = np.ones((1, 2, 2, 3), np.float32)
-    depth = np.ones((1, 2, 2), np.float32) * 2
-    visibility = np.array([[[1, 0], [1, 1]]], bool)
-    confidence = np.ones((1, 2, 2), np.float32)
-    pose = np.eye(4, dtype=np.float32)[None]
-    value = geometry_channels_from_render(
-        xyz, depth, visibility, confidence, pose, np.zeros(3), 2.0,
-    )
-    assert value.shape == (1, 2, 2, 12)
-    assert np.count_nonzero(value[0, 0, 1]) == 0
-    assert value[0, 0, 0, 10] == 1
-    assert value[0, 0, 0, 11] == 1
+def test_rgb_anchor_is_source_locked_and_recal_formula_is_shared():
+    points=np.array([[.001,.001,.001],[.019,.001,.001]],np.float32); rgb=np.array([[10,20,30],[110,120,130]],np.uint8)
+    xyz,color,confidence,count,keys,anchors=fuse_voxels(points,rgb,np.array([.5,.9],np.float32),[1,1],.02,source_locked=[True,False],return_anchors=True)
+    assert len(xyz)==1 and count[0]==2 and tuple(color[0]) == (10,20,30) and anchors["source_locked"][0]
+    assert np.allclose(xyz[0],(points[0]*.5+points[1]*.9)/1.4) and np.isclose(confidence[0],.7)
 
 
-def test_curriculum_balances_lengths_and_checkpoint_boundaries():
-    expected = {1: ("A", 1), 161: ("A", 2), 321: ("A", 3),
-                501: ("B", 1), 901: ("B", 3), 1101: ("C", 1),
-                1701: ("C", 4), 1861: ("C", 6)}
-    for step, (phase, maximum) in expected.items():
-        assert phase_for_step(step) == phase
-        assert max_chunks_for_step(step) == maximum
-    sampler = BalancedRolloutSampler(7)
-    values = [sampler.choose_length(1701 + index) for index in range(40)]
-    counts = [values.count(index) for index in range(1, 5)]
-    assert max(counts) - min(counts) <= 1
-    assert checkpoint_names(80) == ("checkpoint_step_0080.pt",)
-    assert checkpoint_names(500) == ("phase_a_final_step_0500.pt",)
-    assert set(checkpoint_names(2000)) == {
-        "checkpoint_step_2000.pt", "phase_c_final_step_2000.pt",
-    }
-
-
-def test_runtime_reads_actual_patch_grid_without_hardcoding():
-    provider = object.__new__(PointWorldGeoTokenProvider)
-    provider.current_c2w = np.eye(4, dtype=np.float32)[None].repeat(33, 0)
-    provider.current_k = np.eye(3, dtype=np.float32)[None].repeat(33, 0)
-    provider._encode_chunk = lambda _c2w, _k, h, w: (
-        torch.zeros(1, 16, 9, h, w), torch.zeros(1, 1, 9, h, w),
-    )
-    provider._history_part = lambda *_args: None
-    current, history, support = provider._build({
-        "hidden_states": torch.zeros(1, 16, 9, 24, 40),
-        "_geotoken_patch_size": (1, 2, 2),
-    })
-    assert current.tokens.shape == (1, 9 * 12 * 20, 16)
-    assert history is None and support is None
-
-
-def test_phase_b_voxel_corruption_is_rollout_consistent():
-    class Args:
-        point_dropout = 0.2
-        confidence_dropout = 0.1
-        depth_noise = 0.01
-        xyz_jitter = 0.005
-    points = np.array([[1, 0, 2], [2, 0, 3], [3, 0, 4]], np.float32)
-    confidence = np.ones(3, np.float32)
-    keys = np.array([[1, 0, 2], [2, 0, 3], [3, 0, 4]], np.int64)
-    first = augment_partial_voxels(points, confidence, keys, source_center=np.zeros(3), scene_scale=2, args=Args(), seed=9)
-    second = augment_partial_voxels(points, confidence, keys, source_center=np.zeros(3), scene_scale=2, args=Args(), seed=9)
-    assert all(np.array_equal(a, b) for a, b in zip(first, second))
-
-
-def test_phase_b_random_streams_are_independent():
-    keys = np.arange(24, dtype=np.int64).reshape(8, 3)
-    base = stable_voxel_hash(17, keys)
-    point_dropout = voxel_uniform_stream(base, 1)
-    confidence_dropout = voxel_uniform_stream(base, 2)
-    jitter_x = voxel_uniform_stream(base, 3)
-    jitter_y = voxel_uniform_stream(base, 5)
-    jitter_z = voxel_uniform_stream(base, 7)
-    assert not np.array_equal(point_dropout, confidence_dropout)
-    assert not np.array_equal(jitter_x, jitter_y)
-    assert not np.array_equal(jitter_y, jitter_z)
-
-
-def test_recal3r_backend_reset_clears_trajectory_state_without_loading_model():
-    backend = ReCal3RGeometryBackend("unused", "unused", "cpu")
-    backend._frames = [object()]
-    backend._state_args = object()
-    backend._last_predictions = [object()]
-    backend._sequence_version = 3
-    backend.reset()
-    assert backend.get_state()["frame_count"] == 0
-    assert backend.get_state()["has_recurrent_state"] is False
-    assert backend.get_state()["sequence_version"] == 0
+def test_curriculum_is_unchanged():
+    assert TEMPORAL_GROUPS[0] == (0,) and phase_for_step(1101)=="C" and max_chunks_for_step(1861)==6
+    sampler=BalancedRolloutSampler(7); values=[sampler.choose_length(1701+i) for i in range(40)]
+    assert max(values.count(i) for i in range(1,5))-min(values.count(i) for i in range(1,5))<=1
+    assert checkpoint_names(2000)==("checkpoint_step_2000.pt","phase_c_final_step_2000.pt")

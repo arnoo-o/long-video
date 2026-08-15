@@ -14,7 +14,7 @@ from long_video.geometry.voxel_fusion import fuse_voxels
 
 
 FRAME_LIMITS = (0, 32, 64, 96, 128, 160)
-GEOMETRY_CACHE_VERSION = "recal-causal-teacher-world-v3"
+GEOMETRY_CACHE_VERSION = "recal-causal-teacher-world-v4-rgb-anchor"
 
 
 def fuse(root: Path, dataset_root: Path, frame_limit: int, voxel_size: float):
@@ -34,8 +34,9 @@ def fuse(root: Path, dataset_root: Path, frame_limit: int, voxel_size: float):
     keys = np.floor(points / voxel_size).astype(np.int64)
     unique, inverse = np.unique(keys, axis=0, return_inverse=True)
     max_frame = np.full(len(unique), -1, np.int32); np.maximum.at(max_frame, inverse, frame_ids)
-    xyz, rgb, conf, obs, fused_keys = fuse_voxels(points, colors, weights, voxel_size=voxel_size)
-    return fused_keys, xyz, rgb, conf, obs, max_frame
+    xyz, rgb, conf, obs, fused_keys, anchors = fuse_voxels(points, colors, weights, voxel_size=voxel_size,
+        anchor_frame=frame_ids, return_anchors=True)
+    return fused_keys, xyz, rgb, conf, obs, max_frame, anchors
 
 
 def main():
@@ -51,7 +52,7 @@ def main():
         source = args.recal3r_root / trajectory_id
         metadata = json.loads((source / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v3"
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v4-rgb-anchor"
                 or float(metadata.get("voxel_size", -1)) != 0.02):
             raise RuntimeError(f"stale Phase A ReCal cache: {source}")
         target = args.output_root / trajectory_id
@@ -65,12 +66,13 @@ def main():
             "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
         }, indent=2))
         for frame_limit in FRAME_LIMITS:
-            keys, points, rgb, confidence, observation_count, max_frame = fuse(source, args.dataset_root, frame_limit, args.voxel_size)
+            keys, points, rgb, confidence, observation_count, max_frame, anchors = fuse(source, args.dataset_root, frame_limit, args.voxel_size)
             if int(max_frame.max()) > frame_limit: raise RuntimeError("future observation leaked into causal cache")
             np.savez_compressed(
             temporary / f"frame_{frame_limit:03d}.npz", voxel_keys=keys,
                 points_xyz=points, points_rgb=rgb, points_confidence=confidence,
                 observation_count=observation_count, max_observation_frame=max_frame,
+                **anchors,
             ); built.append(frame_limit)
         if tuple(built) != FRAME_LIMITS: raise RuntimeError("incomplete Phase B cache build")
         backup = args.output_root / f".{trajectory_id}.old-{os.getpid()}"

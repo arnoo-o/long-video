@@ -1,0 +1,38 @@
+﻿diff --git a/helios/diffusers_version/transformer_helios_diffusers.py b/helios/diffusers_version/transformer_helios_diffusers.py
+index 92a976b..ee99bd6 100644
+--- a/helios/diffusers_version/transformer_helios_diffusers.py
++++ b/helios/diffusers_version/transformer_helios_diffusers.py
+@@ -192,6 +192,14 @@ class HeliosAttnProcessor:
+         original_context_length: int = None,
+     ) -> torch.Tensor:
+         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
++        binding = getattr(attn, "geotoken_qk_binding", None)
++        if not attn.is_cross_attention and binding is not None:
++            original_value = value
++            query, key, value = binding(
++                query, key, value, original_context_length=original_context_length,
++            )
++            if value is not original_value:
++                raise RuntimeError("GeoToken Q/K binding must not modify attention V")
+ 
+         query = attn.norm_q(query)
+         key = attn.norm_k(key)
+diff --git a/helios/modules/transformer_helios.py b/helios/modules/transformer_helios.py
+index d69fe15..b39f95e 100644
+--- a/helios/modules/transformer_helios.py
++++ b/helios/modules/transformer_helios.py
+@@ -452,6 +452,14 @@ class HeliosAttnProcessor:
+                 rotary_emb = rotary_emb[:, history_seq_len:] if rotary_emb is not None else None
+ 
+         query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
++        binding = getattr(attn, "geotoken_qk_binding", None)
++        if not attn.is_cross_attention and binding is not None:
++            original_value = value
++            query, key, value = binding(
++                query, key, value, original_context_length=original_context_length,
++            )
++            if value is not original_value:
++                raise RuntimeError("GeoToken Q/K binding must not modify attention V")
+ 
+         query = attn.norm_q(query)
+         key = attn.norm_k(key)

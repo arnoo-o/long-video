@@ -30,6 +30,10 @@ class ReCal3RWorldAccumulator:
         # weight.  Preserve that meaning across accumulator reset/publish.
         self._weight = (np.asarray(node.points_confidence, np.float32).clip(1e-6)
                         * self._observations.astype(np.float32))
+        anchors = getattr(node, "appearance_anchors", {})
+        self._anchor_confidence = np.asarray(anchors.get("anchor_confidence", node.points_confidence), np.float32).copy()
+        self._anchor_frame = np.asarray(anchors.get("anchor_frame", np.zeros(len(node.points_xyz))), np.int32).copy()
+        self._source_locked = np.asarray(anchors.get("source_locked", np.ones(len(node.points_xyz), bool)), bool).copy()
         self._seen_frame_ids = set()
         self._fused_frame_ids = set()
         self._pending_frame_ids = set()
@@ -45,8 +49,10 @@ class ReCal3RWorldAccumulator:
         # Convert internal total weights back to means so Pi3X and ReCal3R
         # invoke the exact same fusion primitive.
         means = self._weight / self._observations.clip(1)
-        xyz, rgb, confidence, observations, _ = fuse_voxels(
+        xyz, rgb, confidence, observations, _, anchors = fuse_voxels(
             self._xyz, self._rgb, means, self._observations, self.voxel_size,
+            anchor_confidence=self._anchor_confidence, anchor_frame=self._anchor_frame,
+            source_locked=self._source_locked, return_anchors=True,
         )
         weight = confidence * observations.astype(np.float32)
         bmin = xyz.min(0) if len(xyz) else np.zeros(3, np.float32)
@@ -60,6 +66,7 @@ class ReCal3RWorldAccumulator:
         self._node.bbox_min = bmin.astype(np.float32); self._node.bbox_max = bmax.astype(np.float32)
         self._node.coverage_radius = float(np.linalg.norm(bmax - bmin) * 0.5)
         self._node.scale = scale
+        self._node.appearance_anchors = anchors
         self._node.quality_metrics.update({"recal3r_world_version": self._version, "voxel_size": self.voxel_size,
                                            "accumulator_points": int(len(xyz)),
                                            "fusion_weight_sum": float(weight.sum())})
@@ -67,6 +74,9 @@ class ReCal3RWorldAccumulator:
         self._xyz, self._rgb = xyz.copy(), rgb.copy()
         self._observations = observations.astype(np.int32, copy=True)
         self._weight = confidence * self._observations.astype(np.float32)
+        self._anchor_confidence = anchors["anchor_confidence"].copy()
+        self._anchor_frame = anchors["anchor_frame"].copy()
+        self._source_locked = anchors["source_locked"].copy()
 
 
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
@@ -88,7 +98,7 @@ class ReCal3RWorldAccumulator:
         # Source initializes/alines ReCal only. Pending tails are revisited
         # after the first successful alignment, but every global frame commits once.
         candidates = sorted(self._pending_frame_ids | set(indices))
-        point_parts=[]; confidence_parts=[]; color_parts=[]
+        point_parts=[]; confidence_parts=[]; color_parts=[]; frame_parts=[]
         for index in candidates:
             if index == 0 or index in self._fused_frame_ids: continue
             prediction = replay[index]
@@ -98,14 +108,18 @@ class ReCal3RWorldAccumulator:
             valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)
             if not bool(valid.any()):
                 self._pending_frame_ids.add(index); continue
-            point_parts.append(xyz[valid]); confidence_parts.append(confidence[valid]); color_parts.append(np.asarray(image, np.uint8)[valid])
+            point_parts.append(xyz[valid]); confidence_parts.append(confidence[valid]); color_parts.append(np.asarray(image, np.uint8)[valid]); frame_parts.append(np.full(int(valid.sum()), index, np.int32))
             self._pending_frame_ids.discard(index); self._fused_frame_ids.add(index)
         points = np.concatenate(point_parts) if point_parts else np.empty((0,3),np.float32)
         conf = np.concatenate(confidence_parts) if confidence_parts else np.empty(0,np.float32)
         colors = np.concatenate(color_parts) if color_parts else np.empty((0,3),np.uint8)
+        frames = np.concatenate(frame_parts) if frame_parts else np.empty(0,np.int32)
         if len(points):
             self._xyz = np.concatenate([self._xyz, points]); self._rgb = np.concatenate([self._rgb, colors])
             self._weight = np.concatenate([self._weight, conf]); self._observations = np.concatenate([self._observations, np.ones(len(points), np.int32)])
+            self._anchor_confidence = np.concatenate([self._anchor_confidence, conf])
+            self._anchor_frame = np.concatenate([self._anchor_frame, frames])
+            self._source_locked = np.concatenate([self._source_locked, np.zeros(len(points), bool)])
         self._seen_frame_ids.update(identities); self._version += 1; self._publish()
         return self._node
 

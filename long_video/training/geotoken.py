@@ -15,10 +15,18 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-geotoken-world-binding-v4"
-GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-pi3x-w0-prefix-replay-v4"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v5"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-rgb-anchor-v5"
 GEOMETRY_SCHEMA_VERSION = 3
-WAH_RUNTIME_FINGERPRINT = hashlib.sha256(b"wah-09aa646-confidence-patch-preserved").hexdigest()
+def _wah_runtime_fingerprint():
+    root = Path(__file__).resolve().parents[2]
+    digest = hashlib.sha256(b"wah-09aa646-confidence-patch-preserved")
+    for name in ("patches/wah_confidence.patch", "patches/wah_geotoken_qk_binding.patch"):
+        digest.update((root / name).read_bytes())
+    return digest.hexdigest()
+
+
+WAH_RUNTIME_FINGERPRINT = _wah_runtime_fingerprint()
 PHASE_BOUNDARIES = {500: "phase_a_final", 1100: "phase_b_final", 2000: "phase_c_final"}
 
 
@@ -176,7 +184,7 @@ def load_causal_world_cache(root: Path, frame_limit: int):
     if not metadata_path.is_file():
         raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v3":
+    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v4-rgb-anchor":
         raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():
@@ -194,8 +202,9 @@ def concatenate_conditioning(parts: list[GeometryTokenBatch]) -> GeometryTokenBa
     if not parts:
         raise ValueError("at least one geometry token part is required")
     return GeometryTokenBatch(
-        tokens=torch.cat([part.tokens for part in parts], dim=1),
-        support=torch.cat([part.support for part in parts], dim=1),
+        camera=torch.cat([part.camera for part in parts], dim=1),
+        world=torch.cat([part.world for part in parts], dim=1),
+        world_support=torch.cat([part.world_support for part in parts], dim=1),
     )
 
 

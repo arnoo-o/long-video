@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH="${PROJECT_ROOT}/patches/wah_confidence.patch"
 TRAINING_PATCH="${PROJECT_ROOT}/patches/wah_stage2_training.patch"
 WPF_TRAINING_PATCH="${PROJECT_ROOT}/patches/wah_wpf_adaptation_training.patch"
+GEOTOKEN_QK_PATCH="${PROJECT_ROOT}/patches/wah_geotoken_qk_binding.patch"
 
 if ! git -C "${WAH_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "WAH repository not found: ${WAH_ROOT}" >&2
@@ -28,3 +29,8 @@ if ! git -C "${WAH_ROOT}" apply --reverse --check "${WPF_TRAINING_PATCH}" 2>/dev
   git -C "${WAH_ROOT}" apply "${WPF_TRAINING_PATCH}"
 fi
 echo "Applied WAH WPF-adaptation training patch to ${WAH_ROOT}"
+if ! git -C "${WAH_ROOT}" apply --reverse --check "${GEOTOKEN_QK_PATCH}" 2>/dev/null; then
+  git -C "${WAH_ROOT}" apply --check "${GEOTOKEN_QK_PATCH}"
+  git -C "${WAH_ROOT}" apply "${GEOTOKEN_QK_PATCH}"
+fi
+echo "Applied WAH GeoToken Q/K binding patch to ${WAH_ROOT}"

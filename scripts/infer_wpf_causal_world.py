@@ -21,6 +21,8 @@ def main():
                    help='GeoToken training checkpoint; runs the checkpoint architecture with WPF disabled.')
     p.add_argument('--geotoken-strength',type=float,default=1.0,
                    choices=(0.0,0.25,0.5,1.0))
+    p.add_argument('--camera-strength',type=float,default=1.0)
+    p.add_argument('--world-strength',type=float,default=1.0)
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
     from long_video.wah.upstream import assert_wah_upstream
@@ -71,6 +73,7 @@ def main():
         from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider, source_scene_scale_from_active_node
         conditioner=install_geotoken(pipe.transformer).to(device=a.device)
         conditioner.set_strength(a.geotoken_strength)
+        conditioner.set_strengths(camera=a.camera_strength * a.geotoken_strength, world=a.world_strength * a.geotoken_strength)
         checkpoint=torch.load(a.geotoken_checkpoint,map_location='cpu',weights_only=False)
         from long_video.training.geotoken import TRAINING_SEMANTICS_VERSION, GEOMETRY_SCHEMA_VERSION, GEOMETRY_IMPLEMENTATION_VERSION, WAH_RUNTIME_FINGERPRINT
         if (checkpoint.get('training_semantics_version') != TRAINING_SEMANTICS_VERSION
@@ -120,6 +123,6 @@ def main():
         video,_,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width); g=u8(video); w=u8(warp.rgb); v=np.asarray(warp.visibility)
         offset=0 if not generated else 1; generated.extend(g[offset:]); warps.extend(w[offset:])
         masked=w.copy(); masked[~v]=0; panel=np.concatenate([g,w,masked],axis=2); panels.extend(panel[offset:]); reports.append(report)
-    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'geotoken_strength':a.geotoken_strength if a.geotoken_checkpoint else None,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports},indent=2,default=str))
+    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'camera_strength':a.camera_strength if a.geotoken_checkpoint else None,'world_strength':a.world_strength if a.geotoken_checkpoint else None,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports},indent=2,default=str))
 if __name__=='__main__': main()
 

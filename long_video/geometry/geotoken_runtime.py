@@ -15,6 +15,16 @@ from .point_renderer import render_geometry_cuda
 from .world_identity import point_world_snapshot_identity
 
 
+STAGE_GRIDS = {(12, 20): 0, (24, 40): 1, (48, 80): 2}
+
+
+def stage_for_grid(height: int, width: int) -> int:
+    grid = (int(height), int(width))
+    if grid not in STAGE_GRIDS:
+        raise RuntimeError(f"unknown Helios GeoToken grid {grid}; stage inference is forbidden")
+    return STAGE_GRIDS[grid]
+
+
 def _pad_pool(value: torch.Tensor, kernel: tuple[int, int, int]) -> torch.Tensor:
     pt, ph, pw = kernel
     _, _, t, h, w = value.shape
@@ -60,9 +70,13 @@ class PointWorldGeoTokenProvider:
         self._feature_cache = {}
         self._render_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.world_slot_dropout = 0.0
+        self.timing_resolver = None
 
     def set_world_slot_dropout(self, probability: float):
         self.world_slot_dropout = float(probability)
+
+    def set_timing_resolver(self, resolver):
+        self.timing_resolver = resolver
 
     def attach(self, transformer):
         if self._handle is None:
@@ -291,15 +305,8 @@ class PointWorldGeoTokenProvider:
         patch = tuple(int(value) for value in kwargs.pop("_geotoken_patch_size", (1, 2, 2)))
         current_h = int(hidden.shape[-2]) // patch[1]
         current_w = int(hidden.shape[-1]) // patch[2]
-        # Pyramid grids are 48/80, 24/40 and 12/20 after patching.  Pass the
-        # real stage to the Q/K cap rather than hard-coding a transformer block.
-        stage = 0 if current_h >= 48 else (1 if current_h >= 24 else 2)
-        timestep = kwargs.get("timestep", 0.0)
-        try:
-            progress = float(torch.as_tensor(timestep).float().mean().detach().cpu())
-        except (TypeError, ValueError):
-            progress = 0.0
-        self.conditioner.set_timing(stage_index=stage, denoise_progress=progress if 0.0 <= progress <= 1.0 else 0.0)
+        stage = stage_for_grid(current_h, current_w)
+        self.conditioner.set_timing(stage_index=stage, denoise_progress=self.conditioner.denoise_progress)
         current_feature = self._encode_chunk(
             self.current_c2w, self.current_k, current_h, current_w,
         )
@@ -326,6 +333,11 @@ class PointWorldGeoTokenProvider:
             self.conditioner.clear_active()
             return args, kwargs
         local = dict(kwargs)
+        if self.timing_resolver is not None:
+            self.conditioner.set_timing(
+                stage_index=self.conditioner.stage_index,
+                denoise_progress=float(self.timing_resolver(local)),
+            )
         local["_geotoken_patch_size"] = tuple(module.config.patch_size)
         current, history = self._build(local)
         self.conditioner.set_active(current, history)

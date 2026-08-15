@@ -72,8 +72,9 @@ def main():
         from long_video.geometry.geotoken import install_geotoken
         from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider, source_scene_scale_from_active_node
         conditioner=install_geotoken(pipe.transformer).to(device=a.device)
-        conditioner.set_strength(a.geotoken_strength)
-        conditioner.set_strengths(camera=a.camera_strength * a.geotoken_strength, world=a.world_strength * a.geotoken_strength)
+        conditioner.configure_strengths(
+            geotoken=a.geotoken_strength, camera=a.camera_strength, world=a.world_strength,
+        )
         checkpoint=torch.load(a.geotoken_checkpoint,map_location='cpu',weights_only=False)
         from long_video.training.geotoken import TRAINING_SEMANTICS_VERSION, GEOMETRY_SCHEMA_VERSION, GEOMETRY_IMPLEMENTATION_VERSION, WAH_RUNTIME_FINGERPRINT
         if (checkpoint.get('training_semantics_version') != TRAINING_SEMANTICS_VERSION
@@ -103,6 +104,8 @@ def main():
         source_c2w=np.asarray(node.view_c2w[0],np.float32)
         scene_scale=source_scene_scale_from_active_node(node,source_c2w,K,device=a.device,height=a.height,width=a.width)
         provider=PointWorldGeoTokenProvider(conditioner,device=a.device,source_center=source_c2w[:3,3],scene_scale=scene_scale,render_height=a.height,render_width=a.width)
+        from long_video.geometry.geotoken import scheduler_progress_from_timestep
+        provider.set_timing_resolver(lambda kwargs: scheduler_progress_from_timestep(pipe.scheduler, kwargs["timestep"]))
         provider.attach(pipe.transformer)
         def pre_render_world_hook(active_node,cameras):
             active_world=provider.configure_active_node(active_node)

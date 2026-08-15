@@ -157,6 +157,13 @@ def build_online(args, pipe, record, source, geometry_backend=None, pre_render_w
                 or metadata.get('pi3x_checkpoint_sha256') != file_sha256(args.pi3x_checkpoint)):
             raise RuntimeError(f"stale Pi3X W0 provenance: {cache}")
         node = NodeStore(cache).load("node_000")
+        # Pi3X cache v3 remains valid. Appearance-anchor state is runtime
+        # metadata and must not alter the cached source RGB values.
+        node.appearance_anchors = {
+            "anchor_confidence": np.asarray(node.points_confidence, np.float32).copy(),
+            "anchor_frame": np.zeros(len(node.points_xyz), np.int32),
+            "source_locked": np.ones(len(node.points_xyz), bool),
+        }
     accumulator = None
     if geometry_backend is not None:
         accumulator = ReCal3RWorldAccumulator(
@@ -215,6 +222,11 @@ def native_flow_backward(pipe, z_gt, capture, provider, exact_args):
         raise RuntimeError("GeoToken training requires official train_exact samples for all stages")
     for item in items:
         stage_id = int(item["stage_id"])
+        from long_video.geometry.geotoken import progress_from_sigma
+        pipe.transformer.geotoken.set_timing(
+            stage_index=stage_id,
+            denoise_progress=progress_from_sigma(item["sigmas"]),
+        )
         key = tuple(item["noisy_latents"].shape[-3:])
         if key not in capture.by_shape:
             raise RuntimeError(f"formal inference did not capture Stage{stage_id} shape {key}")
@@ -340,8 +352,9 @@ def main():
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     conditioner = install_geotoken(pipe.transformer).to(device=args.device)
-    conditioner.set_strength(args.geotoken_strength)
-    conditioner.set_strengths(camera=args.camera_strength, world=args.world_strength)
+    conditioner.configure_strengths(
+        geotoken=args.geotoken_strength, camera=args.camera_strength, world=args.world_strength,
+    )
     vae_identity, model_identity = latent_cache_identities(pipe, args.model)
     if args.gradient_checkpointing and hasattr(pipe.transformer, "enable_gradient_checkpointing"):
         pipe.transformer.enable_gradient_checkpointing()

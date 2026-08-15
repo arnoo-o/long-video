@@ -1,8 +1,8 @@
 ﻿diff --git a/helios/diffusers_version/transformer_helios_diffusers.py b/helios/diffusers_version/transformer_helios_diffusers.py
-index 92a976b..ee99bd6 100644
+index 18af698..95c958e 100644
 --- a/helios/diffusers_version/transformer_helios_diffusers.py
 +++ b/helios/diffusers_version/transformer_helios_diffusers.py
-@@ -192,6 +192,14 @@ class HeliosAttnProcessor:
+@@ -211,6 +211,14 @@ class HeliosAttnProcessor:
          original_context_length: int = None,
      ) -> torch.Tensor:
          query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
@@ -18,10 +18,22 @@ index 92a976b..ee99bd6 100644
          query = attn.norm_q(query)
          key = attn.norm_k(key)
 diff --git a/helios/modules/transformer_helios.py b/helios/modules/transformer_helios.py
-index d69fe15..b39f95e 100644
+index bd11067..de27061 100644
 --- a/helios/modules/transformer_helios.py
 +++ b/helios/modules/transformer_helios.py
-@@ -452,6 +452,14 @@ class HeliosAttnProcessor:
+@@ -464,7 +464,10 @@ class HeliosAttnProcessor:
+             history_seq_len = (hidden_states.shape[1] - original_context_length) // len(original_context_length_list)
+ 
+         if attn.restrict_self_attn:
+-            use_cache = self.cache_enabled and not is_first_denoising_step and self.kv_cache is not None
++            use_cache = (
++                self.cache_enabled and not is_first_denoising_step and self.kv_cache is not None
++                and getattr(attn, "geotoken_qk_binding", None) is None
++            )
+             assert not (use_cache and enable_navit), "Cache and NAViT are incompatible"
+ 
+             if use_cache:
+@@ -476,6 +479,14 @@ class HeliosAttnProcessor:
                  rotary_emb = rotary_emb[:, history_seq_len:] if rotary_emb is not None else None
  
          query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)

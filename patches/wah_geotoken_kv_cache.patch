@@ -1,0 +1,16 @@
+﻿diff --git a/helios/modules/transformer_helios.py b/helios/modules/transformer_helios.py
+index 415ad68..de27061 100644
+--- a/helios/modules/transformer_helios.py
++++ b/helios/modules/transformer_helios.py
+@@ -464,7 +464,10 @@ class HeliosAttnProcessor:
+             history_seq_len = (hidden_states.shape[1] - original_context_length) // len(original_context_length_list)
+ 
+         if attn.restrict_self_attn:
+-            use_cache = self.cache_enabled and not is_first_denoising_step and self.kv_cache is not None
++            use_cache = (
++                self.cache_enabled and not is_first_denoising_step and self.kv_cache is not None
++                and getattr(attn, "geotoken_qk_binding", None) is None
++            )
+             assert not (use_cache and enable_navit), "Cache and NAViT are incompatible"
+ 
+             if use_cache:

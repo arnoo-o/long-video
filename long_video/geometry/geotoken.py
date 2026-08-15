@@ -15,6 +15,34 @@ TEMPORAL_GROUPS = ((0,),) + tuple(tuple(range(start, start + 4)) for start in ra
 CAMERA_CHANNELS = 6
 WORLD_BASE_CHANNELS = 9  # XYZ, ray, log-depth, visibility, confidence
 WORLD_CHANNELS = WORLD_BASE_CHANNELS + 3 * 2 * 4
+STAGE_SCALES = (1.0, 0.7, 0.4)
+STAGE_RMS_CAPS = (0.15, 0.10, 0.06)
+
+
+def progress_from_sigma(sigma) -> float:
+    return min(max(1.0 - float(torch.as_tensor(sigma).float().mean()), 0.0), 1.0)
+
+
+def time_scale_from_progress(progress: float) -> float:
+    progress = min(max(float(progress), 0.0), 1.0)
+    return 1.0 if progress <= 0.6 else 0.25 + 0.75 * 0.5 * (1 + math.cos(math.pi * (progress - 0.6) / 0.4))
+
+
+def effective_strengths(geotoken_strength: float, camera_strength: float, world_strength: float):
+    return float(geotoken_strength) * float(camera_strength), float(geotoken_strength) * float(world_strength)
+
+
+def scheduler_progress_from_timestep(scheduler, timestep) -> float:
+    """Resolve an inference timestep through the scheduler's actual sigma table."""
+    timesteps = torch.as_tensor(getattr(scheduler, "timesteps", ()), dtype=torch.float32).flatten()
+    sigmas = torch.as_tensor(getattr(scheduler, "sigmas", ()), dtype=torch.float32).flatten()
+    if not len(timesteps) or len(sigmas) < len(timesteps):
+        raise RuntimeError("Helios scheduler must expose aligned timesteps/sigmas for GeoToken timing")
+    value = torch.as_tensor(timestep, dtype=torch.float32).mean()
+    index = int(torch.argmin(torch.abs(timesteps - value)))
+    if not torch.isclose(timesteps[index], value, rtol=1e-4, atol=1e-4):
+        raise RuntimeError(f"transformer timestep {float(value)} is absent from scheduler timetable")
+    return progress_from_sigma(sigmas[index])
 
 
 @dataclass
@@ -78,11 +106,11 @@ class GeometryTokenizer(nn.Module):
         if camera.ndim != 5 or camera.shape[1:3] != (CAMERA_CHANNELS, 33):
             raise ValueError(f"camera must be [B,6,33,H,W], got {tuple(camera.shape)}")
         if world.ndim != 5 or world.shape[1:3] != (WORLD_BASE_CHANNELS, 33):
-            raise ValueError(f"world must be [B,8,33,H,W], got {tuple(world.shape)}")
+            raise ValueError(f"world must be [B,9,33,H,W], got {tuple(world.shape)}")
         camera_values = camera.permute(0, 2, 3, 4, 1)
         world_values = world.permute(0, 2, 3, 4, 1)
         camera_feature, _ = self.camera(camera_values, torch.ones_like(camera_values[..., :1]))
-        world_support = (world_values[..., 6:7].clamp(0, 1) * world_values[..., 7:8].clamp(0, 1))
+        world_support = (world_values[..., 7:8].clamp(0, 1) * world_values[..., 8:9].clamp(0, 1))
         world_feature, world_support = self.world(self._world_features(world_values), world_support)
         return camera_feature, world_feature, world_support
 
@@ -122,10 +150,8 @@ class GeoTokenConditioner(nn.Module):
         self.denoise_progress = 0.0
         self.diagnostics: dict[int, dict] = {}
 
-    def set_strength(self, strength: float):
-        self.set_strengths(camera=float(strength), world=float(strength))
-
-    def set_strengths(self, *, camera: float = 1.0, world: float = 1.0):
+    def configure_strengths(self, *, geotoken: float = 1.0, camera: float = 1.0, world: float = 1.0):
+        camera, world = effective_strengths(geotoken, camera, world)
         if camera < 0 or world < 0:
             raise ValueError("GeoToken strengths must be non-negative")
         self.camera_strength, self.world_strength = float(camera), float(world)
@@ -167,9 +193,11 @@ class GeoTokenConditioner(nn.Module):
             tokens = self._joined(query.shape[1], current_length)
             if tokens is None: return query, key, value
             adapters = self.adapters[str(index)]
-            stage = (1.0, .7, .4)[min(max(self.stage_index, 0), 2)]
+            if self.stage_index not in (0, 1, 2):
+                raise RuntimeError(f"invalid Helios stage index: {self.stage_index}")
+            stage = STAGE_SCALES[self.stage_index]
             progress = min(max(self.denoise_progress, 0.), 1.)
-            time = 1.0 if progress <= .6 else .25 + .75 * .5 * (1 + math.cos(math.pi * (progress - .6) / .4))
+            time = time_scale_from_progress(progress)
             cam_q = adapters["camera_q_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_q"])
             cam_k = adapters["camera_k_adapter"](tokens.camera) * torch.tanh(self.gates[f"{index}_camera_k"])
             world_q = adapters["world_q_adapter"](tokens.world) * torch.tanh(self.gates[f"{index}_world_q"])
@@ -179,7 +207,7 @@ class GeoTokenConditioner(nn.Module):
             delta_k = (self.camera_strength * cam_k + self.world_strength * tokens.world_support * world_k) * scale
             # Previous appearance history is a frozen WAH query. Its keys remain world/camera-bound.
             delta_q[:, :-current_length] = 0
-            cap = (.15, .10, .06)[min(max(self.stage_index, 0), 2)]
+            cap = STAGE_RMS_CAPS[self.stage_index]
             def cap_delta(delta, base):
                 ratio = delta.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
                 return delta * (cap / ratio.clamp_min(cap)).to(delta.dtype), ratio.max()

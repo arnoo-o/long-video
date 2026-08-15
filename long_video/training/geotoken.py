@@ -15,13 +15,14 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v5"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v6"
 GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-rgb-anchor-v5"
 GEOMETRY_SCHEMA_VERSION = 3
 def _wah_runtime_fingerprint():
     root = Path(__file__).resolve().parents[2]
     digest = hashlib.sha256(b"wah-09aa646-confidence-patch-preserved")
-    for name in ("patches/wah_confidence.patch", "patches/wah_geotoken_qk_binding.patch"):
+    for name in ("patches/wah_confidence.patch", "patches/wah_geotoken_qk_binding.patch",
+                 "patches/wah_geotoken_kv_cache.patch"):
         digest.update((root / name).read_bytes())
     return digest.hexdigest()
 

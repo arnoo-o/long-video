@@ -396,11 +396,16 @@ def main():
     ).is_file()]
     if missing and not args.smoke_only:
         raise RuntimeError(f"ReCal3R geometry is incomplete for {len(missing)} selected trajectories")
-    records = [record for record in selected_records if (
-        (lambda m: m.get("valid", False) and m.get("schema_version") == 3
-         and m.get("geometry_implementation_version") == "recal-full-teacher-world-v4-rgb-anchor")(
-            json.loads((args.recal3r_root / record["trajectory_id"] / "metadata.json").read_text())
-        ))]
+    records = []
+    for record in selected_records:
+        metadata_path = args.recal3r_root / record["trajectory_id"] / "metadata.json"
+        if not metadata_path.is_file():
+            continue
+        candidate_metadata = json.loads(metadata_path.read_text())
+        if (candidate_metadata.get("valid", False) and candidate_metadata.get("schema_version") == 3
+                and candidate_metadata.get("geometry_implementation_version")
+                == "recal-full-teacher-world-v4-rgb-anchor"):
+            records.append(record)
     minimum_valid_records = 1 if args.smoke_only else 90
     if len(records) < minimum_valid_records:
         raise RuntimeError(

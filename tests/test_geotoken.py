@@ -81,6 +81,21 @@ def test_qk_rms_cap_for_every_stage():
         assert "q_delta_ratio" not in diagnostics and "k_delta_ratio" not in diagnostics
 
 
+def test_zero_initialized_qk_cap_has_finite_checkpoint_safe_gradients():
+    module = GeoTokenConditioner(16)
+    current, history = _tokens()
+    module.set_active(current, history)
+    query = torch.randn(1, 5, 16, requires_grad=True)
+    key = torch.randn(1, 5, 16, requires_grad=True)
+    value = torch.randn(1, 5, 16)
+    output_query, output_key, _ = module._make_qk_binding(8)(
+        query, key, value, original_context_length=3,
+    )
+    (output_query.square().mean() + output_key.square().mean()).backward()
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all()
+               for parameter in module.parameters())
+
+
 def test_sigma_progress_and_time_scale():
     assert progress_from_sigma(torch.tensor([1.]))==0 and time_scale_from_progress(0)==1
     assert progress_from_sigma(torch.tensor([.4]))==pytest.approx(.6) and time_scale_from_progress(.6)==1

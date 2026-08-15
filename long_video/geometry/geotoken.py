@@ -229,8 +229,17 @@ class GeoTokenConditioner(nn.Module):
             del cam_k, world_k
             cap = STAGE_RMS_CAPS[self.stage_index]
             def cap_delta(delta, base):
-                ratio = delta.float().square().mean(-1, keepdim=True).sqrt() / base.float().square().mean(-1, keepdim=True).sqrt().clamp_min(1e-8)
-                capped = delta * (cap / ratio.clamp_min(cap)).to(delta.dtype)
+                # The adapters start with zero gates, so an exact ``sqrt(x^2)``
+                # has an undefined backward derivative at x=0.  That is benign
+                # in an eager forward but becomes NaN when a checkpointed block
+                # is recomputed.  Keep the same hard-cap semantics while making
+                # the RMS derivative well-defined at the initialized zero delta.
+                epsilon = 1e-12
+                delta_rms = (delta.float().square().mean(-1, keepdim=True) + epsilon).sqrt()
+                base_rms = (base.float().square().mean(-1, keepdim=True) + epsilon).sqrt()
+                ratio = delta_rms / base_rms.clamp_min(1e-8)
+                scale = torch.where(ratio > cap, cap / ratio, torch.ones_like(ratio))
+                capped = delta * scale.to(delta.dtype)
                 # ``capped`` is exactly scaled by cap / max(ratio, cap), so
                 # its RMS ratio is min(ratio, cap). Reusing the already
                 # materialized pre-cap ratio avoids a second full FP32 tensor.

@@ -140,18 +140,27 @@ class ReCal3RWorldAccumulator:
         return z, inside, depth, index
 
     def _pending_candidate(self, xyz, rgb, confidence, depth, frame_index):
-        key0 = tuple(np.floor(xyz / self.voxel_size).astype(np.int64)); tolerance = max(2*self.voxel_size, .02*float(depth))
+        return self._pending_group(np.asarray([xyz]), np.asarray([rgb]), np.asarray([confidence]),
+                                   np.asarray([depth]), np.asarray([frame_index]))
+
+    def _pending_group(self, xyz, rgb, confidence, depth, frame_index):
+        candidate_voxel_size = 2 * self.voxel_size
+        center = np.median(xyz, axis=0)
+        key0 = tuple(np.floor(center / candidate_voxel_size).astype(np.int64))
+        tolerance = max(2*self.voxel_size, .02*float(np.median(depth)))
         found = None
         for delta in _NEIGHBORS:
             key = tuple(key0[i] + delta[i] for i in range(3)); candidate = self._pending_surfaces.get(key)
             if candidate is not None:
-                center = np.median(np.stack([value[0] for value in candidate["supports"].values()]), 0)
-                if np.linalg.norm(center - xyz) <= tolerance: found = candidate; break
+                old_center = np.median(np.stack([value[0] for value in candidate["supports"].values()]), 0)
+                if np.linalg.norm(old_center - center) <= tolerance: found = candidate; break
         if found is None:
             found = {"key": key0, "supports": {}, "last_chunk": self._chunk_serial}
             self._pending_surfaces[key0] = found
-        old = found["supports"].get(int(frame_index))
-        if old is None or confidence > old[2]: found["supports"][int(frame_index)] = (xyz.copy(), rgb.copy(), float(confidence), float(depth))
+        for point, color, conf, point_depth, frame in zip(xyz, rgb, confidence, depth, frame_index):
+            old = found["supports"].get(int(frame))
+            if old is None or conf > old[2]:
+                found["supports"][int(frame)] = (point.copy(), color.copy(), float(conf), float(point_depth))
         found["last_chunk"] = self._chunk_serial
         return found
 
@@ -182,7 +191,7 @@ class ReCal3RWorldAccumulator:
         names=("association_match_pixels","association_conflict_pixels","association_novel_pixels",
             "source_free_space_rejected","source_surface_duplicate_pixels","matched_world_points",
             "novel_confirmed_points","novel_expired_count")
-        metrics={name:0 for name in names}; residuals=[]; masks=[]; confirmed=[]; fused_frames=[]
+        metrics={name:0 for name in names}; residuals=[]; masks=[]; confirmed=[]; fused_frames=[]; pending_batches=[]
         candidate_started=time.perf_counter(); candidates=sorted(self._pending_frame_ids|set(indices))
         for index in candidates:
             if index==0 or index in self._fused_frame_ids: continue
@@ -214,15 +223,29 @@ class ReCal3RWorldAccumulator:
                 pending=~violation&~duplicate
                 if pending.any():
                     pxyz,pconf,prgb,pdepth=nxyz[pending],nconf[pending],nrgb[pending],ndepth[pending]
-                    pkeys=np.floor(pxyz/self.voxel_size).astype(np.int64); _,first=np.unique(pkeys,axis=0,return_index=True)
-                    pending_positions=np.flatnonzero(pending)
-                    for j in first:
-                        candidate=self._pending_candidate(pxyz[j],prgb[j],pconf[j],pdepth[j],index)
-                        if len(candidate["supports"])>=self.novel_min_frames and all(candidate is not value for value in confirmed):
-                            confirmed.append(candidate); key=tuple(np.floor(pxyz[j]/self.voxel_size).astype(np.int64))
-                            current=np.all(pkeys==key,axis=1); pos=pending_positions[current]
-                            mask[ny[pos],nx[pos]]=(0,255,255)
+                    pos=np.flatnonzero(pending)
+                    pending_batches.append((pxyz,pconf,prgb,pdepth,
+                        np.full(len(pxyz),index,np.int32),np.full(len(pxyz),len(masks),np.int32),ny[pos],nx[pos]))
             masks.append(mask); fused_frames.append(index); self._fused_frame_ids.add(index); self._pending_frame_ids.discard(index)
+        if pending_batches:
+            px,pconf,prgb,pdepth,pframe,pslot,py,px_pixel = (
+                np.concatenate(values) for values in zip(*pending_batches)
+            )
+            candidate_keys=np.floor(px/(2*self.voxel_size)).astype(np.int64)
+            order=np.lexsort((-pconf,pframe,candidate_keys[:,2],candidate_keys[:,1],candidate_keys[:,0]))
+            group_values=np.column_stack([candidate_keys,pframe])[order]
+            first=np.r_[True,np.any(group_values[1:]!=group_values[:-1],axis=1)]
+            selected=order[first]
+            keys_selected=candidate_keys[selected]
+            key_order=np.lexsort((keys_selected[:,2],keys_selected[:,1],keys_selected[:,0]))
+            selected=selected[key_order]; keys_selected=keys_selected[key_order]
+            boundaries=np.flatnonzero(np.r_[True,np.any(keys_selected[1:]!=keys_selected[:-1],axis=1),True])
+            for start,stop in zip(boundaries[:-1],boundaries[1:]):
+                members=selected[start:stop]
+                candidate=self._pending_group(px[members],prgb[members],pconf[members],pdepth[members],pframe[members])
+                if len(candidate["supports"])>=self.novel_min_frames and all(candidate is not value for value in confirmed):
+                    confirmed.append(candidate)
+                    for member in members: masks[pslot[member]][py[member],px_pixel[member]]=(0,255,255)
         for candidate in confirmed:
             values=list(candidate["supports"].values()); xyz_med=np.median(np.stack([v[0] for v in values]),0).astype(np.float32)
             best=max(values,key=lambda value:value[2]); owned=self._owned_neighbor(xyz_med,best[3])

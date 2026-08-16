@@ -245,6 +245,7 @@ class OnlineSpatialHistoryPipeline:
                 "backend": "recal3r_world_accumulator",
                 "updated_frames": int(len(generated)),
                 "world_point_count": int(len(self.active_node.points_xyz)),
+                **self.world_accumulator.last_update_metrics,
             }
         elif self.memory_manager is not None:
             backend = self.memory_manager.geometry_backend

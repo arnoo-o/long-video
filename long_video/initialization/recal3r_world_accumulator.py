@@ -42,6 +42,13 @@ class ReCal3RWorldAccumulator:
         self._replay_k = [np.asarray(node.view_intrinsics[0], np.float32).copy()]
         self._version = 0
         self._alignment = None
+        self.last_update_metrics = {
+            "world_version": self._version,
+            "frames_submitted": 0,
+            "frames_fused": 0,
+            "frames_pending": 0,
+            "fused_observation_points": 0,
+        }
         self._node = replace(node)
         self._publish()
 
@@ -79,6 +86,26 @@ class ReCal3RWorldAccumulator:
         self._source_locked = anchors["source_locked"].copy()
 
 
+    def _render_source_w0_depth(self):
+        """CPU z-buffer of immutable Pi3X W0 at its source camera."""
+        rgb = np.asarray(self.initial_node.view_rgb[0], np.uint8)
+        height, width = rgb.shape[:2]
+        c2w = np.asarray(self.initial_node.view_c2w[0], np.float32)
+        intrinsics = np.asarray(self.initial_node.view_intrinsics[0], np.float32)
+        xyz = np.asarray(self.initial_node.points_xyz, np.float32)
+        local = (xyz - c2w[:3, 3]) @ c2w[:3, :3]
+        z = local[:, 2]
+        uvw = local @ intrinsics.T
+        uv = uvw[:, :2] / np.maximum(z[:, None], 1e-8)
+        x = np.rint(uv[:, 0]).astype(np.int64)
+        y = np.rint(uv[:, 1]).astype(np.int64)
+        valid = (np.isfinite(local).all(1) & (z > .05) & (z < 100.)
+                 & (x >= 0) & (x < width) & (y >= 0) & (y < height))
+        depth = np.full(height * width, np.inf, np.float32)
+        np.minimum.at(depth, y[valid] * width + x[valid], z[valid])
+        depth[~np.isfinite(depth)] = np.nan
+        return depth.reshape(height, width)
+
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
         return self.update_chunk(np.asarray(rgb)[None], np.asarray(c2w)[None], np.asarray(intrinsics)[None], [global_frame_index])
 
@@ -93,22 +120,44 @@ class ReCal3RWorldAccumulator:
         self._replay_rgb.extend(np.asarray(image, np.uint8).copy() for image in rgb)
         self._replay_c2w.extend(np.asarray(pose, np.float32).copy() for pose in c2w)
         self._replay_k.extend(np.asarray(k, np.float32).copy() for k in intrinsics)
+        before_point_count = int(len(self._node.points_xyz))
+        before_observations = int(np.asarray(self._node.observation_count, np.int64).sum())
         replay = self.backend.replay_prefix(np.stack(self._replay_rgb), np.stack(self._replay_c2w), np.stack(self._replay_k),
                                             trajectory_id=self.trajectory_id, global_frame_indices=range(len(self._replay_rgb)))
+        if self.backend.get_state().get("alignment", {}).get("status") != "locked":
+            # The immutable Pi3X W0 source rendering is the sole scale anchor.
+            # Controls and future geometry never participate in this estimate.
+            replay = self.backend.lock_source_depth_anchor(self._render_source_w0_depth())
         # Source initializes/alines ReCal only. Pending tails are revisited
         # after the first successful alignment, but every global frame commits once.
         candidates = sorted(self._pending_frame_ids | set(indices))
         point_parts=[]; confidence_parts=[]; color_parts=[]; frame_parts=[]
+        fused_frames = []
+        validation_keys = ("pixel_count", "inside_count", "finite_world_count", "finite_depth_count", "positive_depth_count", "finite_confidence_count", "confidence_threshold_count", "valid_count")
+        validation_totals = {key: 0 for key in validation_keys}
+        raw_confidence_min = None
+        raw_confidence_max = None
+        raw_confidence_weighted_sum = 0.0
+        raw_confidence_weight = 0
         for index in candidates:
             if index == 0 or index in self._fused_frame_ids: continue
             prediction = replay[index]
             image = self._replay_rgb[index]
+            validation = self.backend.geometry_validation(self.trajectory_id, index)
+            for key in validation_keys:
+                validation_totals[key] += int(validation[key])
+            if validation["raw_confidence_min"] is not None:
+                raw_confidence_min = validation["raw_confidence_min"] if raw_confidence_min is None else min(raw_confidence_min, validation["raw_confidence_min"])
+                raw_confidence_max = validation["raw_confidence_max"] if raw_confidence_max is None else max(raw_confidence_max, validation["raw_confidence_max"])
+                raw_confidence_weighted_sum += validation["raw_confidence_mean"] * validation["finite_confidence_count"]
+                raw_confidence_weight += validation["finite_confidence_count"]
             xyz = np.asarray(prediction.point_maps[0], np.float32)
             confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
             valid = np.isfinite(xyz).all(-1) & np.isfinite(confidence) & (confidence > 0)
             if not bool(valid.any()):
                 self._pending_frame_ids.add(index); continue
             point_parts.append(xyz[valid]); confidence_parts.append(confidence[valid]); color_parts.append(np.asarray(image, np.uint8)[valid]); frame_parts.append(np.full(int(valid.sum()), index, np.int32))
+            fused_frames.append(index)
             self._pending_frame_ids.discard(index); self._fused_frame_ids.add(index)
         points = np.concatenate(point_parts) if point_parts else np.empty((0,3),np.float32)
         conf = np.concatenate(confidence_parts) if confidence_parts else np.empty(0,np.float32)
@@ -121,6 +170,28 @@ class ReCal3RWorldAccumulator:
             self._anchor_frame = np.concatenate([self._anchor_frame, frames])
             self._source_locked = np.concatenate([self._source_locked, np.zeros(len(points), bool)])
         self._seen_frame_ids.update(identities); self._version += 1; self._publish()
+        after_observations = int(np.asarray(self._node.observation_count, np.int64).sum())
+        alignment = self.backend.get_state().get("alignment", {})
+        self.last_update_metrics = {
+            "world_version": int(self._version),
+            "frames_submitted": int(len(indices)),
+            "frames_fused": int(len(fused_frames)),
+            "fused_frame_indices": fused_frames,
+            "frames_pending": int(len(self._pending_frame_ids)),
+            "pending_frame_indices": sorted(self._pending_frame_ids),
+            "fused_observation_points": int(len(points)),
+            "world_point_count_before": before_point_count,
+            "world_point_count_after": int(len(self._node.points_xyz)),
+            "observation_count_before": before_observations,
+            "observation_count_after": after_observations,
+            "alignment": alignment,
+            "geometry_validation": {
+                **validation_totals,
+                "raw_confidence_min": raw_confidence_min,
+                "raw_confidence_max": raw_confidence_max,
+                "raw_confidence_mean": (raw_confidence_weighted_sum / raw_confidence_weight if raw_confidence_weight else None),
+            },
+        }
         return self._node
 
     def get_point_world(self):

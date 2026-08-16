@@ -72,6 +72,8 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._last_predictions = []
         self._results = {}
         self._raw_depth = {}
+        self._geometry_validation = {}
+        self._recal_poses = []
         self._seen = set()
         self._sequence_version = 0
         if not preserve_alignment:
@@ -88,6 +90,10 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "frame_count": len(self._frames),
             "has_recurrent_state": self._state_args is not None,
             "backend": "official_recal3r_recurrent",
+            # This is trajectory-level state, retained across full-prefix
+            # replays. Export it so callers can distinguish a replay that
+            # processed frames from one that produced committable world XYZ.
+            "alignment": dict(self._alignment_metadata),
         }
 
     def _view(self, frame: _Frame, index: int):
@@ -182,50 +188,70 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         return [self._prediction_for_keys([key]) for key in keys]
 
     def _cache_all_results(self):
-        # ReCal predictions are in a recurrent reconstruction coordinate
-        # system.  Lock one Sim(3) using only the prefix seen so far, then
-        # transform both points and ReCal cameras into the project world.
+        # ReCal geometry remains in its own reconstruction coordinates until
+        # the accumulator establishes a source-depth anchor against Pi3X W0.
+        # Free-control camera deltas are intentionally never used as scale.
         recal_poses = [self._recal_c2w(prediction) for prediction in self._last_predictions]
-        if self._alignment is None and len(recal_poses) >= self.min_alignment_frames:
-            try:
-                self._alignment = self._lock_causal_recal_to_world(np.stack(recal_poses), np.stack([frame.c2w for frame in self._frames]))
-                self._alignment_metadata = {
-                    "status": "locked", "scale": float(self._alignment.scale),
-                    "camera_alignment_error": float(self._alignment.camera_alignment_error),
-                    "camera_alignment_error_ratio": float(self._alignment.camera_alignment_error_ratio),
-                    "anchor_frame": len(self._frames) - 1,
-                }
-            except ValueError as error:
-                self._alignment_metadata = {"status": "pending", "reason": str(error)}
+        self._recal_poses = recal_poses
         for frame, prediction, recal_c2w in zip(self._frames, self._last_predictions, recal_poses):
             result, raw_depth = self._geometry_for(frame, prediction, recal_c2w)
             self._results[frame.identity] = result
             self._raw_depth[frame.identity] = raw_depth
 
-    @staticmethod
-    def _lock_causal_recal_to_world(recal_c2w, target_c2w):
-        """Source-anchored causal similarity transform, never global Sim(3) fitting.
+    def lock_source_depth_anchor(self, source_world_depth, *, min_overlap=1024):
+        """Lock ReCal->W0 from source-camera depth overlap exactly once.
 
-        Orientation/origin come from the shared source camera; scale is a
-        robust median of already-observed camera baselines.  The accumulator
-        independently records depth-overlap residuals before accepting points.
+        W0 is Pi3X source-only geometry.  The known source pose fixes
+        orientation/origin; robust depth ratios on the same pixel grid fix only
+        the relative scale.  No target camera-control baseline participates.
         """
+        if self._alignment is not None:
+            return self.replay_predictions()
+        if not self._recal_poses or not self._frames:
+            raise RuntimeError("ReCal source prediction is unavailable for depth anchoring")
+        source_depth = np.asarray(source_world_depth, np.float32)
+        recal_depth = self.raw_recal_depth(self._frames[0].identity.rsplit(':', 1)[0], 0)
+        if source_depth.shape != recal_depth.shape:
+            raise ValueError("Pi3X W0 and ReCal source depth grids must match")
+        overlap = (np.isfinite(source_depth) & (source_depth > 0)
+                   & np.isfinite(recal_depth) & (recal_depth > 0))
+        if int(overlap.sum()) < int(min_overlap):
+            self._alignment_metadata = {
+                "status": "pending", "reason": "insufficient_source_depth_overlap",
+                "overlap_count": int(overlap.sum()), "min_overlap": int(min_overlap),
+            }
+            return self.replay_predictions()
+        ratios = source_depth[overlap] / recal_depth[overlap]
+        ratios = ratios[np.isfinite(ratios) & (ratios > 1e-6)]
+        if len(ratios) < int(min_overlap):
+            self._alignment_metadata = {
+                "status": "pending", "reason": "invalid_source_depth_ratio",
+                "overlap_count": int(len(ratios)), "min_overlap": int(min_overlap),
+            }
+            return self.replay_predictions()
+        scale = float(np.median(ratios))
+        mad = float(np.median(np.abs(ratios - scale)))
+        if not np.isfinite(scale) or scale <= 1e-6:
+            self._alignment_metadata = {"status": "pending", "reason": "invalid_source_depth_scale"}
+            return self.replay_predictions()
         from ..data.recal3r_full_scene import Sim3Alignment
-        source_recal, source_world = recal_c2w[0], target_c2w[0]
+        source_recal = self._recal_poses[0]
+        source_world = self._frames[0].c2w
         rotation = source_world[:3, :3] @ source_recal[:3, :3].T
-        recal_delta = recal_c2w[1:, :3, 3] - source_recal[:3, 3]
-        world_delta = target_c2w[1:, :3, 3] - source_world[:3, 3]
-        a = np.linalg.norm(recal_delta, axis=1); b = np.linalg.norm(world_delta, axis=1)
-        usable = (a > 1e-5) & (b > 1e-5)
-        if int(usable.sum()) < 2:
-            raise ValueError("insufficient causal camera baseline for ReCal-to-W0 lock")
-        ratios = b[usable] / a[usable]; scale = float(np.median(ratios))
         translation = source_world[:3, 3] - scale * (rotation @ source_recal[:3, 3])
-        aligned = scale * (recal_c2w[:, :3, 3] @ rotation.T) + translation
-        residual = np.linalg.norm(aligned - target_c2w[:, :3, 3], axis=1)
-        extent = max(float(np.median(b[usable])), 1e-8)
-        return Sim3Alignment(scale, rotation, translation, float(np.sqrt(np.mean(residual * residual))),
-                             float(np.sqrt(np.mean(residual * residual)) / extent), 0.0, 0.0)
+        self._alignment = Sim3Alignment(scale, rotation, translation, 0.0, 0.0, mad, mad)
+        self._alignment_metadata = {
+            "status": "locked", "anchor": "pi3x_w0_source_depth_overlap_v1",
+            "scale": scale, "depth_ratio_mad": mad,
+            "overlap_count": int(len(ratios)), "anchor_frame": 0,
+        }
+        # Rebuild every replay result under the now-fixed transform before the
+        # accumulator revisits pending tail frames.
+        self._cache_all_results()
+        return self.replay_predictions()
+
+    def replay_predictions(self):
+        return [self._prediction_for_keys([frame.identity]) for frame in self._frames]
 
     def _recal_c2w(self, prediction):
         # Official CUT3R stores poses in its compact encoding.  Decode with
@@ -253,12 +279,38 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         # z-depth is measured after world alignment in the known target camera.
         local = (mapped - frame.c2w[:3, 3]) @ frame.c2w[:3, :3]
         depth = local[..., 2].astype(np.float32)
-        valid = (inside & np.isfinite(mapped).all(-1) & np.isfinite(depth) & (depth > 0)
-                 & np.isfinite(calibrated) & (raw_conf >= self.confidence_threshold))
+        finite_world = np.isfinite(mapped).all(-1)
+        finite_depth = np.isfinite(depth)
+        positive_depth = depth > 0
+        finite_confidence = np.isfinite(raw_conf)
+        confidence_threshold = raw_conf >= self.confidence_threshold
+        valid = (inside & finite_world & finite_depth & positive_depth
+                 & np.isfinite(calibrated) & confidence_threshold)
+        finite_raw_confidence = raw_conf[finite_confidence]
+        self._geometry_validation[frame.identity] = {
+            "pixel_count": int(raw_conf.size),
+            "inside_count": int(inside.sum()),
+            "finite_world_count": int(finite_world.sum()),
+            "finite_depth_count": int(finite_depth.sum()),
+            "positive_depth_count": int(positive_depth.sum()),
+            "finite_confidence_count": int(finite_confidence.sum()),
+            "confidence_threshold_count": int(confidence_threshold.sum()),
+            "valid_count": int(valid.sum()),
+            "raw_confidence_min": float(finite_raw_confidence.min()) if len(finite_raw_confidence) else None,
+            "raw_confidence_max": float(finite_raw_confidence.max()) if len(finite_raw_confidence) else None,
+            "raw_confidence_mean": float(finite_raw_confidence.mean()) if len(finite_raw_confidence) else None,
+        }
         mapped[~valid] = np.nan
         depth[~valid] = np.nan
         calibrated = np.where(valid, calibrated, 0).astype(np.float32)
         return (depth, calibrated, mapped), np.asarray(points[..., 2], np.float32)
+
+    def geometry_validation(self, trajectory_id, global_frame_index):
+        identity = f"{trajectory_id}:{int(global_frame_index)}"
+        value = self._geometry_validation.get(identity)
+        if value is None:
+            raise RuntimeError(f"missing ReCal validation metrics for {identity}")
+        return dict(value)
 
     def raw_recal_depth(self, trajectory_id, global_frame_index):
         """Causal self-view z for the accumulator's one-time overlap anchor."""

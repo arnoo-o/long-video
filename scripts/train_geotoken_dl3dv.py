@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--pi3x-checkpoint", type=Path, required=True)
     parser.add_argument("--recal3r-repo", type=Path, required=True)
     parser.add_argument("--recal3r-checkpoint", type=Path, required=True)
+    parser.add_argument("--recal-confidence-threshold", type=float, default=0.85)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--total-steps", type=int, default=2000)
@@ -488,6 +489,7 @@ def main():
             from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
             geometry_backend = ReCal3RGeometryBackend(
                 args.recal3r_checkpoint, args.recal3r_repo, args.device,
+                confidence_threshold=args.recal_confidence_threshold,
             )
         source_center = arrays["c2w"][0, :3, 3]
         # ReCal3R normalization is confined to the offline A/B phases.
@@ -688,6 +690,7 @@ def main():
             "grad_norm": float(grad_norm), "learning_rate": optimizer.param_groups[0]["lr"],
             "geotoken_parameter_norm": parameter_norm,
             "camera_strength": conditioner.camera_strength, "world_strength": conditioner.world_strength,
+            "recal_confidence_threshold": args.recal_confidence_threshold,
             "geotoken_injection": dict(conditioner.diagnostics) if sample_diagnostics else None,
             "data_load_seconds": data_load_seconds,
             "point_render_seconds": provider.point_render_seconds() if sample_diagnostics else None,

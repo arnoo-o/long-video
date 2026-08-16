@@ -15,7 +15,7 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v6"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v7-source-depth-anchor"
 GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-rgb-anchor-v5"
 GEOMETRY_SCHEMA_VERSION = 3
 def _wah_runtime_fingerprint():

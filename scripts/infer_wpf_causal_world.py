@@ -15,6 +15,7 @@ def main():
     p=argparse.ArgumentParser(); p.add_argument('--wah-root',type=Path,required=True); p.add_argument('--model',type=Path,required=True)
     p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--recal3r-repo',type=Path,required=True)
     p.add_argument('--recal3r-checkpoint',type=Path,required=True); p.add_argument('--output-dir',type=Path,required=True); p.add_argument('--device',default='cuda:0')
+    p.add_argument('--recal-confidence-threshold', type=float, default=0.85)
     p.add_argument('--pi3x-repo',type=Path,required=True); p.add_argument('--pi3x-checkpoint',type=Path,required=True)
     p.add_argument('--wpf-adaptation-checkpoint',type=Path)
     p.add_argument('--geotoken-checkpoint',type=Path,
@@ -23,6 +24,7 @@ def main():
                    choices=(0.0,0.25,0.5,1.0))
     p.add_argument('--camera-strength',type=float,default=1.0)
     p.add_argument('--world-strength',type=float,default=1.0)
+    p.add_argument('--allow-stale-geotoken-semantics', action='store_true')
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.'); a=p.parse_args()
     sys.path.insert(0,str(a.wah_root))
     from long_video.wah.upstream import assert_wah_upstream
@@ -77,10 +79,13 @@ def main():
         )
         checkpoint=torch.load(a.geotoken_checkpoint,map_location='cpu',weights_only=False)
         from long_video.training.geotoken import TRAINING_SEMANTICS_VERSION, GEOMETRY_SCHEMA_VERSION, GEOMETRY_IMPLEMENTATION_VERSION, WAH_RUNTIME_FINGERPRINT
-        if (checkpoint.get('training_semantics_version') != TRAINING_SEMANTICS_VERSION
-                or checkpoint.get('geometry_schema_version') != GEOMETRY_SCHEMA_VERSION
-                or checkpoint.get('geometry_implementation_version') != GEOMETRY_IMPLEMENTATION_VERSION):
+        semantics_match = (checkpoint.get('training_semantics_version') == TRAINING_SEMANTICS_VERSION
+                           and checkpoint.get('geometry_schema_version') == GEOMETRY_SCHEMA_VERSION
+                           and checkpoint.get('geometry_implementation_version') == GEOMETRY_IMPLEMENTATION_VERSION)
+        if not semantics_match and not a.allow_stale_geotoken_semantics:
             raise RuntimeError('GeoToken checkpoint has stale training/world-binding semantics')
+        if not semantics_match:
+            print('WARNING: stale GeoToken semantics allowed for diagnostic inference only')
         if checkpoint.get('wah_runtime_fingerprint') != WAH_RUNTIME_FINGERPRINT: raise RuntimeError('GeoToken checkpoint WAH runtime fingerprint mismatch')
         state=checkpoint.get('geotoken')
         named=dict(pipe.transformer.named_parameters())
@@ -93,7 +98,10 @@ def main():
         geotoken_step=int(checkpoint.get('global_step',-1))
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
-    geo=ReCal3RGeometryBackend(a.recal3r_checkpoint,a.recal3r_repo,a.device)
+    geo=ReCal3RGeometryBackend(
+        a.recal3r_checkpoint, a.recal3r_repo, a.device,
+        confidence_threshold=a.recal_confidence_threshold,
+    )
     trajectory_id=f"inference:{a.session.resolve()}"
     accumulator=ReCal3RWorldAccumulator(geo,node,trajectory_id=trajectory_id,voxel_size=0.02)
     online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=None,world_accumulator=accumulator,prompt=a.prompt,renderer_kwargs={'device':a.device, 'point_radius':0},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
@@ -120,12 +128,33 @@ def main():
             from long_video.online.pipeline import point_world_snapshot_identity
             return {'world_identity':point_world_snapshot_identity(active_node),'freeze_history':provider.freeze_current_snapshot}
         online.pre_render_world_hook=pre_render_world_hook
-    generated=[]; warps=[]; panels=[]; reports=[]
+    from long_video.types import CameraBatch
+    from long_video.geometry.point_renderer import render_geometry_cuda
+    generated=[]; warps=[]; panels=[]; geometry_frames=[]; reports=[]
     with torch.inference_mode():
       for chunk_controls in controls:
-        video,_,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width); g=u8(video); w=u8(warp.rgb); v=np.asarray(warp.visibility)
-        offset=0 if not generated else 1; generated.extend(g[offset:]); warps.extend(w[offset:])
-        masked=w.copy(); masked[~v]=0; panel=np.concatenate([g,w,masked],axis=2); panels.extend(panel[offset:]); reports.append(report)
-    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_visible.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'camera_strength':a.camera_strength if a.geotoken_checkpoint else None,'world_strength':a.world_strength if a.geotoken_checkpoint else None,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports},indent=2,default=str))
+        video,poses,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width)
+        g=u8(video); w=u8(warp.rgb)
+        # Render the post-update PointWorld, not the pre-generation WAH warp.
+        # This makes the diagnostic video reflect the world used by the next
+        # chunk and exposes whether ReCal observations actually changed it.
+        cameras=CameraBatch(np.asarray(poses,np.float32), np.repeat(np.asarray(K,np.float32)[None],len(poses),axis=0), int(a.height), int(a.width))
+        xyz_t=torch.as_tensor(online.active_node.points_xyz,dtype=torch.float32,device=a.device)
+        conf_t=torch.as_tensor(online.active_node.points_confidence,dtype=torch.float32,device=a.device)
+        _, depth_t, visible_t, confidence_t=render_geometry_cuda(xyz_t,conf_t,cameras,parent_point_count=getattr(online.active_node,'parent_point_count',None))
+        depth=np.asarray(depth_t.detach().cpu()); visible=np.asarray(visible_t.detach().cpu()); confidence=np.asarray(confidence_t.detach().cpu())
+        finite=visible & np.isfinite(depth) & (depth>0)
+        values=depth[finite]
+        lo,hi=(float(np.percentile(values,2)),float(np.percentile(values,98))) if len(values) else (0.0,1.0)
+        hi=max(hi,lo+1e-6)
+        normalized=np.clip((depth-lo)/(hi-lo),0,1)
+        geom=np.zeros((len(depth),int(a.height),int(a.width),3),np.uint8)
+        geom[...,0]=np.rint(normalized*255).astype(np.uint8)
+        geom[...,1]=np.rint(np.clip(confidence,0,1)*255).astype(np.uint8)
+        geom[...,2]=np.where(finite,255,0).astype(np.uint8)
+        offset=0 if not generated else 1
+        generated.extend(g[offset:]); warps.extend(w[offset:]); geometry_frames.extend(geom[offset:])
+        panel=np.concatenate([g,w,geom],axis=2); panels.extend(panel[offset:]); reports.append(report)
+    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'geometry_post_update.mp4',np.asarray(geometry_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_geometry.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'camera_strength':a.camera_strength if a.geotoken_checkpoint else None,'world_strength':a.world_strength if a.geotoken_checkpoint else None,'recal_confidence_threshold':a.recal_confidence_threshold,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports},indent=2,default=str))
 if __name__=='__main__': main()
 

@@ -1,316 +1,260 @@
-"""Causal explicit point-world accumulation from frozen ReCal3R predictions."""
+"""Persistent-surface PointWorld ownership for causal ReCal3R observations."""
 from __future__ import annotations
 
 from dataclasses import replace
+import time
 import numpy as np
 
-from ..geometry.voxel_fusion import fuse_voxels
-from ..types import ScaleMetadata
+from ..geometry.point_renderer import render
+from ..types import CameraBatch, ScaleMetadata
+
+
+_NEIGHBORS = tuple((x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1))
 
 
 class ReCal3RWorldAccumulator:
-    """Fuse each newly generated frame once; no candidate/promotion policy."""
+    """Own immutable XYZ surfaces; only confirmed novel surfaces may be added."""
 
-    def __init__(self, backend, initial_node, *, trajectory_id, voxel_size=0.02):
-        self.backend = backend
-        self.initial_node = initial_node
-        self.trajectory_id = str(trajectory_id)
-        self.voxel_size = float(voxel_size)
+    def __init__(self, backend, initial_node, *, trajectory_id, voxel_size=0.02,
+                 novel_min_frames=3, pending_expiry_chunks=8):
+        self.backend, self.initial_node = backend, initial_node
+        self.trajectory_id, self.voxel_size = str(trajectory_id), float(voxel_size)
         if self.voxel_size != 0.02:
             raise ValueError("ReCal3R world accumulation is fixed to voxel_size=0.02")
+        self.novel_min_frames = int(novel_min_frames)
+        self.pending_expiry_chunks = int(pending_expiry_chunks)
         self.reset()
 
     def reset(self):
-        self.backend.reset()
-        node = self.initial_node
+        self.backend.reset(); node = self.initial_node
         self._xyz = np.asarray(node.points_xyz, np.float32).copy()
         self._rgb = np.asarray(node.points_rgb, np.uint8).copy()
         self._observations = np.asarray(node.observation_count, np.int32).clip(1).copy()
-        self._weight = (
-            np.asarray(node.points_confidence, np.float32).clip(1e-6)
-            * self._observations.astype(np.float32)
-        )
+        self._weight = np.asarray(node.points_confidence, np.float32).clip(1e-6) * self._observations
         anchors = getattr(node, "appearance_anchors", {})
-        self._anchor_confidence = np.asarray(
-            anchors.get("anchor_confidence", node.points_confidence), np.float32
-        ).copy()
-        self._anchor_frame = np.asarray(
-            anchors.get("anchor_frame", np.zeros(len(node.points_xyz))), np.int32
-        ).copy()
-        self._source_locked = np.asarray(
-            anchors.get("source_locked", np.ones(len(node.points_xyz), bool)), bool
-        ).copy()
-        self._seen_frame_ids = set()
-        self._fused_frame_ids = set()
-        self._pending_frame_ids = set()
+        self._anchor_confidence = np.asarray(anchors.get("anchor_confidence", node.points_confidence), np.float32).copy()
+        self._anchor_frame = np.asarray(anchors.get("anchor_frame", np.zeros(len(self._xyz))), np.int32).copy()
+        self._source_locked = np.asarray(anchors.get("source_locked", np.ones(len(self._xyz), bool)), bool).copy()
+        self._source_point_count = len(self._xyz)
+        self._seen_frame_ids, self._fused_frame_ids, self._pending_frame_ids = set(), set(), set()
         self._replay_rgb = [np.asarray(node.view_rgb[0], np.uint8).copy()]
         self._replay_c2w = [np.asarray(node.view_c2w[0], np.float32).copy()]
         self._replay_k = [np.asarray(node.view_intrinsics[0], np.float32).copy()]
-        self._version = 0
-        self.last_update_metrics = {
-            "world_version": self._version,
-            "frames_submitted": 0,
-            "frames_fused": 0,
-            "frames_pending": 0,
-            "fused_observation_points": 0,
-        }
+        self._pending_surfaces, self._association_cache = {}, None
+        self._chunk_serial = self._version = 0
         self._node = replace(node)
-        self._publish()
+        self._build_source_projection(); self._rebuild_ownership(); self._publish()
+        self._last_association_masks = []
+        self.last_update_metrics = {"world_version": 0, "frames_submitted": 0,
+            "frames_fused": 0, "frames_pending": 0, "existing_xyz_moved_count": 0}
+
+    def _build_source_projection(self):
+        rgb = np.asarray(self.initial_node.view_rgb[0], np.uint8); h, w = rgb.shape[:2]
+        pose = np.asarray(self.initial_node.view_c2w[0], np.float32)
+        k = np.asarray(self.initial_node.view_intrinsics[0], np.float32)
+        local = (self._xyz[:self._source_point_count] - pose[:3, 3]) @ pose[:3, :3]
+        z = local[:, 2]; uv = local @ k.T
+        x = np.rint(uv[:, 0] / np.maximum(z, 1e-8)).astype(np.int64)
+        y = np.rint(uv[:, 1] / np.maximum(z, 1e-8)).astype(np.int64)
+        ok = np.isfinite(local).all(1) & (z > .05) & (z < 100) & (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        depth = np.full(h * w, np.inf, np.float32); np.minimum.at(depth, y[ok] * w + x[ok], z[ok])
+        point_index = np.full(h * w, -1, np.int64); valid_indices = np.flatnonzero(ok)
+        if len(valid_indices):
+            flat = y[ok] * w + x[ok]; winners = valid_indices[z[ok] <= depth[flat] + 1e-5]
+            point_index[y[winners] * w + x[winners]] = winners
+        depth[~np.isfinite(depth)] = np.nan
+        self._source_depth, self._source_point_index = depth.reshape(h, w), point_index.reshape(h, w)
+
+    def _render_source_w0_depth(self): return self._source_depth.copy()
+
+    def _rebuild_ownership(self):
+        self._owned = {tuple(key): index for index, key in enumerate(np.floor(self._xyz / self.voxel_size).astype(np.int64))}
 
     def _publish(self):
-        means = self._weight / self._observations.clip(1)
-        xyz, rgb, confidence, observations, _, anchors = fuse_voxels(
-            self._xyz,
-            self._rgb,
-            means,
-            self._observations,
-            self.voxel_size,
-            anchor_confidence=self._anchor_confidence,
-            anchor_frame=self._anchor_frame,
-            source_locked=self._source_locked,
-            return_anchors=True,
-        )
-        weight = confidence * observations.astype(np.float32)
-        bmin = xyz.min(0) if len(xyz) else np.zeros(3, np.float32)
-        bmax = xyz.max(0) if len(xyz) else np.zeros(3, np.float32)
-        scale = ScaleMetadata(
-            mode="relative",
-            meters_per_world_unit=None,
-            uncertainty=1.0,
-            anchor_source="pi3x_w0_source_geometry_commanded_pose",
-        )
-        self._node.points_xyz = xyz
-        self._node.points_rgb = rgb
-        self._node.points_confidence = confidence
-        self._node.points_source = np.full(len(xyz), 2, np.int8)
-        self._node.observation_count = np.minimum(
-            observations, np.iinfo(np.uint16).max
-        ).astype(np.uint16)
-        self._node.bbox_min = bmin.astype(np.float32)
-        self._node.bbox_max = bmax.astype(np.float32)
-        self._node.coverage_radius = float(np.linalg.norm(bmax - bmin) * 0.5)
-        self._node.scale = scale
-        self._node.appearance_anchors = anchors
-        self._node.quality_metrics.update(
-            {
-                "recal3r_world_version": self._version,
-                "voxel_size": self.voxel_size,
-                "accumulator_points": int(len(xyz)),
-                "fusion_weight_sum": float(weight.sum()),
-            }
-        )
-        self._xyz, self._rgb = xyz.copy(), rgb.copy()
-        self._observations = observations.astype(np.int32, copy=True)
-        self._weight = confidence * self._observations.astype(np.float32)
-        self._anchor_confidence = anchors["anchor_confidence"].copy()
-        self._anchor_frame = anchors["anchor_frame"].copy()
-        self._source_locked = anchors["source_locked"].copy()
+        confidence = self._weight / self._observations.clip(1)
+        bmin = self._xyz.min(0) if len(self._xyz) else np.zeros(3, np.float32)
+        bmax = self._xyz.max(0) if len(self._xyz) else np.zeros(3, np.float32)
+        self._node.points_xyz, self._node.points_rgb = self._xyz.copy(), self._rgb.copy()
+        self._node.points_confidence = confidence.astype(np.float32)
+        self._node.points_source = np.full(len(self._xyz), 2, np.int8)
+        self._node.observation_count = np.minimum(self._observations, 65535).astype(np.uint16)
+        self._node.bbox_min, self._node.bbox_max = bmin.astype(np.float32), bmax.astype(np.float32)
+        self._node.coverage_radius = float(np.linalg.norm(bmax - bmin) * .5)
+        self._node.scale = ScaleMetadata(mode="relative", meters_per_world_unit=None,
+            uncertainty=1.0, anchor_source="pi3x_w0_source_geometry_commanded_pose")
+        self._node.appearance_anchors = {"anchor_rgb": self._rgb.copy(),
+            "anchor_confidence": self._anchor_confidence.copy(), "anchor_frame": self._anchor_frame.copy(),
+            "source_locked": self._source_locked.copy()}
+        self._node.quality_metrics.update({"recal3r_world_version": self._version,
+            "voxel_size": self.voxel_size, "accumulator_points": int(len(self._xyz)),
+            "surface_ownership": "immutable_xyz_v1"})
 
-    def _render_source_w0_depth(self):
-        """Render immutable Pi3X W0 z-depth in the source camera."""
-        rgb = np.asarray(self.initial_node.view_rgb[0], np.uint8)
-        height, width = rgb.shape[:2]
-        c2w = np.asarray(self.initial_node.view_c2w[0], np.float32)
-        intrinsics = np.asarray(self.initial_node.view_intrinsics[0], np.float32)
-        xyz = np.asarray(self.initial_node.points_xyz, np.float32)
+    def prepare_chunk_association(self, warp, cameras, *, render_seconds=0.0):
+        """Reuse the one pre-generation WAH render as the W_k association cache."""
+        if warp.point_index is None or warp.winning_xyz_world is None:
+            raise RuntimeError("association render must expose point_index and winning_xyz_world")
+        self._association_cache = {"depth": np.asarray(warp.depth).copy(),
+            "visibility": np.asarray(warp.visibility, bool).copy(),
+            "point_index": np.asarray(warp.point_index, np.int64).copy(),
+            "winning_xyz_world": np.asarray(warp.winning_xyz_world, np.float32).copy(),
+            "c2w": np.asarray(cameras.c2w, np.float32).copy(),
+            "intrinsics": np.asarray(cameras.intrinsics, np.float32).copy(),
+            "seconds": float(render_seconds), "reused_wah_warp": True}
 
-        local = (xyz - c2w[:3, 3]) @ c2w[:3, :3]
-        z = local[:, 2]
-        uvw = local @ intrinsics.T
-        uv = uvw[:, :2] / np.maximum(z[:, None], 1e-8)
-        x = np.rint(uv[:, 0]).astype(np.int64)
-        y = np.rint(uv[:, 1]).astype(np.int64)
-        valid = (
-            np.isfinite(local).all(1)
-            & (z > 0.05)
-            & (z < 100.0)
-            & (x >= 0)
-            & (x < width)
-            & (y >= 0)
-            & (y < height)
-        )
-        depth = np.full(height * width, np.inf, np.float32)
-        np.minimum.at(depth, y[valid] * width + x[valid], z[valid])
-        depth[~np.isfinite(depth)] = np.nan
-        return depth.reshape(height, width)
+    def _association_for(self, c2w, intrinsics, height, width):
+        cache = self._association_cache
+        if cache is not None and len(cache["depth"]) in (len(c2w), len(c2w) + 1):
+            start = len(cache["depth"]) - len(c2w)
+            if np.allclose(cache["c2w"][start:], c2w) and np.allclose(cache["intrinsics"][start:], intrinsics):
+                return {key: (value[start:] if isinstance(value, np.ndarray) and value.ndim else value)
+                        for key, value in cache.items()}
+        started = time.perf_counter()
+        warp = render(self._node, CameraBatch(c2w, intrinsics, int(height), int(width)),
+                      device="cpu", point_radius=1)
+        return {"depth": warp.depth, "visibility": warp.visibility, "point_index": warp.point_index,
+            "winning_xyz_world": warp.winning_xyz_world, "c2w": c2w, "intrinsics": intrinsics,
+            "seconds": time.perf_counter() - started, "reused_wah_warp": False}
+
+    def _update_owned(self, indices, confidence, colors, frame_index):
+        if not len(indices): return 0
+        indices, confidence = np.asarray(indices, np.int64), np.asarray(confidence, np.float32)
+        order = np.lexsort((-confidence, indices)); sorted_idx = indices[order]
+        chosen = order[np.r_[True, sorted_idx[1:] != sorted_idx[:-1]]]
+        indices, confidence, colors = indices[chosen], confidence[chosen], np.asarray(colors, np.uint8)[chosen]
+        self._weight[indices] += confidence; self._observations[indices] += 1
+        change = (~self._source_locked[indices]) & (confidence > 1.1 * self._anchor_confidence[indices])
+        target = indices[change]; self._rgb[target] = colors[change]
+        self._anchor_confidence[target] = confidence[change]; self._anchor_frame[target] = int(frame_index)
+        return int(len(indices))
+
+    def _project_source(self, xyz):
+        pose = np.asarray(self.initial_node.view_c2w[0], np.float32)
+        k = np.asarray(self.initial_node.view_intrinsics[0], np.float32)
+        local = (xyz - pose[:3, 3]) @ pose[:3, :3]; z = local[:, 2]; uv = local @ k.T
+        x = np.rint(uv[:, 0] / np.maximum(z, 1e-8)).astype(np.int64)
+        y = np.rint(uv[:, 1] / np.maximum(z, 1e-8)).astype(np.int64)
+        h, w = self._source_depth.shape
+        inside = np.isfinite(local).all(1) & (z > 0) & (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        depth = np.full(len(xyz), np.nan, np.float32); index = np.full(len(xyz), -1, np.int64)
+        depth[inside], index[inside] = self._source_depth[y[inside], x[inside]], self._source_point_index[y[inside], x[inside]]
+        return z, inside, depth, index
+
+    def _pending_candidate(self, xyz, rgb, confidence, depth, frame_index):
+        key0 = tuple(np.floor(xyz / self.voxel_size).astype(np.int64)); tolerance = max(2*self.voxel_size, .02*float(depth))
+        found = None
+        for delta in _NEIGHBORS:
+            key = tuple(key0[i] + delta[i] for i in range(3)); candidate = self._pending_surfaces.get(key)
+            if candidate is not None:
+                center = np.median(np.stack([value[0] for value in candidate["supports"].values()]), 0)
+                if np.linalg.norm(center - xyz) <= tolerance: found = candidate; break
+        if found is None:
+            found = {"key": key0, "supports": {}, "last_chunk": self._chunk_serial}
+            self._pending_surfaces[key0] = found
+        old = found["supports"].get(int(frame_index))
+        if old is None or confidence > old[2]: found["supports"][int(frame_index)] = (xyz.copy(), rgb.copy(), float(confidence), float(depth))
+        found["last_chunk"] = self._chunk_serial
+        return found
+
+    def _owned_neighbor(self, xyz, depth):
+        key0 = tuple(np.floor(xyz/self.voxel_size).astype(np.int64)); tolerance=max(2*self.voxel_size,.02*float(depth))
+        for delta in _NEIGHBORS:
+            index = self._owned.get(tuple(key0[i]+delta[i] for i in range(3)))
+            if index is not None and np.linalg.norm(self._xyz[index]-xyz) <= tolerance: return index
+        return None
 
     def update_frame(self, rgb, c2w, intrinsics, global_frame_index):
-        return self.update_chunk(
-            np.asarray(rgb)[None],
-            np.asarray(c2w)[None],
-            np.asarray(intrinsics)[None],
-            [global_frame_index],
-        )
+        return self.update_chunk(np.asarray(rgb)[None], np.asarray(c2w)[None], np.asarray(intrinsics)[None], [global_frame_index])
 
     def update_chunk(self, rgb, c2w, intrinsics, global_frame_indices):
-        """Fuse/publish once after ReCal3R has causally processed one chunk."""
-        indices = [int(value) for value in global_frame_indices]
-        identities = [(self.trajectory_id, index) for index in indices]
-        if any(identity in self._seen_frame_ids for identity in identities):
-            raise RuntimeError("ReCal3R frame processed twice")
-        if not indices or indices[0] != len(self._replay_rgb):
-            raise RuntimeError("ReCal chunk must append exactly after the previous unique global frame")
-
-        self._replay_rgb.extend(np.asarray(image, np.uint8).copy() for image in rgb)
-        self._replay_c2w.extend(np.asarray(pose, np.float32).copy() for pose in c2w)
-        self._replay_k.extend(np.asarray(k, np.float32).copy() for k in intrinsics)
-
-        before_point_count = int(len(self._node.points_xyz))
-        before_observations = int(
-            np.asarray(self._node.observation_count, np.int64).sum()
-        )
-
-        replay = self.backend.replay_prefix(
-            np.stack(self._replay_rgb),
-            np.stack(self._replay_c2w),
-            np.stack(self._replay_k),
-            trajectory_id=self.trajectory_id,
-            global_frame_indices=range(len(self._replay_rgb)),
-        )
-        if self.backend.get_state().get("alignment", {}).get("status") != "locked":
-            replay = self.backend.lock_source_geometry_alignment(
-                self._render_source_w0_depth()
-            )
-
-        candidates = sorted(self._pending_frame_ids | set(indices))
-        point_parts = []
-        confidence_parts = []
-        color_parts = []
-        frame_parts = []
-        fused_frames = []
-        validation_keys = (
-            "pixel_count",
-            "inside_count",
-            "finite_world_count",
-            "finite_depth_count",
-            "positive_depth_count",
-            "finite_confidence_count",
-            "confidence_threshold_count",
-            "valid_count",
-        )
-        validation_totals = {key: 0 for key in validation_keys}
-        raw_confidence_min = None
-        raw_confidence_max = None
-        raw_confidence_weighted_sum = 0.0
-        raw_confidence_weight = 0
-
+        indices=[int(value) for value in global_frame_indices]; identities=[(self.trajectory_id,index) for index in indices]
+        if any(identity in self._seen_frame_ids for identity in identities): raise RuntimeError("ReCal3R frame processed twice")
+        if not indices or indices[0] != len(self._replay_rgb): raise RuntimeError("ReCal chunk must append after previous unique frame")
+        rgb,c2w,intrinsics=np.asarray(rgb),np.asarray(c2w),np.asarray(intrinsics)
+        self._replay_rgb.extend(np.asarray(x,np.uint8).copy() for x in rgb)
+        self._replay_c2w.extend(np.asarray(x,np.float32).copy() for x in c2w)
+        self._replay_k.extend(np.asarray(x,np.float32).copy() for x in intrinsics)
+        before_xyz=self._xyz.copy(); before_points=len(self._xyz); before_obs=int(self._observations.sum())
+        replay=self.backend.replay_prefix(np.stack(self._replay_rgb),np.stack(self._replay_c2w),np.stack(self._replay_k),
+            trajectory_id=self.trajectory_id,global_frame_indices=range(len(self._replay_rgb)))
+        if self.backend.get_state().get("alignment",{}).get("status") != "locked":
+            replay=self.backend.lock_source_geometry_alignment(self._render_source_w0_depth())
+        association=self._association_for(c2w,intrinsics,rgb.shape[1],rgb.shape[2])
+        names=("association_match_pixels","association_conflict_pixels","association_novel_pixels",
+            "source_free_space_rejected","source_surface_duplicate_pixels","matched_world_points",
+            "novel_confirmed_points","novel_expired_count")
+        metrics={name:0 for name in names}; residuals=[]; masks=[]; confirmed=[]; fused_frames=[]
+        candidate_started=time.perf_counter(); candidates=sorted(self._pending_frame_ids|set(indices))
         for index in candidates:
-            if index == 0 or index in self._fused_frame_ids:
-                continue
-            prediction = replay[index]
-            image = self._replay_rgb[index]
-            validation = self.backend.geometry_validation(self.trajectory_id, index)
-            for key in validation_keys:
-                validation_totals[key] += int(validation[key])
-            if validation["raw_confidence_min"] is not None:
-                raw_confidence_min = (
-                    validation["raw_confidence_min"]
-                    if raw_confidence_min is None
-                    else min(raw_confidence_min, validation["raw_confidence_min"])
-                )
-                raw_confidence_max = (
-                    validation["raw_confidence_max"]
-                    if raw_confidence_max is None
-                    else max(raw_confidence_max, validation["raw_confidence_max"])
-                )
-                raw_confidence_weighted_sum += (
-                    validation["raw_confidence_mean"]
-                    * validation["finite_confidence_count"]
-                )
-                raw_confidence_weight += validation["finite_confidence_count"]
-
-            xyz = np.asarray(prediction.point_maps[0], np.float32)
-            confidence = np.asarray(prediction.geometry_confidence[0], np.float32)
-            valid = (
-                np.isfinite(xyz).all(-1)
-                & np.isfinite(confidence)
-                & (confidence > 0)
-            )
-            if not bool(valid.any()):
-                self._pending_frame_ids.add(index)
-                continue
-
-            point_parts.append(xyz[valid])
-            confidence_parts.append(confidence[valid])
-            color_parts.append(np.asarray(image, np.uint8)[valid])
-            frame_parts.append(np.full(int(valid.sum()), index, np.int32))
-            fused_frames.append(index)
-            self._pending_frame_ids.discard(index)
-            self._fused_frame_ids.add(index)
-
-        points = (
-            np.concatenate(point_parts) if point_parts else np.empty((0, 3), np.float32)
-        )
-        conf = (
-            np.concatenate(confidence_parts)
-            if confidence_parts
-            else np.empty(0, np.float32)
-        )
-        colors = (
-            np.concatenate(color_parts)
-            if color_parts
-            else np.empty((0, 3), np.uint8)
-        )
-        frames = (
-            np.concatenate(frame_parts)
-            if frame_parts
-            else np.empty(0, np.int32)
-        )
-
-        if len(points):
-            self._xyz = np.concatenate([self._xyz, points])
-            self._rgb = np.concatenate([self._rgb, colors])
-            self._weight = np.concatenate([self._weight, conf])
-            self._observations = np.concatenate(
-                [self._observations, np.ones(len(points), np.int32)]
-            )
-            self._anchor_confidence = np.concatenate(
-                [self._anchor_confidence, conf]
-            )
-            self._anchor_frame = np.concatenate([self._anchor_frame, frames])
-            self._source_locked = np.concatenate(
-                [self._source_locked, np.zeros(len(points), bool)]
-            )
-
-        self._seen_frame_ids.update(identities)
-        self._version += 1
-        self._publish()
-        after_observations = int(
-            np.asarray(self._node.observation_count, np.int64).sum()
-        )
-        alignment = self.backend.get_state().get("alignment", {})
-        self.last_update_metrics = {
-            "world_version": int(self._version),
-            "frames_submitted": int(len(indices)),
-            "frames_fused": int(len(fused_frames)),
-            "fused_frame_indices": fused_frames,
-            "frames_pending": int(len(self._pending_frame_ids)),
-            "pending_frame_indices": sorted(self._pending_frame_ids),
-            "fused_observation_points": int(len(points)),
-            "world_point_count_before": before_point_count,
-            "world_point_count_after": int(len(self._node.points_xyz)),
-            "observation_count_before": before_observations,
-            "observation_count_after": after_observations,
-            "alignment": alignment,
-            "geometry_validation": {
-                **validation_totals,
-                "raw_confidence_min": raw_confidence_min,
-                "raw_confidence_max": raw_confidence_max,
-                "raw_confidence_mean": (
-                    raw_confidence_weighted_sum / raw_confidence_weight
-                    if raw_confidence_weight
-                    else None
-                ),
-            },
-        }
+            if index==0 or index in self._fused_frame_ids: continue
+            if index not in indices: self._pending_frame_ids.add(index); continue
+            slot=indices.index(index); prediction=replay[index]
+            xyz=np.asarray(prediction.point_maps[0],np.float32); conf=np.asarray(prediction.geometry_confidence[0],np.float32)
+            image=np.asarray(self._replay_rgb[index],np.uint8); pose=np.asarray(c2w[slot],np.float32)
+            recal_depth=((xyz-pose[:3,3])@pose[:3,:3])[...,2]
+            valid=np.isfinite(xyz).all(-1)&np.isfinite(conf)&(conf>0)&np.isfinite(recal_depth)&(recal_depth>0)
+            world_depth=np.asarray(association["depth"][slot]); visible=np.asarray(association["visibility"][slot],bool)
+            point_index=np.asarray(association["point_index"][slot],np.int64)
+            tolerance=np.maximum(2*self.voxel_size,.02*np.minimum(recal_depth,world_depth)); residual=np.abs(recal_depth-world_depth)
+            match=valid&visible&np.isfinite(world_depth)&(residual<=tolerance)&(point_index>=0)
+            conflict=valid&visible&~match; novel=valid&~visible
+            metrics["association_match_pixels"]+=int(match.sum()); metrics["association_conflict_pixels"]+=int(conflict.sum())
+            metrics["association_novel_pixels"]+=int(novel.sum()); residuals.extend(residual[match].tolist())
+            metrics["matched_world_points"]+=self._update_owned(point_index[match],conf[match],image[match],index)
+            mask=np.zeros((*valid.shape,3),np.uint8); mask[match]=(0,255,0); mask[conflict]=(255,0,0)
+            ny,nx=np.nonzero(novel)
+            if len(ny):
+                nxyz,nconf,nrgb,ndepth=xyz[ny,nx],conf[ny,nx],image[ny,nx],recal_depth[ny,nx]
+                source_z,inside,source_depth,source_idx=self._project_source(nxyz)
+                source_valid=inside&np.isfinite(source_depth); free_tol=np.maximum(3*self.voxel_size,.03*source_depth)
+                violation=source_valid&(source_z<source_depth-free_tol)
+                duplicate=source_valid&(np.abs(source_z-source_depth)<=free_tol)&(source_idx>=0)
+                metrics["source_free_space_rejected"]+=int(violation.sum()); metrics["source_surface_duplicate_pixels"]+=int(duplicate.sum())
+                mask[ny[violation],nx[violation]]=(255,0,255); mask[ny[~violation],nx[~violation]]=(0,0,255)
+                metrics["matched_world_points"]+=self._update_owned(source_idx[duplicate],nconf[duplicate],nrgb[duplicate],index)
+                pending=~violation&~duplicate
+                if pending.any():
+                    pxyz,pconf,prgb,pdepth=nxyz[pending],nconf[pending],nrgb[pending],ndepth[pending]
+                    pkeys=np.floor(pxyz/self.voxel_size).astype(np.int64); _,first=np.unique(pkeys,axis=0,return_index=True)
+                    pending_positions=np.flatnonzero(pending)
+                    for j in first:
+                        candidate=self._pending_candidate(pxyz[j],prgb[j],pconf[j],pdepth[j],index)
+                        if len(candidate["supports"])>=self.novel_min_frames and all(candidate is not value for value in confirmed):
+                            confirmed.append(candidate); key=tuple(np.floor(pxyz[j]/self.voxel_size).astype(np.int64))
+                            current=np.all(pkeys==key,axis=1); pos=pending_positions[current]
+                            mask[ny[pos],nx[pos]]=(0,255,255)
+            masks.append(mask); fused_frames.append(index); self._fused_frame_ids.add(index); self._pending_frame_ids.discard(index)
+        for candidate in confirmed:
+            values=list(candidate["supports"].values()); xyz_med=np.median(np.stack([v[0] for v in values]),0).astype(np.float32)
+            best=max(values,key=lambda value:value[2]); owned=self._owned_neighbor(xyz_med,best[3])
+            if owned is not None:
+                self._update_owned(np.array([owned]),np.array([best[2]]),np.array([best[1]]),max(candidate["supports"]))
+            else:
+                confs=np.array([v[2] for v in values],np.float32); count=len(candidate["supports"])
+                self._xyz=np.vstack([self._xyz,xyz_med]); self._rgb=np.vstack([self._rgb,best[1]])
+                self._observations=np.r_[self._observations,count]; self._weight=np.r_[self._weight,float(confs.sum())]
+                self._anchor_confidence=np.r_[self._anchor_confidence,best[2]]; self._anchor_frame=np.r_[self._anchor_frame,max(candidate["supports"])]
+                self._source_locked=np.r_[self._source_locked,False]
+                self._owned[tuple(np.floor(xyz_med/self.voxel_size).astype(np.int64))]=len(self._xyz)-1
+                metrics["novel_confirmed_points"]+=1
+            self._pending_surfaces.pop(candidate["key"],None)
+        expired=[key for key,value in self._pending_surfaces.items() if self._chunk_serial-value["last_chunk"]>=self.pending_expiry_chunks]
+        for key in expired: self._pending_surfaces.pop(key,None)
+        metrics["novel_expired_count"]=len(expired); self._seen_frame_ids.update(identities)
+        self._version+=1; self._chunk_serial+=1; self._publish(); self._last_association_masks=masks; self._association_cache=None
+        residuals=np.asarray(residuals,np.float32)
+        self.last_update_metrics={"world_version":self._version,"frames_submitted":len(indices),"frames_fused":len(fused_frames),
+            "fused_frame_indices":fused_frames,"frames_pending":len(self._pending_frame_ids),"pending_frame_indices":sorted(self._pending_frame_ids),
+            "world_point_count_before":before_points,"world_point_count_after":len(self._xyz),
+            "observation_count_before":before_obs,"observation_count_after":int(self._observations.sum()),**metrics,
+            "novel_pending_count":len(self._pending_surfaces),"match_depth_residual_median":float(np.median(residuals)) if len(residuals) else None,
+            "match_depth_residual_p95":float(np.percentile(residuals,95)) if len(residuals) else None,
+            "existing_xyz_moved_count":int(np.count_nonzero(np.any(self._xyz[:len(before_xyz)]!=before_xyz,axis=1))),
+            "association_render_seconds":float(association["seconds"]),"candidate_processing_seconds":time.perf_counter()-candidate_started,
+            "association_reused_wah_warp":bool(association["reused_wah_warp"]),"alignment":self.backend.get_state().get("alignment",{})}
+        if self.last_update_metrics["existing_xyz_moved_count"] != 0: raise RuntimeError("persistent surface ownership moved existing XYZ")
         return self._node
 
-    def get_point_world(self):
-        return self._node
-
+    def get_point_world(self): return self._node
+    def association_debug_masks(self): return [mask.copy() for mask in self._last_association_masks]
     def debug_geometry_for_frames(self, global_frame_indices):
-        """Expose the current full-prefix ReCal maps without retaining them."""
-        return [
-            self.backend.raw_recal_debug(self.trajectory_id, int(index))
-            for index in global_frame_indices
-        ]
+        return [self.backend.raw_recal_debug(self.trajectory_id,int(index)) for index in global_frame_indices]

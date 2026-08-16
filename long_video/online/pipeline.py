@@ -177,11 +177,17 @@ class OnlineSpatialHistoryPipeline:
         if self.pre_render_world_hook is not None:
             pre_render_snapshot = self.pre_render_world_hook(self.active_node, cameras)
         wah_world_identity_before = point_world_snapshot_identity(self.active_node)
+        association_render_started = time.perf_counter()
         warp = render(self.active_node,cameras,**self.renderer_kwargs)
+        association_render_seconds = time.perf_counter() - association_render_started
         wah_world_identity_after = point_world_snapshot_identity(self.active_node)
         if pre_render_snapshot is not None:
             validate_conditioning_world_identities(
                 pre_render_snapshot, wah_world_identity_before, wah_world_identity_after,
+            )
+        if self.world_accumulator is not None:
+            self.world_accumulator.prepare_chunk_association(
+                warp, cameras, render_seconds=association_render_seconds,
             )
         if hasattr(self.wah_pipeline, "set_world_projection_from_renderer"):
             self.wah_pipeline.set_world_projection_from_renderer(

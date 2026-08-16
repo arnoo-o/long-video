@@ -412,7 +412,7 @@ def main():
         candidate_metadata = json.loads(metadata_path.read_text())
         if (candidate_metadata.get("valid", False) and candidate_metadata.get("schema_version") == 3
                 and candidate_metadata.get("geometry_implementation_version")
-                == "recal-full-teacher-world-v6-p35-confidence-rgb-anchor"):
+                == "recal-full-teacher-world-v7-p40-confidence-rgb-anchor"):
             records.append(record)
     minimum_valid_records = 1 if args.smoke_only else 90
     if len(records) < minimum_valid_records:
@@ -481,7 +481,7 @@ def main():
         geometry_root = args.recal3r_root / record["trajectory_id"]
         metadata = json.loads((geometry_root / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v6-p35-confidence-rgb-anchor"):
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v7-p40-confidence-rgb-anchor"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(arrays["rgb_paths"][0])
         data_load_seconds = time.time() - total_started

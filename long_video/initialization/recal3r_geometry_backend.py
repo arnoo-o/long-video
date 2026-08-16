@@ -41,7 +41,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self.repo_path = str(repo_path)
         self.device = str(device)
         # Kept as a compatibility argument for old callers.  ReCal acceptance
-        # is intentionally data-driven: each original-grid frame uses the 35th
+        # is intentionally data-driven: each original-grid frame uses the 40th
         # percentile of raw confidence over geometrically valid pixels.
         self.confidence_threshold = float(confidence_threshold)
         self.confidence_temperature = float(confidence_temperature)
@@ -359,7 +359,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         finite_confidence = np.isfinite(raw_conf)
         threshold_support = inside & finite_depth & positive_depth & finite_confidence
         if threshold_support.any():
-            effective_threshold = float(np.percentile(raw_conf[threshold_support], 35.0))
+            effective_threshold = float(np.percentile(raw_conf[threshold_support], 40.0))
             calibrated = calibrate_recal3r_confidence(
                 raw_conf, effective_threshold, self.confidence_temperature,
             )
@@ -385,7 +385,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "positive_depth_count": int(positive_depth.sum()),
             "finite_confidence_count": int(finite_confidence.sum()),
             "confidence_threshold_count": int(confidence_threshold.sum()),
-            "confidence_threshold_mode": "p35_valid_grid_raw_confidence",
+            "confidence_threshold_mode": "p40_valid_grid_raw_confidence",
             "effective_confidence_threshold": (
                 effective_threshold if np.isfinite(effective_threshold) else None
             ),

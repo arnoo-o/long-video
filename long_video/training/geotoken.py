@@ -15,8 +15,8 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v7-source-depth-anchor"
-GEOMETRY_IMPLEMENTATION_VERSION = "recal-teacher-rgb-anchor-v5"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v8-persistent-surface-ownership"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-p40-persistent-surface-ownership-v6"
 GEOMETRY_SCHEMA_VERSION = 3
 def _wah_runtime_fingerprint():
     root = Path(__file__).resolve().parents[2]
@@ -199,7 +199,7 @@ def load_causal_world_cache(root: Path, frame_limit: int):
     if not metadata_path.is_file():
         raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v6-p35-confidence-rgb-anchor":
+    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v7-p40-surface-ownership":
         raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():

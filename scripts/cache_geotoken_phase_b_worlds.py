@@ -14,7 +14,7 @@ from long_video.geometry.voxel_fusion import fuse_voxels
 
 
 FRAME_LIMITS = (0, 32, 64, 96, 128, 160)
-GEOMETRY_CACHE_VERSION = "recal-causal-teacher-world-v6-p35-confidence-rgb-anchor"
+GEOMETRY_CACHE_VERSION = "recal-causal-teacher-world-v7-p40-surface-ownership"
 
 
 def fuse(root: Path, dataset_root: Path, frame_limit: int, voxel_size: float):
@@ -34,8 +34,32 @@ def fuse(root: Path, dataset_root: Path, frame_limit: int, voxel_size: float):
     keys = np.floor(points / voxel_size).astype(np.int64)
     unique, inverse = np.unique(keys, axis=0, return_inverse=True)
     max_frame = np.full(len(unique), -1, np.int32); np.maximum.at(max_frame, inverse, frame_ids)
+    # Offline causal teacher equivalent of persistent ownership: frame-0
+    # surfaces are source-owned immediately; all other voxels need three
+    # distinct frame supports. Their XYZ is the coordinate-wise median of the
+    # first three supporting frames and is then kept immutable while confidence,
+    # observation count and appearance anchors continue to aggregate.
+    pairs = np.stack([inverse, frame_ids.astype(np.int64)], axis=1)
+    unique_pairs, first_observation = np.unique(pairs, axis=0, return_index=True)
+    support_counts = np.bincount(unique_pairs[:, 0], minlength=len(unique))
+    support_starts = np.r_[0, np.cumsum(support_counts)]
+    support_rank = np.arange(len(unique_pairs)) - np.repeat(support_starts[:-1], support_counts)
+    first_three = support_rank < 3
+    support_grid = np.full((len(unique), 3, 3), np.nan, np.float32)
+    support_grid[unique_pairs[first_three, 0], support_rank[first_three]] = points[first_observation[first_three]]
+    canonical = np.nanmedian(support_grid, axis=1).astype(np.float32)
+    source_pairs = unique_pairs[:, 1] == 0
+    source_voxels = unique_pairs[source_pairs, 0]
+    canonical[source_voxels] = points[first_observation[source_pairs]]
+    keep = (support_counts >= 3)
+    keep[source_voxels] = True
+    observation_keep = keep[inverse]
+    points = canonical[inverse[observation_keep]]
+    colors, weights, frame_ids = colors[observation_keep], weights[observation_keep], frame_ids[observation_keep]
     xyz, rgb, conf, obs, fused_keys, anchors = fuse_voxels(points, colors, weights, voxel_size=voxel_size,
         anchor_frame=frame_ids, return_anchors=True)
+    max_by_key = {tuple(key): max_frame[index] for index, key in enumerate(unique) if keep[index]}
+    max_frame = np.asarray([max_by_key[tuple(key)] for key in fused_keys], np.int32)
     return fused_keys, xyz, rgb, conf, obs, max_frame, anchors
 
 
@@ -52,7 +76,7 @@ def main():
         source = args.recal3r_root / trajectory_id
         metadata = json.loads((source / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v6-p35-confidence-rgb-anchor"
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v7-p40-confidence-rgb-anchor"
                 or float(metadata.get("voxel_size", -1)) != 0.02):
             raise RuntimeError(f"stale Phase A ReCal cache: {source}")
         target = args.output_root / trajectory_id
@@ -64,6 +88,7 @@ def main():
             "schema_version": 3, "geometry_implementation_version": GEOMETRY_CACHE_VERSION,
             "source_recal_metadata": metadata, "voxel_size": float(args.voxel_size),
             "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
+            "surface_ownership_version": "immutable-xyz-three-frame-confirmation-v1",
         }, indent=2))
         for frame_limit in FRAME_LIMITS:
             keys, points, rgb, confidence, observation_count, max_frame, anchors = fuse(source, args.dataset_root, frame_limit, args.voxel_size)

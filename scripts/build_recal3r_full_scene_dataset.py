@@ -162,7 +162,7 @@ def process_record(record, args, model_bundle):
     if args.resume and (destination / "metadata.json").exists():
         metadata = json.loads((destination / "metadata.json").read_text())
         if (metadata.get("valid") and
-                metadata.get("geometry_implementation_version") == "recal-full-teacher-world-v6-p35-confidence-rgb-anchor"):
+                metadata.get("geometry_implementation_version") == "recal-full-teacher-world-v7-p40-confidence-rgb-anchor"):
             print(f"[skip] {trajectory_id}")
             return metadata
 
@@ -215,7 +215,7 @@ def process_record(record, args, model_bundle):
             depth = point_self[..., 2]
             raw_depth, _ = remap_model_map(depth.astype(np.float32), transform, cv2.INTER_LINEAR)
             threshold_support = inside & np.isfinite(raw_depth) & (raw_depth > 0) & np.isfinite(raw_conf)
-            effective_threshold = float(np.percentile(raw_conf[threshold_support], 35.0)) if threshold_support.any() else float("inf")
+            effective_threshold = float(np.percentile(raw_conf[threshold_support], 40.0)) if threshold_support.any() else float("inf")
             conf = calibrate_recal3r_confidence(raw_conf, effective_threshold)
             finite = np.isfinite(xyz).all(axis=-1) & np.isfinite(conf)
             valid = inside & finite & (raw_conf >= effective_threshold)
@@ -257,9 +257,9 @@ def process_record(record, args, model_bundle):
                  camera_alignment_error=np.float64(alignment.camera_alignment_error))
         metadata = {
             "schema_version": 3,
-            "geometry_implementation_version": "recal-full-teacher-world-v6-p35-confidence-rgb-anchor",
+            "geometry_implementation_version": "recal-full-teacher-world-v7-p40-confidence-rgb-anchor",
             "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
-            "confidence_calibration": {"kind": "sigmoid", "threshold": "p35_valid_grid_raw_confidence", "temperature": 0.35},
+            "confidence_calibration": {"kind": "sigmoid", "threshold": "p40_valid_grid_raw_confidence", "temperature": 0.35},
             "trajectory_id": trajectory_id,
             "rgb_dir": record["rgb_dir"],
             "scene_hash": record.get("scene_hash"),
@@ -269,7 +269,7 @@ def process_record(record, args, model_bundle):
             "frame_count": 193,
             "height": height,
             "width": width,
-            "confidence_threshold_mode": "p35_valid_grid_raw_confidence",
+            "confidence_threshold_mode": "p40_valid_grid_raw_confidence",
             "voxel_size": args.voxel_size,
             "valid_pixel_ratio": valid_pixels / (193 * height * width),
             "scene_point_count": int(len(scene["points_xyz"])),

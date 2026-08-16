@@ -66,12 +66,29 @@ def test_plane_depth_jitter_plateaus_and_never_moves_owned_xyz():
     assert accumulator.last_update_metrics["association_match_pixels"] == 32
 
 
-def test_front_and_back_current_view_conflicts_are_rejected():
+def test_initial_recal_chunk_does_not_conflict_with_pi3x_w0():
     predictions = [prediction(.5), prediction(1.5)]
     warp, cameras = association(2)
     accumulator = run(predictions, warp, cameras)
-    assert len(accumulator.get_point_world().points_xyz) == 1
+    assert len(accumulator.get_point_world().points_xyz) == 2
     assert int(accumulator.get_point_world().observation_count[0]) == 1
+    assert accumulator.last_update_metrics["association_conflict_pixels"] == 0
+    assert accumulator.last_update_metrics["association_novel_pixels"] == 2
+    assert accumulator.last_update_metrics["source_free_space_rejected"] == 1
+    assert accumulator.last_update_metrics["novel_committed_points"] == 1
+
+
+def test_front_and_back_current_view_conflicts_are_rejected_after_chunk0():
+    backend = Backend([prediction(1.0)])
+    accumulator = ReCal3RWorldAccumulator(backend, node(), trajectory_id="test")
+    warp, cameras = association(1)
+    accumulator.prepare_chunk_association(warp, cameras)
+    accumulator.update_chunk(np.zeros((1, H, W, 3), np.uint8), cameras.c2w, cameras.intrinsics, [1])
+    backend.predictions.extend([prediction(.5), prediction(1.5)])
+    warp, cameras = association(2)
+    accumulator.prepare_chunk_association(warp, cameras)
+    accumulator.update_chunk(np.zeros((2, H, W, 3), np.uint8), cameras.c2w, cameras.intrinsics, [2, 3])
+    assert len(accumulator.get_point_world().points_xyz) == 1
     assert accumulator.last_update_metrics["association_conflict_pixels"] == 2
 
 

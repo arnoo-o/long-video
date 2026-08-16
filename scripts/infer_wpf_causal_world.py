@@ -200,6 +200,6 @@ def main():
     semantics_path=a.output_dir/'recal_debug_semantics.json'
     semantics=json.loads(semantics_path.read_text()); semantics['confidence_threshold']='40th percentile of raw confidence over valid original-grid depth/confidence pixels, per ReCal frame'; semantics['persistent_surface_association_mask']='green=MATCH/owned duplicate, red=CONFLICT, blue=valid NOVEL before commit, cyan=chunk-local NOVEL committed, magenta=FREE_SPACE_VIOLATION, black=invalid'; semantics_path.write_text(json.dumps(semantics,indent=2))
     metrics_path=a.output_dir/'metrics.json'
-    metrics_payload=json.loads(metrics_path.read_text()); metrics_payload['recal_confidence_threshold_mode']='p40_valid_grid_raw_confidence'; metrics_payload['surface_ownership']='immutable_xyz_chunk_local_immediate_commit_v2'; metrics_path.write_text(json.dumps(metrics_payload,indent=2,default=str))
+    metrics_payload=json.loads(metrics_path.read_text()); metrics_payload['recal_confidence_threshold_mode']='p40_valid_grid_raw_confidence'; metrics_payload['surface_ownership']='immutable_xyz_chunk_local_immediate_commit_first_chunk_nonconflicting_v3'; metrics_path.write_text(json.dumps(metrics_payload,indent=2,default=str))
 if __name__=='__main__': main()
 

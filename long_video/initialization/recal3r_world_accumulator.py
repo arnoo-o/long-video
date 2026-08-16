@@ -81,7 +81,7 @@ class ReCal3RWorldAccumulator:
             "source_locked": self._source_locked.copy()}
         self._node.quality_metrics.update({"recal3r_world_version": self._version,
             "voxel_size": self.voxel_size, "accumulator_points": int(len(self._xyz)),
-            "surface_ownership": "immutable_xyz_chunk_local_immediate_commit_v2"})
+            "surface_ownership": "immutable_xyz_chunk_local_immediate_commit_first_chunk_nonconflicting_v3"})
 
     def prepare_chunk_association(self, warp, cameras, *, render_seconds=0.0):
         """Reuse the one pre-generation WAH render as the W_k association cache."""
@@ -241,8 +241,14 @@ class ReCal3RWorldAccumulator:
             )
             tolerance = np.maximum(2 * self.voxel_size, .02 * np.minimum(recal_depth, world_depth))
             match = valid & has_world & (residual <= tolerance)
-            conflict = valid & has_world & ~match
-            novel = valid & ~has_world
+            # W0 is a source-only Pi3X initialization. During the first ReCal
+            # chunk it is an alignment/free-space anchor, not a conflict veto:
+            # unmatched ReCal surfaces must be allowed through the existing
+            # source free-space test and chunk-local ownership commit. Once W1
+            # is published, normal persistent-surface conflict rejection starts.
+            initial_recal_chunk = self._chunk_serial == 0
+            conflict = valid & has_world & ~match & (not initial_recal_chunk)
+            novel = valid & (~has_world | (has_world & ~match & initial_recal_chunk))
             metrics["association_match_pixels"] += int(match.sum())
             metrics["association_conflict_pixels"] += int(conflict.sum())
             metrics["association_novel_pixels"] += int(novel.sum())

@@ -131,6 +131,13 @@ class OnlineSpatialHistoryPipeline:
         result = self._video_array(video)
         if len(result) != 33:
             raise RuntimeError(f"WAH current history chunk must contain 33 frames, got {len(result)}")
+        # WAH's numpy postprocessor emits display-range floats.  ReCal and the
+        # persistent PointWorld require actual RGB samples, not float values
+        # truncated by an implicit astype(uint8) at the fusion boundary.
+        if result.dtype != np.uint8:
+            finite = np.isfinite(result)
+            if finite.all() and float(result.min()) >= 0.0 and float(result.max()) <= 1.0:
+                result = np.rint(result * 255.0).astype(np.uint8)
         return result
 
     @staticmethod

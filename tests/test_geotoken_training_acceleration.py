@@ -64,6 +64,20 @@ def test_history_video_reuses_wah_decode_and_matches_legacy_path():
     assert "_decode_autoregressive_latents" not in source
 
 
+def test_history_video_float_rgb_is_canonical_uint8_before_world_fusion():
+    decoded = torch.full((1, 3, 33, 4, 5), 0.25)
+
+    class Pipe:
+        video_processor = _VideoProcessor()
+
+    online = object.__new__(OnlineSpatialHistoryPipeline)
+    online.wah_pipeline = Pipe()
+    online.autoregressive_state = {"history_video": decoded}
+    current = online._current_history_video_chunk()
+    assert current.dtype == np.uint8
+    assert np.all(current == 64)
+
+
 def test_source_rgb_identity_is_cached_per_trajectory(monkeypatch):
     calls = []
     monkeypatch.setattr(training, "file_sha256", lambda path: calls.append(path) or f"hash:{path}")

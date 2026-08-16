@@ -16,7 +16,7 @@ class ReCal3RWorldAccumulator:
     """Own immutable XYZ surfaces; only confirmed novel surfaces may be added."""
 
     def __init__(self, backend, initial_node, *, trajectory_id, voxel_size=0.02,
-                 novel_min_frames=3, pending_expiry_chunks=8):
+                 novel_min_frames=3, pending_expiry_chunks=2):
         self.backend, self.initial_node = backend, initial_node
         self.trajectory_id, self.voxel_size = str(trajectory_id), float(voxel_size)
         if self.voxel_size != 0.02:
@@ -297,11 +297,17 @@ class ReCal3RWorldAccumulator:
                 masks[int(slot)][py[marked],px_pixel[marked]]=(0,255,255)
             pending_group=~confirmed_group[inverse]
             kept=support_indices[pending_group]
-            not_expired=(self._chunk_serial-all_last[kept])<self.pending_expiry_chunks
-            metrics["novel_expired_count"]=int((~not_expired).sum())
-            kept=kept[not_expired]
             self._pending_xyz,self._pending_rgb,self._pending_conf=all_xyz[kept],all_rgb[kept],all_conf[kept]
             self._pending_depth,self._pending_frame,self._pending_last_chunk=all_depth[kept],all_frame[kept],all_last[kept]
+        expired=(self._chunk_serial-self._pending_last_chunk)>=self.pending_expiry_chunks
+        if expired.any():
+            expired_keys=np.rint(self._pending_xyz[expired]/(2*self.voxel_size)).astype(np.int64)
+            metrics["novel_expired_count"]=int(len(np.unique(expired_keys,axis=0)))
+            keep=~expired
+            self._pending_xyz,self._pending_rgb,self._pending_conf=(value[keep] for value in
+                (self._pending_xyz,self._pending_rgb,self._pending_conf))
+            self._pending_depth,self._pending_frame,self._pending_last_chunk=(value[keep] for value in
+                (self._pending_depth,self._pending_frame,self._pending_last_chunk))
         if len(confirmed_xyz):
             from scipy.spatial import cKDTree
             tree=cKDTree(self._xyz); maximum_tolerance=float(np.max(np.maximum(2*self.voxel_size,.02*confirmed_best_depth)))

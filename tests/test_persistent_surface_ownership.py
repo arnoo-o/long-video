@@ -146,3 +146,16 @@ def test_same_frame_candidate_support_is_counted_once_and_replay_is_exactly_once
         assert "processed twice" in str(error)
     else:
         raise AssertionError("pending/backfill submitted one global frame twice")
+
+
+def test_transient_candidates_expire_after_two_chunks_even_without_new_novel_pixels():
+    warp, cameras = association(1, visible=False)
+    accumulator = run([prediction(2.0)], warp, cameras)
+    assert accumulator.last_update_metrics["novel_pending_count"] == 1
+    accumulator.backend.predictions.extend([prediction(1.0), prediction(1.0)])
+    for frame in (2, 3):
+        warp, cameras = association(1, visible=True, depth=1.0, point_index=0)
+        accumulator.prepare_chunk_association(warp, cameras)
+        accumulator.update_chunk(np.zeros((1,H,W,3),np.uint8),cameras.c2w,cameras.intrinsics,[frame])
+    assert accumulator.last_update_metrics["novel_pending_count"] == 0
+    assert accumulator.last_update_metrics["novel_expired_count"] == 1

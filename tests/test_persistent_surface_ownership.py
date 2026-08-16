@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from long_video.initialization.geometry_backend import GeometryPrediction
-from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
+from long_video.initialization.recal3r_world_accumulator import (
+    MATCH_BASE_TOLERANCE, ONLINE_FUSION_VOXEL_SIZE,
+    SOURCE_FREE_SPACE_BASE_TOLERANCE, ReCal3RWorldAccumulator,
+)
 from long_video.types import CameraBatch, ScaleMetadata, SpatialNode
 
 
@@ -183,3 +186,26 @@ def test_chunk_local_voxel_median_best_rgb_and_distinct_frame_count():
     assert int(world.observation_count[1]) == 3
     assert accumulator.last_update_metrics["novel_committed_points"] == 1
     assert "novel_fusion_seconds" in accumulator.last_update_metrics
+
+
+def test_online_voxel005_does_not_expand_association_tolerances():
+    assert ONLINE_FUSION_VOXEL_SIZE == .05
+    assert MATCH_BASE_TOLERANCE == .04
+    assert SOURCE_FREE_SPACE_BASE_TOLERANCE == .06
+    backend = Backend([prediction(1.0)])
+    accumulator = ReCal3RWorldAccumulator(backend, node(), trajectory_id="test")
+    warp, cameras = association(1)
+    accumulator.prepare_chunk_association(warp, cameras)
+    accumulator.update_chunk(np.zeros((1, H, W, 3), np.uint8), cameras.c2w, cameras.intrinsics, [1])
+    backend.predictions.append(prediction(1.07))
+    accumulator.prepare_chunk_association(warp, cameras)
+    accumulator.update_chunk(np.zeros((1, H, W, 3), np.uint8), cameras.c2w, cameras.intrinsics, [2])
+    assert accumulator.last_update_metrics["association_conflict_pixels"] == 1
+    assert accumulator.last_update_metrics["association_match_pixels"] == 0
+
+
+def test_source_free_space_keeps_original_point06_tolerance_with_voxel005():
+    warp, cameras = association(1, visible=False)
+    accumulator = run([prediction(.92)], warp, cameras)
+    assert accumulator.last_update_metrics["source_free_space_rejected"] == 1
+    assert accumulator.last_update_metrics["novel_committed_points"] == 0

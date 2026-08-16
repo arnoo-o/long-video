@@ -45,6 +45,9 @@ def main():
     initial_world_started=time.perf_counter()
     node=build_pi3x_source_world(stored_node.view_rgb[0], stored_node.view_c2w[0], stored_node.view_intrinsics[0],
                                  Pi3XGeometryBackend(a.pi3x_checkpoint,a.pi3x_repo,a.device))
+    from long_video.initialization.pi3x_initial_world import revoxelize_pi3x_source_world
+    from long_video.initialization.recal3r_world_accumulator import ONLINE_FUSION_VOXEL_SIZE
+    node=revoxelize_pi3x_source_world(node,voxel_size=ONLINE_FUSION_VOXEL_SIZE)
     if torch.cuda.is_available(): torch.cuda.synchronize()
     initial_world_seconds=time.perf_counter()-initial_world_started
     if a.geotoken_checkpoint is None:
@@ -108,7 +111,7 @@ def main():
         confidence_threshold=1.5,
     )
     trajectory_id=f"inference:{a.session.resolve()}"
-    accumulator=ReCal3RWorldAccumulator(geo,node,trajectory_id=trajectory_id,voxel_size=0.02)
+    accumulator=ReCal3RWorldAccumulator(geo,node,trajectory_id=trajectory_id,voxel_size=ONLINE_FUSION_VOXEL_SIZE)
     online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=None,world_accumulator=accumulator,prompt=a.prompt,renderer_kwargs={'device':a.device, 'point_radius':0},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
     online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(PYRAMID_INFERENCE_STEPS))
     online.autoregressive_state['is_amplify_first_chunk']=False
@@ -200,6 +203,6 @@ def main():
     semantics_path=a.output_dir/'recal_debug_semantics.json'
     semantics=json.loads(semantics_path.read_text()); semantics['confidence_threshold']='40th percentile of raw confidence over valid original-grid depth/confidence pixels, per ReCal frame'; semantics['persistent_surface_association_mask']='green=MATCH/owned duplicate, red=CONFLICT, blue=valid NOVEL before commit, cyan=chunk-local NOVEL committed, magenta=FREE_SPACE_VIOLATION, black=invalid'; semantics_path.write_text(json.dumps(semantics,indent=2))
     metrics_path=a.output_dir/'metrics.json'
-    metrics_payload=json.loads(metrics_path.read_text()); metrics_payload['recal_confidence_threshold_mode']='p40_valid_grid_raw_confidence'; metrics_payload['surface_ownership']='immutable_xyz_chunk_local_immediate_commit_first_chunk_nonconflicting_v3'; metrics_path.write_text(json.dumps(metrics_payload,indent=2,default=str))
+    metrics_payload=json.loads(metrics_path.read_text()); metrics_payload['recal_confidence_threshold_mode']='p40_valid_grid_raw_confidence'; metrics_payload['surface_ownership']='immutable_xyz_chunk_local_immediate_commit_first_chunk_nonconflicting_v4'; metrics_payload['online_fusion_voxel_size']=ONLINE_FUSION_VOXEL_SIZE; metrics_payload['match_base_tolerance']=0.04; metrics_payload['source_free_space_base_tolerance']=0.06; metrics_path.write_text(json.dumps(metrics_payload,indent=2,default=str))
 if __name__=='__main__': main()
 

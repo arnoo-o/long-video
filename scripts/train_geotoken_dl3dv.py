@@ -48,6 +48,8 @@ def parse_args():
     parser.add_argument("--xyz-jitter", type=float, default=0.005)
     parser.add_argument("--prompt", default="A stable realistic view of the same scene.")
     parser.add_argument("--resume-checkpoint", type=Path)
+    parser.add_argument("--resume-phase-c-from-phase-b", action="store_true",
+                        help="allow the pinned v6 step1100 Phase-B boundary checkpoint to start v11 Phase C")
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--geotoken-strength", type=float, default=1.0)
@@ -203,7 +205,10 @@ def build_online(args, pipe, record, source, *, pi3x_provenance, prompt_embeddin
                  geometry_backend=None, pre_render_world_hook=None, initial_node=None):
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
-    from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
+    from long_video.initialization.pi3x_initial_world import revoxelize_pi3x_source_world
+    from long_video.initialization.recal3r_world_accumulator import (
+        ONLINE_FUSION_VOXEL_SIZE, ReCal3RWorldAccumulator,
+    )
 
     if initial_node is not None:
         node = initial_node
@@ -232,10 +237,12 @@ def build_online(args, pipe, record, source, *, pi3x_provenance, prompt_embeddin
             "anchor_frame": np.zeros(len(node.points_xyz), np.int32),
             "source_locked": np.ones(len(node.points_xyz), bool),
         }
+        node = revoxelize_pi3x_source_world(node, voxel_size=ONLINE_FUSION_VOXEL_SIZE)
     accumulator = None
     if geometry_backend is not None:
         accumulator = ReCal3RWorldAccumulator(
-            geometry_backend, node, trajectory_id=record["trajectory_id"], voxel_size=0.02,
+            geometry_backend, node, trajectory_id=record["trajectory_id"],
+            voxel_size=ONLINE_FUSION_VOXEL_SIZE,
         )
     online = OnlineSpatialHistoryPipeline(
         wah_pipeline=pipe, active_node=node, memory_manager=None, world_accumulator=accumulator, prompt=args.prompt,
@@ -412,7 +419,7 @@ def main():
         candidate_metadata = json.loads(metadata_path.read_text())
         if (candidate_metadata.get("valid", False) and candidate_metadata.get("schema_version") == 3
                 and candidate_metadata.get("geometry_implementation_version")
-                == "recal-full-teacher-world-v7-p40-confidence-rgb-anchor"):
+                == "recal-full-teacher-world-v4-rgb-anchor"):
             records.append(record)
     minimum_valid_records = 1 if args.smoke_only else 90
     if len(records) < minimum_valid_records:
@@ -468,7 +475,10 @@ def main():
         start_step = load_geotoken_checkpoint(
             args.resume_checkpoint, transformer=pipe.transformer, optimizer=optimizer,
             lr_scheduler=scheduler, sampler=sampler,
+            allow_phase_b_boundary_migration=args.resume_phase_c_from_phase_b,
         )
+        if args.resume_phase_c_from_phase_b and start_step != 1100:
+            raise RuntimeError("Phase-C boundary migration requires an exact step1100 checkpoint")
     geometry_backend = None
     run_started = time.time()
     steps_to_run = [start_step + 1] if args.smoke_only else range(start_step + 1, 2001)
@@ -481,7 +491,7 @@ def main():
         geometry_root = args.recal3r_root / record["trajectory_id"]
         metadata = json.loads((geometry_root / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v7-p40-confidence-rgb-anchor"):
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v4-rgb-anchor"):
             raise RuntimeError(f"invalid ReCal3R geometry selected: {record['trajectory_id']}")
         source = read_rgb(arrays["rgb_paths"][0])
         data_load_seconds = time.time() - total_started

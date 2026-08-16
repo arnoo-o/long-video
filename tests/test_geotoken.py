@@ -15,7 +15,9 @@ from long_video.geometry.geotoken_runtime import (
     stage_for_grid, stage_for_hidden_states, token_grid_for_hidden_states,
 )
 from long_video.geometry.voxel_fusion import _select_anchor_indices, fuse_voxels
-from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
+from long_video.initialization.pi3x_initial_world import (
+    build_pi3x_source_world, revoxelize_pi3x_source_world,
+)
 from long_video.online.pipeline import validate_conditioning_world_identities
 from long_video.training.geotoken import (BalancedRolloutSampler, assert_causal_world_cutoff,
     checkpoint_names, max_chunks_for_step, phase_for_step, split_phase_a_conditioning)
@@ -218,6 +220,26 @@ def test_pi3x_w0_keeps_v3_weighted_rgb_then_locks_voxel_anchor():
         anchor_confidence=np.concatenate([node.appearance_anchors["anchor_confidence"],new_conf]),
         anchor_frame=np.array([0,1],np.int32),source_locked=np.array([True,False]),return_anchors=True)
     assert np.array_equal(rgb[0],expected) and np.array_equal(anchors["anchor_rgb"][0],expected)
+
+
+def test_cached_pi3x_v3_world_is_revoxelized_and_source_locked_in_memory():
+    class Backend:
+        def predict_source(self, _rgb, _c2w, _intrinsics):
+            return SimpleNamespace(
+                point_maps=np.array([[[[.001,0,1],[.039,0,1]]]],np.float32),
+                geometry_confidence=np.array([[[.25,.75]]],np.float32),
+                depth=np.ones((1,1,2),np.float32), depth_convention="Z_DEPTH",
+                diagnostics={"source_rgb_resized":np.array([[[10,20,30],[110,120,130]]],np.uint8)},
+            )
+    cached=build_pi3x_source_world(np.zeros((1,2,3),np.uint8),np.eye(4,dtype=np.float32),np.eye(3,dtype=np.float32),Backend())
+    assert len(cached.points_xyz) == 2
+    online=revoxelize_pi3x_source_world(cached,voxel_size=.05)
+    assert len(online.points_xyz) == 1
+    expected=np.rint((np.array([10,20,30])*.25+np.array([110,120,130])*.75)).astype(np.uint8)
+    assert np.array_equal(online.points_rgb[0],expected)
+    assert bool(online.appearance_anchors["source_locked"][0])
+    assert online.quality_metrics["cache_voxel_size"] == .02
+    assert online.quality_metrics["voxel_size"] == .05
 
 
 def test_curriculum_is_unchanged():

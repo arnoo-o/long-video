@@ -9,14 +9,28 @@ from ..geometry.point_renderer import render
 from ..types import CameraBatch, ScaleMetadata
 
 
+ONLINE_FUSION_VOXEL_SIZE = 0.05
+MATCH_BASE_TOLERANCE = 0.04
+SOURCE_FREE_SPACE_BASE_TOLERANCE = 0.06
+
+
 class ReCal3RWorldAccumulator:
     """Own immutable XYZ surfaces and commit valid novel voxels once per chunk."""
 
-    def __init__(self, backend, initial_node, *, trajectory_id, voxel_size=0.02):
+    def __init__(self, backend, initial_node, *, trajectory_id,
+                 voxel_size=ONLINE_FUSION_VOXEL_SIZE,
+                 match_base_tolerance=MATCH_BASE_TOLERANCE,
+                 source_free_space_base_tolerance=SOURCE_FREE_SPACE_BASE_TOLERANCE):
         self.backend, self.initial_node = backend, initial_node
         self.trajectory_id, self.voxel_size = str(trajectory_id), float(voxel_size)
-        if self.voxel_size != 0.02:
-            raise ValueError("ReCal3R world accumulation is fixed to voxel_size=0.02")
+        self.match_base_tolerance = float(match_base_tolerance)
+        self.source_free_space_base_tolerance = float(source_free_space_base_tolerance)
+        if self.voxel_size != ONLINE_FUSION_VOXEL_SIZE:
+            raise ValueError(f"online ReCal3R fusion is fixed to voxel_size={ONLINE_FUSION_VOXEL_SIZE}")
+        if self.match_base_tolerance != MATCH_BASE_TOLERANCE:
+            raise ValueError(f"MATCH base tolerance is fixed to {MATCH_BASE_TOLERANCE}")
+        if self.source_free_space_base_tolerance != SOURCE_FREE_SPACE_BASE_TOLERANCE:
+            raise ValueError(f"source free-space base tolerance is fixed to {SOURCE_FREE_SPACE_BASE_TOLERANCE}")
         self.reset()
 
     def reset(self):
@@ -81,7 +95,9 @@ class ReCal3RWorldAccumulator:
             "source_locked": self._source_locked.copy()}
         self._node.quality_metrics.update({"recal3r_world_version": self._version,
             "voxel_size": self.voxel_size, "accumulator_points": int(len(self._xyz)),
-            "surface_ownership": "immutable_xyz_chunk_local_immediate_commit_first_chunk_nonconflicting_v3"})
+            "match_base_tolerance": self.match_base_tolerance,
+            "source_free_space_base_tolerance": self.source_free_space_base_tolerance,
+            "surface_ownership": "immutable_xyz_chunk_local_immediate_commit_first_chunk_nonconflicting_v4"})
 
     def prepare_chunk_association(self, warp, cameras, *, render_seconds=0.0):
         """Reuse the one pre-generation WAH render as the W_k association cache."""
@@ -239,7 +255,7 @@ class ReCal3RWorldAccumulator:
                 association["depth"][slot], association["visibility"][slot],
                 association["point_index"][slot], recal_depth,
             )
-            tolerance = np.maximum(2 * self.voxel_size, .02 * np.minimum(recal_depth, world_depth))
+            tolerance = np.maximum(self.match_base_tolerance, .02 * np.minimum(recal_depth, world_depth))
             match = valid & has_world & (residual <= tolerance)
             # W0 is a source-only Pi3X initialization. During the first ReCal
             # chunk it is an alignment/free-space anchor, not a conflict veto:
@@ -261,7 +277,7 @@ class ReCal3RWorldAccumulator:
                 nxyz, nconf, nrgb = xyz[ny, nx], conf[ny, nx], image[ny, nx]
                 source_z, inside, source_depth, source_idx = self._project_source(nxyz)
                 source_valid = inside & np.isfinite(source_depth)
-                free_tol = np.maximum(3 * self.voxel_size, .03 * source_depth)
+                free_tol = np.maximum(self.source_free_space_base_tolerance, .03 * source_depth)
                 violation = source_valid & (source_z < source_depth - free_tol)
                 duplicate = source_valid & (np.abs(source_z - source_depth) <= free_tol) & (source_idx >= 0)
                 metrics["source_free_space_rejected"] += int(violation.sum())

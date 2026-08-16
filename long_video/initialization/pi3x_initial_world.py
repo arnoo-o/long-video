@@ -1,9 +1,39 @@
 """Construct a source-only Pi3X W0 with canonical PointWorld voxel fusion."""
 from __future__ import annotations
 
+from dataclasses import replace
 import numpy as np
 from ..geometry.voxel_fusion import fuse_voxels
 from ..types import ScaleMetadata, SpatialNode
+
+
+def revoxelize_pi3x_source_world(node, *, voxel_size):
+    """Reaggregate a cached v3 W0 in memory without changing cache contents."""
+    voxel_size = float(voxel_size)
+    xyz, colors, confidence, observations, _, anchors = fuse_voxels(
+        node.points_xyz, node.points_rgb, node.points_confidence,
+        observation_count=node.observation_count, voxel_size=voxel_size,
+        rgb_mode="weighted", return_anchors=True,
+    )
+    if not len(xyz):
+        raise RuntimeError("Pi3X source world became empty during runtime revoxelization")
+    result = replace(node)
+    result.points_xyz = xyz
+    result.points_rgb = colors
+    result.points_confidence = confidence
+    result.observation_count = observations
+    result.points_source = np.zeros(len(xyz), np.int8)
+    result.bbox_min = xyz.min(0).astype(np.float32)
+    result.bbox_max = xyz.max(0).astype(np.float32)
+    result.coverage_radius = float(np.linalg.norm(result.bbox_max - result.bbox_min) * .5)
+    result.appearance_anchors = anchors
+    result.quality_metrics = dict(node.quality_metrics)
+    result.quality_metrics.update({
+        "cache_voxel_size": float(node.quality_metrics.get("voxel_size", .02)),
+        "voxel_size": voxel_size,
+        "runtime_revoxelized": True,
+    })
+    return result
 
 
 def build_pi3x_source_world(rgb, c2w, intrinsics, backend, *, node_id="node_000", voxel_size=0.02):

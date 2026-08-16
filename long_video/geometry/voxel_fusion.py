@@ -40,7 +40,9 @@ def _select_anchor_indices(inverse, anchor_confidence, source_locked, voxel_coun
 def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxel_size=0.02,
                 *, anchor_confidence=None, anchor_frame=None, source_locked=None, return_anchors=False,
                 rgb_mode="anchor"):
-    if float(voxel_size) != .02: raise ValueError("persistent PointWorld voxel size is exactly 0.02")
+    voxel_size = float(voxel_size)
+    if not np.isfinite(voxel_size) or voxel_size <= 0:
+        raise ValueError("voxel_size must be finite and positive")
     xyz=np.asarray(points_xyz,np.float32); rgb=np.asarray(points_rgb,np.uint8); conf=np.asarray(confidence,np.float32)
     obs=np.ones(len(xyz),np.int32) if observation_count is None else np.asarray(observation_count,np.int32).clip(1)
     anchor_conf=np.asarray(conf if anchor_confidence is None else anchor_confidence,np.float32)
@@ -51,7 +53,7 @@ def fuse_voxels(points_xyz, points_rgb, confidence, observation_count=None, voxe
     if not len(xyz):
         empty=(np.empty((0,3),np.float32),np.empty((0,3),np.uint8),np.empty(0,np.float32),np.empty(0,np.uint16),np.empty((0,3),np.int64))
         return (*empty, {"anchor_rgb":np.empty((0,3),np.uint8),"anchor_confidence":np.empty(0,np.float32),"anchor_frame":np.empty(0,np.int32),"source_locked":np.empty(0,bool)}) if return_anchors else empty
-    keys=np.floor(xyz/.02).astype(np.int64); unique,inverse=np.unique(keys,axis=0,return_inverse=True)
+    keys=np.floor(xyz/voxel_size).astype(np.int64); unique,inverse=np.unique(keys,axis=0,return_inverse=True)
     weight=conf*obs; total=np.bincount(inverse,weights=weight,minlength=len(unique)).astype(np.float32); count=np.bincount(inverse,weights=obs,minlength=len(unique)).astype(np.int32)
     out_xyz=np.stack([np.bincount(inverse,weights=weight*xyz[:,i],minlength=len(unique))/total for i in range(3)],1).astype(np.float32)
     if rgb_mode == "weighted":

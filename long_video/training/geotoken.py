@@ -15,8 +15,8 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v10-first-chunk-nonconflicting-w0"
-GEOMETRY_IMPLEMENTATION_VERSION = "recal-p40-chunk-local-surface-ownership-v8"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v11-online-voxel005"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-p40-online-voxel005-fixed-association-tolerances-v9"
 GEOMETRY_SCHEMA_VERSION = 3
 def _wah_runtime_fingerprint():
     root = Path(__file__).resolve().parents[2]
@@ -199,7 +199,7 @@ def load_causal_world_cache(root: Path, frame_limit: int):
     if not metadata_path.is_file():
         raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v7-p40-surface-ownership":
+    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v4-rgb-anchor":
         raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():
@@ -250,11 +250,22 @@ def save_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
     torch.save(payload, path)
 
 
-def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler, sampler) -> int:
+def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler, sampler,
+                             allow_phase_b_boundary_migration=False) -> int:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if (payload.get("training_semantics_version") != TRAINING_SEMANTICS_VERSION
-            or payload.get("geometry_schema_version") != GEOMETRY_SCHEMA_VERSION
-            or payload.get("geometry_implementation_version") != GEOMETRY_IMPLEMENTATION_VERSION):
+    current_semantics = (
+        payload.get("training_semantics_version") == TRAINING_SEMANTICS_VERSION
+        and payload.get("geometry_schema_version") == GEOMETRY_SCHEMA_VERSION
+        and payload.get("geometry_implementation_version") == GEOMETRY_IMPLEMENTATION_VERSION
+    )
+    phase_b_boundary_migration = (
+        bool(allow_phase_b_boundary_migration)
+        and int(payload.get("global_step", -1)) == 1100
+        and payload.get("training_semantics_version") == "wah-09aa646-camera-world-qk-binding-v6"
+        and payload.get("geometry_schema_version") == 3
+        and payload.get("geometry_implementation_version") == "recal-teacher-rgb-anchor-v5"
+    )
+    if not current_semantics and not phase_b_boundary_migration:
         raise RuntimeError("GeoToken checkpoint uses stale geometry/training semantics; resume is forbidden")
     if payload.get("wah_runtime_fingerprint") != WAH_RUNTIME_FINGERPRINT:
         raise RuntimeError("GeoToken checkpoint WAH runtime fingerprint mismatch")

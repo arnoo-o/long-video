@@ -230,7 +230,10 @@ class ReCal3RWorldAccumulator:
                     pending_batches.append((pxyz,pconf,prgb,pdepth,
                         np.full(len(pxyz),index,np.int32),np.full(len(pxyz),len(masks),np.int32),ny[pos],nx[pos]))
             masks.append(mask); fused_frames.append(index); self._fused_frame_ids.add(index); self._pending_frame_ids.discard(index)
-        confirmed_payload=[]
+        confirmed_xyz=np.empty((0,3),np.float32); confirmed_rgb=np.empty((0,3),np.uint8)
+        confirmed_conf_sum=np.empty(0,np.float32); confirmed_count=np.empty(0,np.int32)
+        confirmed_best_conf=np.empty(0,np.float32); confirmed_best_depth=np.empty(0,np.float32)
+        confirmed_last_frame=np.empty(0,np.int32)
         if pending_batches:
             px,pconf,prgb,pdepth,pframe,pslot,py,px_pixel = (
                 np.concatenate(values) for values in zip(*pending_batches)
@@ -265,9 +268,14 @@ class ReCal3RWorldAccumulator:
             sorted_groups=inverse[confidence_order]; best_first=np.r_[True,sorted_groups[1:]!=sorted_groups[:-1]]
             best_indices=support_indices[confidence_order[best_first]]
             best_by_group=np.empty(len(unique_keys),np.int64); best_by_group[inverse[confidence_order[best_first]]]=best_indices
-            for group in np.flatnonzero(confirmed_group):
-                members=support_indices[starts[group]:starts[group+1]]; best=best_by_group[group]
-                confirmed_payload.append((canonical[group],all_rgb[best],all_conf[members],all_depth[best],all_frame[members]))
+            confirmed_indices=np.flatnonzero(confirmed_group); confirmed_best=best_by_group[confirmed_indices]
+            confidence_sum=np.bincount(inverse,weights=all_conf[support_indices],minlength=len(unique_keys)).astype(np.float32)
+            last_frame=np.full(len(unique_keys),-1,np.int32)
+            np.maximum.at(last_frame,inverse,all_frame[support_indices])
+            confirmed_xyz=canonical[confirmed_indices]; confirmed_rgb=all_rgb[confirmed_best]
+            confirmed_conf_sum=confidence_sum[confirmed_indices]; confirmed_count=counts[confirmed_indices].astype(np.int32)
+            confirmed_best_conf=all_conf[confirmed_best]; confirmed_best_depth=all_depth[confirmed_best]
+            confirmed_last_frame=last_frame[confirmed_indices]
             combined=np.concatenate([unique_keys,candidate_keys])
             _,combined_inverse=np.unique(combined,axis=0,return_inverse=True)
             group_lookup=np.empty(int(combined_inverse.max())+1,np.int64)
@@ -284,26 +292,25 @@ class ReCal3RWorldAccumulator:
             kept=kept[not_expired]
             self._pending_xyz,self._pending_rgb,self._pending_conf=all_xyz[kept],all_rgb[kept],all_conf[kept]
             self._pending_depth,self._pending_frame,self._pending_last_chunk=all_depth[kept],all_frame[kept],all_last[kept]
-        new_xyz=[]; new_rgb=[]; new_observations=[]; new_weight=[]
-        new_anchor_confidence=[]; new_anchor_frame=[]
-        for xyz_med,best_rgb,confs,best_depth,frames_supported in confirmed_payload:
-            owned=self._owned_neighbor(xyz_med,best_depth)
-            if owned is not None:
-                best_conf=float(np.max(confs)); self._update_owned(np.array([owned]),np.array([best_conf]),np.asarray([best_rgb]),int(np.max(frames_supported)))
-            else:
-                count=len(frames_supported); best_conf=float(np.max(confs))
-                new_xyz.append(xyz_med); new_rgb.append(best_rgb); new_observations.append(count)
-                new_weight.append(float(confs.sum())); new_anchor_confidence.append(best_conf)
-                new_anchor_frame.append(int(np.max(frames_supported)))
-                metrics["novel_confirmed_points"]+=1
-        if new_xyz:
-            start=len(self._xyz); xyz_batch=np.asarray(new_xyz,np.float32)
-            self._xyz=np.concatenate([self._xyz,xyz_batch]); self._rgb=np.concatenate([self._rgb,np.asarray(new_rgb,np.uint8)])
-            self._observations=np.concatenate([self._observations,np.asarray(new_observations,np.int32)])
-            self._weight=np.concatenate([self._weight,np.asarray(new_weight,np.float32)])
-            self._anchor_confidence=np.concatenate([self._anchor_confidence,np.asarray(new_anchor_confidence,np.float32)])
-            self._anchor_frame=np.concatenate([self._anchor_frame,np.asarray(new_anchor_frame,np.int32)])
-            self._source_locked=np.concatenate([self._source_locked,np.zeros(len(new_xyz),bool)])
+        if len(confirmed_xyz):
+            from scipy.spatial import cKDTree
+            tree=cKDTree(self._xyz); maximum_tolerance=float(np.max(np.maximum(2*self.voxel_size,.02*confirmed_best_depth)))
+            distance,nearest=tree.query(confirmed_xyz,k=1,distance_upper_bound=maximum_tolerance,workers=-1)
+            has_nearest=nearest<len(self._xyz); voxel_neighbor=np.zeros(len(confirmed_xyz),bool)
+            if has_nearest.any():
+                candidate_keys=np.floor(confirmed_xyz[has_nearest]/self.voxel_size).astype(np.int64)
+                owned_keys=np.floor(self._xyz[nearest[has_nearest]]/self.voxel_size).astype(np.int64)
+                voxel_neighbor[has_nearest]=np.max(np.abs(candidate_keys-owned_keys),axis=1)<=1
+            tolerance=np.maximum(2*self.voxel_size,.02*confirmed_best_depth)
+            duplicate=has_nearest&voxel_neighbor&(distance<=tolerance); novel=~duplicate
+            xyz_batch=confirmed_xyz[novel]; start=len(self._xyz)
+            self._xyz=np.concatenate([self._xyz,xyz_batch]); self._rgb=np.concatenate([self._rgb,confirmed_rgb[novel]])
+            self._observations=np.concatenate([self._observations,confirmed_count[novel]])
+            self._weight=np.concatenate([self._weight,confirmed_conf_sum[novel]])
+            self._anchor_confidence=np.concatenate([self._anchor_confidence,confirmed_best_conf[novel]])
+            self._anchor_frame=np.concatenate([self._anchor_frame,confirmed_last_frame[novel]])
+            self._source_locked=np.concatenate([self._source_locked,np.zeros(int(novel.sum()),bool)])
+            metrics["novel_confirmed_points"]=int(novel.sum())
             for offset,key in enumerate(np.floor(xyz_batch/self.voxel_size).astype(np.int64)):
                 self._owned[tuple(key)]=start+offset
         self._seen_frame_ids.update(identities)

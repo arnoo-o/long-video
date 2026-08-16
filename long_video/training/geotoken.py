@@ -199,7 +199,7 @@ def load_causal_world_cache(root: Path, frame_limit: int):
     if not metadata_path.is_file():
         raise RuntimeError(f"stale causal geometry cache without provenance: {root}")
     metadata = json.loads(metadata_path.read_text())
-    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v4-rgb-anchor":
+    if metadata.get("schema_version") != 3 or metadata.get("geometry_implementation_version") != "recal-causal-teacher-world-v5-mean-confidence-rgb-anchor":
         raise RuntimeError(f"stale causal geometry cache: {root}")
     path = Path(root) / f"frame_{int(frame_limit):03d}.npz"
     if not path.is_file():

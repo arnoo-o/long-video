@@ -40,6 +40,9 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self.checkpoint = str(checkpoint)
         self.repo_path = str(repo_path)
         self.device = str(device)
+        # Kept as a compatibility argument for old callers.  ReCal acceptance
+        # is intentionally data-driven: each original-grid frame uses the mean
+        # raw confidence over geometrically valid pixels as its threshold.
         self.confidence_threshold = float(confidence_threshold)
         self.confidence_temperature = float(confidence_temperature)
         # Kept for API/checkpoint compatibility. Source alignment no longer
@@ -350,16 +353,21 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._raw_confidence[frame.identity] = raw_conf.astype(np.float32, copy=True)
         self._native_points[frame.identity] = native_points.astype(np.float32, copy=True)
         self._commanded_world[frame.identity] = mapped.astype(np.float32, copy=True)
-        calibrated = calibrate_recal3r_confidence(
-            raw_conf, self.confidence_threshold, self.confidence_temperature,
-        )
-
-        target_c2w = np.asarray(frame.c2w, np.float32)
         finite_world = np.isfinite(mapped).all(-1)
         finite_depth = np.isfinite(depth)
         positive_depth = depth > 0
         finite_confidence = np.isfinite(raw_conf)
-        confidence_threshold = raw_conf >= self.confidence_threshold
+        threshold_support = inside & finite_depth & positive_depth & finite_confidence
+        if threshold_support.any():
+            effective_threshold = float(raw_conf[threshold_support].mean())
+            calibrated = calibrate_recal3r_confidence(
+                raw_conf, effective_threshold, self.confidence_temperature,
+            )
+            confidence_threshold = raw_conf >= effective_threshold
+        else:
+            effective_threshold = float("inf")
+            calibrated = np.zeros_like(raw_conf, dtype=np.float32)
+            confidence_threshold = np.zeros_like(raw_conf, dtype=bool)
         valid = (
             inside
             & finite_world
@@ -377,6 +385,10 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "positive_depth_count": int(positive_depth.sum()),
             "finite_confidence_count": int(finite_confidence.sum()),
             "confidence_threshold_count": int(confidence_threshold.sum()),
+            "confidence_threshold_mode": "mean_valid_grid_raw_confidence",
+            "effective_confidence_threshold": (
+                effective_threshold if np.isfinite(effective_threshold) else None
+            ),
             "valid_count": int(valid.sum()),
             "raw_confidence_min": (
                 float(finite_raw_confidence.min()) if len(finite_raw_confidence) else None

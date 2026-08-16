@@ -143,3 +143,25 @@ def test_geometry_for_ignores_recal_self_view_xy():
     _, _, world_reference = backend._geometry_for(frame, reference)[0]
     _, _, world_perturbed = backend._geometry_for(frame, perturbed)[0]
     assert np.allclose(world_reference, world_perturbed, equal_nan=True)
+
+
+def test_geometry_for_uses_mean_raw_confidence_over_valid_grid_as_threshold():
+    height, width = 384, 512
+    frame = _Frame(
+        rgb=np.zeros((height, width, 3), np.uint8),
+        c2w=np.eye(4, dtype=np.float32),
+        intrinsics=_intrinsics(height, width),
+        identity="traj:19",
+    )
+    prediction = _prediction(height, width, depth=2.0)
+    confidence = prediction["conf_self"].numpy()
+    confidence[..., : width // 2] = 0.5
+    confidence[..., width // 2 :] = 1.5
+    backend = _backend(scale=1.0)
+    _, calibrated, world = backend._geometry_for(frame, prediction)[0]
+    validation = backend.geometry_validation("traj", 19)
+    assert np.isclose(validation["effective_confidence_threshold"], 1.0)
+    assert validation["confidence_threshold_mode"] == "mean_valid_grid_raw_confidence"
+    assert not np.isfinite(world[:, : width // 2]).any()
+    assert np.isfinite(world[:, width // 2 :]).all()
+    assert np.all(calibrated[:, : width // 2] == 0)

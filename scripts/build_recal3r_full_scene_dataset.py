@@ -162,7 +162,7 @@ def process_record(record, args, model_bundle):
     if args.resume and (destination / "metadata.json").exists():
         metadata = json.loads((destination / "metadata.json").read_text())
         if (metadata.get("valid") and
-                metadata.get("geometry_implementation_version") == "recal-full-teacher-world-v4-rgb-anchor"):
+                metadata.get("geometry_implementation_version") == "recal-full-teacher-world-v5-mean-confidence-rgb-anchor"):
             print(f"[skip] {trajectory_id}")
             return metadata
 
@@ -212,9 +212,13 @@ def process_record(record, args, model_bundle):
             point_target_world = apply_sim3_points(point_recal_world, alignment).astype(np.float32)
             xyz, inside = remap_model_map(point_target_world, transform, cv2.INTER_LINEAR)
             raw_conf, _ = remap_model_map(confidence.astype(np.float32), transform, cv2.INTER_LINEAR)
-            conf = calibrate_recal3r_confidence(raw_conf, args.confidence_threshold)
+            depth = point_self[..., 2]
+            raw_depth, _ = remap_model_map(depth.astype(np.float32), transform, cv2.INTER_LINEAR)
+            threshold_support = inside & np.isfinite(raw_depth) & (raw_depth > 0) & np.isfinite(raw_conf)
+            effective_threshold = float(raw_conf[threshold_support].mean()) if threshold_support.any() else float("inf")
+            conf = calibrate_recal3r_confidence(raw_conf, effective_threshold)
             finite = np.isfinite(xyz).all(axis=-1) & np.isfinite(conf)
-            valid = inside & finite & (raw_conf >= args.confidence_threshold)
+            valid = inside & finite & (raw_conf >= effective_threshold)
             xyz[~valid] = 0
             conf = np.where(np.isfinite(conf), conf, 0).astype(np.float32)
             xyz_maps[frame_index] = xyz
@@ -253,9 +257,9 @@ def process_record(record, args, model_bundle):
                  camera_alignment_error=np.float64(alignment.camera_alignment_error))
         metadata = {
             "schema_version": 3,
-            "geometry_implementation_version": "recal-full-teacher-world-v4-rgb-anchor",
+            "geometry_implementation_version": "recal-full-teacher-world-v5-mean-confidence-rgb-anchor",
             "alignment_version": "offline-full-trajectory-recal-to-dataset-v3",
-            "confidence_calibration": {"kind": "sigmoid", "threshold": args.confidence_threshold, "temperature": 0.35},
+            "confidence_calibration": {"kind": "sigmoid", "threshold": "mean_valid_grid_raw_confidence", "temperature": 0.35},
             "trajectory_id": trajectory_id,
             "rgb_dir": record["rgb_dir"],
             "scene_hash": record.get("scene_hash"),
@@ -265,7 +269,7 @@ def process_record(record, args, model_bundle):
             "frame_count": 193,
             "height": height,
             "width": width,
-            "confidence_threshold": args.confidence_threshold,
+            "confidence_threshold_mode": "mean_valid_grid_raw_confidence",
             "voxel_size": args.voxel_size,
             "valid_pixel_ratio": valid_pixels / (193 * height * width),
             "scene_point_count": int(len(scene["points_xyz"])),

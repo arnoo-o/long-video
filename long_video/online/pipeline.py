@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import fields, replace
+import time
 import numpy as np
+import torch
 
 from ..data.controls import integrate_controls
 from ..geometry.point_renderer import render
@@ -186,6 +188,9 @@ class OnlineSpatialHistoryPipeline:
                 warp.rgb, warp.visibility, warp.confidence,
                 height=cameras.height, width=cameras.width,
             )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        pixel_generation_started = time.perf_counter()
         try:
             _generated_delta, self.autoregressive_state = self.wah_adapter.generate_next_chunk(
                 self.autoregressive_state, warp, output_type="latent", fill_frame=self.wah_fill_frame,
@@ -195,6 +200,9 @@ class OnlineSpatialHistoryPipeline:
             world_projection_diagnostics = list(context.diagnostics) if context is not None else []
             if hasattr(self.wah_pipeline, "clear_world_projection_context"):
                 self.wah_pipeline.clear_world_projection_context()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        pixel_generation_seconds = time.perf_counter() - pixel_generation_started
         # Geometry history follows the same autoregressive-state ownership as
         # WAH latents.  The hook captures the pre-render active world and each
         # snapshot is detached by the provider before any ReCal3R/world mutation.
@@ -289,6 +297,9 @@ class OnlineSpatialHistoryPipeline:
             "chunk_index": self.chunk_index,
             "world_projection_diagnostics": world_projection_diagnostics,
             "uses_future_gt": False,
+            # Time spent in WAH's actual chunk generation only. Rendering,
+            # ReCal replay and PointWorld fusion are deliberately excluded.
+            "pixel_generation_seconds": pixel_generation_seconds,
         }
         self.chunk_index += 1
         return generated_chunk, poses, warp, statistics

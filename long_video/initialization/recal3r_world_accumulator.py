@@ -307,3 +307,10 @@ class ReCal3RWorldAccumulator:
 
     def get_point_world(self):
         return self._node
+
+    def debug_geometry_for_frames(self, global_frame_indices):
+        """Expose the current full-prefix ReCal maps without retaining them."""
+        return [
+            self.backend.raw_recal_debug(self.trajectory_id, int(index))
+            for index in global_frame_indices
+        ]

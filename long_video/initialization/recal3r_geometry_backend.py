@@ -12,6 +12,7 @@ from ..data.recal3r_full_scene import (
     official_resize_crop,
     remap_model_map,
 )
+from ..geometry.backprojection import backproject_z_depth
 from ..types import Z_DEPTH
 from .geometry_backend import GeometryPrediction, MultiViewGeometryBackend
 
@@ -77,6 +78,9 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         self._last_predictions = []
         self._results = {}
         self._raw_depth = {}
+        self._raw_confidence = {}
+        self._native_points = {}
+        self._commanded_world = {}
         self._geometry_validation = {}
         self._seen = set()
         self._sequence_version = 0
@@ -94,7 +98,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "frame_count": len(self._frames),
             "has_recurrent_state": self._state_args is not None,
             "backend": "official_recal3r_recurrent",
-            "geometry_placement": "source_scaled_self_view_at_commanded_c2w",
+            "geometry_placement": "recal_z_backprojected_with_commanded_intrinsics_at_commanded_c2w",
             "alignment": dict(self._alignment_metadata),
         }
 
@@ -301,7 +305,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "depth_ratio_mad": mad,
             "overlap_count": int(len(ratios)),
             "anchor_frame": 0,
-            "placement": "commanded_c2w",
+            "placement": "commanded_intrinsics_and_c2w",
         }
         # Rebuild all prefix outputs using the fixed scale. Pending generated
         # frames can then be backfilled by the accumulator exactly once.
@@ -315,26 +319,42 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         points = prediction["pts3d_in_self_view"].detach().cpu().numpy()[0]
         raw_confidence = prediction["conf_self"].detach().cpu().numpy()[0]
         transform = official_resize_crop(*frame.rgb.shape[:2], 512)
-
-        if self._alignment_scale is None:
-            world = np.full_like(points, np.nan, dtype=np.float32)
-        else:
-            # ReCal owns local geometry; the commanded camera owns world pose.
-            local = np.asarray(points, np.float32) * float(self._alignment_scale)
-            target_c2w = np.asarray(frame.c2w, np.float32)
-            world = local @ target_c2w[:3, :3].T + target_c2w[:3, 3]
-
-        mapped, inside = remap_model_map(world, transform, interpolation=1)
+        # ReCal's predicted X/Y coordinates live in its own implicit camera
+        # model. Only its self-view Z is transferable to the commanded camera.
+        raw_depth_model = np.asarray(points[..., 2], np.float32)
+        raw_depth, depth_inside = remap_model_map(
+            raw_depth_model, transform, interpolation=1
+        )
         raw_conf, _ = remap_model_map(
             raw_confidence.astype(np.float32), transform, interpolation=1
         )
+        if self._alignment_scale is None:
+            depth = np.full_like(raw_depth, np.nan, dtype=np.float32)
+        else:
+            depth = raw_depth * float(self._alignment_scale)
+        # Reconstruct local XYZ on the original RGB grid with the actual
+        # commanded intrinsics, then place it with the commanded camera pose.
+        native_points = backproject_z_depth(raw_depth, frame.intrinsics)
+        local = backproject_z_depth(depth, frame.intrinsics)
+        target_c2w = np.asarray(frame.c2w, np.float32)
+        mapped = local @ target_c2w[:3, :3].T + target_c2w[:3, 3]
+        inside = depth_inside
+        # Keep pre-threshold, pre-fusion diagnostics separate from the returned
+        # conditioning geometry, whose invalid pixels are intentionally NaN.
+        # Lightweight tests intentionally call this private helper without
+        # constructing a full backend/resetting its runtime caches.
+        if not hasattr(self, "_raw_confidence"):
+            self._raw_confidence = {}
+            self._native_points = {}
+            self._commanded_world = {}
+        self._raw_confidence[frame.identity] = raw_conf.astype(np.float32, copy=True)
+        self._native_points[frame.identity] = native_points.astype(np.float32, copy=True)
+        self._commanded_world[frame.identity] = mapped.astype(np.float32, copy=True)
         calibrated = calibrate_recal3r_confidence(
             raw_conf, self.confidence_threshold, self.confidence_temperature,
         )
 
         target_c2w = np.asarray(frame.c2w, np.float32)
-        local_check = (mapped - target_c2w[:3, 3]) @ target_c2w[:3, :3]
-        depth = local_check[..., 2].astype(np.float32)
         finite_world = np.isfinite(mapped).all(-1)
         finite_depth = np.isfinite(depth)
         positive_depth = depth > 0
@@ -371,7 +391,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         mapped[~valid] = np.nan
         depth[~valid] = np.nan
         calibrated = np.where(valid, calibrated, 0).astype(np.float32)
-        return (depth, calibrated, mapped), np.asarray(points[..., 2], np.float32)
+        return (depth, calibrated, mapped), raw_depth.astype(np.float32)
 
     def geometry_validation(self, trajectory_id, global_frame_index):
         identity = f"{trajectory_id}:{int(global_frame_index)}"
@@ -393,6 +413,19 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             interpolation=1,
         )
         return depth.astype(np.float32)
+
+    def raw_recal_debug(self, trajectory_id, global_frame_index):
+        """Return original-grid ReCal maps before thresholding or voxel fusion."""
+        identity = f"{trajectory_id}:{int(global_frame_index)}"
+        values = {
+            "raw_recal_depth": self.raw_recal_depth(trajectory_id, global_frame_index),
+            "raw_recal_confidence": self._raw_confidence.get(identity),
+            "native_recal_world": self._native_points.get(identity),
+            "commanded_world_before_fusion": self._commanded_world.get(identity),
+        }
+        if any(value is None for value in values.values()):
+            raise RuntimeError(f"missing ReCal debug geometry for {identity}")
+        return {key: np.asarray(value).copy() for key, value in values.items()}
 
     def _prediction_for_keys(self, keys):
         values = [self._results[key] for key in keys]

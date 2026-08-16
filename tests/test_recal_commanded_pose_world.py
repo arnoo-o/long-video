@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 
+from long_video.geometry.backprojection import backproject_z_depth
 from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend, _Frame
 
 
@@ -28,6 +29,10 @@ def _prediction(height=384, width=512, depth=1.0):
     }
 
 
+def _intrinsics(height, width):
+    return np.array([[420.0, 0.0, width / 2.0], [0.0, 395.0, height / 2.0], [0.0, 0.0, 1.0]], np.float32)
+
+
 def test_recal_self_view_points_use_commanded_camera_pose():
     height, width = 384, 512
     commanded = np.eye(4, dtype=np.float32)
@@ -35,7 +40,7 @@ def test_recal_self_view_points_use_commanded_camera_pose():
     frame = _Frame(
         rgb=np.zeros((height, width, 3), np.uint8),
         c2w=commanded,
-        intrinsics=np.eye(3, dtype=np.float32),
+        intrinsics=_intrinsics(height, width),
         identity="traj:1",
     )
 
@@ -46,9 +51,9 @@ def test_recal_self_view_points_use_commanded_camera_pose():
     assert np.allclose(raw_depth, 1.0)
     assert np.allclose(depth, 2.0)
     assert np.all(np.isfinite(world))
-    assert np.allclose(world[..., 0], 10.0)
-    assert np.allclose(world[..., 1], -3.0)
-    assert np.allclose(world[..., 2], 7.0)
+    expected = backproject_z_depth(np.full((height, width), 2.0, np.float32), frame.intrinsics)
+    expected = expected @ commanded[:3, :3].T + commanded[:3, 3]
+    assert np.allclose(world, expected)
     assert np.all(calibrated > 0)
 
 
@@ -78,7 +83,7 @@ def test_source_geometry_alignment_sets_scale_without_camera_baseline():
     assert np.isclose(backend._alignment_scale, 2.0)
     assert backend._alignment_metadata["status"] == "locked"
     assert backend._alignment_metadata["anchor"] == "pi3x_w0_source_geometry_alignment_v2"
-    assert backend._alignment_metadata["placement"] == "commanded_c2w"
+    assert backend._alignment_metadata["placement"] == "commanded_intrinsics_and_c2w"
 
 
 def test_commanded_pose_remains_authoritative_after_source_scale_lock():
@@ -89,12 +94,52 @@ def test_commanded_pose_remains_authoritative_after_source_scale_lock():
     frame = _Frame(
         rgb=np.zeros((height, width, 3), np.uint8),
         c2w=commanded,
-        intrinsics=np.eye(3, dtype=np.float32),
+        intrinsics=_intrinsics(height, width),
         identity="traj:17",
     )
 
     depth, _, world = backend._geometry_for(frame, _prediction(height, width))[0]
     assert np.allclose(depth, 1.5)
-    assert np.allclose(world[..., 0], -4.0)
-    assert np.allclose(world[..., 1], 2.0)
-    assert np.allclose(world[..., 2], 9.5)
+    expected = backproject_z_depth(np.full((height, width), 1.5, np.float32), frame.intrinsics)
+    expected = expected @ commanded[:3, :3].T + commanded[:3, 3]
+    assert np.allclose(world, expected)
+
+
+def test_depth_backprojection_round_trips_through_same_commanded_camera():
+    height, width = 97, 151
+    depth = np.linspace(0.4, 9.0, height * width, dtype=np.float32).reshape(height, width)
+    intrinsics = _intrinsics(height, width)
+    angle = 0.37
+    c2w = np.array([
+        [np.cos(angle), 0.0, np.sin(angle), 1.2],
+        [0.0, 1.0, 0.0, -0.7],
+        [-np.sin(angle), 0.0, np.cos(angle), 3.1],
+        [0.0, 0.0, 0.0, 1.0],
+    ], np.float32)
+    local = backproject_z_depth(depth, intrinsics)
+    world = local @ c2w[:3, :3].T + c2w[:3, 3]
+    recovered = (world - c2w[:3, 3]) @ c2w[:3, :3]
+    projected = recovered @ intrinsics.T
+    uv = projected[..., :2] / projected[..., 2:3]
+    y, x = np.indices((height, width), dtype=np.float32)
+    error = np.linalg.norm(uv - np.stack([x, y], -1), axis=-1)
+    assert float(np.median(error)) < 0.25
+
+
+def test_geometry_for_ignores_recal_self_view_xy():
+    height, width = 384, 512
+    frame = _Frame(
+        rgb=np.zeros((height, width, 3), np.uint8),
+        c2w=np.eye(4, dtype=np.float32),
+        intrinsics=_intrinsics(height, width),
+        identity="traj:xy",
+    )
+    backend = _backend(scale=1.7)
+    reference = _prediction(height, width, depth=2.0)
+    perturbed = _prediction(height, width, depth=2.0)
+    noisy = perturbed["pts3d_in_self_view"].numpy()
+    noisy[..., 0] = 5000.0
+    noisy[..., 1] = -7000.0
+    _, _, world_reference = backend._geometry_for(frame, reference)[0]
+    _, _, world_perturbed = backend._geometry_for(frame, perturbed)[0]
+    assert np.allclose(world_reference, world_perturbed, equal_nan=True)

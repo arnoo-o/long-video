@@ -130,7 +130,29 @@ def main():
         online.pre_render_world_hook=pre_render_world_hook
     from long_video.types import CameraBatch
     from long_video.geometry.point_renderer import render_geometry_cuda
+    def scalar_debug_frame(values):
+        values = np.asarray(values, np.float32)
+        finite = values[np.isfinite(values)]
+        image = np.zeros((*values.shape, 3), np.uint8)
+        if len(finite):
+            lo, hi = np.percentile(finite, (2, 98))
+            hi = max(float(hi), float(lo) + 1e-6)
+            normalized = np.clip((values - lo) / (hi - lo), 0, 1)
+            image[...] = np.rint(normalized[..., None] * 255).astype(np.uint8)
+        return image
+
+    def xyz_debug_frame(values):
+        values = np.asarray(values, np.float32)
+        image = np.zeros((*values.shape[:2], 3), np.uint8)
+        finite = np.isfinite(values).all(-1)
+        if finite.any():
+            lo, hi = np.percentile(values[finite], (2, 98), axis=0)
+            normalized = np.clip((values - lo) / np.maximum(hi - lo, 1e-6), 0, 1)
+            image[finite] = np.rint(normalized[finite] * 255).astype(np.uint8)
+        return image
+
     generated=[]; warps=[]; panels=[]; geometry_frames=[]; reports=[]
+    raw_depth_frames=[]; raw_confidence_frames=[]; native_world_frames=[]; commanded_world_frames=[]
     with torch.inference_mode():
       for chunk_controls in controls:
         video,poses,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width)
@@ -154,7 +176,13 @@ def main():
         geom[...,2]=np.where(finite,255,0).astype(np.uint8)
         offset=0 if not generated else 1
         generated.extend(g[offset:]); warps.extend(w[offset:]); geometry_frames.extend(geom[offset:])
+        frame_indices = range(int(report['frame_start']) - 1, int(report['frame_end']) + 1)
+        recal_debug = accumulator.debug_geometry_for_frames(frame_indices)
+        raw_depth_frames.extend(scalar_debug_frame(item['raw_recal_depth']) for item in recal_debug[offset:])
+        raw_confidence_frames.extend(scalar_debug_frame(item['raw_recal_confidence']) for item in recal_debug[offset:])
+        native_world_frames.extend(xyz_debug_frame(item['native_recal_world']) for item in recal_debug[offset:])
+        commanded_world_frames.extend(xyz_debug_frame(item['commanded_world_before_fusion']) for item in recal_debug[offset:])
         panel=np.concatenate([g,w,geom],axis=2); panels.extend(panel[offset:]); reports.append(report)
-    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'geometry_post_update.mp4',np.asarray(geometry_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_geometry.mp4',np.asarray(panels),fps=24,macro_block_size=1); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'camera_strength':a.camera_strength if a.geotoken_checkpoint else None,'world_strength':a.world_strength if a.geotoken_checkpoint else None,'recal_confidence_threshold':a.recal_confidence_threshold,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports},indent=2,default=str))
+    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'geometry_post_update.mp4',np.asarray(geometry_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_geometry.mp4',np.asarray(panels),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'raw_recal_depth.mp4',np.asarray(raw_depth_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'raw_recal_confidence.mp4',np.asarray(raw_confidence_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'native_recal_world.mp4',np.asarray(native_world_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'commanded_world_before_fusion.mp4',np.asarray(commanded_world_frames),fps=24,macro_block_size=1); (a.output_dir/'recal_debug_semantics.json').write_text(json.dumps({'raw_recal_depth':'ReCal pts3d_in_self_view.z remapped to the original RGB grid before thresholding','raw_recal_confidence':'ReCal conf_self remapped to the original RGB grid before thresholding','native_recal_world':'ReCal self-view Z remapped to the original RGB grid and backprojected with commanded intrinsics; local XYZ coordinate colors, not RGB','commanded_world_before_fusion':'the same commanded-intrinsics backprojection after fixed ReCal-to-W0 scale plus commanded c2w, before validity threshold or voxel fusion; coordinate colors, not RGB'},indent=2)); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'camera_strength':a.camera_strength if a.geotoken_checkpoint else None,'world_strength':a.world_strength if a.geotoken_checkpoint else None,'recal_confidence_threshold':a.recal_confidence_threshold,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports},indent=2,default=str))
 if __name__=='__main__': main()
 

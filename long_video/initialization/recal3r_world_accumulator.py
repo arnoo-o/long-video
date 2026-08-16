@@ -41,6 +41,9 @@ class ReCal3RWorldAccumulator:
         self._replay_c2w = [np.asarray(node.view_c2w[0], np.float32).copy()]
         self._replay_k = [np.asarray(node.view_intrinsics[0], np.float32).copy()]
         self._pending_surfaces, self._association_cache = {}, None
+        self._pending_xyz=np.empty((0,3),np.float32); self._pending_rgb=np.empty((0,3),np.uint8)
+        self._pending_conf=np.empty(0,np.float32); self._pending_depth=np.empty(0,np.float32)
+        self._pending_frame=np.empty(0,np.int32); self._pending_last_chunk=np.empty(0,np.int32)
         self._chunk_serial = self._version = 0
         self._node = replace(node)
         self._build_source_projection(); self._rebuild_ownership(); self._publish()
@@ -146,7 +149,7 @@ class ReCal3RWorldAccumulator:
     def _pending_group(self, xyz, rgb, confidence, depth, frame_index):
         candidate_voxel_size = 2 * self.voxel_size
         center = np.median(xyz, axis=0)
-        key0 = tuple(np.floor(center / candidate_voxel_size).astype(np.int64))
+        key0 = tuple(np.rint(center / candidate_voxel_size).astype(np.int64))
         tolerance = max(2*self.voxel_size, .02*float(np.median(depth)))
         found = None
         for delta in _NEIGHBORS:
@@ -227,39 +230,72 @@ class ReCal3RWorldAccumulator:
                     pending_batches.append((pxyz,pconf,prgb,pdepth,
                         np.full(len(pxyz),index,np.int32),np.full(len(pxyz),len(masks),np.int32),ny[pos],nx[pos]))
             masks.append(mask); fused_frames.append(index); self._fused_frame_ids.add(index); self._pending_frame_ids.discard(index)
+        confirmed_payload=[]
         if pending_batches:
             px,pconf,prgb,pdepth,pframe,pslot,py,px_pixel = (
                 np.concatenate(values) for values in zip(*pending_batches)
             )
-            candidate_keys=np.floor(px/(2*self.voxel_size)).astype(np.int64)
+            candidate_keys=np.rint(px/(2*self.voxel_size)).astype(np.int64)
             order=np.lexsort((-pconf,pframe,candidate_keys[:,2],candidate_keys[:,1],candidate_keys[:,0]))
             group_values=np.column_stack([candidate_keys,pframe])[order]
             first=np.r_[True,np.any(group_values[1:]!=group_values[:-1],axis=1)]
             selected=order[first]
-            keys_selected=candidate_keys[selected]
-            key_order=np.lexsort((keys_selected[:,2],keys_selected[:,1],keys_selected[:,0]))
-            selected=selected[key_order]; keys_selected=keys_selected[key_order]
-            boundaries=np.flatnonzero(np.r_[True,np.any(keys_selected[1:]!=keys_selected[:-1],axis=1),True])
-            for start,stop in zip(boundaries[:-1],boundaries[1:]):
-                members=selected[start:stop]
-                candidate=self._pending_group(px[members],prgb[members],pconf[members],pdepth[members],pframe[members])
-                if len(candidate["supports"])>=self.novel_min_frames and all(candidate is not value for value in confirmed):
-                    confirmed.append(candidate)
-                    for member in members: masks[pslot[member]][py[member],px_pixel[member]]=(0,255,255)
+            current_xyz,current_rgb,current_conf,current_depth,current_frame=(
+                values[selected] for values in (px,prgb,pconf,pdepth,pframe)
+            )
+            all_xyz=np.concatenate([self._pending_xyz,current_xyz]); all_rgb=np.concatenate([self._pending_rgb,current_rgb])
+            all_conf=np.concatenate([self._pending_conf,current_conf]); all_depth=np.concatenate([self._pending_depth,current_depth])
+            all_frame=np.concatenate([self._pending_frame,current_frame]); all_last=np.concatenate([
+                self._pending_last_chunk,np.full(len(current_xyz),self._chunk_serial,np.int32)])
+            all_keys=np.rint(all_xyz/(2*self.voxel_size)).astype(np.int64)
+            order=np.lexsort((-all_conf,all_frame,all_keys[:,2],all_keys[:,1],all_keys[:,0]))
+            pairs=np.column_stack([all_keys,all_frame])[order]
+            unique_support=np.r_[True,np.any(pairs[1:]!=pairs[:-1],axis=1)]
+            support_indices=order[unique_support]
+            support_keys=all_keys[support_indices]
+            key_order=np.lexsort((support_keys[:,2],support_keys[:,1],support_keys[:,0]))
+            support_indices=support_indices[key_order]; support_keys=support_keys[key_order]
+            unique_keys,inverse=np.unique(support_keys,axis=0,return_inverse=True)
+            counts=np.bincount(inverse,minlength=len(unique_keys)); starts=np.r_[0,np.cumsum(counts)]
+            ranks=np.arange(len(support_indices))-np.repeat(starts[:-1],counts)
+            first_three=ranks<3; grid=np.full((len(unique_keys),3,3),np.nan,np.float32)
+            grid[inverse[first_three],ranks[first_three]]=all_xyz[support_indices[first_three]]
+            canonical=np.nanmedian(grid,axis=1).astype(np.float32); confirmed_group=counts>=self.novel_min_frames
+            confidence_order=np.lexsort((-all_conf[support_indices],inverse))
+            sorted_groups=inverse[confidence_order]; best_first=np.r_[True,sorted_groups[1:]!=sorted_groups[:-1]]
+            best_indices=support_indices[confidence_order[best_first]]
+            best_by_group=np.empty(len(unique_keys),np.int64); best_by_group[inverse[confidence_order[best_first]]]=best_indices
+            for group in np.flatnonzero(confirmed_group):
+                members=support_indices[starts[group]:starts[group+1]]; best=best_by_group[group]
+                confirmed_payload.append((canonical[group],all_rgb[best],all_conf[members],all_depth[best],all_frame[members]))
+            combined=np.concatenate([unique_keys,candidate_keys])
+            _,combined_inverse=np.unique(combined,axis=0,return_inverse=True)
+            group_lookup=np.empty(int(combined_inverse.max())+1,np.int64)
+            group_lookup[combined_inverse[:len(unique_keys)]]=np.arange(len(unique_keys))
+            current_groups=group_lookup[combined_inverse[len(unique_keys):]]
+            current_confirmed=confirmed_group[current_groups]
+            for slot in np.unique(pslot[current_confirmed]):
+                marked=current_confirmed&(pslot==slot)
+                masks[int(slot)][py[marked],px_pixel[marked]]=(0,255,255)
+            pending_group=~confirmed_group[inverse]
+            kept=support_indices[pending_group]
+            not_expired=(self._chunk_serial-all_last[kept])<self.pending_expiry_chunks
+            metrics["novel_expired_count"]=int((~not_expired).sum())
+            kept=kept[not_expired]
+            self._pending_xyz,self._pending_rgb,self._pending_conf=all_xyz[kept],all_rgb[kept],all_conf[kept]
+            self._pending_depth,self._pending_frame,self._pending_last_chunk=all_depth[kept],all_frame[kept],all_last[kept]
         new_xyz=[]; new_rgb=[]; new_observations=[]; new_weight=[]
         new_anchor_confidence=[]; new_anchor_frame=[]
-        for candidate in confirmed:
-            values=list(candidate["supports"].values()); xyz_med=np.median(np.stack([v[0] for v in values]),0).astype(np.float32)
-            best=max(values,key=lambda value:value[2]); owned=self._owned_neighbor(xyz_med,best[3])
+        for xyz_med,best_rgb,confs,best_depth,frames_supported in confirmed_payload:
+            owned=self._owned_neighbor(xyz_med,best_depth)
             if owned is not None:
-                self._update_owned(np.array([owned]),np.array([best[2]]),np.array([best[1]]),max(candidate["supports"]))
+                best_conf=float(np.max(confs)); self._update_owned(np.array([owned]),np.array([best_conf]),np.asarray([best_rgb]),int(np.max(frames_supported)))
             else:
-                confs=np.array([v[2] for v in values],np.float32); count=len(candidate["supports"])
-                new_xyz.append(xyz_med); new_rgb.append(best[1]); new_observations.append(count)
-                new_weight.append(float(confs.sum())); new_anchor_confidence.append(best[2])
-                new_anchor_frame.append(max(candidate["supports"]))
+                count=len(frames_supported); best_conf=float(np.max(confs))
+                new_xyz.append(xyz_med); new_rgb.append(best_rgb); new_observations.append(count)
+                new_weight.append(float(confs.sum())); new_anchor_confidence.append(best_conf)
+                new_anchor_frame.append(int(np.max(frames_supported)))
                 metrics["novel_confirmed_points"]+=1
-            self._pending_surfaces.pop(candidate["key"],None)
         if new_xyz:
             start=len(self._xyz); xyz_batch=np.asarray(new_xyz,np.float32)
             self._xyz=np.concatenate([self._xyz,xyz_batch]); self._rgb=np.concatenate([self._rgb,np.asarray(new_rgb,np.uint8)])
@@ -270,16 +306,14 @@ class ReCal3RWorldAccumulator:
             self._source_locked=np.concatenate([self._source_locked,np.zeros(len(new_xyz),bool)])
             for offset,key in enumerate(np.floor(xyz_batch/self.voxel_size).astype(np.int64)):
                 self._owned[tuple(key)]=start+offset
-        expired=[key for key,value in self._pending_surfaces.items() if self._chunk_serial-value["last_chunk"]>=self.pending_expiry_chunks]
-        for key in expired: self._pending_surfaces.pop(key,None)
-        metrics["novel_expired_count"]=len(expired); self._seen_frame_ids.update(identities)
+        self._seen_frame_ids.update(identities)
         self._version+=1; self._chunk_serial+=1; self._publish(); self._last_association_masks=masks; self._association_cache=None
         residuals=np.asarray(residuals,np.float32)
         self.last_update_metrics={"world_version":self._version,"frames_submitted":len(indices),"frames_fused":len(fused_frames),
             "fused_frame_indices":fused_frames,"frames_pending":len(self._pending_frame_ids),"pending_frame_indices":sorted(self._pending_frame_ids),
             "world_point_count_before":before_points,"world_point_count_after":len(self._xyz),
             "observation_count_before":before_obs,"observation_count_after":int(self._observations.sum()),**metrics,
-            "novel_pending_count":len(self._pending_surfaces),"match_depth_residual_median":float(np.median(residuals)) if len(residuals) else None,
+            "novel_pending_count":int(len(np.unique(np.rint(self._pending_xyz/(2*self.voxel_size)).astype(np.int64),axis=0))),"match_depth_residual_median":float(np.median(residuals)) if len(residuals) else None,
             "match_depth_residual_p95":float(np.percentile(residuals,95)) if len(residuals) else None,
             "existing_xyz_moved_count":int(np.count_nonzero(np.any(self._xyz[:len(before_xyz)]!=before_xyz,axis=1))),
             "association_render_seconds":float(association["seconds"]),"candidate_processing_seconds":time.perf_counter()-candidate_started,

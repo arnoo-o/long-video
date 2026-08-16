@@ -15,8 +15,8 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v8-persistent-surface-ownership"
-GEOMETRY_IMPLEMENTATION_VERSION = "recal-p40-persistent-surface-ownership-v6"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v9-chunk-local-surface-ownership"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-p40-chunk-local-surface-ownership-v7"
 GEOMETRY_SCHEMA_VERSION = 3
 def _wah_runtime_fingerprint():
     root = Path(__file__).resolve().parents[2]

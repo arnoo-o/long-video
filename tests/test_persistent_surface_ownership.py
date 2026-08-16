@@ -80,28 +80,22 @@ def test_source_free_space_violation_is_hard_rejected():
     accumulator = run([prediction(.5)], warp, cameras)
     assert len(accumulator.get_point_world().points_xyz) == 1
     assert accumulator.last_update_metrics["source_free_space_rejected"] == 1
-    assert accumulator.last_update_metrics["novel_pending_count"] == 0
+    assert accumulator.last_update_metrics["novel_committed_points"] == 0
 
 
-def test_one_or_two_supports_pending_three_supports_commit_once():
-    two = [prediction(2.0), prediction(2.001)]
-    warp, cameras = association(2, visible=False)
-    accumulator = run(two, warp, cameras)
-    assert len(accumulator.get_point_world().points_xyz) == 1
-    assert accumulator.last_update_metrics["novel_pending_count"] == 1
-    three = two + [prediction(1.999)]
-    warp, cameras = association(3, visible=False)
-    accumulator = run(three, warp, cameras)
+def test_single_frame_novel_surface_commits_immediately():
+    warp, cameras = association(1, visible=False)
+    accumulator = run([prediction(2.0)], warp, cameras)
     assert len(accumulator.get_point_world().points_xyz) == 2
-    assert accumulator.last_update_metrics["novel_confirmed_points"] == 1
-    assert accumulator.last_update_metrics["novel_pending_count"] == 0
+    assert accumulator.last_update_metrics["novel_committed_points"] == 1
+    assert int(accumulator.get_point_world().observation_count[1]) == 1
 
 
-def test_surface_behind_source_or_outside_source_fov_can_be_pending():
+def test_surface_behind_source_or_outside_source_fov_commits():
     warp, cameras = association(2, visible=False)
     accumulator = run([prediction(2.0), prediction(2.0, x=10.0)], warp, cameras)
     assert accumulator.last_update_metrics["source_free_space_rejected"] == 0
-    assert accumulator.last_update_metrics["novel_pending_count"] == 2
+    assert accumulator.last_update_metrics["novel_committed_points"] == 2
 
 
 def test_confirmed_surface_reobserves_as_match_and_source_rgb_stays_locked():
@@ -119,7 +113,7 @@ def test_confirmed_surface_reobserves_as_match_and_source_rgb_stays_locked():
     np.testing.assert_array_equal(accumulator.get_point_world().points_xyz[1], committed)
     np.testing.assert_array_equal(accumulator.get_point_world().points_rgb[0], [10, 20, 30])
     assert accumulator.last_update_metrics["association_match_pixels"] == 1
-    assert accumulator.last_update_metrics["novel_confirmed_points"] == 0
+    assert accumulator.last_update_metrics["novel_committed_points"] == 0
 
 
 def test_source_locked_rgb_rejects_higher_confidence_generated_color():
@@ -132,11 +126,8 @@ def test_source_locked_rgb_rejects_higher_confidence_generated_color():
     assert bool(accumulator.get_point_world().appearance_anchors["source_locked"][0])
 
 
-def test_same_frame_candidate_support_is_counted_once_and_replay_is_exactly_once():
+def test_replay_is_exactly_once():
     accumulator = ReCal3RWorldAccumulator(Backend([prediction(2.0)]), node(), trajectory_id="test")
-    candidate = accumulator._pending_candidate(np.array([0, 0, 2], np.float32), np.zeros(3, np.uint8), 1.0, 2.0, 1)
-    accumulator._pending_candidate(np.array([.001, 0, 2], np.float32), np.zeros(3, np.uint8), 2.0, 2.0, 1)
-    assert len(candidate["supports"]) == 1
     warp, cameras = association(1, visible=False); accumulator.prepare_chunk_association(warp, cameras)
     accumulator.update_chunk(np.zeros((1, H, W, 3), np.uint8), cameras.c2w, cameras.intrinsics, [1])
     accumulator.backend.predictions.append(prediction(2.0)); accumulator.prepare_chunk_association(warp, cameras)
@@ -145,17 +136,33 @@ def test_same_frame_candidate_support_is_counted_once_and_replay_is_exactly_once
     except RuntimeError as error:
         assert "processed twice" in str(error)
     else:
-        raise AssertionError("pending/backfill submitted one global frame twice")
+        raise AssertionError("one global frame was submitted twice")
 
 
-def test_transient_candidates_expire_after_two_chunks_even_without_new_novel_pixels():
-    warp, cameras = association(1, visible=False)
-    accumulator = run([prediction(2.0)], warp, cameras)
-    assert accumulator.last_update_metrics["novel_pending_count"] == 1
-    accumulator.backend.predictions.extend([prediction(1.0), prediction(1.0)])
-    for frame in (2, 3):
-        warp, cameras = association(1, visible=True, depth=1.0, point_index=0)
-        accumulator.prepare_chunk_association(warp, cameras)
-        accumulator.update_chunk(np.zeros((1,H,W,3),np.uint8),cameras.c2w,cameras.intrinsics,[frame])
-    assert accumulator.last_update_metrics["novel_pending_count"] == 0
-    assert accumulator.last_update_metrics["novel_expired_count"] == 1
+def test_three_by_three_search_recovers_one_pixel_reprojection_error():
+    pred = prediction(1.0, pixel=(0, 1))
+    warp, cameras = association(1, visible=True, depth=1.0, point_index=0)
+    accumulator = run([pred], warp, cameras)
+    assert accumulator.last_update_metrics["association_match_pixels"] == 1
+    assert accumulator.last_update_metrics["association_conflict_pixels"] == 0
+    assert accumulator.last_update_metrics["association_novel_pixels"] == 0
+
+
+def test_chunk_local_voxel_median_best_rgb_and_distinct_frame_count():
+    predictions = [
+        prediction(2.001, x=.001, confidence=.2),
+        prediction(2.004, x=.004, confidence=.9),
+        prediction(2.007, x=.007, confidence=.4),
+    ]
+    warp, cameras = association(3, visible=False)
+    accumulator = ReCal3RWorldAccumulator(Backend(predictions), node(), trajectory_id="test")
+    accumulator.prepare_chunk_association(warp, cameras)
+    images = np.zeros((3, H, W, 3), np.uint8)
+    images[0, 0, 0] = (20, 0, 0); images[1, 0, 0] = (90, 0, 0); images[2, 0, 0] = (40, 0, 0)
+    accumulator.update_chunk(images, cameras.c2w, cameras.intrinsics, [1, 2, 3])
+    world = accumulator.get_point_world()
+    np.testing.assert_allclose(world.points_xyz[1], [.004, 0, 2.004], atol=1e-6)
+    np.testing.assert_array_equal(world.points_rgb[1], [90, 0, 0])
+    assert int(world.observation_count[1]) == 3
+    assert accumulator.last_update_metrics["novel_committed_points"] == 1
+    assert "novel_fusion_seconds" in accumulator.last_update_metrics

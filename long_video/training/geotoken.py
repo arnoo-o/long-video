@@ -282,5 +282,14 @@ def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
     np.random.set_state(payload["rng_state"]["numpy"])
     torch.set_rng_state(payload["rng_state"]["torch"])
     if torch.cuda.is_available() and payload["rng_state"].get("cuda") is not None:
-        torch.cuda.set_rng_state_all(payload["rng_state"]["cuda"])
+        cuda_states = payload["rng_state"]["cuda"]
+        if len(cuda_states) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_states)
+        elif phase_b_boundary_migration and torch.cuda.device_count() == 1 and len(cuda_states) >= 2:
+            # The pinned v6 checkpoint trained on physical cuda:1 with both
+            # H100s visible. Formal v11 isolates that same GPU as logical
+            # cuda:0, so restore its saved RNG stream explicitly.
+            torch.cuda.set_rng_state(cuda_states[1], device=0)
+        else:
+            raise RuntimeError("checkpoint CUDA RNG topology does not match the current training process")
     return int(payload["global_step"])

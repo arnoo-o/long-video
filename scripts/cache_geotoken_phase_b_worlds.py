@@ -14,7 +14,7 @@ from long_video.geometry.voxel_fusion import fuse_voxels
 
 
 FRAME_LIMITS = (0, 32, 64, 96, 128, 160)
-GEOMETRY_CACHE_VERSION = "recal-causal-teacher-world-v5-mean-confidence-rgb-anchor"
+GEOMETRY_CACHE_VERSION = "recal-causal-teacher-world-v6-p35-confidence-rgb-anchor"
 
 
 def fuse(root: Path, dataset_root: Path, frame_limit: int, voxel_size: float):
@@ -52,7 +52,7 @@ def main():
         source = args.recal3r_root / trajectory_id
         metadata = json.loads((source / "metadata.json").read_text())
         if (not metadata.get("valid", False) or metadata.get("schema_version") != 3
-                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v5-mean-confidence-rgb-anchor"
+                or metadata.get("geometry_implementation_version") != "recal-full-teacher-world-v6-p35-confidence-rgb-anchor"
                 or float(metadata.get("voxel_size", -1)) != 0.02):
             raise RuntimeError(f"stale Phase A ReCal cache: {source}")
         target = args.output_root / trajectory_id

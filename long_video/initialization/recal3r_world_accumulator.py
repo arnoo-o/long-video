@@ -227,6 +227,16 @@ class ReCal3RWorldAccumulator:
                 if pending.any():
                     pxyz,pconf,prgb,pdepth=nxyz[pending],nconf[pending],nrgb[pending],ndepth[pending]
                     pos=np.flatnonzero(pending)
+                    # One frame contributes at most one support to one transient
+                    # candidate. Reduce before the cross-frame sort so memory and
+                    # time scale with candidate cells, not raw image pixels.
+                    frame_keys=np.rint(pxyz/(2*self.voxel_size)).astype(np.int64)
+                    frame_order=np.lexsort((-pconf,frame_keys[:,2],frame_keys[:,1],frame_keys[:,0]))
+                    ordered_keys=frame_keys[frame_order]
+                    frame_first=np.r_[True,np.any(ordered_keys[1:]!=ordered_keys[:-1],axis=1)]
+                    selected_frame=frame_order[frame_first]
+                    pxyz,pconf,prgb,pdepth=pxyz[selected_frame],pconf[selected_frame],prgb[selected_frame],pdepth[selected_frame]
+                    pos=pos[selected_frame]
                     pending_batches.append((pxyz,pconf,prgb,pdepth,
                         np.full(len(pxyz),index,np.int32),np.full(len(pxyz),len(masks),np.int32),ny[pos],nx[pos]))
             masks.append(mask); fused_frames.append(index); self._fused_frame_ids.add(index); self._pending_frame_ids.discard(index)

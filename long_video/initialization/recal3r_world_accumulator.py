@@ -246,6 +246,8 @@ class ReCal3RWorldAccumulator:
                 if len(candidate["supports"])>=self.novel_min_frames and all(candidate is not value for value in confirmed):
                     confirmed.append(candidate)
                     for member in members: masks[pslot[member]][py[member],px_pixel[member]]=(0,255,255)
+        new_xyz=[]; new_rgb=[]; new_observations=[]; new_weight=[]
+        new_anchor_confidence=[]; new_anchor_frame=[]
         for candidate in confirmed:
             values=list(candidate["supports"].values()); xyz_med=np.median(np.stack([v[0] for v in values]),0).astype(np.float32)
             best=max(values,key=lambda value:value[2]); owned=self._owned_neighbor(xyz_med,best[3])
@@ -253,13 +255,21 @@ class ReCal3RWorldAccumulator:
                 self._update_owned(np.array([owned]),np.array([best[2]]),np.array([best[1]]),max(candidate["supports"]))
             else:
                 confs=np.array([v[2] for v in values],np.float32); count=len(candidate["supports"])
-                self._xyz=np.vstack([self._xyz,xyz_med]); self._rgb=np.vstack([self._rgb,best[1]])
-                self._observations=np.r_[self._observations,count]; self._weight=np.r_[self._weight,float(confs.sum())]
-                self._anchor_confidence=np.r_[self._anchor_confidence,best[2]]; self._anchor_frame=np.r_[self._anchor_frame,max(candidate["supports"])]
-                self._source_locked=np.r_[self._source_locked,False]
-                self._owned[tuple(np.floor(xyz_med/self.voxel_size).astype(np.int64))]=len(self._xyz)-1
+                new_xyz.append(xyz_med); new_rgb.append(best[1]); new_observations.append(count)
+                new_weight.append(float(confs.sum())); new_anchor_confidence.append(best[2])
+                new_anchor_frame.append(max(candidate["supports"]))
                 metrics["novel_confirmed_points"]+=1
             self._pending_surfaces.pop(candidate["key"],None)
+        if new_xyz:
+            start=len(self._xyz); xyz_batch=np.asarray(new_xyz,np.float32)
+            self._xyz=np.concatenate([self._xyz,xyz_batch]); self._rgb=np.concatenate([self._rgb,np.asarray(new_rgb,np.uint8)])
+            self._observations=np.concatenate([self._observations,np.asarray(new_observations,np.int32)])
+            self._weight=np.concatenate([self._weight,np.asarray(new_weight,np.float32)])
+            self._anchor_confidence=np.concatenate([self._anchor_confidence,np.asarray(new_anchor_confidence,np.float32)])
+            self._anchor_frame=np.concatenate([self._anchor_frame,np.asarray(new_anchor_frame,np.int32)])
+            self._source_locked=np.concatenate([self._source_locked,np.zeros(len(new_xyz),bool)])
+            for offset,key in enumerate(np.floor(xyz_batch/self.voxel_size).astype(np.int64)):
+                self._owned[tuple(key)]=start+offset
         expired=[key for key,value in self._pending_surfaces.items() if self._chunk_serial-value["last_chunk"]>=self.pending_expiry_chunks]
         for key in expired: self._pending_surfaces.pop(key,None)
         metrics["novel_expired_count"]=len(expired); self._seen_frame_ids.update(identities)

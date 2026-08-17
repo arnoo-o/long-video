@@ -15,6 +15,7 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from dataclasses import asdict, dataclass, fields
+import uuid
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -89,6 +90,11 @@ def save_config(config: RemoteConfig) -> None:
 
 def _posix_command(arguments) -> str:
     return shlex.join([str(item) for item in arguments])
+
+
+def make_run_name() -> str:
+    """Return a collision-proof name even for back-to-back GUI launches."""
+    return f"gui_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
 class SegmentDialog(tk.Toplevel):
@@ -220,8 +226,29 @@ class RemoteInferenceWorker:
         self.events.put((kind, value))
 
     def _base_ssh(self):
-        return ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30",
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+                "-o", "ConnectionAttempts=2", "-o", "ServerAliveInterval=15",
+                "-o", "ServerAliveCountMax=4",
                 "-i", self.config.ssh_key, self.config.host]
+
+    def _quick_remote(self, command: list[str], label: str, *, timeout=45):
+        """Run setup commands with a deadline instead of blocking the GUI forever."""
+        if self.cancelled.is_set():
+            raise RuntimeError("任务已取消")
+        self._emit("status", label)
+        try:
+            completed = subprocess.run(
+                self._base_ssh() + [_posix_command(command)], capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"{label}超时（{timeout}s），请检查 SSH/H100 状态后重试") from error
+        if completed.stdout.strip():
+            self._emit("log", completed.stdout.strip())
+        if completed.returncode:
+            detail = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError(f"{label}失败，SSH exit code={completed.returncode}: {detail}")
 
     def _stream(self, command: list[str], label: str, *, remote_group=False, cwd=None):
         if self.cancelled.is_set():
@@ -233,24 +260,42 @@ class RemoteInferenceWorker:
             remote = f"echo $$ > {shlex.quote(self.remote_pid_file)}; {remote}"
             remote = "setsid bash -c " + shlex.quote(remote)
         self._emit("status", label)
-        self.process = subprocess.Popen(
+        process = subprocess.Popen(
             self._base_ssh() + [remote], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace",
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        assert self.process.stdout is not None
-        for line in self.process.stdout:
-            self._emit("log", line.rstrip())
-        code = self.process.wait()
-        self.process = None
+        self.process = process
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                self._emit("log", line.rstrip())
+            code = process.wait()
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            if self.process is process:
+                self.process = None
         if code != 0:
             raise RuntimeError(f"{label}失败，SSH exit code={code}")
 
     def _copy(self, source: str, target: str, label: str):
         self._emit("status", label)
         command = ["scp", "-q", "-i", self.config.ssh_key, source, target]
-        completed = subprocess.run(command, capture_output=True, text=True,
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=1800,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"{label}传输超时") from error
         if completed.returncode:
             raise RuntimeError(f"{label}失败：{completed.stderr.strip()}")
 
@@ -267,8 +312,7 @@ class RemoteInferenceWorker:
     def run(self, *, source_image: Path | None, prompt: str, negative_prompt: str,
             segments: list[TrajectorySegment], output_root: Path, seed: int):
         try:
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            run_name = f"gui_{stamp}"
+            run_name = make_run_name()
             local_dir = output_root / run_name
             local_dir.mkdir(parents=True, exist_ok=False)
             document = trajectory_document(segments)
@@ -286,7 +330,7 @@ class RemoteInferenceWorker:
             remote_controls = str(PurePosixPath(remote_dir) / "controls.json")
             remote_source = str(PurePosixPath(remote_dir) / "source.png")
             self.remote_pid_file = str(PurePosixPath(remote_dir) / "inference.pid")
-            self._stream(["mkdir", "-p", remote_dir], "创建 H100 任务目录")
+            self._quick_remote(["mkdir", "-p", remote_dir], "创建 H100 任务目录")
             self._copy(str(controls_path), f"{self.config.host}:{remote_controls}", "上传轨迹")
             if source_image is not None:
                 self._copy(str(source_image), f"{self.config.host}:{remote_source}", "上传首帧")
@@ -516,6 +560,9 @@ class InferenceGUI(tk.Tk):
         self.log.configure(state="disabled")
 
     def _start(self):
+        if self.thread is not None and self.thread.is_alive():
+            messagebox.showwarning("任务仍在结束", "上一任务尚未完全释放，请稍后再试。", parent=self)
+            return
         try:
             source = Path(self.source_path.get()).resolve() if self.source_path.get().strip() else None
             if source is not None and not source.is_file():
@@ -556,9 +603,14 @@ class InferenceGUI(tk.Tk):
             self.worker.cancel()
 
     def _finish(self):
+        if self.thread is not None and self.thread.is_alive():
+            self.after(50, self._finish)
+            return
         self.progress.stop()
         self.start_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
+        self.worker = None
+        self.thread = None
 
     def _poll(self):
         try:

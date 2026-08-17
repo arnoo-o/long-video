@@ -63,3 +63,8 @@ def test_trajectory_document_is_json_serializable():
 def test_invalid_segment_is_rejected():
     with np.testing.assert_raises(ValueError):
         build_controls([TrajectorySegment("none", 10, "none", 0, 1)])
+
+
+def test_gui_run_names_are_unique_for_back_to_back_jobs():
+    from scripts.geotoken_inference_gui import make_run_name
+    assert make_run_name() != make_run_name()

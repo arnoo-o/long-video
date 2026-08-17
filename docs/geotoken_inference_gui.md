@@ -37,3 +37,5 @@ python scripts/geotoken_inference_gui.py
 ## 取消与恢复
 
 “取消”会关闭本地 SSH 子进程并向 H100 inference process group 发送终止信号。远程任务目录与已产生的日志/结果不会删除，可用于排查。
+
+每次启动使用带 UUID 的独立任务目录。GUI 会等上一 worker 线程完全退出后才允许再次启动，并为任务目录创建设置 SSH 连接超时，因此连续修改轨迹后重复推理不会复用上一轮进程或无限卡在“创建 H100 任务目录”。

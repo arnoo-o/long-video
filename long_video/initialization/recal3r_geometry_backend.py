@@ -36,15 +36,19 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
     """
 
     def __init__(self, checkpoint, repo_path, device, confidence_threshold=1.5,
-                 confidence_temperature=0.35, min_alignment_frames=3):
+                 confidence_temperature=0.35, min_alignment_frames=3,
+                 confidence_quantile=0.4):
         self.checkpoint = str(checkpoint)
         self.repo_path = str(repo_path)
         self.device = str(device)
         # Kept as a compatibility argument for old callers.  ReCal acceptance
-        # is intentionally data-driven: each original-grid frame uses the 40th
-        # percentile of raw confidence over geometrically valid pixels.
+        # is intentionally data-driven: each original-grid frame uses a
+        # configurable raw-confidence quantile over geometrically valid pixels.
         self.confidence_threshold = float(confidence_threshold)
         self.confidence_temperature = float(confidence_temperature)
+        self.confidence_quantile = float(confidence_quantile)
+        if not np.isfinite(self.confidence_quantile) or not 0 <= self.confidence_quantile <= 1:
+            raise ValueError("confidence_quantile must be in [0,1]")
         # Kept for API/checkpoint compatibility. Source alignment no longer
         # waits for a camera-baseline estimate.
         self.min_alignment_frames = int(min_alignment_frames)
@@ -359,7 +363,8 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         finite_confidence = np.isfinite(raw_conf)
         threshold_support = inside & finite_depth & positive_depth & finite_confidence
         if threshold_support.any():
-            effective_threshold = float(np.percentile(raw_conf[threshold_support], 40.0))
+            confidence_quantile = float(getattr(self, "confidence_quantile", 0.4))
+            effective_threshold = float(np.quantile(raw_conf[threshold_support], confidence_quantile))
             calibrated = calibrate_recal3r_confidence(
                 raw_conf, effective_threshold, self.confidence_temperature,
             )
@@ -385,7 +390,10 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "positive_depth_count": int(positive_depth.sum()),
             "finite_confidence_count": int(finite_confidence.sum()),
             "confidence_threshold_count": int(confidence_threshold.sum()),
-            "confidence_threshold_mode": "p40_valid_grid_raw_confidence",
+            "confidence_threshold_mode": (
+                f"p{100 * float(getattr(self, 'confidence_quantile', 0.4)):g}_valid_grid_raw_confidence"
+            ),
+            "confidence_quantile": float(getattr(self, "confidence_quantile", 0.4)),
             "effective_confidence_threshold": (
                 effective_threshold if np.isfinite(effective_threshold) else None
             ),

@@ -204,6 +204,14 @@ def test_online_voxel005_does_not_expand_association_tolerances():
     assert accumulator.last_update_metrics["association_match_pixels"] == 0
 
 
+def test_inference_can_override_online_fusion_voxel_size():
+    accumulator = ReCal3RWorldAccumulator(
+        Backend([prediction(1.0)]), node(), trajectory_id="test", voxel_size=.08,
+    )
+    assert accumulator.voxel_size == .08
+    assert accumulator.get_point_world().quality_metrics["voxel_size"] == .08
+
+
 def test_source_free_space_keeps_original_point06_tolerance_with_voxel005():
     warp, cameras = association(1, visible=False)
     accumulator = run([prediction(.92)], warp, cameras)

@@ -165,3 +165,20 @@ def test_geometry_for_uses_p40_raw_confidence_over_valid_grid_as_threshold():
     assert not np.isfinite(world[:, : width // 4]).any()
     assert np.isfinite(world[:, width // 4 :]).all()
     assert np.all(calibrated[:, : width // 4] == 0)
+
+
+def test_geometry_for_supports_configurable_raw_confidence_quantile():
+    height, width = 384, 512
+    frame = _Frame(np.zeros((height, width, 3), np.uint8), np.eye(4, dtype=np.float32),
+                   _intrinsics(height, width), "traj:23")
+    prediction = _prediction(height, width, depth=2.0)
+    confidence = prediction["conf_self"].numpy()
+    confidence[..., : width // 2] = 0.2
+    confidence[..., width // 2:] = 1.8
+    backend = _backend(scale=1.0)
+    backend.confidence_quantile = 0.75
+    backend._geometry_for(frame, prediction)
+    validation = backend.geometry_validation("traj", 23)
+    assert np.isclose(validation["effective_confidence_threshold"], 1.8)
+    assert validation["confidence_threshold_mode"] == "p75_valid_grid_raw_confidence"
+    assert validation["confidence_quantile"] == .75

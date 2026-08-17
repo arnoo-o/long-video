@@ -25,8 +25,8 @@ class ReCal3RWorldAccumulator:
         self.trajectory_id, self.voxel_size = str(trajectory_id), float(voxel_size)
         self.match_base_tolerance = float(match_base_tolerance)
         self.source_free_space_base_tolerance = float(source_free_space_base_tolerance)
-        if self.voxel_size != ONLINE_FUSION_VOXEL_SIZE:
-            raise ValueError(f"online ReCal3R fusion is fixed to voxel_size={ONLINE_FUSION_VOXEL_SIZE}")
+        if not np.isfinite(self.voxel_size) or self.voxel_size <= 0:
+            raise ValueError("online ReCal3R fusion voxel_size must be finite and positive")
         if self.match_base_tolerance != MATCH_BASE_TOLERANCE:
             raise ValueError(f"MATCH base tolerance is fixed to {MATCH_BASE_TOLERANCE}")
         if self.source_free_space_base_tolerance != SOURCE_FREE_SPACE_BASE_TOLERANCE:

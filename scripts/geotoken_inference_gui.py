@@ -63,6 +63,8 @@ class RemoteConfig:
     width: int = 640
     height: int = 384
     fov_degrees: float = 90.0
+    online_fusion_voxel_size: float = 0.05
+    recal_confidence_quantile: float = 0.4
     download_debug: bool = False
     allow_stale_geotoken_semantics: bool = False
 
@@ -176,7 +178,7 @@ class SettingsDialog(tk.Toplevel):
                 raw = self.variables[field.name].get()
                 if field.name in {"width", "height"}:
                     raw = int(raw)
-                elif field.name == "fov_degrees":
+                elif field.name in {"fov_degrees", "online_fusion_voxel_size", "recal_confidence_quantile"}:
                     raw = float(raw)
                 values[field.name] = raw
             config = RemoteConfig(**values)
@@ -184,6 +186,10 @@ class SettingsDialog(tk.Toplevel):
                 raise ValueError(f"SSH key 不存在：{config.ssh_key}")
             if config.width != 640 or config.height != 384:
                 raise ValueError("当前正式推理只支持 384x640，禁止静默使用错位分辨率")
+            if not 0 < config.online_fusion_voxel_size <= 1:
+                raise ValueError("online_fusion_voxel_size 必须在 (0, 1] 范围内")
+            if not 0 <= config.recal_confidence_quantile <= 1:
+                raise ValueError("recal_confidence_quantile 必须在 [0, 1] 范围内")
         except ValueError as error:
             messagebox.showerror("设置错误", str(error), parent=self)
             return
@@ -311,6 +317,8 @@ class RemoteInferenceWorker:
                 "--geotoken-checkpoint", self.config.geotoken_checkpoint,
                 "--output-dir", remote_output, "--device", "cuda",
                 "--height", str(self.config.height), "--width", str(self.config.width),
+                "--online-fusion-voxel-size", str(self.config.online_fusion_voxel_size),
+                "--recal-confidence-quantile", str(self.config.recal_confidence_quantile),
                 "--prompt", prompt or "Continue the scene consistently.",
             ]
             if self.config.allow_stale_geotoken_semantics:
@@ -344,6 +352,8 @@ class InferenceGUI(tk.Tk):
         self.negative_prompt = tk.StringVar(value="low quality, blurry, distorted")
         self.output_root = tk.StringVar(value=str(Path.home() / "Videos" / "GeoToken"))
         self.seed = tk.StringVar(value="0")
+        self.fusion_voxel_size = tk.StringVar(value=str(self.config_data.online_fusion_voxel_size))
+        self.confidence_quantile = tk.StringVar(value=str(self.config_data.recal_confidence_quantile))
         self.status = tk.StringVar(value="就绪")
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -361,6 +371,12 @@ class InferenceGUI(tk.Tk):
         ttk.Entry(source, textvariable=self.negative_prompt).grid(row=2, column=1, columnspan=2, sticky="ew", padx=6)
         ttk.Label(source, text="随机种子").grid(row=3, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(source, textvariable=self.seed, width=12).grid(row=3, column=1, sticky="w", padx=6)
+        ttk.Label(source, text="点云合并参数（voxel size）").grid(row=4, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(source, textvariable=self.fusion_voxel_size, width=12).grid(row=4, column=1, sticky="w", padx=6)
+        ttk.Label(source, text="默认 0.05；越大点云越稀疏").grid(row=4, column=1, sticky="w", padx=(120, 6))
+        ttk.Label(source, text="ReCal 置信度分位阈值").grid(row=5, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(source, textvariable=self.confidence_quantile, width=12).grid(row=5, column=1, sticky="w", padx=6)
+        ttk.Label(source, text="默认 0.4（P40）；越大筛选越严格").grid(row=5, column=1, sticky="w", padx=(120, 6))
         source.columnconfigure(1, weight=1)
 
         trajectory = ttk.LabelFrame(self, text="轨迹段（每段自动平滑缓入/缓出）")
@@ -490,6 +506,8 @@ class InferenceGUI(tk.Tk):
         self.wait_window(dialog)
         if dialog.result:
             self.config_data = dialog.result
+            self.fusion_voxel_size.set(str(self.config_data.online_fusion_voxel_size))
+            self.confidence_quantile.set(str(self.config_data.recal_confidence_quantile))
 
     def _append_log(self, text):
         self.log.configure(state="normal")
@@ -510,6 +528,15 @@ class InferenceGUI(tk.Tk):
             trajectory_document(self.segments)
             output = Path(self.output_root.get()).resolve()
             seed = int(self.seed.get())
+            fusion_voxel_size = float(self.fusion_voxel_size.get())
+            if not 0 < fusion_voxel_size <= 1:
+                raise ValueError("点云合并参数必须在 (0, 1] 范围内")
+            self.config_data.online_fusion_voxel_size = fusion_voxel_size
+            confidence_quantile = float(self.confidence_quantile.get())
+            if not 0 <= confidence_quantile <= 1:
+                raise ValueError("ReCal 置信度分位阈值必须在 [0, 1] 范围内")
+            self.config_data.recal_confidence_quantile = confidence_quantile
+            save_config(self.config_data)
         except ValueError as error:
             messagebox.showerror("无法启动", str(error), parent=self)
             return

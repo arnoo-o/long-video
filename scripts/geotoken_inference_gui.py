@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path, PurePosixPath
 import queue
@@ -19,9 +20,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from long_video.inference.trajectory import (  # noqa: E402
-    MOVEMENT_AXES, ROTATION_SIGNS, TrajectorySegment, trajectory_document,
-)
+# Load this pure-stdlib module by path so the Windows GUI does not import
+# long_video.__init__ (and therefore does not require local NumPy/PyTorch).
+_trajectory_path = REPO_ROOT / "long_video" / "inference" / "trajectory.py"
+_trajectory_spec = importlib.util.spec_from_file_location("geotoken_gui_trajectory", _trajectory_path)
+if _trajectory_spec is None or _trajectory_spec.loader is None:
+    raise RuntimeError(f"cannot load trajectory module: {_trajectory_path}")
+_trajectory_module = importlib.util.module_from_spec(_trajectory_spec)
+sys.modules[_trajectory_spec.name] = _trajectory_module
+_trajectory_spec.loader.exec_module(_trajectory_module)
+MOVEMENT_AXES = _trajectory_module.MOVEMENT_AXES
+ROTATION_SIGNS = _trajectory_module.ROTATION_SIGNS
+TrajectorySegment = _trajectory_module.TrajectorySegment
+trajectory_document = _trajectory_module.trajectory_document
 
 
 ROTATION_LABELS = {"无": "none", "向左": "left", "向右": "right"}

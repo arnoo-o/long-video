@@ -373,10 +373,10 @@ class InferenceGUI(tk.Tk):
         ttk.Entry(source, textvariable=self.seed, width=12).grid(row=3, column=1, sticky="w", padx=6)
         ttk.Label(source, text="点云合并参数（voxel size）").grid(row=4, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(source, textvariable=self.fusion_voxel_size, width=12).grid(row=4, column=1, sticky="w", padx=6)
-        ttk.Label(source, text="默认 0.05；越大点云越稀疏").grid(row=4, column=1, sticky="w", padx=(120, 6))
+        ttk.Label(source, text="默认 0.05；越大点云越稀疏").grid(row=4, column=2, sticky="w", padx=6)
         ttk.Label(source, text="ReCal 置信度分位阈值").grid(row=5, column=0, sticky="w", padx=6, pady=5)
         ttk.Entry(source, textvariable=self.confidence_quantile, width=12).grid(row=5, column=1, sticky="w", padx=6)
-        ttk.Label(source, text="默认 0.4（P40）；越大筛选越严格").grid(row=5, column=1, sticky="w", padx=(120, 6))
+        ttk.Label(source, text="默认 0.4（P40）；越大筛选越严格").grid(row=5, column=2, sticky="w", padx=6)
         source.columnconfigure(1, weight=1)
 
         trajectory = ttk.LabelFrame(self, text="轨迹段（每段自动平滑缓入/缓出）")

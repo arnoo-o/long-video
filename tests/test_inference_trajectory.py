@@ -66,5 +66,5 @@ def test_invalid_segment_is_rejected():
 
 
 def test_gui_run_names_are_unique_for_back_to_back_jobs():
-    from scripts.geotoken_inference_gui import make_run_name
+    from long_video.inference.trajectory import make_run_name
     assert make_run_name() != make_run_name()

@@ -15,7 +15,6 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from dataclasses import asdict, dataclass, fields
-import uuid
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -34,6 +33,7 @@ MOVEMENT_AXES = _trajectory_module.MOVEMENT_AXES
 ROTATION_SIGNS = _trajectory_module.ROTATION_SIGNS
 TrajectorySegment = _trajectory_module.TrajectorySegment
 trajectory_document = _trajectory_module.trajectory_document
+make_run_name = _trajectory_module.make_run_name
 
 
 ROTATION_LABELS = {"无": "none", "向左": "left", "向右": "right"}
@@ -90,11 +90,6 @@ def save_config(config: RemoteConfig) -> None:
 
 def _posix_command(arguments) -> str:
     return shlex.join([str(item) for item in arguments])
-
-
-def make_run_name() -> str:
-    """Return a collision-proof name even for back-to-back GUI launches."""
-    return f"gui_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
 class SegmentDialog(tk.Toplevel):

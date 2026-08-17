@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
+import time
+import uuid
 
 
 ROTATION_SIGNS = {"none": 0.0, "left": -1.0, "right": 1.0}
@@ -17,6 +19,11 @@ MOVEMENT_AXES = {
     "back_left": (-math.sqrt(0.5), -math.sqrt(0.5)),
     "back_right": (-math.sqrt(0.5), math.sqrt(0.5)),
 }
+
+
+def make_run_name() -> str:
+    """Return a collision-proof name even for back-to-back GUI launches."""
+    return f"gui_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
 @dataclass(frozen=True)
@@ -100,4 +107,3 @@ def trajectory_document(segments: list[TrajectorySegment], *, fps: float = 24.0)
         "segments": [asdict(segment) for segment in segments],
         "controls": controls,
     }
-

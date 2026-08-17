@@ -11,6 +11,9 @@ def u8(value):
     x=np.asarray(value)
     return x if x.dtype==np.uint8 else np.rint(np.clip(x,0,1)*255).astype(np.uint8)
 
+def progress_event(event, **values):
+    print(json.dumps({'event':event, **values}, default=str), flush=True)
+
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--wah-root',type=Path,required=True); p.add_argument('--model',type=Path,required=True)
     p.add_argument('--session',type=Path,required=True); p.add_argument('--controls',type=Path,required=True); p.add_argument('--recal3r-repo',type=Path,required=True)
@@ -36,6 +39,8 @@ def main():
         p.error('--online-fusion-voxel-size must be finite and positive')
     if not np.isfinite(a.recal_confidence_quantile) or not 0 <= a.recal_confidence_quantile <= 1:
         p.error('--recal-confidence-quantile must be in [0,1]')
+    progress_event('inference_start', online_fusion_voxel_size=a.online_fusion_voxel_size,
+                   recal_confidence_quantile=a.recal_confidence_quantile)
     sys.path.insert(0,str(a.wah_root))
     from long_video.wah.upstream import assert_wah_upstream
     assert_wah_upstream(a.wah_root)
@@ -46,12 +51,14 @@ def main():
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.wah.world_projected_pipeline import PYRAMID_INFERENCE_STEPS, WorldProjectedWarpAsHistoryPipeline
     stored_node=NodeStore(a.session).load('node_000')
+    progress_event('source_session_loaded', resolution=list(stored_node.view_rgb.shape[1:3]))
     # W0 is rebuilt from this one source observation.  Never reuse a node
     # whose point cloud could have been seeded from earlier scene frames.
     from long_video.initialization.pi3x_geometry_backend import Pi3XGeometryBackend
     from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
     if torch.cuda.is_available(): torch.cuda.synchronize()
     initial_world_started=time.perf_counter()
+    progress_event('pi3x_w0_start')
     node=build_pi3x_source_world(stored_node.view_rgb[0], stored_node.view_c2w[0], stored_node.view_intrinsics[0],
                                  Pi3XGeometryBackend(a.pi3x_checkpoint,a.pi3x_repo,a.device))
     from long_video.initialization.pi3x_initial_world import revoxelize_pi3x_source_world
@@ -59,14 +66,19 @@ def main():
     node=revoxelize_pi3x_source_world(node,voxel_size=online_fusion_voxel_size)
     if torch.cuda.is_available(): torch.cuda.synchronize()
     initial_world_seconds=time.perf_counter()-initial_world_started
+    progress_event('pi3x_w0_complete', seconds=initial_world_seconds,
+                   point_count=int(len(node.points_xyz)), voxel_size=online_fusion_voxel_size)
+    progress_event('wah_pipeline_load_start')
     if a.geotoken_checkpoint is None:
         pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     else:
         # GeoToken was trained with the unprojected official WAH pipeline.
         from warp_as_history import WarpAsHistoryPipeline
         pipe=WarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
+    progress_event('wah_pipeline_load_complete')
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
+    progress_event('wah_lora_configured')
     adaptation_step=None
     if a.wpf_adaptation_checkpoint is not None:
         from long_video.training.wpf_adaptation import (
@@ -88,6 +100,7 @@ def main():
     geotoken_step=None
     provider=None
     if a.geotoken_checkpoint is not None:
+        progress_event('geotoken_checkpoint_load_start', checkpoint=str(a.geotoken_checkpoint))
         from long_video.geometry.geotoken import install_geotoken
         from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider, source_scene_scale_from_active_node
         conditioner=install_geotoken(pipe.transformer).to(device=a.device)
@@ -113,6 +126,7 @@ def main():
             for name,value in state.items():
                 named[name].copy_(value.to(device=named[name].device,dtype=named[name].dtype))
         geotoken_step=int(checkpoint.get('global_step',-1))
+        progress_event('geotoken_checkpoint_load_complete', step=geotoken_step)
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
     geo=ReCal3RGeometryBackend(
@@ -121,10 +135,12 @@ def main():
     )
     trajectory_id=f"inference:{a.session.resolve()}"
     accumulator=ReCal3RWorldAccumulator(geo,node,trajectory_id=trajectory_id,voxel_size=online_fusion_voxel_size)
+    progress_event('recal_accumulator_ready', point_count=int(len(node.points_xyz)))
     online=OnlineSpatialHistoryPipeline(wah_pipeline=pipe,active_node=node,memory_manager=None,world_accumulator=accumulator,prompt=a.prompt,renderer_kwargs={'device':a.device, 'point_radius':0},wah_state_kwargs={'height':a.height,'width':a.width,'num_frames':33,'output_type':'np','pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS)})
     online.autoregressive_state=pipe.init_autoregressive_state(prompt=a.prompt,image=Image.fromarray(node.view_rgb[0]),conditioning_type='warp',warp_history_downsample_mode='short',rope_alignment=True,height=a.height,width=a.width,num_frames=33,output_type='np',pyramid_num_inference_steps_list=list(PYRAMID_INFERENCE_STEPS))
     online.autoregressive_state['is_amplify_first_chunk']=False
     online.wah_adapter.configure_state(online.autoregressive_state); controls=json.loads(a.controls.read_text()); K=resize_intrinsics(node.view_intrinsics[0],node.view_rgb.shape[1:3],(a.height,a.width))
+    progress_event('autoregressive_state_ready', chunks_total=len(controls))
     if a.geotoken_checkpoint is not None:
         source_c2w=np.asarray(node.view_c2w[0],np.float32)
         scene_scale=source_scene_scale_from_active_node(node,source_c2w,K,device=a.device,height=a.height,width=a.width)
@@ -172,6 +188,8 @@ def main():
     raw_depth_frames=[]; raw_confidence_frames=[]; native_world_frames=[]; commanded_world_frames=[]; association_mask_frames=[]
     with torch.inference_mode():
       for chunk_index, chunk_controls in enumerate(controls):
+        progress_event('chunk_start', chunk=chunk_index + 1, chunks_total=len(controls),
+                       point_count=int(len(online.active_node.points_xyz)))
         if torch.cuda.is_available(): torch.cuda.synchronize()
         chunk_inference_started=time.perf_counter()
         video,poses,warp,report=online.generate_chunk(chunk_controls,K,a.height,a.width)

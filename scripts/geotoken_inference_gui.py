@@ -245,12 +245,16 @@ class RemoteInferenceWorker:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(f"{label}失败，SSH exit code={completed.returncode}: {detail}")
 
-    def _stream(self, command: list[str], label: str, *, remote_group=False, cwd=None):
+    def _stream(self, command: list[str], label: str, *, remote_group=False, cwd=None,
+                remote_log=None):
         if self.cancelled.is_set():
             raise RuntimeError("任务已取消")
         remote = _posix_command(command)
         if cwd is not None:
             remote = f"cd {shlex.quote(str(cwd))} && {remote}"
+        if remote_log is not None:
+            remote = (f"set -o pipefail; {remote} 2>&1 | "
+                      f"tee -a {shlex.quote(str(remote_log))}")
         if remote_group:
             remote = f"echo $$ > {shlex.quote(self.remote_pid_file)}; {remote}"
             remote = "setsid bash -c " + shlex.quote(remote)
@@ -346,6 +350,7 @@ class RemoteInferenceWorker:
             ], "建立 source-only session", cwd=self.config.remote_repo)
             inference = [
                 "env", f"CUDA_VISIBLE_DEVICES={self.config.cuda_device}", "PYTHONPATH=.",
+                "PYTHONUNBUFFERED=1",
                 self.config.remote_python, "scripts/infer_wpf_causal_world.py",
                 "--wah-root", self.config.wah_root, "--model", self.config.helios_model,
                 "--session", session_dir, "--controls", remote_controls,
@@ -363,7 +368,8 @@ class RemoteInferenceWorker:
             if self.config.allow_stale_geotoken_semantics:
                 inference.append("--allow-stale-geotoken-semantics")
             self._stream(inference, "H100 GeoToken 推理", remote_group=True,
-                         cwd=self.config.remote_repo)
+                         cwd=self.config.remote_repo,
+                         remote_log=str(PurePosixPath(remote_dir) / "inference.log"))
             outputs = list(self.BASIC_OUTPUTS)
             if self.config.download_debug:
                 outputs.extend(self.DEBUG_OUTPUTS)

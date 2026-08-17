@@ -158,6 +158,7 @@ def test_geometry_for_uses_p40_raw_confidence_over_valid_grid_as_threshold():
     confidence[..., : width // 4] = 0.1
     confidence[..., width // 4 :] = 1.5
     backend = _backend(scale=1.0)
+    backend.confidence_quantile = 0.4
     _, calibrated, world = backend._geometry_for(frame, prediction)[0]
     validation = backend.geometry_validation("traj", 19)
     assert np.isclose(validation["effective_confidence_threshold"], 1.5)

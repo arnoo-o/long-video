@@ -188,8 +188,8 @@ def test_chunk_local_voxel_median_best_rgb_and_distinct_frame_count():
     assert "novel_fusion_seconds" in accumulator.last_update_metrics
 
 
-def test_online_voxel005_does_not_expand_association_tolerances():
-    assert ONLINE_FUSION_VOXEL_SIZE == .05
+def test_online_voxel0015_does_not_expand_association_tolerances():
+    assert ONLINE_FUSION_VOXEL_SIZE == .015
     assert MATCH_BASE_TOLERANCE == .04
     assert SOURCE_FREE_SPACE_BASE_TOLERANCE == .06
     backend = Backend([prediction(1.0)])

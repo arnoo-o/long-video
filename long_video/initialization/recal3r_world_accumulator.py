@@ -9,7 +9,7 @@ from ..geometry.point_renderer import render
 from ..types import CameraBatch, ScaleMetadata
 
 
-ONLINE_FUSION_VOXEL_SIZE = 0.05
+ONLINE_FUSION_VOXEL_SIZE = 0.015
 MATCH_BASE_TOLERANCE = 0.04
 SOURCE_FREE_SPACE_BASE_TOLERANCE = 0.06
 

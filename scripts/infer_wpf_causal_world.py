@@ -30,10 +30,10 @@ def main():
     p.add_argument('--world-strength',type=float,default=1.0)
     p.add_argument('--allow-stale-geotoken-semantics', action='store_true')
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.')
-    p.add_argument('--online-fusion-voxel-size',type=float,default=0.05,
-                   help='Phase-C/inference PointWorld voxel fusion size (default: 0.05).')
-    p.add_argument('--recal-confidence-quantile',type=float,default=0.4,
-                   help='Raw-confidence quantile over each valid original-grid frame (default: 0.4/P40).')
+    p.add_argument('--online-fusion-voxel-size',type=float,default=0.015,
+                   help='Phase-C/inference PointWorld voxel fusion size (formal v12: 0.015).')
+    p.add_argument('--recal-confidence-quantile',type=float,default=0.3,
+                   help='Raw-confidence quantile over each valid original-grid frame (formal v12: 0.3/P30).')
     a=p.parse_args()
     if not np.isfinite(a.online_fusion_voxel_size) or a.online_fusion_voxel_size <= 0:
         p.error('--online-fusion-voxel-size must be finite and positive')
@@ -117,6 +117,10 @@ def main():
         if not semantics_match:
             print('WARNING: stale GeoToken semantics allowed for diagnostic inference only')
         if checkpoint.get('wah_runtime_fingerprint') != WAH_RUNTIME_FINGERPRINT: raise RuntimeError('GeoToken checkpoint WAH runtime fingerprint mismatch')
+        if semantics_match and (
+            float(checkpoint.get('phase_c_online_fusion_voxel_size',-1)) != float(a.online_fusion_voxel_size)
+            or float(checkpoint.get('phase_c_recal_confidence_quantile',-1)) != float(a.recal_confidence_quantile)
+        ): raise RuntimeError('GeoToken checkpoint Phase-C geometry config does not match inference')
         state=checkpoint.get('geotoken')
         named=dict(pipe.transformer.named_parameters())
         expected={name for name in named if 'geotoken.' in name}

@@ -15,9 +15,13 @@ from ..geometry.geotoken import GeometryTokenBatch
 
 
 TOTAL_STEPS = 2000
-TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v11-online-voxel005"
-GEOMETRY_IMPLEMENTATION_VERSION = "recal-p40-online-voxel005-fixed-association-tolerances-v9"
+TRAINING_SEMANTICS_VERSION = "wah-09aa646-camera-world-qk-binding-v12-online-voxel0015-p30"
+GEOMETRY_IMPLEMENTATION_VERSION = "recal-p30-online-voxel0015-fixed-association-tolerances-v10"
 GEOMETRY_SCHEMA_VERSION = 3
+PHASE_C_ONLINE_FUSION_VOXEL_SIZE = 0.015
+PHASE_C_RECAL_CONFIDENCE_QUANTILE = 0.3
+
+
 def _wah_runtime_fingerprint():
     root = Path(__file__).resolve().parents[2]
     digest = hashlib.sha256(b"wah-09aa646-confidence-patch-preserved")
@@ -234,6 +238,8 @@ def save_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
         "training_semantics_version": TRAINING_SEMANTICS_VERSION,
         "geometry_schema_version": GEOMETRY_SCHEMA_VERSION,
         "geometry_implementation_version": GEOMETRY_IMPLEMENTATION_VERSION,
+        "phase_c_online_fusion_voxel_size": PHASE_C_ONLINE_FUSION_VOXEL_SIZE,
+        "phase_c_recal_confidence_quantile": PHASE_C_RECAL_CONFIDENCE_QUANTILE,
         "wah_runtime_fingerprint": WAH_RUNTIME_FINGERPRINT,
         "geotoken": state,
         "optimizer": optimizer.state_dict(),
@@ -267,6 +273,11 @@ def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
     )
     if not current_semantics and not phase_b_boundary_migration:
         raise RuntimeError("GeoToken checkpoint uses stale geometry/training semantics; resume is forbidden")
+    if current_semantics and (
+        float(payload.get("phase_c_online_fusion_voxel_size", -1)) != PHASE_C_ONLINE_FUSION_VOXEL_SIZE
+        or float(payload.get("phase_c_recal_confidence_quantile", -1)) != PHASE_C_RECAL_CONFIDENCE_QUANTILE
+    ):
+        raise RuntimeError("GeoToken checkpoint Phase-C geometry runtime config mismatch")
     if payload.get("wah_runtime_fingerprint") != WAH_RUNTIME_FINGERPRINT:
         raise RuntimeError("GeoToken checkpoint WAH runtime fingerprint mismatch")
     named = dict(transformer.named_parameters())
@@ -287,7 +298,7 @@ def load_geotoken_checkpoint(path: Path, *, transformer, optimizer, lr_scheduler
             torch.cuda.set_rng_state_all(cuda_states)
         elif phase_b_boundary_migration and torch.cuda.device_count() == 1 and len(cuda_states) >= 2:
             # The pinned v6 checkpoint trained on physical cuda:1 with both
-            # H100s visible. Formal v11 isolates that same GPU as logical
+            # H100s visible. Formal v12 isolates that same GPU as logical
             # cuda:0, so restore its saved RNG stream explicitly.
             torch.cuda.set_rng_state(cuda_states[1], device=0)
         else:

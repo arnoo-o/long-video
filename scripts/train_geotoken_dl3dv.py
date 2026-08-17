@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument("--recal3r-repo", type=Path, required=True)
     parser.add_argument("--recal3r-checkpoint", type=Path, required=True)
     parser.add_argument("--recal-confidence-threshold", type=float, default=0.85)
+    parser.add_argument("--phase-c-online-fusion-voxel-size", type=float, default=0.015)
+    parser.add_argument("--phase-c-recal-confidence-quantile", type=float, default=0.3)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--total-steps", type=int, default=2000)
@@ -49,13 +51,18 @@ def parse_args():
     parser.add_argument("--prompt", default="A stable realistic view of the same scene.")
     parser.add_argument("--resume-checkpoint", type=Path)
     parser.add_argument("--resume-phase-c-from-phase-b", action="store_true",
-                        help="allow the pinned v6 step1100 Phase-B boundary checkpoint to start v11 Phase C")
+                        help="allow the pinned v6 step1100 Phase-B boundary checkpoint to start v12 Phase C")
     parser.add_argument("--smoke-only", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--geotoken-strength", type=float, default=1.0)
     parser.add_argument("--camera-strength", type=float, default=1.0)
     parser.add_argument("--world-strength", type=float, default=1.0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.phase_c_online_fusion_voxel_size != 0.015:
+        parser.error("formal v12 training requires --phase-c-online-fusion-voxel-size=0.015")
+    if args.phase_c_recal_confidence_quantile != 0.3:
+        parser.error("formal v12 training requires --phase-c-recal-confidence-quantile=0.3")
+    return args
 
 
 def read_rgb(path):
@@ -206,9 +213,7 @@ def build_online(args, pipe, record, source, *, pi3x_provenance, prompt_embeddin
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
     from long_video.initialization.pi3x_initial_world import revoxelize_pi3x_source_world
-    from long_video.initialization.recal3r_world_accumulator import (
-        ONLINE_FUSION_VOXEL_SIZE, ReCal3RWorldAccumulator,
-    )
+    from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
 
     if initial_node is not None:
         node = initial_node
@@ -237,12 +242,14 @@ def build_online(args, pipe, record, source, *, pi3x_provenance, prompt_embeddin
             "anchor_frame": np.zeros(len(node.points_xyz), np.int32),
             "source_locked": np.ones(len(node.points_xyz), bool),
         }
-        node = revoxelize_pi3x_source_world(node, voxel_size=ONLINE_FUSION_VOXEL_SIZE)
+        node = revoxelize_pi3x_source_world(
+            node, voxel_size=args.phase_c_online_fusion_voxel_size,
+        )
     accumulator = None
     if geometry_backend is not None:
         accumulator = ReCal3RWorldAccumulator(
             geometry_backend, node, trajectory_id=record["trajectory_id"],
-            voxel_size=ONLINE_FUSION_VOXEL_SIZE,
+            voxel_size=args.phase_c_online_fusion_voxel_size,
         )
     online = OnlineSpatialHistoryPipeline(
         wah_pipeline=pipe, active_node=node, memory_manager=None, world_accumulator=accumulator, prompt=args.prompt,
@@ -500,6 +507,7 @@ def main():
             geometry_backend = ReCal3RGeometryBackend(
                 args.recal3r_checkpoint, args.recal3r_repo, args.device,
                 confidence_threshold=args.recal_confidence_threshold,
+                confidence_quantile=args.phase_c_recal_confidence_quantile,
             )
         source_center = arrays["c2w"][0, :3, 3]
         # ReCal3R normalization is confined to the offline A/B phases.
@@ -701,6 +709,8 @@ def main():
             "geotoken_parameter_norm": parameter_norm,
             "camera_strength": conditioner.camera_strength, "world_strength": conditioner.world_strength,
             "recal_confidence_threshold": args.recal_confidence_threshold,
+            "phase_c_online_fusion_voxel_size": args.phase_c_online_fusion_voxel_size,
+            "phase_c_recal_confidence_quantile": args.phase_c_recal_confidence_quantile,
             "geotoken_injection": dict(conditioner.diagnostics) if sample_diagnostics else None,
             "data_load_seconds": data_load_seconds,
             "point_render_seconds": provider.point_render_seconds() if sample_diagnostics else None,

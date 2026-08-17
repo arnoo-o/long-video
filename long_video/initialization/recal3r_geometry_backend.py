@@ -37,7 +37,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
 
     def __init__(self, checkpoint, repo_path, device, confidence_threshold=1.5,
                  confidence_temperature=0.35, min_alignment_frames=3,
-                 confidence_quantile=0.4):
+                 confidence_quantile=0.3):
         self.checkpoint = str(checkpoint)
         self.repo_path = str(repo_path)
         self.device = str(device)
@@ -363,7 +363,7 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
         finite_confidence = np.isfinite(raw_conf)
         threshold_support = inside & finite_depth & positive_depth & finite_confidence
         if threshold_support.any():
-            confidence_quantile = float(getattr(self, "confidence_quantile", 0.4))
+            confidence_quantile = float(getattr(self, "confidence_quantile", 0.3))
             effective_threshold = float(np.quantile(raw_conf[threshold_support], confidence_quantile))
             calibrated = calibrate_recal3r_confidence(
                 raw_conf, effective_threshold, self.confidence_temperature,
@@ -391,9 +391,9 @@ class ReCal3RGeometryBackend(MultiViewGeometryBackend):
             "finite_confidence_count": int(finite_confidence.sum()),
             "confidence_threshold_count": int(confidence_threshold.sum()),
             "confidence_threshold_mode": (
-                f"p{100 * float(getattr(self, 'confidence_quantile', 0.4)):g}_valid_grid_raw_confidence"
+                f"p{100 * float(getattr(self, 'confidence_quantile', 0.3)):g}_valid_grid_raw_confidence"
             ),
-            "confidence_quantile": float(getattr(self, "confidence_quantile", 0.4)),
+            "confidence_quantile": float(getattr(self, "confidence_quantile", 0.3)),
             "effective_confidence_threshold": (
                 effective_threshold if np.isfinite(effective_threshold) else None
             ),

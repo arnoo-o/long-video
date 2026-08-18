@@ -267,18 +267,11 @@ class RemoteInferenceWorker:
 
     def _resolve_checkpoint(self, configured: str) -> str:
         configured = str(_clean_config_value(configured))
-        # Never silently select the old v11 semantics from a saved GUI value.
-        if "train_geotoken_phasec_online005_v11_20260816" in configured:
-            configured = configured.replace(
-                "train_geotoken_phasec_online005_v11_20260816",
-                "train_geotoken_phasec_online0015_p30_v12_20260817",
-            )
-        parent = str(PurePosixPath(configured).parent)
         command = (
             f"if test -f {shlex.quote(configured)}; then printf '%s\\n' {shlex.quote(configured)}; "
-            f"else find {shlex.quote(parent)} -maxdepth 1 -type f -name 'checkpoint_step_*.pt' "
-            "-printf '%f\\n' | sort -V | tail -1 | "
-            f"sed 's#^#{parent}/#'; fi"
+            f"elif test -d {shlex.quote(configured)}; then find {shlex.quote(configured)} "
+            "-maxdepth 1 -type f -name '*.pt' -printf '%p\\n' | sort -V | tail -1; "
+            "else printf 'CHECKPOINT_NOT_FOUND\\n' >&2; exit 2; fi"
         )
         completed = subprocess.run(
             self._base_ssh() + [command], capture_output=True, text=True,
@@ -287,7 +280,7 @@ class RemoteInferenceWorker:
         )
         resolved = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
         if completed.returncode or not resolved.endswith(".pt"):
-            detail = completed.stderr.strip() or "未找到 checkpoint_step_*.pt"
+            detail = completed.stderr.strip() or "指定 checkpoint 不存在，且未提供有效 checkpoint 目录"
             raise RuntimeError(f"无法定位 GeoToken checkpoint：{detail}")
         self._emit("log", f"使用 GeoToken checkpoint：{resolved}")
         return resolved

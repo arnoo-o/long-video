@@ -49,6 +49,7 @@ MOVEMENT_DISPLAY = {value: key for key, value in MOVEMENT_LABELS.items()}
 class RemoteConfig:
     host: str = "ubuntu@185.216.22.6"
     ssh_key: str = str(Path.home() / ".ssh" / "autodl_wan")
+    ssh_bind_address: str = "192.168.3.9"
     remote_repo: str = "/ephemeral/mdu/recovery-20260807/source/long-video-wpf-adaptation"
     remote_python: str = "/ephemeral/mdu/recovery-20260807/envs/wah/bin/python"
     remote_jobs_root: str = "/ephemeral/mdu/recovery-20260807/geotoken_inference/gui_jobs"
@@ -236,10 +237,14 @@ class RemoteInferenceWorker:
         self.events.put((kind, value))
 
     def _base_ssh(self):
-        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+        command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
                 "-o", "ConnectionAttempts=2", "-o", "ServerAliveInterval=15",
                 "-o", "ServerAliveCountMax=4",
-                "-i", self.config.ssh_key, self.config.host]
+                "-i", self.config.ssh_key]
+        if self.config.ssh_bind_address:
+            command.extend(["-b", self.config.ssh_bind_address])
+        command.append(self.config.host)
+        return command
 
     def _quick_remote(self, command: list[str], label: str, *, timeout=45):
         """Run setup commands with a deadline instead of blocking the GUI forever."""
@@ -329,7 +334,10 @@ class RemoteInferenceWorker:
 
     def _copy(self, source: str, target: str, label: str):
         self._emit("status", label)
-        command = ["scp", "-q", "-i", self.config.ssh_key, source, target]
+        command = ["scp", "-q", "-o", "ConnectTimeout=30"]
+        if self.config.ssh_bind_address:
+            command.extend(["-o", f"BindAddress={self.config.ssh_bind_address}"])
+        command.extend(["-i", self.config.ssh_key, source, target])
         try:
             completed = subprocess.run(
                 command, capture_output=True, text=True, timeout=1800,
@@ -406,6 +414,7 @@ class RemoteInferenceWorker:
                 "--height", str(self.config.height), "--width", str(self.config.width),
                 "--online-fusion-voxel-size", str(self.config.online_fusion_voxel_size),
                 "--recal-confidence-quantile", str(self.config.recal_confidence_quantile),
+                "--override-checkpoint-geometry-config",
                 "--prompt", prompt or "Continue the scene consistently.",
             ]
             if self.config.allow_stale_geotoken_semantics:

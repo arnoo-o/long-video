@@ -34,6 +34,8 @@ def main():
                    help='Phase-C/inference PointWorld voxel fusion size (formal v12: 0.015).')
     p.add_argument('--recal-confidence-quantile',type=float,default=0.3,
                    help='Raw-confidence quantile over each valid original-grid frame (formal v12: 0.3/P30).')
+    p.add_argument('--override-checkpoint-geometry-config', action='store_true',
+                   help='Use requested voxel/quantile instead of checkpoint metadata.')
     a=p.parse_args()
     # A checkpoint may carry the geometry configuration it was trained with.
     # Read this metadata before constructing Pi3X W0/ReCal so all world
@@ -46,7 +48,8 @@ def main():
         )
         checkpoint_voxel = checkpoint_metadata.get('phase_c_online_fusion_voxel_size')
         checkpoint_quantile = checkpoint_metadata.get('phase_c_recal_confidence_quantile')
-        if checkpoint_voxel is not None and checkpoint_quantile is not None:
+        if (checkpoint_voxel is not None and checkpoint_quantile is not None
+                and not a.override_checkpoint_geometry_config):
             if (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
                     or float(checkpoint_quantile) != float(a.recal_confidence_quantile)):
                 progress_event(

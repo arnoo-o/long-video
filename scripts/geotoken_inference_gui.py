@@ -58,7 +58,7 @@ class RemoteConfig:
     recal_checkpoint: str = "/ephemeral/mdu/recovery-20260807/source/ReCal3R/src/cut3r_512_dpt_4_64.pth"
     pi3x_repo: str = "/ephemeral/mdu/recovery-20260807/source/Pi3"
     pi3x_checkpoint: str = "/ephemeral/mdu/recovery-20260807/models/pi3x/model.safetensors"
-    geotoken_checkpoint: str = "/ephemeral/mdu/recovery-20260807/geotoken_runs/train_geotoken_phasec_online005_v11_20260816/checkpoints/checkpoint_step_1840.pt"
+    geotoken_checkpoint: str = "/ephemeral/mdu/recovery-20260807/geotoken_runs/train_geotoken_phasec_online0015_p30_v12_20260817/checkpoints/checkpoint_step_1120.pt"
     text_to_image_model: str = "stabilityai/stable-diffusion-xl-base-1.0"
     cuda_device: str = "1"
     width: int = 640
@@ -74,12 +74,27 @@ CONFIG_DIR = Path(os.getenv("APPDATA", Path.home())) / "GeoTokenInferenceGUI"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
+def _clean_config_value(value):
+    """Accept both a raw value and the ``key = value`` form used in notes."""
+    if isinstance(value, str):
+        value = value.strip()
+        if "=" in value:
+            prefix, suffix = value.split("=", 1)
+            known = {field.name for field in fields(RemoteConfig)}
+            if prefix.strip().lower().replace("-", "_") in known:
+                value = suffix.strip()
+    return value
+
+
 def load_config() -> RemoteConfig:
     config = RemoteConfig()
     if CONFIG_PATH.exists():
         payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
         allowed = {field.name for field in fields(RemoteConfig)}
-        config = RemoteConfig(**{key: value for key, value in payload.items() if key in allowed})
+        config = RemoteConfig(**{
+            key: _clean_config_value(value)
+            for key, value in payload.items() if key in allowed
+        })
     return config
 
 
@@ -245,6 +260,33 @@ class RemoteInferenceWorker:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(f"{label}失败，SSH exit code={completed.returncode}: {detail}")
 
+    def _resolve_checkpoint(self, configured: str) -> str:
+        configured = str(_clean_config_value(configured))
+        # Never silently select the old v11 semantics from a saved GUI value.
+        if "train_geotoken_phasec_online005_v11_20260816" in configured:
+            configured = configured.replace(
+                "train_geotoken_phasec_online005_v11_20260816",
+                "train_geotoken_phasec_online0015_p30_v12_20260817",
+            )
+        parent = str(PurePosixPath(configured).parent)
+        command = (
+            f"if test -f {shlex.quote(configured)}; then printf '%s\\n' {shlex.quote(configured)}; "
+            f"else find {shlex.quote(parent)} -maxdepth 1 -type f -name 'checkpoint_step_*.pt' "
+            "-printf '%f\\n' | sort -V | tail -1 | "
+            f"sed 's#^#{parent}/#'; fi"
+        )
+        completed = subprocess.run(
+            self._base_ssh() + [command], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=45,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        resolved = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+        if completed.returncode or not resolved.endswith(".pt"):
+            detail = completed.stderr.strip() or "未找到 checkpoint_step_*.pt"
+            raise RuntimeError(f"无法定位 GeoToken checkpoint：{detail}")
+        self._emit("log", f"使用 GeoToken checkpoint：{resolved}")
+        return resolved
+
     def _stream(self, command: list[str], label: str, *, remote_group=False, cwd=None,
                 remote_log=None):
         if self.cancelled.is_set():
@@ -348,6 +390,7 @@ class RemoteInferenceWorker:
                 "--output-session", session_dir, "--height", str(self.config.height),
                 "--width", str(self.config.width), "--fov-degrees", str(self.config.fov_degrees),
             ], "建立 source-only session", cwd=self.config.remote_repo)
+            geotoken_checkpoint = self._resolve_checkpoint(self.config.geotoken_checkpoint)
             inference = [
                 "env", f"CUDA_VISIBLE_DEVICES={self.config.cuda_device}", "PYTHONPATH=.",
                 "PYTHONUNBUFFERED=1",
@@ -358,7 +401,7 @@ class RemoteInferenceWorker:
                 "--recal3r-checkpoint", self.config.recal_checkpoint,
                 "--pi3x-repo", self.config.pi3x_repo,
                 "--pi3x-checkpoint", self.config.pi3x_checkpoint,
-                "--geotoken-checkpoint", self.config.geotoken_checkpoint,
+                "--geotoken-checkpoint", geotoken_checkpoint,
                 "--output-dir", remote_output, "--device", "cuda",
                 "--height", str(self.config.height), "--width", str(self.config.width),
                 "--online-fusion-voxel-size", str(self.config.online_fusion_voxel_size),

@@ -37,7 +37,7 @@ for experimental_patch in "${STAGE2_PATCH}" "${WPF_PATCH}"; do
     echo "Removed disabled WAH experimental patch: ${experimental_patch##*/}"
   elif git -C "${WAH_ROOT}" apply --check "${experimental_patch}" 2>/dev/null; then
     echo "Disabled WAH experimental patch is absent: ${experimental_patch##*/}"
-  elif ! grep -RqsE '_stage2_training_observer|_pyramid_training_observer|_pyramid_adapter_names|pyramid_training' \
+  elif ! grep -Rqs --exclude='*.pyc' --exclude-dir='__pycache__' -E '_stage2_training_observer|_pyramid_training_observer|_pyramid_adapter_names|pyramid_training' \
       "${WAH_ROOT}/warp_as_history" "${WAH_ROOT}/helios"; then
     # These patches overlap the Q/K patch context, so patch --check can fail
     # even when the disabled experiment is absent. The runtime marker check is

@@ -148,8 +148,9 @@ def main():
             checkpoint_quantile = checkpoint.get('phase_c_recal_confidence_quantile')
             if checkpoint_voxel is None or checkpoint_quantile is None:
                 raise RuntimeError('GeoToken checkpoint is missing Phase-C geometry config metadata')
-            if (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
-                    or float(checkpoint_quantile) != float(a.recal_confidence_quantile)):
+            if (not a.override_checkpoint_geometry_config and
+                    (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
+                     or float(checkpoint_quantile) != float(a.recal_confidence_quantile))):
                 raise RuntimeError('internal checkpoint geometry config resolution error')
         state=checkpoint.get('geotoken')
         named=dict(pipe.transformer.named_parameters())

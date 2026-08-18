@@ -332,6 +332,51 @@ class RemoteInferenceWorker:
         if code != 0:
             raise RuntimeError(f"{label}失败，SSH exit code={code}")
 
+    def _launch_inference_and_wait(self, command: list[str], *, remote_log: str,
+                                   remote_output: str, label: str, timeout=14400):
+        """Run long inference detached; never bind its lifetime to SSH."""
+        remote = _posix_command(command)
+        remote = f"cd {shlex.quote(str(self.config.remote_repo))} && {remote}"
+        launch = (
+            f"nohup setsid bash -c {shlex.quote(remote)} "
+            f"> {shlex.quote(remote_log)} 2>&1 < /dev/null & echo $!"
+        )
+        self._emit("status", label)
+        try:
+            started = subprocess.run(
+                self._base_ssh() + [launch], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=90,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"{label}启动超时") from error
+        if started.returncode:
+            raise RuntimeError(f"{label}启动失败：{started.stderr.strip()}")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.cancelled.is_set():
+                raise RuntimeError("任务已取消")
+            try:
+                probe = subprocess.run(
+                    self._base_ssh() + [
+                        f"if test -f {shlex.quote(str(PurePosixPath(remote_output) / 'metrics.json'))}; "
+                        f"then echo DONE; elif grep -Eq 'Traceback|RuntimeError|ERROR:' {shlex.quote(remote_log)} 2>/dev/null; "
+                        "then echo FAILED; else echo RUNNING; fi"
+                    ], capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=45,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                state = probe.stdout.strip().splitlines()[-1] if probe.stdout.strip() else "RUNNING"
+                if state == "DONE":
+                    self._emit("log", "H100 推理完成")
+                    return
+                if state == "FAILED":
+                    raise RuntimeError(f"{label}失败，请查看远端日志：{remote_log}")
+            except subprocess.TimeoutExpired:
+                self._emit("log", "SSH 状态查询超时，远端推理继续运行，正在重试")
+            time.sleep(10)
+        raise RuntimeError(f"{label}超时，远端日志：{remote_log}")
+
     def _copy(self, source: str, target: str, label: str):
         self._emit("status", label)
         command = ["scp", "-q", "-o", "ConnectTimeout=30"]
@@ -419,9 +464,12 @@ class RemoteInferenceWorker:
             ]
             if self.config.allow_stale_geotoken_semantics:
                 inference.append("--allow-stale-geotoken-semantics")
-            self._stream(inference, "H100 GeoToken 推理", remote_group=True,
-                         cwd=self.config.remote_repo,
-                         remote_log=str(PurePosixPath(remote_dir) / "inference.log"))
+            self._launch_inference_and_wait(
+                inference,
+                label="H100 GeoToken 推理",
+                remote_log=str(PurePosixPath(remote_dir) / "inference.log"),
+                remote_output=remote_output,
+            )
             outputs = list(self.BASIC_OUTPUTS)
             if self.config.download_debug:
                 outputs.extend(self.DEBUG_OUTPUTS)

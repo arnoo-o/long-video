@@ -466,6 +466,22 @@ def main():
     trainable = assert_geotoken_only_trainable(pipe.transformer)
     if hasattr(pipe, "_world_projection_context") or hasattr(pipe, "_pyramid_training_adapter_name"):
         raise RuntimeError("GeoToken training requires WPF and wpf_adaptation to be absent")
+    disabled_experimental_attrs = (
+        "_stage2_training_observer",
+        "_stage2_completion_adapter_name",
+        "_pyramid_training_observer",
+        "_pyramid_adapter_names",
+        "_trainable_pyramid_adapter_name",
+    )
+    enabled_experimental_attrs = [
+        name for name in disabled_experimental_attrs
+        if getattr(pipe, name, None) is not None
+    ]
+    if enabled_experimental_attrs:
+        raise RuntimeError(
+            "Stage2/WPF experimental training adapters must be disabled: "
+            + ", ".join(enabled_experimental_attrs)
+        )
     for module in (pipe.vae,):
         if any(parameter.requires_grad for parameter in module.parameters()):
             raise RuntimeError("VAE must remain frozen")

@@ -4,9 +4,9 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${WAH_ROOT:?Set WAH_ROOT to the clean Warp-as-History checkout}"
 PATCH="${PROJECT_ROOT}/patches/wah_confidence.patch"
-TRAINING_PATCH="${PROJECT_ROOT}/patches/wah_stage2_training.patch"
-WPF_TRAINING_PATCH="${PROJECT_ROOT}/patches/wah_wpf_adaptation_training.patch"
 GEOTOKEN_QK_PATCH="${PROJECT_ROOT}/patches/wah_geotoken_qk_binding.patch"
+STAGE2_PATCH="${PROJECT_ROOT}/patches/wah_stage2_training.patch"
+WPF_PATCH="${PROJECT_ROOT}/patches/wah_wpf_adaptation_training.patch"
 
 if ! git -C "${WAH_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "WAH repository not found: ${WAH_ROOT}" >&2
@@ -25,13 +25,21 @@ if ! grep -q 'GeoToken Q/K binding must not modify attention V' \
   git -C "${WAH_ROOT}" apply "${GEOTOKEN_QK_PATCH}"
 fi
 echo "Applied WAH GeoToken Q/K binding patch to ${WAH_ROOT}"
-if ! git -C "${WAH_ROOT}" apply --reverse --check "${TRAINING_PATCH}" 2>/dev/null; then
-  git -C "${WAH_ROOT}" apply --check "${TRAINING_PATCH}"
-  git -C "${WAH_ROOT}" apply "${TRAINING_PATCH}"
-fi
-echo "Applied WAH Stage2 training patch to ${WAH_ROOT}"
-if ! git -C "${WAH_ROOT}" apply --reverse --check "${WPF_TRAINING_PATCH}" 2>/dev/null; then
-  git -C "${WAH_ROOT}" apply --check "${WPF_TRAINING_PATCH}"
-  git -C "${WAH_ROOT}" apply "${WPF_TRAINING_PATCH}"
-fi
-echo "Applied WAH WPF-adaptation training patch to ${WAH_ROOT}"
+
+# Stage2 completion/pyramid-training and WPF adaptation are intentionally
+# disabled for the current GeoToken run.  They are orthogonal experimental
+# adapters and must not silently alter the pinned WAH path.  If either patch
+# is already present, remove it when the patch applies cleanly in reverse;
+# otherwise fail instead of leaving a mixed WAH checkout.
+for experimental_patch in "${STAGE2_PATCH}" "${WPF_PATCH}"; do
+  if git -C "${WAH_ROOT}" apply --reverse --check "${experimental_patch}" 2>/dev/null; then
+    git -C "${WAH_ROOT}" apply --reverse "${experimental_patch}"
+    echo "Removed disabled WAH experimental patch: ${experimental_patch##*/}"
+  elif git -C "${WAH_ROOT}" apply --check "${experimental_patch}" 2>/dev/null; then
+    echo "Disabled WAH experimental patch is absent: ${experimental_patch##*/}"
+  else
+    echo "WAH checkout has a partial or drifted experimental patch: ${experimental_patch##*/}" >&2
+    exit 1
+  fi
+done
+echo "WAH Stage2/WPF experimental training patches are disabled."

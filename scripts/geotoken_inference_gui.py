@@ -58,7 +58,7 @@ class RemoteConfig:
     recal_checkpoint: str = "/ephemeral/mdu/recovery-20260807/source/ReCal3R/src/cut3r_512_dpt_4_64.pth"
     pi3x_repo: str = "/ephemeral/mdu/recovery-20260807/source/Pi3"
     pi3x_checkpoint: str = "/ephemeral/mdu/recovery-20260807/models/pi3x/model.safetensors"
-    geotoken_checkpoint: str = "/ephemeral/mdu/recovery-20260807/geotoken_runs/train_geotoken_phasec_online0015_p30_v12_20260817/checkpoints/checkpoint_step_1120.pt"
+    geotoken_checkpoint: str = "/ephemeral/mdu/recovery-20260807/geotoken_runs/train_geotoken_phasec_online0015_p30_v12_20260817/checkpoints/phase_c_final_step_2000.pt"
     text_to_image_model: str = "stabilityai/stable-diffusion-xl-base-1.0"
     cuda_device: str = "1"
     width: int = 640
@@ -267,6 +267,12 @@ class RemoteInferenceWorker:
             configured = configured.replace(
                 "train_geotoken_phasec_online005_v11_20260816",
                 "train_geotoken_phasec_online0015_p30_v12_20260817",
+            )
+        if "train_geotoken_accel_v6_20260816/checkpoints/phase_b_final_step_1100.pt" in configured:
+            configured = (
+                "/ephemeral/mdu/recovery-20260807/geotoken_runs/"
+                "train_geotoken_phasec_online0015_p30_v12_20260817/checkpoints/"
+                "phase_c_final_step_2000.pt"
             )
         parent = str(PurePosixPath(configured).parent)
         command = (

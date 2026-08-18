@@ -35,6 +35,29 @@ def main():
     p.add_argument('--recal-confidence-quantile',type=float,default=0.3,
                    help='Raw-confidence quantile over each valid original-grid frame (formal v12: 0.3/P30).')
     a=p.parse_args()
+    # A checkpoint may carry the geometry configuration it was trained with.
+    # Read this metadata before constructing Pi3X W0/ReCal so all world
+    # construction uses the same semantics.  Older v6 checkpoints do not
+    # carry these fields and remain compatible with the CLI defaults.
+    checkpoint_metadata = None
+    if a.geotoken_checkpoint is not None:
+        checkpoint_metadata = torch.load(
+            a.geotoken_checkpoint, map_location='cpu', weights_only=False,
+        )
+        checkpoint_voxel = checkpoint_metadata.get('phase_c_online_fusion_voxel_size')
+        checkpoint_quantile = checkpoint_metadata.get('phase_c_recal_confidence_quantile')
+        if checkpoint_voxel is not None and checkpoint_quantile is not None:
+            if (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
+                    or float(checkpoint_quantile) != float(a.recal_confidence_quantile)):
+                progress_event(
+                    'geometry_config_from_checkpoint',
+                    requested_voxel_size=a.online_fusion_voxel_size,
+                    requested_confidence_quantile=a.recal_confidence_quantile,
+                    checkpoint_voxel_size=checkpoint_voxel,
+                    checkpoint_confidence_quantile=checkpoint_quantile,
+                )
+            a.online_fusion_voxel_size = float(checkpoint_voxel)
+            a.recal_confidence_quantile = float(checkpoint_quantile)
     if not np.isfinite(a.online_fusion_voxel_size) or a.online_fusion_voxel_size <= 0:
         p.error('--online-fusion-voxel-size must be finite and positive')
     if not np.isfinite(a.recal_confidence_quantile) or not 0 <= a.recal_confidence_quantile <= 1:
@@ -107,7 +130,7 @@ def main():
         conditioner.configure_strengths(
             geotoken=a.geotoken_strength, camera=a.camera_strength, world=a.world_strength,
         )
-        checkpoint=torch.load(a.geotoken_checkpoint,map_location='cpu',weights_only=False)
+        checkpoint = checkpoint_metadata
         from long_video.training.geotoken import TRAINING_SEMANTICS_VERSION, GEOMETRY_SCHEMA_VERSION, GEOMETRY_IMPLEMENTATION_VERSION, WAH_RUNTIME_FINGERPRINT
         semantics_match = (checkpoint.get('training_semantics_version') == TRAINING_SEMANTICS_VERSION
                            and checkpoint.get('geometry_schema_version') == GEOMETRY_SCHEMA_VERSION
@@ -117,10 +140,14 @@ def main():
         if not semantics_match:
             print('WARNING: stale GeoToken semantics allowed for diagnostic inference only')
         if checkpoint.get('wah_runtime_fingerprint') != WAH_RUNTIME_FINGERPRINT: raise RuntimeError('GeoToken checkpoint WAH runtime fingerprint mismatch')
-        if semantics_match and (
-            float(checkpoint.get('phase_c_online_fusion_voxel_size',-1)) != float(a.online_fusion_voxel_size)
-            or float(checkpoint.get('phase_c_recal_confidence_quantile',-1)) != float(a.recal_confidence_quantile)
-        ): raise RuntimeError('GeoToken checkpoint Phase-C geometry config does not match inference')
+        if semantics_match:
+            checkpoint_voxel = checkpoint.get('phase_c_online_fusion_voxel_size')
+            checkpoint_quantile = checkpoint.get('phase_c_recal_confidence_quantile')
+            if checkpoint_voxel is None or checkpoint_quantile is None:
+                raise RuntimeError('GeoToken checkpoint is missing Phase-C geometry config metadata')
+            if (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
+                    or float(checkpoint_quantile) != float(a.recal_confidence_quantile)):
+                raise RuntimeError('internal checkpoint geometry config resolution error')
         state=checkpoint.get('geotoken')
         named=dict(pipe.transformer.named_parameters())
         expected={name for name in named if 'geotoken.' in name}

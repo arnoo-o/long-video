@@ -19,7 +19,7 @@ DL3DV download, selection, manifest, and preprocessing tools are retained under
 Pinned WAH commit: `09aa6461355b298bfced51007bd709a251d6033a`.
 
 Windows users can author smooth multi-segment camera trajectories and run the
-H100 pipeline with `scripts\launch_geotoken_inference_gui.bat`.  The GUI uploads
+H100 pipeline with `scripts\launch_wah_world_inference_gui.bat`.  The GUI uploads
 the source image/controls over SSH, streams progress, and downloads the videos
-and metrics.  See `docs/geotoken_inference_gui.md` for setup and text-only
+and metrics.  See `docs/wah_world_inference_gui.md` for setup and text-only
 source-image generation.

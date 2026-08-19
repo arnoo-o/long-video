@@ -23,7 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 # Load this pure-stdlib module by path so the Windows GUI does not import
 # long_video.__init__ (and therefore does not require local NumPy/PyTorch).
 _trajectory_path = REPO_ROOT / "long_video" / "inference" / "trajectory.py"
-_trajectory_spec = importlib.util.spec_from_file_location("geotoken_gui_trajectory", _trajectory_path)
+_trajectory_spec = importlib.util.spec_from_file_location("wah_world_gui_trajectory", _trajectory_path)
 if _trajectory_spec is None or _trajectory_spec.loader is None:
     raise RuntimeError(f"cannot load trajectory module: {_trajectory_path}")
 _trajectory_module = importlib.util.module_from_spec(_trajectory_spec)
@@ -50,11 +50,11 @@ class RemoteConfig:
     host: str = "ubuntu@185.216.22.6"
     ssh_key: str = str(Path.home() / ".ssh" / "autodl_wan")
     ssh_bind_address: str = "192.168.3.9"
-    remote_repo: str = "/ephemeral/mdu/recovery-20260807/source/long-video-wpf-adaptation"
+    remote_repo: str = "/ephemeral/mdu/recovery-20260807/source/long-video-wah-world"
     remote_python: str = "/ephemeral/mdu/recovery-20260807/envs/wah/bin/python"
-    remote_jobs_root: str = "/ephemeral/mdu/recovery-20260807/geotoken_inference/gui_jobs"
-    wah_root: str = "/ephemeral/mdu/recovery-20260807/source/long-video/third_party/Warp-as-History"
-    helios_model: str = "/ephemeral/mdu/recovery-20260807/source/long-video/third_party/Warp-as-History/checkpoints/helios-distilled"
+    remote_jobs_root: str = "/ephemeral/mdu/recovery-20260807/wah_world_inference/gui_jobs"
+    wah_root: str = "/ephemeral/mdu/recovery-20260807/pointfilm_90d2591/Warp-as-History"
+    helios_model: str = "/ephemeral/mdu/recovery-20260807/pointfilm_90d2591/Warp-as-History/checkpoints/helios-distilled"
     recal_repo: str = "/ephemeral/mdu/recovery-20260807/source/ReCal3R"
     recal_checkpoint: str = "/ephemeral/mdu/recovery-20260807/source/ReCal3R/src/cut3r_512_dpt_4_64.pth"
     pi3x_repo: str = "/ephemeral/mdu/recovery-20260807/source/Pi3"
@@ -69,7 +69,7 @@ class RemoteConfig:
     download_debug: bool = False
 
 
-CONFIG_DIR = Path(os.getenv("APPDATA", Path.home())) / "GeoTokenInferenceGUI"
+CONFIG_DIR = Path(os.getenv("APPDATA", Path.home())) / "WAHWorldInferenceGUI"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
@@ -417,7 +417,7 @@ class RemoteInferenceWorker:
             inference = [
                 "env", f"CUDA_VISIBLE_DEVICES={self.config.cuda_device}", "PYTHONPATH=.",
                 "PYTHONUNBUFFERED=1",
-                self.config.remote_python, "scripts/infer_wpf_causal_world.py",
+                self.config.remote_python, "scripts/infer_wah_causal_world.py",
                 "--wah-root", self.config.wah_root, "--model", self.config.helios_model,
                 "--session", session_dir, "--controls", remote_controls,
                 "--recal3r-repo", self.config.recal_repo,
@@ -428,7 +428,6 @@ class RemoteInferenceWorker:
                 "--height", str(self.config.height), "--width", str(self.config.width),
                 "--online-fusion-voxel-size", str(self.config.online_fusion_voxel_size),
                 "--recal-confidence-quantile", str(self.config.recal_confidence_quantile),
-                "--override-checkpoint-geometry-config",
                 "--prompt", prompt or "Continue the scene consistently.",
             ]
             self._launch_inference_and_wait(

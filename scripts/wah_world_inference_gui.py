@@ -234,12 +234,12 @@ class RemoteInferenceWorker:
     def _emit(self, kind, value):
         self.events.put((kind, value))
 
-    def _base_ssh(self):
+    def _base_ssh(self, *, use_bind=True):
         command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=30",
                 "-o", "ConnectionAttempts=2", "-o", "ServerAliveInterval=15",
-                "-o", "ServerAliveCountMax=4",
+                "-o", "ServerAliveCountMax=4", "-o", "RequestTTY=no",
                 "-i", self.config.ssh_key]
-        if self.config.ssh_bind_address:
+        if use_bind and self.config.ssh_bind_address:
             command.extend(["-b", self.config.ssh_bind_address])
         command.append(self.config.host)
         return command
@@ -249,14 +249,35 @@ class RemoteInferenceWorker:
         if self.cancelled.is_set():
             raise RuntimeError("任务已取消")
         self._emit("status", label)
-        try:
-            completed = subprocess.run(
-                self._base_ssh() + [_posix_command(command)], capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=timeout,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"{label}超时（{timeout}s），请检查 SSH/H100 状态后重试") from error
+        remote_command = _posix_command(command)
+        attempts = [(self._base_ssh(), timeout)]
+        # A stale/unavailable local bind address can make only the short setup
+        # SSH call hang. Retry without binding the source address before giving
+        # up; this does not change the remote command or inference semantics.
+        if self.config.ssh_bind_address:
+            attempts.append((self._base_ssh(use_bind=False), min(timeout, 30)))
+        completed = None
+        last_error = None
+        for index, (ssh_command, attempt_timeout) in enumerate(attempts):
+            try:
+                completed = subprocess.run(
+                    ssh_command + [remote_command], capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=attempt_timeout,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as error:
+                last_error = error
+                if index + 1 < len(attempts):
+                    self._emit("log", f"{label}首次 SSH setup 超时，正在切换无绑定连接重试")
+                    continue
+                raise RuntimeError(f"{label}超时（{attempt_timeout}s），请检查 SSH/H100 状态后重试") from error
+            if completed.returncode == 0:
+                break
+            if index + 1 < len(attempts):
+                self._emit("log", f"{label}首次 SSH setup 失败，正在切换无绑定连接重试")
+                continue
+        if completed is None:
+            raise RuntimeError(f"{label}执行失败") from last_error
         if completed.stdout.strip():
             self._emit("log", completed.stdout.strip())
         if completed.returncode:

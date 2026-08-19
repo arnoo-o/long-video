@@ -21,46 +21,12 @@ def main():
     p.add_argument('--recal-confidence-threshold', type=float, default=None,
                    help='Deprecated: ReCal uses each valid-grid raw-confidence 40th percentile.')
     p.add_argument('--pi3x-repo',type=Path,required=True); p.add_argument('--pi3x-checkpoint',type=Path,required=True)
-    p.add_argument('--wpf-adaptation-checkpoint',type=Path)
-    p.add_argument('--geotoken-checkpoint',type=Path,
-                   help='GeoToken training checkpoint; runs the checkpoint architecture with WPF disabled.')
-    p.add_argument('--geotoken-strength',type=float,default=1.0,
-                   choices=(0.0,0.25,0.5,1.0))
-    p.add_argument('--camera-strength',type=float,default=1.0)
-    p.add_argument('--world-strength',type=float,default=1.0)
-    p.add_argument('--allow-stale-geotoken-semantics', action='store_true')
     p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--prompt',default='Continue the scene consistently.')
     p.add_argument('--online-fusion-voxel-size',type=float,default=0.015,
                    help='Phase-C/inference PointWorld voxel fusion size (formal v12: 0.015).')
     p.add_argument('--recal-confidence-quantile',type=float,default=0.3,
                    help='Raw-confidence quantile over each valid original-grid frame (formal v12: 0.3/P30).')
-    p.add_argument('--override-checkpoint-geometry-config', action='store_true',
-                   help='Use requested voxel/quantile instead of checkpoint metadata.')
     a=p.parse_args()
-    # A checkpoint may carry the geometry configuration it was trained with.
-    # Read this metadata before constructing Pi3X W0/ReCal so all world
-    # construction uses the same semantics.  Older v6 checkpoints do not
-    # carry these fields and remain compatible with the CLI defaults.
-    checkpoint_metadata = None
-    if a.geotoken_checkpoint is not None:
-        checkpoint_metadata = torch.load(
-            a.geotoken_checkpoint, map_location='cpu', weights_only=False,
-        )
-        checkpoint_voxel = checkpoint_metadata.get('phase_c_online_fusion_voxel_size')
-        checkpoint_quantile = checkpoint_metadata.get('phase_c_recal_confidence_quantile')
-        if (checkpoint_voxel is not None and checkpoint_quantile is not None
-                and not a.override_checkpoint_geometry_config):
-            if (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
-                    or float(checkpoint_quantile) != float(a.recal_confidence_quantile)):
-                progress_event(
-                    'geometry_config_from_checkpoint',
-                    requested_voxel_size=a.online_fusion_voxel_size,
-                    requested_confidence_quantile=a.recal_confidence_quantile,
-                    checkpoint_voxel_size=checkpoint_voxel,
-                    checkpoint_confidence_quantile=checkpoint_quantile,
-                )
-            a.online_fusion_voxel_size = float(checkpoint_voxel)
-            a.recal_confidence_quantile = float(checkpoint_quantile)
     if not np.isfinite(a.online_fusion_voxel_size) or a.online_fusion_voxel_size <= 0:
         p.error('--online-fusion-voxel-size must be finite and positive')
     if not np.isfinite(a.recal_confidence_quantile) or not 0 <= a.recal_confidence_quantile <= 1:
@@ -75,7 +41,8 @@ def main():
     from long_video.initialization.recal3r_world_accumulator import ReCal3RWorldAccumulator
     from long_video.memory.node_store import NodeStore
     from long_video.online.pipeline import OnlineSpatialHistoryPipeline
-    from long_video.wah.world_projected_pipeline import PYRAMID_INFERENCE_STEPS, WorldProjectedWarpAsHistoryPipeline
+    from warp_as_history import WarpAsHistoryPipeline
+    PYRAMID_INFERENCE_STEPS = (2, 2, 2)
     stored_node=NodeStore(a.session).load('node_000')
     progress_event('source_session_loaded', resolution=list(stored_node.view_rgb.shape[1:3]))
     # W0 is rebuilt from this one source observation.  Never reuse a node
@@ -95,73 +62,11 @@ def main():
     progress_event('pi3x_w0_complete', seconds=initial_world_seconds,
                    point_count=int(len(node.points_xyz)), voxel_size=online_fusion_voxel_size)
     progress_event('wah_pipeline_load_start')
-    if a.geotoken_checkpoint is None:
-        pipe=WorldProjectedWarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
-    else:
-        # GeoToken was trained with the unprojected official WAH pipeline.
-        from warp_as_history import WarpAsHistoryPipeline
-        pipe=WarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
+    pipe=WarpAsHistoryPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to(a.device)
     progress_event('wah_pipeline_load_complete')
     if not hasattr(pipe.transformer.config,'image_dim'): pipe.transformer.register_to_config(image_dim=None)
     pipe._configure_wah_lora(str(a.wah_root/'checkpoints/warp-as-history/visible_lora_state_step1000.safetensors'))
     progress_event('wah_lora_configured')
-    adaptation_step=None
-    if a.wpf_adaptation_checkpoint is not None:
-        from long_video.training.wpf_adaptation import (
-            adaptation_parameter_items, configure_trainable_wpf_adapter,
-        )
-        configure_trainable_wpf_adapter(pipe)
-        checkpoint=torch.load(a.wpf_adaptation_checkpoint,map_location='cpu',weights_only=False)
-        state=checkpoint.get('wpf_adaptation')
-        if not isinstance(state,dict):
-            raise RuntimeError('checkpoint does not contain wpf_adaptation state')
-        current=dict(pipe.transformer.named_parameters())
-        expected={name for name,_ in adaptation_parameter_items(pipe.transformer)}
-        if set(state)!=expected:
-            raise RuntimeError('checkpoint wpf_adaptation keys do not match the inference adapter')
-        with torch.no_grad():
-            for name,value in state.items():
-                current[name].copy_(value.to(device=current[name].device,dtype=current[name].dtype))
-        adaptation_step=int(checkpoint.get('global_step',-1))
-    geotoken_step=None
-    provider=None
-    if a.geotoken_checkpoint is not None:
-        progress_event('geotoken_checkpoint_load_start', checkpoint=str(a.geotoken_checkpoint))
-        from long_video.geometry.geotoken import install_geotoken
-        from long_video.geometry.geotoken_runtime import PointWorldGeoTokenProvider, source_scene_scale_from_active_node
-        conditioner=install_geotoken(pipe.transformer).to(device=a.device)
-        conditioner.configure_strengths(
-            geotoken=a.geotoken_strength, camera=a.camera_strength, world=a.world_strength,
-        )
-        checkpoint = checkpoint_metadata
-        from long_video.training.geotoken import TRAINING_SEMANTICS_VERSION, GEOMETRY_SCHEMA_VERSION, GEOMETRY_IMPLEMENTATION_VERSION, WAH_RUNTIME_FINGERPRINT
-        semantics_match = (checkpoint.get('training_semantics_version') == TRAINING_SEMANTICS_VERSION
-                           and checkpoint.get('geometry_schema_version') == GEOMETRY_SCHEMA_VERSION
-                           and checkpoint.get('geometry_implementation_version') == GEOMETRY_IMPLEMENTATION_VERSION)
-        if not semantics_match and not a.allow_stale_geotoken_semantics:
-            raise RuntimeError('GeoToken checkpoint has stale training/world-binding semantics')
-        if not semantics_match:
-            print('WARNING: stale GeoToken semantics allowed for diagnostic inference only')
-        if checkpoint.get('wah_runtime_fingerprint') != WAH_RUNTIME_FINGERPRINT: raise RuntimeError('GeoToken checkpoint WAH runtime fingerprint mismatch')
-        if semantics_match:
-            checkpoint_voxel = checkpoint.get('phase_c_online_fusion_voxel_size')
-            checkpoint_quantile = checkpoint.get('phase_c_recal_confidence_quantile')
-            if checkpoint_voxel is None or checkpoint_quantile is None:
-                raise RuntimeError('GeoToken checkpoint is missing Phase-C geometry config metadata')
-            if (not a.override_checkpoint_geometry_config and
-                    (float(checkpoint_voxel) != float(a.online_fusion_voxel_size)
-                     or float(checkpoint_quantile) != float(a.recal_confidence_quantile))):
-                raise RuntimeError('internal checkpoint geometry config resolution error')
-        state=checkpoint.get('geotoken')
-        named=dict(pipe.transformer.named_parameters())
-        expected={name for name in named if 'geotoken.' in name}
-        if not isinstance(state,dict) or set(state) != expected:
-            raise RuntimeError('checkpoint GeoToken parameter set does not match inference transformer')
-        with torch.no_grad():
-            for name,value in state.items():
-                named[name].copy_(value.to(device=named[name].device,dtype=named[name].dtype))
-        geotoken_step=int(checkpoint.get('global_step',-1))
-        progress_event('geotoken_checkpoint_load_complete', step=geotoken_step)
     for module in (pipe.transformer,pipe.vae):
         for q in module.parameters(): q.requires_grad_(False)
     geo=ReCal3RGeometryBackend(
@@ -176,26 +81,6 @@ def main():
     online.autoregressive_state['is_amplify_first_chunk']=False
     online.wah_adapter.configure_state(online.autoregressive_state); controls=json.loads(a.controls.read_text()); K=resize_intrinsics(node.view_intrinsics[0],node.view_rgb.shape[1:3],(a.height,a.width))
     progress_event('autoregressive_state_ready', chunks_total=len(controls))
-    if a.geotoken_checkpoint is not None:
-        source_c2w=np.asarray(node.view_c2w[0],np.float32)
-        scene_scale=source_scene_scale_from_active_node(node,source_c2w,K,device=a.device,height=a.height,width=a.width)
-        provider=PointWorldGeoTokenProvider(conditioner,device=a.device,source_center=source_c2w[:3,3],scene_scale=scene_scale,render_height=a.height,render_width=a.width)
-        from long_video.geometry.geotoken import scheduler_progress_from_timestep
-        provider.set_timing_resolver(lambda kwargs: scheduler_progress_from_timestep(pipe.scheduler, kwargs["timestep"]))
-        provider.attach(pipe.transformer)
-        def pre_render_world_hook(active_node,cameras):
-            active_world=provider.configure_active_node(active_node)
-            source_geometry=provider.ensure_source_geometry(source_c2w, K)
-            existing_source=online.autoregressive_state.setdefault('_geotoken_source_geometry',source_geometry)
-            if existing_source is not source_geometry: raise RuntimeError('GeoToken source geometry changed within one trajectory')
-            provider.configure_chunk(
-                cameras.c2w,cameras.intrinsics,online.autoregressive_state.get('_geotoken_history_snapshots',()),
-                history_window=online.autoregressive_state.get('_wah_geometry_slot_refs',()),
-                source_geometry=online.autoregressive_state['_geotoken_source_geometry'],
-            )
-            from long_video.online.pipeline import point_world_snapshot_identity
-            return {'world_identity':point_world_snapshot_identity(active_node),'freeze_history':provider.freeze_current_snapshot}
-        online.pre_render_world_hook=pre_render_world_hook
     from long_video.types import CameraBatch
     from long_video.geometry.point_renderer import render_geometry_cuda
     def scalar_debug_frame(values):
@@ -269,7 +154,18 @@ def main():
     imageio.mimwrite(a.output_dir/'persistent_surface_association_mask.mp4',np.asarray(association_mask_frames),fps=24,macro_block_size=1)
     confidence_mode=f"p{100 * a.recal_confidence_quantile:g}_valid_grid_raw_confidence"
     confidence_description=(f"{100 * a.recal_confidence_quantile:g}th percentile of raw confidence over valid original-grid depth/confidence pixels, per ReCal frame")
-    a.output_dir.mkdir(parents=True,exist_ok=True); imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'generated_pixels_and_warp_world.mp4',np.concatenate([np.asarray(generated),np.asarray(warps)],axis=2),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'geometry_post_update.mp4',np.asarray(geometry_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'debug_generated_warp_geometry.mp4',np.asarray(panels),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'raw_recal_depth.mp4',np.asarray(raw_depth_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'raw_recal_confidence.mp4',np.asarray(raw_confidence_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'native_recal_world.mp4',np.asarray(native_world_frames),fps=24,macro_block_size=1); imageio.mimwrite(a.output_dir/'commanded_world_before_fusion.mp4',np.asarray(commanded_world_frames),fps=24,macro_block_size=1); (a.output_dir/'recal_debug_semantics.json').write_text(json.dumps({'raw_recal_depth':'ReCal pts3d_in_self_view.z remapped to the original RGB grid before thresholding','raw_recal_confidence':'ReCal conf_self remapped to the original RGB grid before thresholding','confidence_threshold':confidence_description,'native_recal_world':'ReCal self-view Z remapped to the original RGB grid and backprojected with commanded intrinsics; local XYZ coordinate colors, not RGB','commanded_world_before_fusion':'the same commanded-intrinsics backprojection after fixed ReCal-to-W0 scale plus commanded c2w, before validity threshold or voxel fusion; coordinate colors, not RGB','generated_pixels_and_warp_world':'left: generated RGB pixels; right: RGB warp rendered from the pre-generation persistent PointWorld'},indent=2)); (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':a.geotoken_checkpoint is None,'wpf_adaptation_checkpoint':str(a.wpf_adaptation_checkpoint) if a.wpf_adaptation_checkpoint else None,'wpf_adaptation_step':adaptation_step,'geotoken_checkpoint':str(a.geotoken_checkpoint) if a.geotoken_checkpoint else None,'geotoken_step':geotoken_step,'camera_strength':a.camera_strength if a.geotoken_checkpoint else None,'world_strength':a.world_strength if a.geotoken_checkpoint else None,'recal_confidence_threshold_mode':confidence_mode,'recal_confidence_quantile':a.recal_confidence_quantile,'geotoken_injection':getattr(conditioner,'diagnostics',None) if a.geotoken_checkpoint else None,'chunks':reports,'initial_world_seconds':float(initial_world_seconds),'chunk_inference_seconds':chunk_inference_seconds,'chunk_inference_seconds_total':float(sum(chunk_inference_seconds)),'inference_core_seconds':float(initial_world_seconds+sum(chunk_inference_seconds)),'pixel_generation_seconds_total':float(sum(item.get('pixel_generation_seconds',0.0) for item in reports)),'pixel_generation_seconds_mean':float(np.mean([item.get('pixel_generation_seconds',0.0) for item in reports])) if reports else 0.0},indent=2,default=str))
+    a.output_dir.mkdir(parents=True,exist_ok=True)
+    imageio.mimwrite(a.output_dir/'generated.mp4',np.asarray(generated),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'warp.mp4',np.asarray(warps),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'generated_pixels_and_warp_world.mp4',np.concatenate([np.asarray(generated),np.asarray(warps)],axis=2),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'geometry_post_update.mp4',np.asarray(geometry_frames),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'debug_generated_warp_geometry.mp4',np.asarray(panels),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'raw_recal_depth.mp4',np.asarray(raw_depth_frames),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'raw_recal_confidence.mp4',np.asarray(raw_confidence_frames),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'native_recal_world.mp4',np.asarray(native_world_frames),fps=24,macro_block_size=1)
+    imageio.mimwrite(a.output_dir/'commanded_world_before_fusion.mp4',np.asarray(commanded_world_frames),fps=24,macro_block_size=1)
+    (a.output_dir/'recal_debug_semantics.json').write_text(json.dumps({'raw_recal_depth':'ReCal pts3d_in_self_view.z remapped to the original RGB grid before thresholding','raw_recal_confidence':'ReCal conf_self remapped to the original RGB grid before thresholding','confidence_threshold':confidence_description,'native_recal_world':'ReCal self-view Z remapped to the original RGB grid and backprojected with commanded intrinsics; local XYZ coordinate colors, not RGB','commanded_world_before_fusion':'the same commanded-intrinsics backprojection after fixed ReCal-to-W0 scale plus commanded c2w, before validity threshold or voxel fusion; coordinate colors, not RGB','generated_pixels_and_warp_world':'left: generated RGB pixels; right: RGB warp rendered from the pre-generation persistent PointWorld'},indent=2))
+    (a.output_dir/'metrics.json').write_text(json.dumps({'pyramid_num_inference_steps_list':list(PYRAMID_INFERENCE_STEPS),'wpf_enabled':False,'wpf_adaptation_checkpoint':None,'wpf_adaptation_step':None,'geotoken_checkpoint':None,'geotoken_step':None,'camera_strength':None,'world_strength':None,'recal_confidence_threshold_mode':confidence_mode,'recal_confidence_quantile':a.recal_confidence_quantile,'geotoken_injection':None,'chunks':reports,'initial_world_seconds':float(initial_world_seconds),'chunk_inference_seconds':chunk_inference_seconds,'chunk_inference_seconds_total':float(sum(chunk_inference_seconds)),'inference_core_seconds':float(initial_world_seconds+sum(chunk_inference_seconds)),'pixel_generation_seconds_total':float(sum(item.get('pixel_generation_seconds',0.0) for item in reports)),'pixel_generation_seconds_mean':float(np.mean([item.get('pixel_generation_seconds',0.0) for item in reports])) if reports else 0.0},indent=2,default=str))
     semantics_path=a.output_dir/'recal_debug_semantics.json'
     semantics=json.loads(semantics_path.read_text()); semantics['confidence_threshold']=confidence_description; semantics['persistent_surface_association_mask']='green=MATCH/owned duplicate, red=CONFLICT, blue=valid NOVEL before commit, cyan=chunk-local NOVEL committed, magenta=FREE_SPACE_VIOLATION, black=invalid'; semantics_path.write_text(json.dumps(semantics,indent=2))
     metrics_path=a.output_dir/'metrics.json'

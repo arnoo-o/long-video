@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local Tk GUI that launches GeoToken inference on H100 over SSH."""
+"""Local Tk GUI that launches causal WAH inference on H100 over SSH."""
 from __future__ import annotations
 
 import json
@@ -59,7 +59,6 @@ class RemoteConfig:
     recal_checkpoint: str = "/ephemeral/mdu/recovery-20260807/source/ReCal3R/src/cut3r_512_dpt_4_64.pth"
     pi3x_repo: str = "/ephemeral/mdu/recovery-20260807/source/Pi3"
     pi3x_checkpoint: str = "/ephemeral/mdu/recovery-20260807/models/pi3x/model.safetensors"
-    geotoken_checkpoint: str = "/ephemeral/mdu/recovery-20260807/geotoken_runs/train_geotoken_phasec_online0015_p30_v12_20260817/checkpoints/phase_c_final_step_2000.pt"
     text_to_image_model: str = "stabilityai/stable-diffusion-xl-base-1.0"
     cuda_device: str = "1"
     width: int = 640
@@ -68,7 +67,6 @@ class RemoteConfig:
     online_fusion_voxel_size: float = 0.015
     recal_confidence_quantile: float = 0.3
     download_debug: bool = False
-    allow_stale_geotoken_semantics: bool = False
 
 
 CONFIG_DIR = Path(os.getenv("APPDATA", Path.home())) / "GeoTokenInferenceGUI"
@@ -265,26 +263,6 @@ class RemoteInferenceWorker:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(f"{label}失败，SSH exit code={completed.returncode}: {detail}")
 
-    def _resolve_checkpoint(self, configured: str) -> str:
-        configured = str(_clean_config_value(configured))
-        command = (
-            f"if test -f {shlex.quote(configured)}; then printf '%s\\n' {shlex.quote(configured)}; "
-            f"elif test -d {shlex.quote(configured)}; then find {shlex.quote(configured)} "
-            "-maxdepth 1 -type f -name '*.pt' -printf '%p\\n' | sort -V | tail -1; "
-            "else printf 'CHECKPOINT_NOT_FOUND\\n' >&2; exit 2; fi"
-        )
-        completed = subprocess.run(
-            self._base_ssh() + [command], capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=45,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        resolved = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
-        if completed.returncode or not resolved.endswith(".pt"):
-            detail = completed.stderr.strip() or "指定 checkpoint 不存在，且未提供有效 checkpoint 目录"
-            raise RuntimeError(f"无法定位 GeoToken checkpoint：{detail}")
-        self._emit("log", f"使用 GeoToken checkpoint：{resolved}")
-        return resolved
-
     def _stream(self, command: list[str], label: str, *, remote_group=False, cwd=None,
                 remote_log=None):
         if self.cancelled.is_set():
@@ -436,7 +414,6 @@ class RemoteInferenceWorker:
                 "--output-session", session_dir, "--height", str(self.config.height),
                 "--width", str(self.config.width), "--fov-degrees", str(self.config.fov_degrees),
             ], "建立 source-only session", cwd=self.config.remote_repo)
-            geotoken_checkpoint = self._resolve_checkpoint(self.config.geotoken_checkpoint)
             inference = [
                 "env", f"CUDA_VISIBLE_DEVICES={self.config.cuda_device}", "PYTHONPATH=.",
                 "PYTHONUNBUFFERED=1",
@@ -447,7 +424,6 @@ class RemoteInferenceWorker:
                 "--recal3r-checkpoint", self.config.recal_checkpoint,
                 "--pi3x-repo", self.config.pi3x_repo,
                 "--pi3x-checkpoint", self.config.pi3x_checkpoint,
-                "--geotoken-checkpoint", geotoken_checkpoint,
                 "--output-dir", remote_output, "--device", "cuda",
                 "--height", str(self.config.height), "--width", str(self.config.width),
                 "--online-fusion-voxel-size", str(self.config.online_fusion_voxel_size),
@@ -455,11 +431,9 @@ class RemoteInferenceWorker:
                 "--override-checkpoint-geometry-config",
                 "--prompt", prompt or "Continue the scene consistently.",
             ]
-            if self.config.allow_stale_geotoken_semantics:
-                inference.append("--allow-stale-geotoken-semantics")
             self._launch_inference_and_wait(
                 inference,
-                label="H100 GeoToken 推理",
+                label="H100 WAH 推理",
                 remote_log=str(PurePosixPath(remote_dir) / "inference.log"),
                 remote_output=remote_output,
             )
@@ -477,7 +451,7 @@ class RemoteInferenceWorker:
 class InferenceGUI(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("GeoToken H100 推理工具")
+        self.title("WAH H100 推理工具")
         self.geometry("1050x790")
         self.minsize(900, 680)
         self.config_data = load_config()
@@ -488,7 +462,7 @@ class InferenceGUI(tk.Tk):
         self.source_path = tk.StringVar()
         self.prompt = tk.StringVar(value="Continue the scene consistently.")
         self.negative_prompt = tk.StringVar(value="low quality, blurry, distorted")
-        self.output_root = tk.StringVar(value=str(Path.home() / "Videos" / "GeoToken"))
+        self.output_root = tk.StringVar(value=str(Path.home() / "Videos" / "WAH"))
         self.seed = tk.StringVar(value="0")
         self.fusion_voxel_size = tk.StringVar(value=str(self.config_data.online_fusion_voxel_size))
         self.confidence_quantile = tk.StringVar(value=str(self.config_data.recal_confidence_quantile))

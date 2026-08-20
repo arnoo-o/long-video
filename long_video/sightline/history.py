@@ -71,5 +71,5 @@ class CameraHistoryState:
         if len(keys)<19: keys=[None]*(19-len(keys))+keys
         return [(source_camera, source_intrinsics) if key is None or key not in self._items else (self._items[key][1], self._items[key][2] if self._items[key][2] is not None else source_intrinsics) for key in keys]
     def slot_frame_ids(self):
-        return tuple(sorted(self._items)[-19:])
+        return tuple(self._items[key][0] for key in sorted(self._items)[-19:])
     def indices(self): return tuple(sorted(self._items))

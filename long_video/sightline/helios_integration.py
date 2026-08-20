@@ -87,12 +87,14 @@ class SightlineRayProvider:
         if history.shape[:1] != (B,) or history.shape[-1] != 7:
             raise RuntimeError(f"invalid history ray shape: history={tuple(history.shape)}, key={key_length}, current={current_count}")
         if history.shape[1] != expected:
-            if expected % history.shape[1] != 0:
+            if history.shape[1] % expected == 0:
+                factor=history.shape[1]//expected
+                history=history.reshape(B,expected,factor,7)[:, :, factor//2]
+            elif expected % history.shape[1] != 0:
                 raise RuntimeError(f"history ray count does not match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
-            # Helios may expand each latent-history token into multiple native
-            # temporal tokens at a pyramid stage. Reuse the same physical camera
-            # ray for that representation, never invent a dummy ray.
-            history=history.repeat_interleave(expected//history.shape[1],dim=1)
+            else:
+                factor=expected//history.shape[1]
+                history=history.repeat_interleave(factor,dim=1)
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
 

@@ -6,7 +6,8 @@ alpha_init: 0.0
 history_sizes: [16, 2, 1]
 chunk_length: 33
 chunk_stride: 32
-memory_layers: []
+sightline_layers: [0]
+memory_layers: [0]
 correspondence_layers: []
 lora_layers: []
 lora_rank: 8

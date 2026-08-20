@@ -44,7 +44,7 @@ def main():
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda')
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
     conditioner=SightlineConditioner(inner).to('cuda',dtype=torch.bfloat16); provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
-    layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.memory_layers or cfg.correspondence_layers)
+    layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner); runner.assert_geometry_free_imports()

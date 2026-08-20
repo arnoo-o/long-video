@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 import torch
+from .rays import latent_camera_indices
 
 @dataclass(frozen=True)
 class HistoryLayout:
@@ -51,7 +52,9 @@ class CameraHistoryState:
         for i,item in enumerate(representatives):
             index=start+i
             if index in self._items:
-                if self._items[index] is not item: raise RuntimeError(f"inconsistent camera boundary {index}")
+                old=self._items[index]
+                if old is not item and not (isinstance(old,torch.Tensor) and isinstance(item,torch.Tensor) and torch.equal(old,item)):
+                    raise RuntimeError(f"inconsistent camera boundary {index}")
             else: self._items[index]=item
         self._chunk_index+=1
     def slots(self):

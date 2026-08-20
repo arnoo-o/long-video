@@ -14,7 +14,8 @@ class SightlinePipeline:
     """Owns runtime state while delegating denoising to pinned Helios itself."""
     def __init__(self, helios_pipeline, *, config:SightlineConfig, conditioner=None):
         self.helios=helios_pipeline; self.config=config; self.conditioner=conditioner
-        self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(config.memory_layers,config.memory_budget,config.memory_pool)
+        inner_dim=int(conditioner.q_proj[-1].out_features) if conditioner is not None else None
+        self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim)
         self.runtime=SightlineRuntimeContext(); self._source_initialized=False
     def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps, attention_kwargs=None):
         if not self._source_initialized: self._source_initialized=True

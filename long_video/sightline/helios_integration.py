@@ -37,7 +37,9 @@ class SightlineHeliosAttnProcessor:
             key=torch.cat((key[:,:history_len]*scale,key[:,history_len:]),1)
         if getattr(attn,'restrict_self_attn',False) and history_len:
             key=key[:,:history_len]; value=value[:,:history_len]
-        if self.memory is not None: key,value,self.last_attention_meta=self.memory.append_native_attention(attn,key,value,rotary_emb,self.rotary_apply,current_chunk=kwargs.get('current_chunk',0),**kwargs)
+        if self.memory is not None:
+            memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None)
+            key,value,self.last_attention_meta=self.memory.append_native_attention(attn,key,value,rotary_emb,self.rotary_apply,current_chunk=kwargs.get('current_chunk',0),timestamp_embedding=kwargs.get('timestamp_embedding'),**memory_kwargs)
         self.last_q=query; self.last_k=key
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=None,parallel_config=None)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
@@ -46,29 +48,24 @@ class SightlineHeliosAttnProcessor:
 
 class SightlineRayProvider:
     """Runtime ray provider bound to one actual Helios token grid."""
-    def __init__(self, c2w, intrinsics, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
+    def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
-        self.c2w=c2w; self.intrinsics=intrinsics
+        self.c2w=c2w; self.intrinsics=intrinsics; self.context=None
+    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, stage=0, sigma=0.0, token_shape=None):
+        if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
+        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape}
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape
-        T=9
-        if self.token_shape is None:
-            candidates=[]
-            for patch in (1,2,4):
-                h=self.source_height//self.vae_spatial_factor//patch; w=self.source_width//self.vae_spatial_factor//patch
-                if h>0 and w>0: candidates.append((T,h,w))
-            matches=[x for x in candidates if x[0]*x[1]*x[2]==current_length]
-            if len(matches)!=1: raise RuntimeError(f"cannot resolve actual Helios token grid for {current_length}; candidates={candidates}")
-            T,H,W=matches[0]
-        else: T,H,W=self.token_shape
+        context=self.context
+        if context is None: raise RuntimeError("SightlineRayProvider has no current chunk context")
+        c2w=context['c2w']; intrinsics=context['intrinsics']; history=kwargs.get('history_rays',context.get('history_rays')); T,H,W=context.get('token_shape') or self.token_shape or (None,None,None)
+        if T is None or H is None or W is None: raise RuntimeError("real Helios token_shape is required; refusing to guess")
         current_count=T*H*W
         if current_length != current_count: raise RuntimeError(f"runtime context current_length={current_length} != ray grid tokens={current_count}")
-        rays=token_rays_for_shape(self.c2w,self.intrinsics,(B,T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(B,current_count,7)
+        rays=token_rays_for_shape(c2w,intrinsics,(B,T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(B,current_count,7)
         if key_length == current_count: return rays,rays
         history=kwargs.get('history_rays')
-        if history is None:
-            source=torch.zeros_like(rays); source[...,2]=1.0
-            history=source[:,:key_length-current_count]
+        if history is None: raise RuntimeError("history rays are required for attention with history tokens")
         if history.shape[:1] != (B,) or history.shape[-1] != 7 or history.shape[1] != key_length-current_count: raise RuntimeError("history ray count does not match native Helios context")
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
@@ -81,7 +78,8 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         if not isinstance(index,int) or index<0 or index>=len(blocks): raise ValueError(f"invalid Helios layer {index}")
         attn=getattr(blocks[index],'attn1',None)
         if attn is None: raise RuntimeError(f"layer {index} has no self-attention")
-        processor=SightlineHeliosAttnProcessor(conditioner,ray_provider,memory=memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn)
+        layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') else memory
+        processor=SightlineHeliosAttnProcessor(conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn)
         if hasattr(attn,'set_processor'): attn.set_processor(processor)
         else: attn.processor=processor
         installed.append(index)

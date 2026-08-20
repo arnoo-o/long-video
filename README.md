@@ -2,7 +2,16 @@
 
 Causal long-video inference uses one compact path:
 
-1. ReCal3R builds and grows the causal point-cloud world from the source and prior generated chunks.
+The formal mainline is now Sightline: Helios receives source RGB, camera intrinsics,
+c2w controls, generated latent history, deterministic Plücker rays, and bounded
+K/V-only long-term memory. It does not import WAH, PointWorld, ReCal3R, Pi3X,
+depth, warp rendering, or confidence/visibility maps. The previous causal-world
+implementation remains in the repository as legacy/reference code only.
+
+The Sightline entrypoints are `scripts/infer_sightline.py` and
+`scripts/train_sightline_dl3dv.py`; training is intentionally not launched by
+this change. Sparse offline teachers are built with
+`scripts/build_sightline_correspondences.py`.
 2. Parent-First renderer produces aligned warp RGB, binary visibility, and confidence.
 3. Pinned original Warp-as-History consumes the rendered warp as history conditioning.
 4. Helios samples three pyramid stages with `[2, 2, 4]` scheduler updates.

@@ -1,0 +1,24 @@
+ray_epsilon: 1.0e-6
+scale_augmentation_probability: 0.3
+scale_augmentation_range: [-1.2, 1.6]
+sightline_enabled: true
+alpha_init: 0.0
+history_sizes: [16, 2, 1]
+chunk_length: 33
+chunk_stride: 32
+memory_layers: []
+correspondence_layers: []
+lora_layers: []
+lora_rank: 8
+memory_pool: 2
+memory_budget: 12960
+lambda_corr: 0.02
+lambda_corr_final: 0.005
+lambda_corr_decay_start: 0.4
+learning_rate: 0.0001
+lora_learning_rate: 0.00003
+gradient_checkpointing: true
+diagnostics_frequency: 10
+sightline_training_semantics_version: sightline-v1
+sightline_correspondence_schema_version: sightline-correspondence-v1
+sightline_checkpoint_schema_version: sightline-checkpoint-v1

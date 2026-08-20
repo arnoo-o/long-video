@@ -8,7 +8,7 @@ class MemoryToken:
 class LongTermKVMemory:
     def __init__(self, budget=2160*6, pool=2, timestamp_buckets=64, hidden_dim=None):
         self.budget=budget; self.pool=pool; self.tokens=[]; self.timestamp=nn.Embedding(timestamp_buckets,hidden_dim) if hidden_dim else None
-    def capture(self, hidden, rays, chunk_index, *, grid_shape=None):
+    def capture(self, hidden, rays, chunk_index, *, grid_shape=None, ray_recompute=None):
         if hidden.ndim<3: raise ValueError("hidden must be [B,N,C]")
         # caller supplies already aligned rays; pool spatially by simple grouping
         if rays.shape[:2] != hidden.shape[:2]: raise ValueError("memory hidden/ray token count mismatch")
@@ -20,6 +20,8 @@ class LongTermKVMemory:
         if H%self.pool or W%self.pool: raise ValueError("memory grid must be divisible by 2x2 pooling")
         hh=hh.reshape(hh.shape[0],T,H//self.pool,self.pool,W//self.pool,self.pool,-1).mean((3,5))
         rr=rr.reshape(rr.shape[0],T,H//self.pool,self.pool,W//self.pool,self.pool,-1).mean((3,5))
+        if ray_recompute is not None:
+            rr=ray_recompute((T,H//self.pool,W//self.pool)).reshape(rr.shape[0],T,H//self.pool,W//self.pool,-1)
         hh=hh.reshape(hh.shape[0],-1,hidden.shape[-1]); rr=rr.reshape(rr.shape[0],-1,rays.shape[-1])
         # Re-normalize pooled direction and moment components; callers may
         # replace this with exact cell-centre rays from the camera/K provider.
@@ -45,6 +47,9 @@ class LongTermKVMemory:
             # caller can pass a dedicated memory rotary tensor via kwargs.
             memory_rotary=kwargs.get('memory_rotary_emb')
             if memory_rotary is not None: mem_k=rotary_apply(mem_k,memory_rotary)
+        if sightline_projector is not None:
+            delta=sightline_projector.project(rays.to(hidden),kind='k',training=sightline_projector.training)
+            mem_k=mem_k+delta.unflatten(-1,(attn.heads,-1))
         if timestamp_embedding is not None:
             ages=torch.tensor([max(0,current_chunk-t.chunk_index) for t in self.tokens],device=hidden.device,dtype=torch.long).clamp_max(timestamp_embedding.num_embeddings-1)
             age=timestamp_embedding(ages).to(mem_k.dtype).unsqueeze(0).unflatten(2,(attn.heads,-1))

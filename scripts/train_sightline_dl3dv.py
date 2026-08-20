@@ -18,11 +18,21 @@ def main():
     items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device); item=items[0]
     trainable.train(); noisy=item['noisy_latents']; p_t,p_h,p_w=tuple(getattr(pipe.transformer.config,'patch_size',(1,2,2))); token_shape=(noisy.shape[2]//p_t,noisy.shape[3]//p_h,noisy.shape[4]//p_w)
     c2w=torch.eye(4,device='cuda',dtype=torch.float32)[None].repeat(1,33,1,1); K=torch.eye(3,device='cuda',dtype=torch.float32)[None].repeat(1,33,1,1); K[:, :, 0,0]=cfg.source_width; K[:, :, 1,1]=cfg.source_height; K[:, :, 0,2]=cfg.source_width/2; K[:, :, 1,2]=cfg.source_height/2
-    provider=SightlineRayProvider(c2w,K,token_shape=token_shape,source_height=cfg.source_height,source_width=cfg.source_width); provider.set_context(chunk_index=0,c2w=c2w,intrinsics=K,history_rays=None,token_shape=token_shape)
+    provider=SightlineRayProvider(c2w,K,token_shape=token_shape,source_height=cfg.source_height,source_width=cfg.source_width)
+    source_history=c2w[:, :1].expand(-1,20,-1,-1); source_K=K[:, :1].expand(-1,20,-1,-1)
+    provider.set_context(chunk_index=0,c2w=c2w,intrinsics=K,history_cameras=source_history,history_intrinsics=source_K,token_shape=token_shape,stage_shapes=(token_shape,))
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
     install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=cfg.sightline_layers,helios_module=helios_source)
     prompt_embeds=pipe._get_t5_prompt_embeds(a.prompt,device='cuda',dtype=torch.bfloat16)
-    model_out=pipe.transformer(hidden_states=noisy,timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,attention_kwargs={'current_chunk':0})
+    _,_,latent_t,latent_h,latent_w=noisy.shape
+    zeros=lambda n: torch.zeros((noisy.shape[0],noisy.shape[1],n,latent_h,latent_w),device=noisy.device,dtype=noisy.dtype)
+    indices_current=torch.arange(latent_t,device=noisy.device).view(1,-1)
+    indices_history=torch.arange(20,device=noisy.device).view(1,-1)
+    model_out=pipe.transformer(hidden_states=noisy,timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,
+        indices_hidden_states=indices_current,
+        indices_latents_history_short=indices_history[:,[0,19]], indices_latents_history_mid=indices_history[:,[17,18]], indices_latents_history_long=indices_history[:,:16],
+        latents_history_short=zeros(2),latents_history_mid=zeros(2),latents_history_long=zeros(16),
+        attention_kwargs={'current_chunk':0})
     prediction=model_out[0] if isinstance(model_out,(tuple,list)) else getattr(model_out,'sample',model_out)
     if prediction.shape != noisy.shape: raise RuntimeError(f'Helios prediction shape mismatch {prediction.shape} vs {noisy.shape}')
     loss=(prediction.float()-item['target'].float()).square().mean(); loss.backward()

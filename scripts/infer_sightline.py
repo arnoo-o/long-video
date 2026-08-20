@@ -37,7 +37,7 @@ def main():
     needed=1+a.chunks*32
     if c2w.shape[0] < needed: c2w=np.concatenate((c2w,np.repeat(c2w[-1:],needed-c2w.shape[0],0)),0)
     c2w=c2w[:needed]
-    c2w=canonicalize_c2w(torch.from_numpy(c2w[None])).squeeze(0).to('cuda',dtype=torch.float32)
+    c2w=canonicalize_c2w(torch.from_numpy(c2w[None])).to('cuda',dtype=torch.float32)
     if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
     elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
@@ -46,8 +46,9 @@ def main():
     conditioner=SightlineConditioner(inner).to('cuda',dtype=torch.bfloat16); provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
     layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
-    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source)
-    runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner); runner.assert_geometry_free_imports()
-    result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps)
+    runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
+    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory)
+    runner.assert_geometry_free_imports()
+    result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K)
     frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
 if __name__=='__main__': main()

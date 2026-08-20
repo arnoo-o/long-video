@@ -34,9 +34,13 @@ def main():
     if a.controls:
         from long_video.data.controls import integrate_controls
         controls=json.loads(Path(a.controls).read_text()); c2w=np.concatenate((c2w[:1],integrate_controls(c2w[0],controls)),0)
-    if c2w.shape[0] < 33: c2w=np.concatenate((c2w,np.repeat(c2w[-1:],33-c2w.shape[0],0)),0)
+    needed=1+a.chunks*32
+    if c2w.shape[0] < needed: c2w=np.concatenate((c2w,np.repeat(c2w[-1:],needed-c2w.shape[0],0)),0)
+    c2w=c2w[:needed]
     c2w=torch.from_numpy(canonicalize_c2w(torch.from_numpy(c2w[None])).squeeze(0)).to('cuda',dtype=torch.float32)
-    K=torch.from_numpy(K).to('cuda',dtype=torch.float32)[None].expand(1,33,3,3)
+    if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
+    elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
+    K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda')
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
     conditioner=SightlineConditioner(inner).to('cuda',dtype=torch.bfloat16); provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)

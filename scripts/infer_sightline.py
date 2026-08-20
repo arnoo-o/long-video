@@ -37,7 +37,7 @@ def main():
     needed=1+a.chunks*32
     if c2w.shape[0] < needed: c2w=np.concatenate((c2w,np.repeat(c2w[-1:],needed-c2w.shape[0],0)),0)
     c2w=c2w[:needed]
-    c2w=torch.from_numpy(canonicalize_c2w(torch.from_numpy(c2w[None])).squeeze(0)).to('cuda',dtype=torch.float32)
+    c2w=canonicalize_c2w(torch.from_numpy(c2w[None])).squeeze(0).to('cuda',dtype=torch.float32)
     if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
     elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]

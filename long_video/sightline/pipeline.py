@@ -1,17 +1,14 @@
 """Geometry-free Helios autoregressive pipeline contract."""
-from dataclasses import dataclass
 import torch
+from ..config import SightlineConfig
 from .history import HistoryManager
 from .memory import LongTermKVMemory
 from .rays import token_rays_for_shape
-@dataclass
-class SightlineConfig:
-    history_sizes: tuple=(16,2,1); chunk_length:int=33; stride:int=32
-    memory_budget:int=12960; memory_layers:tuple=(); sightline_enabled:bool=True
 class SightlinePipeline:
     def __init__(self, helios, *, config=None, conditioner=None):
-        self.helios=helios; self.config=config or SightlineConfig(); self.conditioner=conditioner
-        self.history=HistoryManager(self.config.history_sizes,self.config.chunk_length,self.config.stride); self.memory=LongTermKVMemory(self.config.memory_budget)
+        if config is None: raise ValueError("SightlinePipeline requires validated SightlineConfig")
+        self.helios=helios; self.config=config; self.conditioner=conditioner
+        self.history=HistoryManager(self.config.history_sizes,self.config.chunk_length,self.config.chunk_stride); self.memory=LongTermKVMemory(self.config.memory_budget)
     @torch.no_grad()
     def generate_chunk(self, source_latent, c2w, intrinsics, controls=None, *, source_height: int, source_width: int):
         if self.history._source is None: self.history.set_source(source_latent)

@@ -17,8 +17,27 @@ lambda_corr_final: 0.005
 lambda_corr_decay_start: 0.4
 learning_rate: 0.0001
 lora_learning_rate: 0.00003
+warmup_ratio: 0.04
+grad_clip: 1.0
+bf16: true
+accumulation_steps: 1
+high_noise_bias: 0.0
+teacher_forcing_ratio: 1.0
+self_rollout_ratio: 0.0
+memory_write_sigma: 0.0
+correspondence_rows_per_batch: 1024
 gradient_checkpointing: true
 diagnostics_frequency: 10
+phase: P1
+model_id: ""
+source_height: 384
+source_width: 640
+chunk_count: 6
+pyramid_steps: [2, 2, 2]
+data_path: ""
+latent_cache_path: ""
+correspondence_cache_path: ""
+output_path: ""
 sightline_training_semantics_version: sightline-v1
 sightline_correspondence_schema_version: sightline-correspondence-v1
 sightline_checkpoint_schema_version: sightline-checkpoint-v1

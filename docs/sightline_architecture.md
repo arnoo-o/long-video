@@ -17,6 +17,6 @@ arrays. They are never imported by inference. The training objective combines
 exact flow matching with a probe-layer correspondence cross entropy and optional
 LoRA on one or two selected layers.
 
-The former WAH, PointWorld, ReCal3R, Pi3X, GeoToken and WPF implementations are
-legacy/reference assets only. They are intentionally absent from Sightline's
-import dependency chain and must not be initialized by the new scripts.
+The former WAH, PointWorld, ReCal3R and Pi3X implementations are legacy/reference
+assets only. They are intentionally absent from Sightline's import dependency
+chain and must not be initialized by the new scripts.

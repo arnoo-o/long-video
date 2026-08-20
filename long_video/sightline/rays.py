@@ -5,6 +5,14 @@ import torch
 TEMPORAL_GROUPS = ((0,), (1,2,3,4), (5,6,7,8), (9,10,11,12), (13,14,15,16),
                    (17,18,19,20), (21,22,23,24), (25,26,27,28), (29,30,31,32))
 
+def canonicalize_c2w(c2w: torch.Tensor) -> torch.Tensor:
+    """Express trajectory poses in the first-frame coordinate system."""
+    if c2w.ndim == 3:
+        return torch.linalg.inv(c2w[:, :1]) @ c2w[:, :1]
+    if c2w.ndim != 4:
+        raise ValueError("c2w must be [B,4,4] or [B,T,4,4]")
+    return torch.linalg.inv(c2w[:, :1]) @ c2w
+
 def temporal_group_cameras(c2w: torch.Tensor, intrinsics: torch.Tensor) -> tuple[torch.Tensor,torch.Tensor]:
     if c2w.ndim == 3: c2w=c2w[:,None].expand(-1,33,-1,-1)
     if c2w.ndim != 4 or c2w.shape[1] != 33: raise ValueError("c2w must be [B,4,4] or [B,33,4,4]")

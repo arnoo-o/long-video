@@ -7,7 +7,7 @@ class SightlineConfig:
     ray_epsilon: float; scale_augmentation_probability: float; scale_augmentation_range: tuple[float,float]; sightline_enabled:bool; alpha_init:float
     history_sizes: tuple[int,int,int]; chunk_length:int; chunk_stride:int; memory_layers:tuple[int,...]; correspondence_layers:tuple[int,...]
     lora_layers:tuple[int,...]; lora_rank:int; memory_pool:int; memory_budget:int; lambda_corr:float; lambda_corr_final:float
-    lambda_corr_decay_start:float; learning_rate:float; lora_learning_rate:float; gradient_checkpointing:bool; diagnostics_frequency:int
+    lambda_corr_decay_start:float; learning_rate:float; lora_learning_rate:float; warmup_ratio:float; grad_clip:float; bf16:bool; accumulation_steps:int; high_noise_bias:float; teacher_forcing_ratio:float; self_rollout_ratio:float; memory_write_sigma:float; correspondence_rows_per_batch:int; diagnostics_frequency:int; phase:str; model_id:str; source_height:int; source_width:int; chunk_count:int; pyramid_steps:tuple[int,...]; data_path:str; latent_cache_path:str; correspondence_cache_path:str; output_path:str
     sightline_training_semantics_version:str; sightline_correspondence_schema_version:str; sightline_checkpoint_schema_version:str
 def load_sightline_config(path: str|Path) -> SightlineConfig:
     raw=yaml.safe_load(Path(path).read_text()) or {}; allowed=set(SightlineConfig.__dataclass_fields__)
@@ -21,4 +21,6 @@ def load_sightline_config(path: str|Path) -> SightlineConfig:
     for key in ('memory_layers','correspondence_layers','lora_layers'):
         if any(int(x)<0 for x in raw[key]): raise ValueError(f'invalid {key}')
     if not (0<=raw['lambda_corr_decay_start']<=1) or raw['diagnostics_frequency']<1: raise ValueError('invalid schedule/diagnostic configuration')
+    if raw['phase'] not in ('P1','P2','P3') or raw['chunk_count'] not in range(1,7) or tuple(raw['pyramid_steps'])!=(2,2,2): raise ValueError('invalid phase/chunk/stage configuration')
+    if raw['source_height']<=0 or raw['source_width']<=0 or raw['accumulation_steps']<1 or raw['correspondence_rows_per_batch']<1: raise ValueError('invalid data/training configuration')
     return SightlineConfig(**{k:(tuple(v) if k.endswith('_layers') or k=='history_sizes' else tuple(v) if k=='scale_augmentation_range' else v) for k,v in raw.items()})

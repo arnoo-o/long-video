@@ -36,8 +36,24 @@ class HistoryManager:
         self.chunk_index += 1
     def layout(self) -> HistoryLayout:
         if self._source is None: raise RuntimeError("source prefix is not initialized")
-        selected=sorted(self._frames)[-19:]; padded=[0]*(19-len(selected))+selected
+        selected=sorted(self._frames)[-19:]; padded=[None]*(19-len(selected))+selected
         return HistoryLayout(0,tuple(padded[:16]),tuple(padded[16:18]),tuple(padded[18:]))
     def slots(self) -> list[Any]:
-        layout=self.layout(); return [self._source]+[self._source if f==0 else self._frames[f] for f in layout.long+layout.mid+layout.short]
+        layout=self.layout(); return [self._source]+[self._source if f is None else self._frames[f] for f in layout.long+layout.mid+layout.short]
     def seen_frames(self) -> tuple[int,...]: return tuple(sorted(self._frames))
+
+class CameraHistoryState:
+    """Camera representatives kept in lockstep with native latent history."""
+    def __init__(self): self._items={}; self._chunk_index=0
+    def append_chunk(self, representatives):
+        if len(representatives)!=9: raise ValueError("a 33-RGB-frame chunk must have 9 latent cameras")
+        start=self._chunk_index*8
+        for i,item in enumerate(representatives):
+            index=start+i
+            if index in self._items:
+                if self._items[index] is not item: raise RuntimeError(f"inconsistent camera boundary {index}")
+            else: self._items[index]=item
+        self._chunk_index+=1
+    def slots(self):
+        keys=sorted(self._items); selected=keys[-19:]; return [self._items[k] for k in selected]
+    def indices(self): return tuple(sorted(self._items))

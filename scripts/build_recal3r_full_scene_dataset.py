@@ -38,7 +38,7 @@ from long_video.training.stage2_cleanup import select_balanced_training_records
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Build aligned full-scene ReCal3R geometry for the fixed WPF training subset.")
+    parser = argparse.ArgumentParser(description="Build legacy/reference aligned full-scene ReCal3R geometry.")
     parser.add_argument("--recal3r-repo", type=Path, required=True)
     parser.add_argument("--recal3r-checkpoint", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)

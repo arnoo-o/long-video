@@ -22,8 +22,8 @@ def main():
     from long_video.initialization.pi3x_geometry_backend import Pi3XGeometryBackend
     from long_video.initialization.pi3x_initial_world import build_pi3x_source_world
     from long_video.memory.node_store import NodeStore
-    from long_video.training.wpf_adaptation import select_balanced_training_records
-    records=select_balanced_training_records(json.loads((a.dataset_root/'dl3dv_24fps_manifest.json').read_text())['records'],a.record_count)
+    # Legacy cache builder: deterministic manifest order, no retired WPF helper.
+    records=json.loads((a.dataset_root/'dl3dv_24fps_manifest.json').read_text())['records'][:a.record_count]
     backend=Pi3XGeometryBackend(a.pi3x_checkpoint,a.pi3x_repo,a.device); a.cache_root.mkdir(parents=True,exist_ok=True)
     commit=subprocess.check_output(['git','-C',str(a.pi3x_repo),'rev-parse','HEAD'],text=True).strip()
     for record in records:

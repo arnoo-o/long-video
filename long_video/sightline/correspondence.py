@@ -1,7 +1,12 @@
 """Sparse offline correspondence helpers (no dense N×N matrices)."""
 import torch
-def mutual_nearest(a,b):
-    d=torch.cdist(a,b); ab=d.argmin(1); ba=d.argmin(0); q=torch.arange(a.shape[0],device=a.device); keep=ba[ab]==q
+def mutual_nearest(a,b,chunk_size=4096):
+    if a.ndim!=2 or b.ndim!=2: raise ValueError('nearest-neighbour inputs must be [N,D]')
+    ab=[]
+    for start in range(0,a.shape[0],chunk_size): ab.append(torch.cdist(a[start:start+chunk_size],b).argmin(1))
+    ab=torch.cat(ab); ba=[]
+    for start in range(0,b.shape[0],chunk_size): ba.append(torch.cdist(b[start:start+chunk_size],a).argmin(1))
+    ba=torch.cat(ba); q=torch.arange(a.shape[0],device=a.device); keep=ba[ab]==q
     return torch.stack((q[keep],ab[keep]),-1)
 def cycle_consistent(pairs_ab,pairs_bc):
     if pairs_ab.numel()==0:return pairs_ab

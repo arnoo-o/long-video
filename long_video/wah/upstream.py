@@ -1,4 +1,4 @@
-"""Pinned upstream identity required by GeoToken conditioning semantics."""
+"""Pinned upstream identity for the legacy/reference WAH baseline only."""
 from __future__ import annotations
 import subprocess
 from pathlib import Path

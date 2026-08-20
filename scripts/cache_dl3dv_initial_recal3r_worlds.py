@@ -20,10 +20,9 @@ def main():
     from long_video.initialization.initial_node_pipeline import initialize_spatial_node
     from long_video.initialization.recal3r_geometry_backend import ReCal3RGeometryBackend
     from long_video.memory.node_store import NodeStore
-    from long_video.training.wpf_adaptation import select_balanced_training_records
     from long_video.types import ViewSet
     records = json.loads((a.dataset_root / "dl3dv_24fps_manifest.json").read_text())["records"]
-    records = select_balanced_training_records(records, a.record_count)
+    records = records[:a.record_count]
     backend = ReCal3RGeometryBackend(a.recal3r_checkpoint, a.recal3r_repo, a.device)
     a.cache_root.mkdir(parents=True, exist_ok=True)
     for ordinal, record in enumerate(records, 1):

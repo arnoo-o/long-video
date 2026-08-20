@@ -314,7 +314,7 @@ def _render_geometry_cuda_single(
     points_xyz, points_confidence, cameras, *, near=.05, far=100.,
     depth_epsilon=1e-5, chunk_points=1_000_000,
 ):
-    """CUDA-only z-buffer for GeoToken conditioning.
+    """CUDA-only z-buffer for legacy/reference point-world conditioning.
 
     This deliberately omits RGB, source labels, point indices, and coverage.
     Inputs remain CUDA tensors and the result never crosses the CPU boundary.
@@ -375,7 +375,7 @@ def render_geometry_cuda(
     points_xyz, points_confidence, cameras, *, parent_point_count=None,
     near=.05, far=100., depth_epsilon=1e-5, chunk_points=1_000_000,
 ):
-    """Render final GeoToken geometry on CUDA, including Parent-First exclusion."""
+    """Render final legacy point-world geometry on CUDA, including Parent-First exclusion."""
     import torch
 
     if parent_point_count is None or not 0 < int(parent_point_count) < len(points_xyz):

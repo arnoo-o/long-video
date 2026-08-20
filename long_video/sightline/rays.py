@@ -1,46 +1,34 @@
-"""Deterministic Plücker sightlines for arbitrary Helios token grids."""
+"""Deterministic Plücker sightlines on each actual transformer token grid."""
+from __future__ import annotations
 import torch
 
-def _as_batched(x, dims):
-    if x.ndim == dims - 1:
-        return x.unsqueeze(0)
-    if x.ndim != dims:
-        raise ValueError(f"expected {dims-1} or {dims} dimensions, got {x.shape}")
-    return x
+TEMPORAL_GROUPS = ((0,), (1,2,3,4), (5,6,7,8), (9,10,11,12), (13,14,15,16),
+                   (17,18,19,20), (21,22,23,24), (25,26,27,28), (29,30,31,32))
 
-def plucker_rays(c2w: torch.Tensor, intrinsics: torch.Tensor, height: int, width: int,
-                 *, temporal: int = 1, patch_size: tuple[int,int] = (1,1), eps: float = 1e-6):
-    """Return ``[B,T,Ht,Wt,7]`` = direction, normalized moment, log moment norm.
+def temporal_group_cameras(c2w: torch.Tensor, intrinsics: torch.Tensor) -> tuple[torch.Tensor,torch.Tensor]:
+    if c2w.ndim == 3: c2w=c2w[:,None].expand(-1,33,-1,-1)
+    if c2w.ndim != 4 or c2w.shape[1] != 33: raise ValueError("c2w must be [B,4,4] or [B,33,4,4]")
+    if intrinsics.ndim == 3: intrinsics=intrinsics[:,None].expand(-1,33,-1,-1)
+    if intrinsics.ndim != 4 or intrinsics.shape[:2] != c2w.shape[:2]: raise ValueError("K must be [B,3,3] or [B,33,3,3]")
+    indices=torch.tensor([g[len(g)//2] for g in TEMPORAL_GROUPS],device=c2w.device)
+    return c2w.index_select(1,indices),intrinsics.index_select(1,indices)
 
-    Ray centers are computed on the requested token grid, never interpolated from
-    another stage.  ``c2w`` is camera-to-world and K is in source pixel units.
-    """
-    flattened = c2w.ndim == 4
-    if flattened:
-        B,T = c2w.shape[:2]; c2w = c2w.reshape(B*T,4,4)
-        if intrinsics.ndim == 4: intrinsics = intrinsics.reshape(B*T,3,3)
-    else:
-        c2w = _as_batched(c2w, 3); B,T = c2w.shape[0], temporal
-    K = _as_batched(intrinsics, 3)
-    flat_B = c2w.shape[0]; device, dtype = c2w.device, c2w.dtype
-    ph, pw = patch_size
-    ys = (torch.arange(height, device=device, dtype=dtype) + .5) * ph - .5
-    xs = (torch.arange(width, device=device, dtype=dtype) + .5) * pw - .5
-    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-    pix = torch.stack((xx, yy, torch.ones_like(xx)), -1).reshape(1,-1,3).expand(flat_B,-1,-1)
-    dcam = torch.linalg.solve(K, pix.transpose(1,2)).transpose(1,2)
-    dcam = dcam / dcam.norm(dim=-1, keepdim=True).clamp_min(eps)
-    R = c2w[:, :3, :3]; o = c2w[:, :3, 3]
-    d = torch.bmm(dcam, R.transpose(1,2)); d = d / d.norm(dim=-1,keepdim=True).clamp_min(eps)
-    m = torch.cross(o[:,None,:].expand_as(d), d, dim=-1)
-    mn = m.norm(dim=-1, keepdim=True).clamp_min(eps)
-    out = torch.cat((d, m / mn, mn.log()), -1).reshape(flat_B,1,height,width,7)
-    if flattened: return out.reshape(B,T,height,width,7).contiguous()
-    return out.expand(B, temporal, height, width, 7).contiguous()
+def plucker_rays(c2w: torch.Tensor, intrinsics: torch.Tensor, token_height: int, token_width: int, *, source_height: int, source_width: int, eps: float=1e-6) -> torch.Tensor:
+    if c2w.ndim==3: c2w=c2w[:,None]
+    if intrinsics.ndim==3: intrinsics=intrinsics[:,None].expand(-1,c2w.shape[1],-1,-1)
+    if c2w.ndim!=4 or intrinsics.ndim!=4 or c2w.shape[:2]!=intrinsics.shape[:2]: raise ValueError("camera/K batch and temporal dimensions must match")
+    B,T=c2w.shape[:2]; device,dtype=c2w.device,c2w.dtype
+    u=(torch.arange(token_width,device=device,dtype=dtype)+.5)*(source_width/token_width)-.5; v=(torch.arange(token_height,device=device,dtype=dtype)+.5)*(source_height/token_height)-.5
+    vv,uu=torch.meshgrid(v,u,indexing='ij'); pix=torch.stack((uu,vv,torch.ones_like(uu)),-1).reshape(1,1,-1,3).expand(B,T,-1,-1)
+    K=intrinsics.reshape(B*T,3,3); p=pix.reshape(B*T,-1,3); dcam=torch.linalg.solve(K,p.transpose(1,2)).transpose(1,2); dcam=dcam/dcam.norm(dim=-1,keepdim=True).clamp_min(eps)
+    R=c2w[:,:,:3,:3].reshape(B*T,3,3); origin=c2w[:,:,:3,3].reshape(B*T,1,3); direction=torch.bmm(dcam,R.transpose(1,2)); direction=direction/direction.norm(dim=-1,keepdim=True).clamp_min(eps)
+    moment=torch.cross(origin.expand_as(direction),direction,dim=-1); norm=moment.norm(dim=-1,keepdim=True).clamp_min(eps)
+    return torch.cat((direction,moment/norm,norm.log()),-1).reshape(B,T,token_height,token_width,7)
 
-def token_rays_for_shape(c2w, intrinsics, shape, patch_size=(1,1)):
-    if len(shape) != 5: raise ValueError(f"expected [B,T,H,W,C], got {shape}")
-    B,T,H,W,_ = shape
-    rays = plucker_rays(c2w, intrinsics, H, W, temporal=T, patch_size=patch_size)
-    if rays.shape[:4] != (B,T,H,W): raise RuntimeError("ray/token shape mismatch")
+def token_rays_for_shape(c2w: torch.Tensor, intrinsics: torch.Tensor, shape: tuple[int,...], *, source_height:int, source_width:int) -> torch.Tensor:
+    if len(shape)!=5: raise ValueError("shape must be [B,T,H,W,C]")
+    B,T,H,W,_=shape
+    if c2w.ndim==4 and c2w.shape[1]==33 and T==9: c2w,intrinsics=temporal_group_cameras(c2w,intrinsics)
+    rays=plucker_rays(c2w,intrinsics,H,W,source_height=source_height,source_width=source_width)
+    if rays.shape[:4]!=(B,T,H,W): raise RuntimeError(f"rays {rays.shape[:4]} do not match tokens {(B,T,H,W)}")
     return rays

@@ -31,11 +31,11 @@ def validate_conditioning_world_identities(snapshot, wah_before, wah_after):
         )
     if not allow_distinct and geo_identity != wah_expected:
         raise RuntimeError(
-            "GeoToken and WAH must consume one immutable PointWorld snapshot outside Phase A: "
+            "Legacy WAH world conditioning must consume one immutable PointWorld snapshot outside Phase A: "
             f"geo={geo_identity!r}, wah={wah_expected!r}"
         )
     if allow_distinct and geo_identity is None:
-        raise RuntimeError("Phase A split conditioning requires an explicit GeoToken world identity")
+        raise RuntimeError("Legacy Phase A split conditioning requires an explicit world identity")
 
 
 
@@ -215,10 +215,10 @@ class OnlineSpatialHistoryPipeline:
         if isinstance(pre_render_snapshot, dict):
             freeze = pre_render_snapshot.get("freeze_history")
             if freeze is not None:
-                history = self.autoregressive_state.setdefault("_geotoken_history_snapshots", [])
+                history = self.autoregressive_state.setdefault("_legacy_geometry_history_snapshots", [])
                 history.append(freeze(chunk_index=self.chunk_index, frame_start=self.frame_index))
                 snapshot = history[-1]
-                # Explicit WAH slot identities, not a separate GeoToken
+                # Explicit legacy WAH slot identities.
                 # eviction policy.  The official state declares its retained
                 # 16+2+1 history capacity; these identities are only the
                 # geometry-side references for those exact appearance slots.
@@ -228,9 +228,9 @@ class OnlineSpatialHistoryPipeline:
                 self.autoregressive_state["_wah_geometry_slot_refs"] = refs[max(0, len(refs)-capacity):]
                 # Keep only snapshots still referenced by WAH plus source.
                 retained = {id(ref[0]) for ref in self.autoregressive_state["_wah_geometry_slot_refs"]}
-                source = self.autoregressive_state.get("_geotoken_source_geometry")
+                source = self.autoregressive_state.get("_legacy_source_geometry")
                 if source is not None: retained.add(id(source[0]))
-                self.autoregressive_state["_geotoken_history_snapshots"] = [
+                self.autoregressive_state["_legacy_geometry_history_snapshots"] = [
                     item for item in history if id(item) in retained
                 ]
         generated_chunk = self._current_history_video_chunk()

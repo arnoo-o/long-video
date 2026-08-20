@@ -1,52 +1,24 @@
-"""Validated YAML configuration loading with dotted CLI overrides."""
-from __future__ import annotations
-from copy import deepcopy
+"""Validated configuration loader for the Sightline mainline."""
+from dataclasses import dataclass
 from pathlib import Path
-import json
 import yaml
-
-REQUIRED={
-    "confidence":("source_prior","token_visible_threshold","token_confidence_threshold","lambda_confidence"),
-    "wah":("conditioning_type","warp_history_downsample_mode","rope_alignment"),
-    "recal3r":("checkpoint","repo_path","device"),
-    "online_memory":("min_transition_frames","keyframe_count","heldout_count",
-                     "coverage_threshold","voxel_size"),
-}
-
-def _coerce(value):
-    try: return json.loads(value)
-    except (ValueError,TypeError): return value
-
-def load_yaml(path,overrides=()):
-    path=Path(path)
-    data=yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(data,dict): raise ValueError(f"{path} must contain a mapping")
-    result=deepcopy(data)
-    for override in overrides:
-        if "=" not in override: raise ValueError(f"override must be key=value: {override}")
-        dotted,value=override.split("=",1); cursor=result
-        parts=dotted.split(".")
-        for part in parts[:-1]:
-            if part not in cursor or not isinstance(cursor[part],dict): cursor[part]={}
-            cursor=cursor[part]
-        cursor[parts[-1]]=_coerce(value)
-    validate_config(path.stem,result)
-    return result
-
-def validate_config(kind,config):
-    missing=[key for key in REQUIRED.get(kind,()) if key not in config]
-    if missing: raise ValueError(f"{kind} config missing required keys: {missing}")
-    if "device" in config and config["device"] in (None,"cuda"):
-        raise ValueError(f"{kind}.device must be explicit, e.g. cuda:0 or cpu")
-    if kind=="online_memory":
-        if config["min_transition_frames"]<config["keyframe_count"]+config["heldout_count"]:
-            raise ValueError("transition frames must cover mapping plus held-out frames")
-        forbidden=[key for key in config if key.endswith("_m")]
-        if forbidden: raise ValueError(f"node-unit config must not use metric suffixes: {forbidden}")
-    if kind=="wah":
-        expected={"conditioning_type":"warp","warp_history_downsample_mode":"short",
-                  "rope_alignment":True}
-        wrong={k:(config.get(k),v) for k,v in expected.items() if config.get(k)!=v}
-        if wrong: raise ValueError(f"WAH spatial-history invariants violated: {wrong}")
-    return config
-
+@dataclass(frozen=True)
+class SightlineConfig:
+    ray_epsilon: float; scale_augmentation_probability: float; scale_augmentation_range: tuple[float,float]; sightline_enabled:bool; alpha_init:float
+    history_sizes: tuple[int,int,int]; chunk_length:int; chunk_stride:int; memory_layers:tuple[int,...]; correspondence_layers:tuple[int,...]
+    lora_layers:tuple[int,...]; lora_rank:int; memory_pool:int; memory_budget:int; lambda_corr:float; lambda_corr_final:float
+    lambda_corr_decay_start:float; learning_rate:float; lora_learning_rate:float; gradient_checkpointing:bool; diagnostics_frequency:int
+    sightline_training_semantics_version:str; sightline_correspondence_schema_version:str; sightline_checkpoint_schema_version:str
+def load_sightline_config(path: str|Path) -> SightlineConfig:
+    raw=yaml.safe_load(Path(path).read_text()) or {}; allowed=set(SightlineConfig.__dataclass_fields__)
+    unknown=set(raw)-allowed
+    if unknown: raise ValueError(f'unknown Sightline config keys: {sorted(unknown)}')
+    required=allowed-set(raw)
+    if required: raise ValueError(f'missing Sightline config keys: {sorted(required)}')
+    if tuple(raw['history_sizes'])!=(16,2,1) or raw['chunk_length']!=33 or raw['chunk_stride']!=32: raise ValueError('invalid causal history/chunk semantics')
+    if not (raw['ray_epsilon']>0 and 0<=raw['scale_augmentation_probability']<=1): raise ValueError('invalid ray/augmentation values')
+    if raw['scale_augmentation_range'][0]>=raw['scale_augmentation_range'][1] or raw['lora_rank'] not in (8,16) or raw['memory_pool']!=2 or raw['memory_budget']<1: raise ValueError('invalid memory/LoRA configuration')
+    for key in ('memory_layers','correspondence_layers','lora_layers'):
+        if any(int(x)<0 for x in raw[key]): raise ValueError(f'invalid {key}')
+    if not (0<=raw['lambda_corr_decay_start']<=1) or raw['diagnostics_frequency']<1: raise ValueError('invalid schedule/diagnostic configuration')
+    return SightlineConfig(**{k:(tuple(v) if k.endswith('_layers') or k=='history_sizes' else tuple(v) if k=='scale_augmentation_range' else v) for k,v in raw.items()})

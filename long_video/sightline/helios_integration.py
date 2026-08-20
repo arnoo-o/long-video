@@ -28,7 +28,8 @@ class SightlineHeliosAttnProcessor:
         self.last_hidden_states=hidden_states
         self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
-        dq,dk=self.conditioner(rays_q,rays_k,training=self.conditioner.training)
+        condition_dtype=next(self.conditioner.parameters()).dtype
+        dq,dk=self.conditioner(rays_q.to(condition_dtype),rays_k.to(condition_dtype),training=self.conditioner.training)
         dq=dq.unflatten(-1,(attn.heads,-1)); dk=dk.unflatten(-1,(attn.heads,-1))
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         query=query+dq; key=key+dk

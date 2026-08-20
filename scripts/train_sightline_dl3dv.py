@@ -1,6 +1,6 @@
 """Construct and dry-run the real geometry-free Sightline training system."""
 from __future__ import annotations
-import argparse,json
+import argparse,json,time
 from pathlib import Path
 import torch
 from long_video.config import load_sightline_config
@@ -35,10 +35,10 @@ def main():
         attention_kwargs={'current_chunk':0})
     prediction=model_out[0] if isinstance(model_out,(tuple,list)) else getattr(model_out,'sample',model_out)
     if prediction.shape != noisy.shape: raise RuntimeError(f'Helios prediction shape mismatch {prediction.shape} vs {noisy.shape}')
-    loss=(prediction.float()-item['target'].float()).square().mean(); loss.backward()
+    started=time.perf_counter(); loss=(prediction.float()-item['target'].float()).square().mean(); loss.backward(); elapsed=time.perf_counter()-started
     alpha_grad=trainable.conditioner.alpha.grad
     if alpha_grad is None or not torch.isfinite(alpha_grad).all(): raise RuntimeError('Sightline alpha gradient is missing/non-finite')
-    record={'total_loss':float(loss.detach()),'flow_loss':float(loss.detach()),'alpha':float(trainable.conditioner.alpha.detach()),'alpha_grad':float(alpha_grad.detach().abs()),'uses_future_gt':False,'dry_run':True,'optimizer_step':False,'prediction_source':'helios_transformer'}
+    record={'total_loss':float(loss.detach()),'flow_loss':float(loss.detach()),'corr_loss':0.0,'lambda_corr':cfg.lambda_corr,'alpha':float(trainable.conditioner.alpha.detach()),'alpha_grad':float(alpha_grad.detach().abs()),'wrong_ray_delta':None,'memory_zero_delta':None,'memory_shuffle_delta':None,'corr_gain':None,'vram_gb':float(torch.cuda.max_memory_allocated()/2**30),'step_time_sec':elapsed,'uses_future_gt':False,'dry_run':True,'optimizer_step':False,'prediction_source':'helios_transformer'}
     Path(a.metrics).write_text(json.dumps(record)+'\n'); print(json.dumps(record))
     if not a.dry_run: print('Training system constructed; formal optimizer loop intentionally not started.')
 if __name__=='__main__': main()

@@ -5,6 +5,7 @@ from torch import nn
 @dataclass
 class MemoryToken:
     hidden: torch.Tensor; ray: torch.Tensor; chunk_index: int; token_index: int
+    temporal: int; pooled_y: int; pooled_x: int
 class LongTermKVMemory:
     def __init__(self, budget=2160*6, pool=2, timestamp_buckets=64, hidden_dim=None):
         self.budget=budget; self.pool=pool; self.tokens=[]; self.timestamp=nn.Embedding(timestamp_buckets,hidden_dim) if hidden_dim else None
@@ -27,14 +28,17 @@ class LongTermKVMemory:
         # replace this with exact cell-centre rays from the camera/K provider.
         rr[..., :3] = rr[..., :3] / rr[..., :3].norm(dim=-1, keepdim=True).clamp_min(1e-6)
         rr[..., 3:6] = rr[..., 3:6] / rr[..., 3:6].norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        for i in range(hh.shape[1]): self.tokens.append(MemoryToken(hh[:,i:i+1].detach(),rr[:,i:i+1].detach(),chunk_index,i))
+        pooled_h,pooled_w=H//self.pool,W//self.pool
+        for i in range(hh.shape[1]):
+            t=i//(pooled_h*pooled_w); rem=i%(pooled_h*pooled_w); y,x=divmod(rem,pooled_w)
+            self.tokens.append(MemoryToken(hh[:,i:i+1].detach(),rr[:,i:i+1].detach(),chunk_index,i,t,y,x))
         if len(self.tokens)>self.budget: self.tokens=self.tokens[-self.budget:]
     def get(self):
         if not self.tokens: return None,None
         return torch.cat([t.hidden for t in self.tokens],1), torch.cat([t.ray for t in self.tokens],1)
     def __len__(self): return len(self.tokens)
 
-    def append_native_attention(self, attn, key, value, rotary_emb, rotary_apply, *, current_chunk=0, timestamp_embedding=None, sightline_projector=None, **kwargs):
+    def append_native_attention(self, attn, key, value, rotary_emb, rotary_apply, *, current_chunk=0, timestamp_embedding=None, sightline_projector=None, memory_rotary_emb=None, **kwargs):
         hidden,rays=self.get()
         if hidden is None: return key,value,{"memory_tokens":0}
         if hidden.shape[0] != key.shape[0]:
@@ -42,13 +46,12 @@ class LongTermKVMemory:
             else: raise ValueError("memory batch differs from attention batch")
         mem_k=attn.to_k(hidden); mem_v=attn.to_v(hidden)
         mem_k=attn.norm_k(mem_k).unflatten(2,(attn.heads,-1)); mem_v=mem_v.unflatten(2,(attn.heads,-1))
-        if rotary_emb is None:
-            raise RuntimeError("native rotary embedding is required for long-memory K")
+        if memory_rotary_emb is None:
+            raise RuntimeError("dedicated memory_rotary_emb is required for long-memory K")
         memory_tokens=mem_k.shape[1]
-        if rotary_emb.ndim < 2 or memory_tokens > rotary_emb.shape[1]:
-            raise RuntimeError(f"memory rotary embedding has {rotary_emb.shape[1] if rotary_emb.ndim > 1 else 0} positions for {memory_tokens} memory tokens")
-        positions=torch.arange(memory_tokens,device=hidden.device,dtype=torch.long)
-        memory_rotary=rotary_emb.index_select(1,positions)
+        if memory_rotary_emb.ndim < 2 or memory_rotary_emb.shape[1] != memory_tokens:
+            raise RuntimeError(f"memory rotary embedding must have exactly {memory_tokens} positions")
+        memory_rotary=memory_rotary_emb.to(device=hidden.device,dtype=mem_k.dtype)
         mem_k=rotary_apply(mem_k,memory_rotary)
         if sightline_projector is not None:
             delta=sightline_projector.project(rays.to(hidden),kind='k',training=sightline_projector.training)

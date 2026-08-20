@@ -31,7 +31,6 @@ class SightlinePipeline:
         if self._trajectory_c2w is None or self.ray_provider is None: raise RuntimeError('Sightline trajectory/provider is not bound')
         cameras,K=chunk_cameras(self._trajectory_c2w,self._trajectory_K,chunk_index); reps,repK=temporal_group_cameras(cameras,K)
         frame_ids=(torch.arange(9,device=cameras.device)*4 + chunk_index*32).tolist()
-        self.camera_history.append_chunk(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))
         source_camera=self._source_camera
         source_K=self._source_intrinsics
         history_slots=self.camera_history.slots(source_camera,source_K)
@@ -39,11 +38,15 @@ class SightlinePipeline:
         history_K=torch.stack([source_K]+[K for _,K in history_slots],1)
         shapes=self._stage_shapes(latents)
         self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_cameras=history_cameras,history_intrinsics=history_K,stage_shapes=shapes,token_shape=shapes[0])
+        self._pending_camera_chunk=(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))
         attention_kwargs['current_chunk']=chunk_index
         attention_kwargs['sightline_stage_shapes']=shapes
 
     def _finalize_chunk(self, chunk_index):
-        if self.ray_provider is None: return
+        if self.ray_provider is None:
+            pending=getattr(self,'_pending_camera_chunk',None)
+            if pending is not None: self.camera_history.append_chunk(*pending); self._pending_camera_chunk=None
+            return
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             if processor.last_hidden_states is None or processor.memory is None: continue
             hidden=processor.last_hidden_states[:, -processor.last_current_length:]
@@ -52,6 +55,10 @@ class SightlinePipeline:
             rays=self.ray_provider.current_rays(shape)
             processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays)
             processor.last_hidden_states=None
+        pending=getattr(self,'_pending_camera_chunk',None)
+        if pending is not None:
+            self.camera_history.append_chunk(*pending)
+            self._pending_camera_chunk=None
 
     def _install_chunk_hooks(self):
         if self._hooks_installed: return

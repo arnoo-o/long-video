@@ -55,5 +55,13 @@ def validate_latent_cache(path: str|Path, *, expected_frames=193):
         if file.suffix not in (".npy",".npz",".pt",".pth"): continue
         if file.suffix==".npy":
             arr=np.load(file,mmap_mode="r")
-            if arr.ndim>=3 and arr.shape[0] not in (expected_frames,9): raise ValueError(f"unexpected latent frame count in {file}")
+            if arr.ndim < 3: continue
+            temporal_axes=[axis for axis,size in enumerate(arr.shape) if size in (expected_frames, expected_frames-1, 9, 33)]
+            if not temporal_axes:
+                raise ValueError(f"cannot identify temporal axis in latent cache {file} shape={arr.shape}")
+            if len(temporal_axes)>1 and expected_frames in arr.shape:
+                temporal_axes=[axis for axis in temporal_axes if arr.shape[axis] == expected_frames]
+            # Record the detected axis for callers without imposing C/T order.
+            if arr.shape[temporal_axes[0]] not in (expected_frames, expected_frames-1,9,33):
+                raise ValueError(f"invalid temporal axis in {file}")
     return files

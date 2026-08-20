@@ -5,6 +5,16 @@ from pathlib import Path
 import numpy as np
 
 SCHEMA='sightline-correspondence-v1'
+def _camera_sequence(array, name, frames=193):
+    array=np.asarray(array)
+    if name=='c2w':
+        if array.shape==(frames,4,4): return array
+        if array.shape==(1,frames,4,4): return array[0]
+    else:
+        if array.shape==(3,3): return np.repeat(array[None],frames,axis=0)
+        if array.shape==(frames,3,3): return array
+        if array.shape==(1,frames,3,3): return array[0]
+    raise ValueError(f'{name} must be [193,...] or [1,193,...], got {array.shape}')
 def _nn(a,b):
     try:
         from scipy.spatial import cKDTree
@@ -26,15 +36,13 @@ def _rows(x,y,valid_x,valid_y,frame_x,frame_y,threshold, token_height, token_wid
             if not _view_visible(y[k:k+1], c2w, K, height, width)[0]: continue
         qy,qx=divmod(int(q),token_width); ky,kx=divmod(int(k),token_width)
         qchunk,qlocal=divmod(int(frame_x),32); kchunk,klocal=divmod(int(frame_y),32)
-        out.append({'query_frame':int(frame_x),'key_frame':int(frame_y),'query_chunk':qchunk,'key_chunk':kchunk,'query_token_index':int(q),'positive_key_index':int(k),'query_temporal':qlocal,'key_temporal':klocal,'query_y':qy,'query_x':qx,'key_y':ky,'key_x':kx,'stage':{'token_height':token_height,'token_width':token_width},'weight':float(np.exp(-float(dist)/max(threshold,1e-6))),'pair_type':'long_gap_revisit' if abs(frame_x-frame_y)>32 else ('cross_chunk' if qchunk!=kchunk else 'intra_chunk')})
+        out.append({'query_frame':int(frame_x),'key_frame':int(frame_y),'query_chunk':qchunk,'key_chunk':kchunk,'query_token_index':int(q),'positive_key_index':int(k),'query_temporal':qlocal,'key_temporal':klocal,'query_y':qy,'query_x':qx,'key_y':ky,'key_x':kx,'query_boundary':frame_x % 32 == 0,'key_boundary':frame_y % 32 == 0,'stage':{'token_height':token_height,'token_width':token_width},'weight':float(np.exp(-float(dist)/max(threshold,1e-6))),'pair_type':'long_gap_revisit' if abs(frame_x-frame_y)>32 else ('cross_chunk' if qchunk!=kchunk else 'intra_chunk')})
     return out
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--xyz',type=Path,required=True); p.add_argument('--valid',type=Path,required=True); p.add_argument('--confidence',type=Path,required=True); p.add_argument('--out',type=Path,required=True); p.add_argument('--c2w',type=Path); p.add_argument('--intrinsics',type=Path); p.add_argument('--confidence-threshold',type=float,default=0.0); p.add_argument('--distance-fraction',type=float,default=.015); p.add_argument('--token-height',type=int,required=True); p.add_argument('--token-width',type=int,required=True); a=p.parse_args()
     xyz=np.load(a.xyz,mmap_mode='r'); valid=np.load(a.valid,mmap_mode='r').astype(bool); conf=np.load(a.confidence,mmap_mode='r');
     if xyz.shape[:3]!=valid.shape or conf.shape!=valid.shape: raise ValueError('teacher arrays must share [F,H,W] shape')
-    F,H,W=valid.shape; rows=[]; c2w=np.load(a.c2w) if a.c2w else None; K=np.load(a.intrinsics) if a.intrinsics else None
-    if c2w is not None and c2w.ndim==4: c2w=c2w[:,0]
-    if K is not None and K.ndim==3: K=K[0]
+    F,H,W=valid.shape; rows=[]; c2w=_camera_sequence(np.load(a.c2w),'c2w',F) if a.c2w else None; K=_camera_sequence(np.load(a.intrinsics),'K',F) if a.intrinsics else None
     for f in range(F):
         for g in (f+1, f+33, f+64):
             if g>=F: continue
@@ -48,7 +56,7 @@ def main():
                 return np.asarray(values,np.float32),np.asarray(flags,bool),np.asarray(scores,np.float32)
             q,qv,qc=tokenize(f); k,kv,kc=tokenize(g)
             qv&=np.isfinite(q).all(1); kv&=np.isfinite(k).all(1); depth=np.linalg.norm(q[qv],axis=1); threshold=float(np.median(depth)*a.distance_fraction) if len(depth) else .01
-            rows.extend(_rows(q,k,qv,kv,f,g,threshold,a.token_height,a.token_width,c2w[f] if c2w is not None and len(c2w)>f else None, K[f] if K is not None and K.ndim==3 and len(K)>f else K, H, W))
+            rows.extend(_rows(q,k,qv,kv,f,g,threshold,a.token_height,a.token_width,c2w[f] if c2w is not None else None, K[f] if K is not None else None, H, W))
     # Stable deduplication of query/key identities.
     unique={(r['query_frame'],r['query_token_index'],r['key_frame'],r['positive_key_index']):r for r in rows}; rows=list(unique.values()); a.out.parent.mkdir(parents=True,exist_ok=True); a.out.write_text(json.dumps({'schema_version':SCHEMA,'token_grid':{'source_height':H,'source_width':W,'token_height':a.token_height,'token_width':a.token_width},'rows':rows},separators=(',',':')))
 if __name__=='__main__': main()

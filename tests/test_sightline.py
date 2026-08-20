@@ -43,17 +43,38 @@ def test_history_ray_count_must_be_exact():
         provider(torch.zeros(1,4,8),key_length=9,current_length=4)
 
 def test_train_chunk_policy_is_single_and_causal():
-    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk
+    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan
     train_chunk=2; policies=[chunk_grad_policy(i,train_chunk) for i in range(6)]
     assert policies[:2]==["forward_detached"]*2 and policies[2]=="backward"
     assert policies[3:]==["rollout_detached"]*3
     assert_single_backward_chunk(policies,train_chunk)
+    assert causal_chunk_plan(6,2)==tuple(policies)
 
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
 
 def test_temporal_group_camera_shapes():
     c=torch.eye(4).repeat(2,33,1,1); k=torch.eye(3).repeat(2,33,1,1); cg,kg=temporal_group_cameras(c,k); assert cg.shape==(2,9,4,4) and kg.shape==(2,9,3,3)
+
+def test_lora_fused_and_unfused_change_real_projection():
+    from long_video.training.sightline import install_lora, LoRALinear
+    class Attn(torch.nn.Module):
+        def __init__(self, fused):
+            super().__init__()
+            if fused: self.to_qkv=torch.nn.Linear(4,12)
+            else:
+                self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4)
+            self.to_out=torch.nn.ModuleList([torch.nn.Linear(4,4),torch.nn.Identity()])
+    class Block(torch.nn.Module):
+        def __init__(self,fused): super().__init__(); self.attn1=Attn(fused)
+    class T(torch.nn.Module):
+        def __init__(self,fused): super().__init__(); self.transformer_blocks=torch.nn.ModuleList([Block(fused)])
+    for fused in (False,True):
+        model=T(fused); assert install_lora(model,[0])==(0,)
+        target=model.transformer_blocks[0].attn1.to_qkv if fused else model.transformer_blocks[0].attn1.to_q
+        assert isinstance(target,LoRALinear)
+        with torch.no_grad(): target.lora_up.weight.fill_(0.1)
+        assert not torch.equal(target(torch.ones(1,4)),target.base(torch.ones(1,4)))
 
 def test_processor_qk_only_cpu_shape_and_v_unchanged():
     class A:
@@ -62,4 +83,4 @@ def test_processor_qk_only_cpu_shape_and_v_unchanged():
     def qkv(attn,h,e): return attn.to_q(h),attn.to_k(h),attn.to_v(h)
     def rope(x,r): return x
     def dispatch(q,k,v,**kw): return torch.nn.functional.scaled_dot_product_attention(q.transpose(1,2),k.transpose(1,2),v.transpose(1,2)).transpose(1,2)
-    proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=rope,attention_dispatch=dispatch); h=torch.randn(1,4,8); out=proc(a,h,rotary_emb=torch.zeros(1,4,1,2)); assert out.shape==h.shape; assert torch.equal(proc.last_k,proc.last_k)
+    proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=rope,attention_dispatch=dispatch); h=torch.randn(1,4,8); out=proc(a,h,rotary_emb=torch.zeros(1,4,1,2)); assert out.shape==h.shape; assert torch.equal(proc.last_value,proc.last_value_native.unflatten(2,(a.heads,-1)))

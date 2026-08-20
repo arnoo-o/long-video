@@ -15,13 +15,14 @@ class SightlineHeliosAttnProcessor:
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
-        self.last_q=None; self.last_k=None; self.last_attention_meta={}
+        self.last_q=None; self.last_k=None; self.last_value_native=None; self.last_value=None; self.last_attention_meta={}
         self.last_hidden_states=None; self.last_current_length=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
         if self.qkv_projection is None or self.rotary_apply is None or self.attention_dispatch is None:
             raise RuntimeError("Sightline processor is not bound to pinned Helios primitives")
         query,key,value=self.qkv_projection(attn,hidden_states,encoder_hidden_states)
+        self.last_value_native=value.detach().clone()
         query=attn.norm_q(query); key=attn.norm_k(key)
         query=query.unflatten(2,(attn.heads,-1)); key=key.unflatten(2,(attn.heads,-1)); value=value.unflatten(2,(attn.heads,-1))
         if rotary_emb is not None:
@@ -56,14 +57,23 @@ class SightlineHeliosAttnProcessor:
         if getattr(attn,'restrict_self_attn',False) and history_len:
             key=key[:,:history_len]; value=value[:,:history_len]
         if self.memory is not None:
-            memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None)
+            memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None); memory_kwargs.pop('memory_rotary_emb',None)
             key,value,self.last_attention_meta=self.memory.append_native_attention(
                 attn,key,value,rotary_emb,self.rotary_apply,
                 current_chunk=kwargs.get('current_chunk',0),
                 timestamp_embedding=getattr(self.memory,'timestamp',None),
                 sightline_projector=self.conditioner,
+                memory_rotary_emb=kwargs.get('memory_rotary_emb'),
                 **memory_kwargs)
+            mem_count=self.last_attention_meta.get('memory_tokens',0)
+            if mem_count and attention_mask is not None:
+                old_len=key.shape[1]-mem_count
+                if attention_mask.shape[-1] != old_len:
+                    raise ValueError('attention mask key axis does not match key length before memory')
+                pad=torch.zeros((*attention_mask.shape[:-1],mem_count),device=attention_mask.device,dtype=attention_mask.dtype)
+                attention_mask=torch.cat((attention_mask,pad),dim=-1)
         self.last_q=query; self.last_k=key
+        self.last_value=value
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)

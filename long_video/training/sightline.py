@@ -33,6 +33,14 @@ def assert_single_backward_chunk(policies, train_chunk: int) -> None:
     if sum(policy == "backward" for policy in policies) != 1 or policies[train_chunk] != "backward":
         raise RuntimeError("exactly one train chunk may retain autograd")
 
+def causal_chunk_plan(max_chunks: int, train_chunk: int):
+    """Return the only permitted per-chunk autograd policy for one sample."""
+    if not 0 <= train_chunk < max_chunks <= 6:
+        raise ValueError("invalid train chunk")
+    policies=tuple(chunk_grad_policy(i,train_chunk) for i in range(max_chunks))
+    assert_single_backward_chunk(policies,train_chunk)
+    return policies
+
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
         super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.timestamp=nn.Embedding(timestamp_buckets,inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
@@ -60,6 +68,9 @@ class LoRALinear(nn.Module):
         for parameter in self.base.parameters(): parameter.requires_grad_(False)
     def forward(self,x): return self.base(x)+self.lora_up(self.lora_down(x))*self.scale
 
+class LoRAFusedQKV(LoRALinear):
+    """LoRA over Helios fused QKV output; preserves the native fused call."""
+
 def install_lora(transformer: nn.Module, layers, rank=8):
     """Wrap only Q/K/V/O of explicitly selected self-attention blocks."""
     if rank not in (8,16): raise ValueError("LoRA rank must be 8 or 16")
@@ -68,9 +79,12 @@ def install_lora(transformer: nn.Module, layers, rank=8):
         if not 0 <= int(index) < len(blocks): raise ValueError(f"invalid LoRA layer {index}")
         attn=getattr(blocks[int(index)],"attn1",None)
         if attn is None: raise RuntimeError(f"layer {index} has no self-attention")
+        fused=getattr(attn,"to_qkv",None)
+        if isinstance(fused,nn.Linear):
+            attn.to_qkv=LoRAFusedQKV(fused,rank)
         for name in ("to_q","to_k","to_v"):
             module=getattr(attn,name,None)
-            if isinstance(module,nn.Linear): setattr(attn,name,LoRALinear(module,rank))
+            if isinstance(module,nn.Linear) and not isinstance(module,LoRALinear): setattr(attn,name,LoRALinear(module,rank))
         output=getattr(attn,"to_out",None)
         if output is not None and isinstance(output[0],nn.Linear): output[0]=LoRALinear(output[0],rank)
         installed.append(int(index))

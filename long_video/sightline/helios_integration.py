@@ -79,7 +79,8 @@ class SightlineRayProvider:
         if history is None and context.get('history_cameras') is not None:
             hc=context['history_cameras']; hk=context.get('history_intrinsics')
             if hk is None: hk=intrinsics[:, :hc.shape[1]]
-            history=plucker_rays(hc,hk,T,H,W,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7)
+            if hc.shape[1] < 1: raise RuntimeError("history camera set is empty")
+            history=plucker_rays(hc,hk,1,H,W,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7)
         if history is None: raise RuntimeError("history rays are required for attention with history tokens")
         if history.shape[:1] != (B,) or history.shape[-1] != 7 or history.shape[1] != key_length-current_count: raise RuntimeError("history ray count does not match native Helios context")
         all_rays=torch.cat((history.to(rays),rays),1)

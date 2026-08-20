@@ -31,7 +31,7 @@ def test_camera_history_33_to_9_and_exact_shared_boundary():
     Ks2=[Ks[-1]]+[torch.eye(3)*(i+1) for i in range(9,17)]
     state.append_chunk(reps2, [32,36,40,44,48,52,56,60,64], Ks2)
     slots=state.slots(source,K)
-    assert len(slots)==19 and torch.equal(slots[0][0], reps[1])
+    assert len(slots)==19 and torch.equal(slots[0][0], source) and torch.equal(slots[2][0], reps[0])
     assert state.slot_frame_ids()[-1] == 64
 
 def test_history_ray_count_must_be_exact():

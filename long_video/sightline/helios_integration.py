@@ -82,8 +82,16 @@ class SightlineRayProvider:
             if hc.shape[1] < 1: raise RuntimeError("history camera set is empty")
             history=plucker_rays(hc,hk,H,W,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7)
         if history is None: raise RuntimeError("history rays are required for attention with history tokens")
-        if history.shape[:1] != (B,) or history.shape[-1] != 7 or history.shape[1] != key_length-current_count:
-            raise RuntimeError(f"history ray count does not match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
+        expected=key_length-current_count
+        if history.shape[:1] != (B,) or history.shape[-1] != 7:
+            raise RuntimeError(f"invalid history ray shape: history={tuple(history.shape)}, key={key_length}, current={current_count}")
+        if history.shape[1] != expected:
+            if expected % history.shape[1] != 0:
+                raise RuntimeError(f"history ray count does not match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
+            # Helios may expand each latent-history token into multiple native
+            # temporal tokens at a pyramid stage. Reuse the same physical camera
+            # ray for that representation, never invent a dummy ray.
+            history=history.repeat_interleave(expected//history.shape[1],dim=1)
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
 

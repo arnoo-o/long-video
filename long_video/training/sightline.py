@@ -9,6 +9,30 @@ from torch import nn
 from ..sightline.conditioning import SightlineConditioner
 from ..sightline.correspondence import correspondence_loss
 
+def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None) -> int:
+    if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
+    return int(torch.randint(max_chunks,(1,),generator=generator).item())
+
+def assert_trainable_whitelist(module: nn.Module) -> None:
+    allowed=("conditioner.","timestamp.","corr_head.","lora_")
+    bad=[name for name,p in module.named_parameters() if p.requires_grad and not name.startswith(allowed)]
+    if bad: raise RuntimeError(f"Sightline trainable whitelist violation: {bad[:8]}")
+
+def chunk_grad_policy(chunk_index: int, train_chunk: int):
+    if chunk_index < train_chunk: return "forward_detached"
+    if chunk_index == train_chunk: return "backward"
+    return "rollout_detached"
+
+def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> int:
+    """Monotonic 1..6 chunk curriculum, kept independent of data semantics."""
+    if step < 0 or warmup_steps < 1 or not 1 <= maximum <= 6:
+        raise ValueError("invalid curriculum arguments")
+    return min(maximum, 1 + step // warmup_steps)
+
+def assert_single_backward_chunk(policies, train_chunk: int) -> None:
+    if sum(policy == "backward" for policy in policies) != 1 or policies[train_chunk] != "backward":
+        raise RuntimeError("exactly one train chunk may retain autograd")
+
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
         super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.timestamp=nn.Embedding(timestamp_buckets,inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
@@ -27,3 +51,27 @@ class SightlineTrainable(nn.Module):
     def diagnostics(self):
         alpha=self.conditioner.alpha.detach(); grad=self.conditioner.alpha.grad
         return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':float(self.conditioner.q_proj[0].weight.grad.norm()) if self.conditioner.q_proj[0].weight.grad is not None else 0.0,'ek_grad_norm':float(self.conditioner.k_proj[0].weight.grad.norm()) if self.conditioner.k_proj[0].weight.grad is not None else 0.0}
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank=8, scale=None):
+        super().__init__(); self.base=base; self.rank=rank; self.scale=float(scale if scale is not None else 1.0/rank)
+        self.lora_down=nn.Linear(base.in_features,rank,bias=False); self.lora_up=nn.Linear(rank,base.out_features,bias=False)
+        nn.init.kaiming_uniform_(self.lora_down.weight,a=math.sqrt(5)); nn.init.zeros_(self.lora_up.weight)
+        for parameter in self.base.parameters(): parameter.requires_grad_(False)
+    def forward(self,x): return self.base(x)+self.lora_up(self.lora_down(x))*self.scale
+
+def install_lora(transformer: nn.Module, layers, rank=8):
+    """Wrap only Q/K/V/O of explicitly selected self-attention blocks."""
+    if rank not in (8,16): raise ValueError("LoRA rank must be 8 or 16")
+    blocks=list(getattr(transformer,"transformer_blocks",getattr(transformer,"blocks",[]))); installed=[]
+    for index in layers:
+        if not 0 <= int(index) < len(blocks): raise ValueError(f"invalid LoRA layer {index}")
+        attn=getattr(blocks[int(index)],"attn1",None)
+        if attn is None: raise RuntimeError(f"layer {index} has no self-attention")
+        for name in ("to_q","to_k","to_v"):
+            module=getattr(attn,name,None)
+            if isinstance(module,nn.Linear): setattr(attn,name,LoRALinear(module,rank))
+        output=getattr(attn,"to_out",None)
+        if output is not None and isinstance(output[0],nn.Linear): output[0]=LoRALinear(output[0],rank)
+        installed.append(int(index))
+    return tuple(installed)

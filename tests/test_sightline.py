@@ -2,7 +2,7 @@ import pytest
 torch=pytest.importorskip('torch')
 from long_video.sightline.rays import plucker_rays, temporal_group_cameras
 from long_video.sightline.conditioning import SightlineConditioner
-from long_video.sightline.history import HistoryManager
+from long_video.sightline.history import HistoryManager, CameraHistoryState
 from long_video.sightline.memory import LongTermKVMemory
 from long_video.sightline.rays import temporal_group_cameras
 from long_video.sightline.helios_integration import SightlineHeliosAttnProcessor, SightlineRayProvider
@@ -21,6 +21,33 @@ def test_history_six_chunks_causal_and_shared_boundary():
     chunks=[[torch.tensor(float(c*32+i)) for i in range(33)] for c in range(6)]
     for c,chunk in enumerate(chunks): h.append_chunk(chunk); assert max(h.seen_frames())==c*32+32
     assert len(h.slots())==20 and max(h.layout().long+h.layout().mid+h.layout().short)<=192
+
+def test_camera_history_33_to_9_and_exact_shared_boundary():
+    state=CameraHistoryState(); source=torch.eye(4); K=torch.eye(3)
+    reps=[torch.full((4,4),float(i)) for i in range(9)]
+    Ks=[torch.eye(3)*(i+1) for i in range(9)]
+    state.append_chunk(reps, [0,4,8,12,16,20,24,28,32], Ks)
+    reps2=[reps[-1]]+[torch.full((4,4),float(i)) for i in range(9,17)]
+    Ks2=[Ks[-1]]+[torch.eye(3)*(i+1) for i in range(9,17)]
+    state.append_chunk(reps2, [32,36,40,44,48,52,56,60,64], Ks2)
+    slots=state.slots(source,K)
+    assert len(slots)==19 and torch.equal(slots[0][0], reps[1])
+    assert state.slot_frame_ids()[-1] == 64
+
+def test_history_ray_count_must_be_exact():
+    from long_video.sightline.helios_integration import SightlineRayProvider
+    provider=SightlineRayProvider(source_height=4,source_width=4)
+    c=torch.eye(4).view(1,1,4,4); k=torch.eye(3).view(1,1,3,3)
+    provider.set_context(chunk_index=0,c2w=c,intrinsics=k,history_cameras=c[:,:1],history_intrinsics=k[:,:1],token_shape=(1,2,2),stage_shapes=((1,2,2),))
+    with pytest.raises(RuntimeError,match="exactly match"):
+        provider(torch.zeros(1,4,8),key_length=9,current_length=4)
+
+def test_train_chunk_policy_is_single_and_causal():
+    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk
+    train_chunk=2; policies=[chunk_grad_policy(i,train_chunk) for i in range(6)]
+    assert policies[:2]==["forward_detached"]*2 and policies[2]=="backward"
+    assert policies[3:]==["rollout_detached"]*3
+    assert_single_backward_chunk(policies,train_chunk)
 
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7

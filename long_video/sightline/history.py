@@ -46,17 +46,30 @@ class HistoryManager:
 class CameraHistoryState:
     """Camera representatives kept in lockstep with native latent history."""
     def __init__(self): self._items={}; self._chunk_index=0
-    def append_chunk(self, representatives):
+    def append_chunk(self, representatives, frame_ids=None, intrinsics=None):
         if len(representatives)!=9: raise ValueError("a 33-RGB-frame chunk must have 9 latent cameras")
+        if frame_ids is None: raise ValueError("camera frame identities are required")
+        if len(frame_ids)!=9: raise ValueError("camera frame identity count must be 9")
+        if intrinsics is not None and len(intrinsics) != 9: raise ValueError("camera intrinsics count must be 9")
         start=self._chunk_index*8
         for i,item in enumerate(representatives):
             index=start+i
+            K = None if intrinsics is None else intrinsics[i]
             if index in self._items:
-                old=self._items[index]
+                old_frame,old,old_K=self._items[index]
+                if old_frame != int(frame_ids[i]): raise RuntimeError(f"inconsistent camera boundary identity {index}")
                 if old is not item and not (isinstance(old,torch.Tensor) and isinstance(item,torch.Tensor) and torch.equal(old,item)):
                     raise RuntimeError(f"inconsistent camera boundary {index}")
-            else: self._items[index]=item
+                if K is not None and old_K is not None and not torch.equal(old_K,K): raise RuntimeError(f"inconsistent intrinsics boundary {index}")
+            else: self._items[index]=(int(frame_ids[i]),item,K)
         self._chunk_index+=1
-    def slots(self):
-        keys=sorted(self._items); selected=keys[-19:]; return [self._items[k] for k in selected]
+    def slots(self, source_camera, source_intrinsics=None):
+        if not self._items:
+            return [(source_camera, source_intrinsics)] * 19
+        last=max(self._items)
+        keys=list(range(max(0,last-18),last+1))
+        if len(keys)<19: keys=[None]*(19-len(keys))+keys
+        return [(source_camera, source_intrinsics) if key is None or key not in self._items else (self._items[key][1], self._items[key][2] if self._items[key][2] is not None else source_intrinsics) for key in keys]
+    def slot_frame_ids(self):
+        return tuple(sorted(self._items)[-19:])
     def indices(self): return tuple(sorted(self._items))

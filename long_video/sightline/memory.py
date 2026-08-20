@@ -42,11 +42,14 @@ class LongTermKVMemory:
             else: raise ValueError("memory batch differs from attention batch")
         mem_k=attn.to_k(hidden); mem_v=attn.to_v(hidden)
         mem_k=attn.norm_k(mem_k).unflatten(2,(attn.heads,-1)); mem_v=mem_v.unflatten(2,(attn.heads,-1))
-        if rotary_emb is not None:
-            # Memory uses a fixed temporal band and pooled spatial identity; the
-            # caller can pass a dedicated memory rotary tensor via kwargs.
-            memory_rotary=kwargs.get('memory_rotary_emb')
-            if memory_rotary is not None: mem_k=rotary_apply(mem_k,memory_rotary)
+        if rotary_emb is None:
+            raise RuntimeError("native rotary embedding is required for long-memory K")
+        memory_tokens=mem_k.shape[1]
+        if rotary_emb.ndim < 2 or memory_tokens > rotary_emb.shape[1]:
+            raise RuntimeError(f"memory rotary embedding has {rotary_emb.shape[1] if rotary_emb.ndim > 1 else 0} positions for {memory_tokens} memory tokens")
+        positions=torch.arange(memory_tokens,device=hidden.device,dtype=torch.long)
+        memory_rotary=rotary_emb.index_select(1,positions)
+        mem_k=rotary_apply(mem_k,memory_rotary)
         if sightline_projector is not None:
             delta=sightline_projector.project(rays.to(hidden),kind='k',training=sightline_projector.training)
             mem_k=mem_k+delta.unflatten(-1,(attn.heads,-1))

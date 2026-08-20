@@ -1,0 +1,59 @@
+"""Load and validate the already-built DL3DV/latent/teacher cache manifest."""
+from __future__ import annotations
+from dataclasses import dataclass
+import json
+from pathlib import Path
+import numpy as np
+
+REQUIRED_RECORD_KEYS=("trajectory_id","rgb_dir","target_c2w_local","intrinsics")
+OPTIONAL_CACHE_KEYS=("latent_cache","gt_latent_cache","recal_xyz","recal_valid","recal_confidence","recal_pointmap")
+@dataclass(frozen=True)
+class SightlineRecord:
+    raw: dict; root: Path
+    @property
+    def trajectory_id(self): return str(self.raw["trajectory_id"])
+    def path(self,key): return self.root / self.raw[key]
+    def load_cameras(self):
+        c2w=np.load(self.path("target_c2w_local"),mmap_mode="r"); K=np.load(self.path("intrinsics"),mmap_mode="r")
+        if c2w.shape != (193,4,4) or K.shape not in ((3,3),(193,3,3)): raise ValueError(f"{self.trajectory_id}: camera cache must contain 193 frames")
+        if K.ndim==2: K=np.repeat(K[None],193,axis=0)
+        return c2w,K
+    def rgb_paths(self):
+        paths=sorted((self.root/self.raw["rgb_dir"]).glob("*"))
+        if len(paths)!=193: raise ValueError(f"{self.trajectory_id}: expected 193 RGB frames, found {len(paths)}")
+        return paths
+    def validate_teacher_and_latent_caches(self):
+        checked=[]
+        for key in OPTIONAL_CACHE_KEYS:
+            if key not in self.raw:
+                continue
+            path=self.path(key)
+            if not path.exists():
+                raise FileNotFoundError(f"{self.trajectory_id}: missing {key}: {path}")
+            checked.append(path)
+        for key in ("latent_cache", "gt_latent_cache"):
+            if key in self.raw:
+                validate_latent_cache(self.path(key))
+        return checked
+
+def load_sightline_manifest(path: str|Path, *, expected_count: int|None=None) -> list[SightlineRecord]:
+    path=Path(path); payload=json.loads(path.read_text()); records=payload.get("records")
+    if not isinstance(records,list) or (expected_count is not None and len(records)!=expected_count): raise ValueError("invalid Sightline dataset manifest record count")
+    root=path.parent; result=[]
+    for row in records:
+        missing=[key for key in REQUIRED_RECORD_KEYS if key not in row]
+        if missing: raise ValueError(f"record missing keys: {missing}")
+        item=SightlineRecord(row,root); item.load_cameras(); item.rgb_paths(); item.validate_teacher_and_latent_caches(); result.append(item)
+    return result
+
+def validate_latent_cache(path: str|Path, *, expected_frames=193):
+    path=Path(path)
+    if not path.exists(): raise FileNotFoundError(path)
+    files=sorted(path.glob("**/*")) if path.is_dir() else [path]
+    if not files: raise ValueError(f"empty latent cache: {path}")
+    for file in files:
+        if file.suffix not in (".npy",".npz",".pt",".pth"): continue
+        if file.suffix==".npy":
+            arr=np.load(file,mmap_mode="r")
+            if arr.ndim>=3 and arr.shape[0] not in (expected_frames,9): raise ValueError(f"unexpected latent frame count in {file}")
+    return files

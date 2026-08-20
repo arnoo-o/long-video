@@ -10,9 +10,11 @@ def helio_source_fingerprint(source_text: str) -> str:
 
 class SightlineHeliosAttnProcessor:
     def __init__(self, conditioner: SightlineConditioner, ray_provider, *, memory=None,
-                 qkv_projection=None, rotary_apply=None, attention_dispatch=None):
+                 qkv_projection=None, rotary_apply=None, attention_dispatch=None,
+                 attention_backend=None, parallel_config=None):
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
+        self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.last_q=None; self.last_k=None; self.last_attention_meta={}
         self.last_hidden_states=None; self.last_current_length=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
@@ -35,10 +37,22 @@ class SightlineHeliosAttnProcessor:
         query=query+dq; key=key+dk
         history_len=max(0,key.shape[1]-current_len)
         if getattr(attn,'is_amplify_history',False) and history_len:
-            scale=1.0+getattr(attn,'max_scale',1.0-1.0)*0.0
             scale=1.0+__import__('torch').sigmoid(attn.history_key_scale)*(attn.max_scale-1.0)
             if getattr(attn,'history_scale_mode','per_head')=='per_head': scale=scale.view(1,1,-1,1)
             key=torch.cat((key[:,:history_len]*scale,key[:,history_len:]),1)
+        boost_mask=getattr(attn,'history_key_boost_mask',None)
+        boost_scale=float(getattr(attn,'history_key_boost_scale',1.0) or 1.0)
+        if boost_mask is not None and boost_scale != 1.0:
+            boost_mask=boost_mask.to(device=key.device,dtype=torch.bool)
+            if boost_mask.ndim != 1 or boost_mask.shape[0] != key.shape[1]: raise ValueError('native history boost mask does not match key length')
+            key=torch.where(boost_mask.view(1,-1,1,1),key*boost_scale,key)
+        history_bias=getattr(attn,'history_key_bias',None)
+        if history_bias is not None:
+            history_bias=history_bias.to(device=query.device,dtype=query.dtype)
+            if history_bias.ndim==1: history_bias=history_bias.unsqueeze(0)
+            if history_bias.shape != (query.shape[0],key.shape[1]): raise ValueError('native history bias does not match key length')
+            additive=history_bias[:,None,None,:]
+            attention_mask=additive if attention_mask is None else attention_mask.to(additive)+additive
         if getattr(attn,'restrict_self_attn',False) and history_len:
             key=key[:,:history_len]; value=value[:,:history_len]
         if self.memory is not None:
@@ -50,7 +64,7 @@ class SightlineHeliosAttnProcessor:
                 sightline_projector=self.conditioner,
                 **memory_kwargs)
         self.last_q=query; self.last_k=key
-        out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=None,parallel_config=None)
+        out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)
         return attn.to_out[1](attn.to_out[0](out))
@@ -87,14 +101,7 @@ class SightlineRayProvider:
         if history.shape[:1] != (B,) or history.shape[-1] != 7:
             raise RuntimeError(f"invalid history ray shape: history={tuple(history.shape)}, key={key_length}, current={current_count}")
         if history.shape[1] != expected:
-            if history.shape[1] % expected == 0:
-                factor=history.shape[1]//expected
-                history=history.reshape(B,expected,factor,7)[:, :, factor//2]
-            elif expected % history.shape[1] != 0:
-                raise RuntimeError(f"history ray count does not match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
-            else:
-                factor=expected//history.shape[1]
-                history=history.repeat_interleave(factor,dim=1)
+            raise RuntimeError(f"history ray count does not exactly match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
 
@@ -112,7 +119,8 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') else memory
         if layer_memory is not None and memory is not None:
             layer_memory.timestamp=memory.timestamp
-        processor=SightlineHeliosAttnProcessor(conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn)
+        native=helios_module.HeliosAttnProcessor()
+        processor=SightlineHeliosAttnProcessor(conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
         if hasattr(attn,'set_processor'): attn.set_processor(processor)
         else: attn.processor=processor
         installed.append(index)

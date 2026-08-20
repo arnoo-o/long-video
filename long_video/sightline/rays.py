@@ -6,8 +6,13 @@ TEMPORAL_GROUPS = ((0,), (1,2,3,4), (5,6,7,8), (9,10,11,12), (13,14,15,16),
                    (17,18,19,20), (21,22,23,24), (25,26,27,28), (29,30,31,32))
 
 def latent_camera_indices(device=None) -> torch.Tensor:
-    """Canonical 33 RGB -> 9 latent camera representatives used everywhere."""
-    return torch.tensor([group[len(group)//2] for group in TEMPORAL_GROUPS], device=device, dtype=torch.long)
+    """Canonical 33 RGB -> 9 latent camera representatives used everywhere.
+
+    The final RGB frame of each native temporal group is used. This makes the
+    last representative of chunk ``k`` and the first representative of chunk
+    ``k+1`` the shared boundary frame 32, 64, ... exactly.
+    """
+    return torch.tensor([group[-1] for group in TEMPORAL_GROUPS], device=device, dtype=torch.long)
 
 def chunk_frame_slice(chunk_index: int) -> slice:
     if chunk_index < 0 or chunk_index > 5: raise ValueError("chunk index must be 0..5")

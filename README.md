@@ -1,34 +1,28 @@
-# long-video
+# long-video Sightline
 
-Causal long-video inference uses one compact path:
+The formal mainline is geometry-free Sightline: source RGB is resized with its
+intrinsics, encoded to a source latent, and passed to pinned Helios. Subsequent
+camera poses come from dataset c2w or WASD controls. Each 33-RGB-frame/9-latent
+chunk uses native Helios source + 16/2/1 latent history, deterministic
+Plücker-ray Q/K conditioning after QKNorm and native RoPE, and selected-layer
+K/V-only long memory. The original six chunks, stride 32 and pyramid settings
+`[2, 2, 2]` are fixed invariants.
 
-The formal mainline is now Sightline: Helios receives source RGB, camera intrinsics,
-c2w controls, generated latent history, deterministic Plücker rays, and bounded
-K/V-only long-term memory. It does not import WAH, PointWorld, ReCal3R, Pi3X,
-depth, warp rendering, or confidence/visibility maps. The previous causal-world
-implementation remains in the repository as legacy/reference code only.
+Formal entrypoints:
 
-The Sightline entrypoints are `scripts/infer_sightline.py` and
-`scripts/train_sightline_dl3dv.py`; training is intentionally not launched by
-this change. Sparse offline teachers are built with
-`scripts/build_sightline_correspondences.py`.
-2. Parent-First renderer produces aligned warp RGB, binary visibility, and confidence.
-3. Pinned original Warp-as-History consumes the rendered warp as history conditioning.
-4. Helios samples three pyramid stages with `[2, 2, 4]` scheduler updates.
-5. Only Stage2 steps 0, 1, and 2 apply renderer RGB consistency; Stage2 step 3 remains native Helios.
+```text
+scripts/infer_sightline.py
+scripts/train_sightline_dl3dv.py
+scripts/build_sightline_correspondences.py
+scripts/probe_sightline_layers.py
+```
 
-The clamp is `I_mixed = M * I_warp + (1-M) * I_model`, where `M` is raw binary
-renderer visibility. It decodes the clean/x0 prediction, composites pixels,
-deterministically VAE-encodes the result, and returns it to the native next
-scheduler coordinate. There is no final post-hoc clamp.
+The Sightline process does not import or initialize WAH, PointWorld, ReCal3R,
+Pi3X, depth or warp rendering. Existing WAH/PointWorld/ReCal3R/Pi3X files are
+legacy/reference utilities only. Offline ReCal3R arrays may be read solely by
+the sparse correspondence builder.
 
-DL3DV download, selection, manifest, and preprocessing tools are retained under
-`scripts/select_download_dl3dv_film.py` and `scripts/build_dl3dv_film_dataset.py`.
-
-Pinned WAH commit: `09aa6461355b298bfced51007bd709a251d6033a`.
-
-Windows users can author smooth multi-segment camera trajectories and run the
-H100 pipeline with `scripts\launch_wah_world_inference_gui.bat`.  The GUI uploads
-the source image/controls over SSH, streams progress, and downloads the videos
-and metrics.  See `docs/wah_world_inference_gui.md` for setup and text-only
-source-image generation.
+Use `configs/sightline.yaml` as the single configuration schema. Formal training
+is not launched by repository setup. See `docs/sightline_architecture.md` for
+the runtime contract and `third_party_versions.json` for pinned Helios/WAH
+provenance.

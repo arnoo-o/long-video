@@ -1,36 +1,19 @@
 {
-    "wah":  {
-                "path":  "/ephemeral/mdu/long-video/third_party/Warp-as-History",
-                "remote":  "https://github.com/yyfz/Warp-as-History",
-                "commit":  "09aa6461355b298bfced51007bd709a251d6033a",
-                "patch":  "patches/wah_confidence.patch",
-                "patch_apply_check":  true,
-                "training_attention_patched":  true
-            },
-    "helios":  {
-                   "path":  "/ephemeral/mdu/long-video-assets/helios-distilled",
-                   "model":  "BestWishYsh/Helios-Distilled"
-               },
-    "recal3r":  {
-                "repo_path": null,
-                "checkpoint": null,
-                "view_count": 8,
-                "frozen": true
-            },
-    "h100_wah_environment":  {
-                                 "python":  "3.12.3",
-                                 "pytorch":  "2.5.1+cu124",
-                                 "cuda":  "12.4",
-                                 "diffusers":  "0.36.0"
-                             },
-    "habitat_environment":  {
-                                "path":  "/ephemeral/mdu/envs/longvideo-habitat",
-                                "habitat_sim":  "0.3.3"
-                            },
-    "causal_world": {
-                         "geometry": "recal3r",
-                         "activation_delay_chunks": 2,
-                         "parent_first_rendering": true,
-                         "uses_future_gt": false
-                    }
+  "helios": {
+    "source": "pinned Warp-as-History Helios source",
+    "model": "BestWishYsh/Helios-Distilled",
+    "source_commit": "09aa6461355b298bfced51007bd709a251d6033a",
+    "attention_api": "HeliosAttnProcessor:_get_qkv_projections,norm_q/norm_k,apply_rotary_emb_transposed,dispatch_attention_fn"
+  },
+  "legacy_wah": {
+    "remote": "https://github.com/yyfz/Warp-as-History",
+    "commit": "09aa6461355b298bfced51007bd709a251d6033a",
+    "status": "reference-only"
+  },
+  "runtime": {
+    "python": "3.12.3",
+    "pytorch": "2.5.1+cu124",
+    "cuda": "12.4",
+    "diffusers": "0.36.0"
+  }
 }

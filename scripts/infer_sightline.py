@@ -1,6 +1,6 @@
 """Geometry-free Sightline inference using the pinned Helios pipeline."""
 from __future__ import annotations
-import argparse, json, sys
+import argparse, hashlib, json, sys
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -19,9 +19,15 @@ def main():
     from long_video.config import load_sightline_config
     from long_video.sightline.conditioning import SightlineConditioner
     from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
+    from long_video.sightline.pipeline import SightlinePipeline
     from long_video.sightline.rays import canonicalize_c2w, temporal_group_cameras
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
+    source_file=Path(a.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'
+    if not source_file.is_file(): raise FileNotFoundError(source_file)
+    source_fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
+    for symbol in ('_get_qkv_projections','apply_rotary_emb_transposed','dispatch_attention_fn','HeliosAttnProcessor'):
+        if not hasattr(helios_source,symbol): raise RuntimeError(f'pinned Helios API missing {symbol}')
     cfg=load_sightline_config(a.config); image=Image.open(a.source); K=np.load(a.intrinsics) if a.intrinsics.endswith('.npy') else np.asarray(json.loads(Path(a.intrinsics).read_text()),np.float32)
     image,K=resize_source(image,K,cfg.source_height,cfg.source_width)
     c2w=np.load(a.c2w) if a.c2w and a.c2w.endswith('.npy') else np.asarray(json.loads(Path(a.c2w).read_text()),np.float32) if a.c2w else np.eye(4,dtype=np.float32)[None].repeat(33,0)
@@ -37,6 +43,7 @@ def main():
     layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.memory_layers or cfg.correspondence_layers)
     if not layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source)
-    result=pipe(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,num_inference_steps=a.steps,history_sizes=list(cfg.history_sizes),num_latent_frames_per_chunk=9,is_enable_stage2=True,pyramid_num_inference_steps_list=list(cfg.pyramid_steps),output_type='np')
-    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
+    runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner); runner.assert_geometry_free_imports()
+    result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps)
+    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
 if __name__=='__main__': main()

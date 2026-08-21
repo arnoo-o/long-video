@@ -190,3 +190,9 @@ def test_single_pose_canonicalization():
     from long_video.sightline.rays import canonicalize_c2w
     pose=torch.eye(4).repeat(2,1,1); pose[:,0,3]=torch.tensor([2.,3.])
     assert torch.allclose(canonicalize_c2w(pose),torch.eye(4).repeat(2,1,1))
+
+def test_shared_boundary_correspondence_identity_is_not_deduplicated():
+    from scripts.build_sightline_correspondences import correspondence_identity
+    base={'query_chunk':0,'key_chunk':0,'query_latent_temporal':8,'key_latent_temporal':8,'query_y':1,'query_x':2,'key_y':3,'key_x':4}
+    boundary=dict(base,query_chunk=1,query_latent_temporal=0)
+    assert correspondence_identity(base)!=correspondence_identity(boundary)

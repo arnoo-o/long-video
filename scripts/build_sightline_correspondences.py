@@ -6,6 +6,8 @@ import numpy as np
 from long_video.sightline.rays import rgb_frame_latent_memberships
 
 SCHEMA='sightline-correspondence-v1'
+def correspondence_identity(row):
+    return (row['query_chunk'],row['key_chunk'],row['query_latent_temporal'],row['key_latent_temporal'],row['query_y'],row['query_x'],row['key_y'],row['key_x'])
 def _camera_sequence(array, name, frames=193):
     array=np.asarray(array)
     if name=='c2w':
@@ -70,6 +72,5 @@ def main():
             target_scene=xyz[g][valid[g]&np.isfinite(xyz[g]).all(-1)]
             rows.extend(_rows(q,k,qv,kv,f,g,threshold,a.token_height,a.token_width,c2w[g] if c2w is not None else None, K[g] if K is not None else None, H, W,target_scene))
     # Stable deduplication of query/key identities.
-    identity=lambda r:(r['query_chunk'],r['key_chunk'],r['query_latent_temporal'],r['key_latent_temporal'],r['query_y'],r['query_x'],r['key_y'],r['key_x'])
-    unique={identity(r):r for r in rows}; rows=list(unique.values()); a.out.parent.mkdir(parents=True,exist_ok=True); a.out.write_text(json.dumps({'schema_version':SCHEMA,'token_grid':{'source_height':H,'source_width':W,'token_height':a.token_height,'token_width':a.token_width},'rows':rows},separators=(',',':')))
+    unique={correspondence_identity(r):r for r in rows}; rows=list(unique.values()); a.out.parent.mkdir(parents=True,exist_ok=True); a.out.write_text(json.dumps({'schema_version':SCHEMA,'token_grid':{'source_height':H,'source_width':W,'token_height':a.token_height,'token_width':a.token_width},'rows':rows},separators=(',',':')))
 if __name__=='__main__': main()

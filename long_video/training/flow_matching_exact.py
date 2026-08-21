@@ -31,6 +31,14 @@ def _pyramid_noise(reference, stages, *, generator=None):
 
 def _upsample(source,target): return _resize_spatial(source,target.shape[-2],target.shape[-1])
 
+def _apply_schedule_shift(sigmas,reference,config):
+    seq_len=(reference.shape[-1]*reference.shape[-2]*reference.shape[-3])//4
+    base_len=float(config.get('base_image_seq_len',256)); max_len=float(config.get('max_image_seq_len',4096))
+    base_shift=float(config.get('base_shift',.5)); max_shift=float(config.get('max_shift',1.15))
+    mu=seq_len*((max_shift-base_shift)/(max_len-base_len))+(base_shift-(max_shift-base_shift)/(max_len-base_len)*base_len)
+    if config.get('time_shift_type','linear')=='exponential': mu=torch.exp(torch.tensor(min(mu,torch.log(torch.tensor(7.)).item()),device=sigmas.device,dtype=sigmas.dtype))
+    return (sigmas*mu)/(1+(mu-1)*sigmas)
+
 def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), device=None, generator=None):
     device=device or target_latents.device; stages=len(stage_steps)
     scheduler=pipe.scheduler
@@ -45,9 +53,14 @@ def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), devi
         timesteps=scheduler.timesteps_per_stage[stage][indices].to(device=device)
         sigmas=scheduler.sigmas_per_stage[stage][indices].to(device=device,dtype=start_point.dtype)
         while sigmas.ndim<start_point.ndim: sigmas=sigmas.unsqueeze(-1)
+        if bool(scheduler.config.get('use_dynamic_shifting',False)):
+            sigmas=_apply_schedule_shift(sigmas,start_point,scheduler.config)
+            stage_timesteps=scheduler.timesteps_per_stage[stage].to(device=device,dtype=sigmas.dtype)
+            timesteps=stage_timesteps.min()+sigmas*(stage_timesteps.max()-stage_timesteps.min())
+            while timesteps.ndim>1: timesteps=timesteps.squeeze(-1)
         sigma=sigmas
         noisy=sigma*start_point+(1-sigma)*end_point
         for name,tensor in {'noisy':noisy,'target':start_point-end_point,'start':start_point,'end':end_point}.items():
             if tensor.shape!=current.shape: raise RuntimeError(f'stage {stage} {name} shape mismatch: {tensor.shape} vs {current.shape}')
-        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage]})
+        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'use_dynamic_shifting':bool(scheduler.config.get('use_dynamic_shifting',False))})
     return items

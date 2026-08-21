@@ -39,6 +39,7 @@ def main():
         capture=Path(directory)/f'{index}.pt'; metrics=Path(directory)/f'{index}.jsonl'
         command=[sys.executable,str(train_script),'--model',args.model,'--helios-root',args.helios_root,'--manifest',args.manifest,'--config',args.config,'--expected-records',str(args.expected_records),'--record-index',str(index),'--train-chunk','1','--probe-only','--probe-step','1000','--probe-capture',str(capture),'--metrics',str(metrics),'--output-dir',directory]
         if args.checkpoint: command.extend(['--resume',args.checkpoint])
+        else: command.append('--alpha-zero-baseline')
         subprocess.run(command,check=True)
         payload=torch.load(capture,map_location='cpu')
         if payload.get("source")!="real_helios_forward": raise RuntimeError(f"{capture} is not a real Helios capture")

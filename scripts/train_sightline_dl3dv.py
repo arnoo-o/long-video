@@ -96,7 +96,7 @@ def _reset_sequence(runner):
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True)
     p.add_argument('--expected-records',type=int,default=100); p.add_argument('--max-steps',type=int,default=2500); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int,default=80)
-    p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
+    p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config); records=load_sightline_manifest(args.manifest,expected_count=args.expected_records)
     sys.path.insert(0,args.helios_root)
@@ -116,6 +116,8 @@ def main():
     start_step=args.probe_step if args.probe_only else 0
     if args.resume:
         payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True); start_step=completed_step+1
+    elif args.alpha_zero_baseline:
+        trainable.conditioner.alpha.data.zero_(); runner.memory.timestamp.weight.data.zero_()
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):

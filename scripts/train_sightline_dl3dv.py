@@ -78,9 +78,19 @@ def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk):
 
 def _load_correspondence(path):
     payload=json.loads(Path(path).read_text())
-    if payload.get('schema_version')!='sightline-correspondence-v4': raise RuntimeError('stale correspondence cache; rebuild with long-memory rows')
-    if tuple(payload.get('pair_offsets',())) != (-128,-96,-64,-33,-1,1,33,64,96,128): raise RuntimeError('correspondence pair offset metadata mismatch')
-    return payload['rows']
+    if payload.get('schema_version')!='sightline-correspondence-v5': raise RuntimeError('stale correspondence cache; v4 caches are not accepted')
+    required=('trajectory_id','source_height','source_width','token_grid','c2w_fingerprint','intrinsics_fingerprint','xyz_fingerprint','valid_fingerprint','confidence_fingerprint','overlap_mining','vote','candidate_pair_count','accepted_pair_count','row_count')
+    missing=[key for key in required if key not in payload]
+    if missing: raise RuntimeError(f'correspondence v5 metadata missing {missing}')
+    rows=payload.get('rows')
+    if not isinstance(rows,list) or payload['row_count']!=len(rows): raise RuntimeError('correspondence row_count mismatch')
+    height=int(payload['token_grid']['token_height']); width=int(payload['token_grid']['token_width'])
+    for row in rows:
+        qf,kf=int(row['query_frame']),int(row['key_frame'])
+        if kf>=qf or int(row['query_chunk'])<0 or int(row['key_chunk'])<0 or not (0<=int(row['query_y'])<height and 0<=int(row['key_y'])<height and 0<=int(row['query_x'])<width and 0<=int(row['key_x'])<width): raise RuntimeError('invalid causal correspondence identity')
+        if int(row.get('matched_count',0))<=0 or int(row.get('valid_count',0))<=0 or not (0<float(row.get('coverage',0))<=1): raise RuntimeError('invalid correspondence vote statistics')
+        if not np.isfinite(float(row.get('weight',float('nan')))) or float(row.get('weight',-1))<0 or not np.isfinite(float(row.get('vote',float('nan')))) or float(row.get('vote',-1))<0: raise RuntimeError('invalid correspondence weight/vote')
+    return rows
 
 def _mapped_correspondences(processor,rows,chunk):
     q,k=processor.last_q,processor.last_k

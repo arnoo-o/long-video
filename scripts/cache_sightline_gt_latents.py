@@ -1,12 +1,12 @@
 """Encode continuous 193-frame RGB records into a canonical 49-latent cache."""
 from __future__ import annotations
-import argparse,json
+import argparse,json,hashlib,glob
 from pathlib import Path
 from PIL import Image
 import torch
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--rgb-dir',required=True); p.add_argument('--out',required=True); p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--model-provenance',required=True); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--rgb-dir',required=True); p.add_argument('--out',required=True); p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); a=p.parse_args()
     import sys; sys.path.insert(0,a.helios_root)
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda'); paths=sorted(Path(a.rgb_dir).glob('*'))
@@ -29,8 +29,18 @@ def main():
     temporal=[axis for axis,size in enumerate(latent.shape) if size in (49,193)]
     if len(temporal)!=1: raise RuntimeError(f'cannot identify continuous latent temporal axis: {latent.shape}')
     axis=temporal[0]; latent=latent.movedim(axis,2)
-    if latent.shape[2]==193: latent=latent[:,:,::4]
-    if latent.shape[2]!=49: raise RuntimeError('continuous VAE encode did not produce 49 temporal latents')
-    output=Path(a.out); output.parent.mkdir(parents=True,exist_ok=True); torch.save({'latents':latent.cpu(),'schema':'continuous_49','model_provenance':a.model_provenance},output)
-    print(json.dumps({'out':str(output),'schema':'continuous_49','shape':list(latent.shape),'model_provenance':a.model_provenance}))
+    if latent.shape[2]!=49: raise RuntimeError('continuous VAE encode must natively produce T=49; refusing frame subsampling')
+    model_files=[]
+    for pattern in ('config.json','model_index.json','transformer/config.json','transformer/*.index.json','vae/config.json','vae/*.index.json'):
+        model_files.extend(glob.glob(str(Path(a.model)/pattern)))
+    digest=hashlib.sha256()
+    for filename in sorted(set(model_files)):
+        digest.update(Path(filename).read_bytes())
+    model_identity={'model_ref':str(a.model),'config_fingerprint':digest.hexdigest()}
+    vae_config=dict(pipe.vae.config) if hasattr(pipe.vae.config,'items') else str(pipe.vae.config)
+    provenance={'model_identity':model_identity,'vae_config':vae_config,'preprocessing':{'height':a.height,'width':a.width,'normalization':'pinned Helios video_processor'},'latent_normalization':{'mean':list(pipe.vae.config.latents_mean),'std':list(pipe.vae.config.latents_std)},'encode_mode':'mode','encoding_dtype':str(pixels.dtype)}
+    provenance['fingerprint']=hashlib.sha256(json.dumps(provenance,sort_keys=True,default=str).encode()).hexdigest()
+    if not torch.isfinite(latent).all(): raise RuntimeError('continuous latent contains non-finite values')
+    output=Path(a.out); output.parent.mkdir(parents=True,exist_ok=True); torch.save({'latents':latent.cpu(),'schema':'continuous_49','provenance':provenance},output)
+    print(json.dumps({'out':str(output),'schema':'continuous_49','shape':list(latent.shape),'provenance_fingerprint':provenance['fingerprint']}))
 if __name__=='__main__': main()

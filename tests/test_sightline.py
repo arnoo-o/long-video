@@ -239,6 +239,11 @@ def test_continuous_latent_cache_accepts_tchw_and_rejects_rgb_frames(tmp_path):
     bad=tmp_path/'bad.pt'; torch.save({'latents':torch.zeros(16,193,2,3)},bad)
     with pytest.raises(ValueError): load_latent_tensor(bad)
 
+def test_manifest_without_latent_key_resolves_continuous_cache(tmp_path):
+    from long_video.training.sightline_data import SightlineRecord,resolve_continuous_latent_cache
+    record=SightlineRecord({'trajectory_id':'traj'},tmp_path); target=tmp_path/'traj'/'continuous_49.pt'; target.parent.mkdir(); target.touch()
+    assert resolve_continuous_latent_cache(record,cache_root=tmp_path)==target
+
 def test_lora_and_timestamp_follow_requested_dtype_device():
     from long_video.training.sightline import LoRALinear
     from long_video.sightline.memory import LayerKVMemoryBank

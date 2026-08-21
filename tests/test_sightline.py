@@ -198,6 +198,7 @@ def test_detached_autoregressive_chunk_has_no_gt_argument():
     from scripts.train_sightline_dl3dv import _generate_detached_chunk
     calls=[]
     class Pipe:
+        transformer=SimpleNamespace(dtype=torch.float32)
         def stage2_sample(self,**kwargs): calls.append(kwargs); return kwargs['latents']
     source=torch.zeros(1,2,1,4,4); history={name:(torch.zeros(1,2,n,4,4),torch.arange(n).view(1,-1)) for name,n in [('long',16),('mid',2),('short',2)]}
     result=_generate_detached_chunk(Pipe(),source,history,torch.zeros(1,2,3),SimpleNamespace(pyramid_steps=(2,2,2)),1)

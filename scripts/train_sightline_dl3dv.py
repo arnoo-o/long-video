@@ -226,7 +226,7 @@ def main():
         if phase['correspondence'] or diagnostic_correspondence:
             if not active_corr_layers or any(layer not in pipe.transformer._sightline_processors for layer in active_corr_layers): raise RuntimeError('active correspondence/probe layers are not installed Sightline layers')
             for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=True
-            corr_rows=_load_correspondence(record.path('correspondence_cache'))
+            corr_rows=_load_correspondence(record.path('correspondence_cache')) if 'correspondence_cache' in record.raw else []
         else: corr_rows=None
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'])
         if not 0<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum')

@@ -71,6 +71,13 @@ def run_single_graph_chunks(max_chunks, train_chunk, forward_chunk):
         outputs.append(output)
     return outputs,policies
 
+def selected_qk_logits(query, key, query_indices):
+    """Compute attention logits only for selected queries, never full Q x K."""
+    if query.ndim!=4 or key.ndim!=4: raise ValueError('Q/K must be [B,N,H,D]')
+    indices=torch.as_tensor(query_indices,device=query.device,dtype=torch.long)
+    selected=query.index_select(1,indices)
+    return torch.einsum('bqhd,bkhd->bhqk',selected,key)*(selected.shape[-1]**-.5)
+
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
         super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
@@ -93,7 +100,8 @@ class SightlineTrainable(nn.Module):
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):
         super().__init__(); self.base=base; self.rank=rank; self.scale=float(scale if scale is not None else 1.0/rank)
-        self.lora_down=nn.Linear(base.in_features,rank,bias=False); self.lora_up=nn.Linear(rank,base.out_features,bias=False)
+        factory={'device':base.weight.device,'dtype':base.weight.dtype}
+        self.lora_down=nn.Linear(base.in_features,rank,bias=False,**factory); self.lora_up=nn.Linear(rank,base.out_features,bias=False,**factory)
         nn.init.kaiming_uniform_(self.lora_down.weight,a=math.sqrt(5)); nn.init.zeros_(self.lora_up.weight)
         for parameter in self.base.parameters(): parameter.requires_grad_(False)
     def forward(self,x): return self.base(x)+self.lora_up(self.lora_down(x))*self.scale

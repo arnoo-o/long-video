@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 def _density(batch, device):
-    u=torch.sigmoid(torch.randn((batch,),device=device)); return u
+    return torch.rand((batch,),device=device)
 
 def _resize_spatial(latents, height, width, scale=1.0):
     batch,channels,frames,_,_=latents.shape
@@ -50,8 +50,9 @@ def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), devi
         start_point=noise[stage] if stage==0 else start*noise[stage]+(1-start)*_upsample(clean[stage-1],current)
         end_point=current if stage==stages-1 else end*noise[stage]+(1-end)*current
         indices=(_density(target_latents.shape[0],device)*train_steps).long().clamp(0,train_steps-1)
-        timesteps=scheduler.timesteps_per_stage[stage][indices].to(device=device)
-        sigmas=scheduler.sigmas_per_stage[stage][indices].to(device=device,dtype=start_point.dtype)
+        cpu_indices=indices.detach().cpu()
+        timesteps=scheduler.timesteps_per_stage[stage][cpu_indices].to(device=device)
+        sigmas=scheduler.sigmas_per_stage[stage][cpu_indices].to(device=device,dtype=start_point.dtype)
         while sigmas.ndim<start_point.ndim: sigmas=sigmas.unsqueeze(-1)
         if bool(scheduler.config.get('use_dynamic_shifting',False)):
             sigmas=_apply_schedule_shift(sigmas,start_point,scheduler.config)

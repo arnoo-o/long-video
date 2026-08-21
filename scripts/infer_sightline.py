@@ -10,7 +10,11 @@ import torch
 def resize_source(image, K, height=384, width=640):
     image=image.convert('RGB'); old_w,old_h=image.size; image=image.resize((width,height),Image.Resampling.LANCZOS)
     sx,sy=width/old_w,height/old_h
-    K=np.asarray(K,np.float32).copy(); K[0]*=sx; K[1]*=sy; return image,K
+    K=np.asarray(K,np.float32).copy()
+    if K.shape==(3,3): K[0,:]*=sx; K[1,:]*=sy
+    elif K.ndim==3 and K.shape[1:]==(3,3): K[:,0,:]*=sx; K[:,1,:]*=sy
+    else: raise ValueError('K must be [3,3] or [F,3,3]')
+    return image,K
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int,default=2); p.add_argument('--layers',default=''); a=p.parse_args()
@@ -20,7 +24,7 @@ def main():
     sys.path.insert(0,a.helios_root)
     from long_video.config import load_sightline_config
     from long_video.training.sightline import SightlineTrainable, install_lora
-    from long_video.training.sightline_checkpoint import restore_runtime_checkpoint
+    from long_video.training.sightline_checkpoint import restore_runtime_checkpoint, runtime_provenance
     from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
     from long_video.sightline.pipeline import SightlinePipeline
     from long_video.sightline.rays import canonicalize_c2w, temporal_group_cameras
@@ -50,14 +54,17 @@ def main():
     layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
+    runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
-        restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget})
+        provenance=runtime_provenance(pipe,a.model,a.helios_root)
+        restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget},provenance=provenance)
     else:
         runner.memory.set_enabled(False)
         if float(conditioner.alpha.detach()) != 0.0: raise RuntimeError('alpha-zero baseline must have alpha=0')
+    trainable.eval(); conditioner.eval()
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K)
     frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))

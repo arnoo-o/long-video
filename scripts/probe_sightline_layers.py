@@ -7,7 +7,7 @@ REQUIRED = {
     "layer", "sigma", "correspondence_mrr", "top1", "top5",
     "positive_attention_mass", "memory_attention_mass", "wrong_ray_delta",
     "memory_zero_delta", "memory_shuffle_delta", "fm_loss", "corr_loss",
-    "vram_gb", "step_time_sec",
+    "corr_gain", "alpha", "alpha_grad", "vram_gb", "step_time_sec", "ablation_time_sec",
 }
 
 def main() -> None:
@@ -35,10 +35,10 @@ def main() -> None:
         x = list(range(len(rows)))
         charts = {
             "loss_curve": (("fm_loss", "corr_loss"), "loss"),
-            "sightline_signal": (("wrong_ray_delta",), "delta"),
-            "correspondence": (("correspondence_mrr", "top1", "top5"), "score"),
+            "sightline_signal": (("alpha", "alpha_grad", "wrong_ray_delta"), "signal"),
+            "correspondence": (("correspondence_mrr", "top1", "top5", "corr_gain"), "score"),
             "memory_signal": (("memory_attention_mass", "memory_zero_delta", "memory_shuffle_delta"), "signal"),
-            "efficiency": (("vram_gb", "step_time_sec"), "value"),
+            "efficiency": (("vram_gb", "step_time_sec", "ablation_time_sec"), "value"),
         }
         for name, (keys, ylabel) in charts.items():
             plt.figure()

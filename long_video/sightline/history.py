@@ -72,4 +72,8 @@ class CameraHistoryState:
         return [(source_camera, source_intrinsics) if key is None or key not in self._items else (self._items[key][1], self._items[key][2] if self._items[key][2] is not None else source_intrinsics) for key in keys]
     def slot_frame_ids(self):
         return tuple(self._items[key][0] for key in sorted(self._items)[-19:])
+    def slot_latent_ids(self):
+        if not self._items: return (0,)*19
+        last=max(self._items); keys=list(range(max(0,last-18),last+1))
+        return tuple([0]*(19-len(keys))+keys)
     def indices(self): return tuple(sorted(self._items))

@@ -7,16 +7,48 @@ import numpy as np
 
 REQUIRED_RECORD_KEYS=("trajectory_id","rgb_dir","target_c2w_local","intrinsics")
 OPTIONAL_CACHE_KEYS=("latent_cache","gt_latent_cache","recal_xyz","recal_valid","recal_confidence","recal_pointmap","correspondence_cache")
-LEGAL_LATENT_FRAMES=(49,193,192,33,9)
+LATENT_SCHEMAS=("continuous_49","overlap_chunks_6x9")
 
-def identify_latent_temporal_axis(shape, *, expected_frames=None):
-    legal=set(LEGAL_LATENT_FRAMES)
-    if expected_frames is not None: legal.add(int(expected_frames))
-    candidates=[axis for axis,size in enumerate(shape) if size in legal]
+def identify_latent_temporal_axis(shape, *, temporal_size):
+    candidates=[axis for axis,size in enumerate(shape) if size == int(temporal_size)]
     if len(shape)==5: candidates=[axis for axis in candidates if axis not in (0,1)]
-    elif len(shape)==4: candidates=[axis for axis in candidates if axis!=1 or shape[0] not in legal]
-    if len(candidates)!=1: raise ValueError(f"cannot uniquely identify temporal axis in latent shape {tuple(shape)}: {candidates}")
+    if len(candidates)!=1: raise ValueError(f"cannot uniquely identify temporal axis {temporal_size} in latent shape {tuple(shape)}: {candidates}")
     return candidates[0]
+
+def _payload_tensor(file):
+    import torch
+    if file.suffix in ('.pt','.pth'):
+        value=torch.load(file,map_location='cpu')
+    elif file.suffix=='.npy': value=torch.from_numpy(np.asarray(np.load(file)))
+    elif file.suffix=='.npz':
+        archive=np.load(file); keys=[key for key in ('latent','latents','video_latents','target_latents') if key in archive]
+        if len(keys)!=1: raise ValueError(f"npz latent payload must contain exactly one supported key: {file}")
+        value=torch.from_numpy(np.asarray(archive[keys[0]]))
+    else: raise ValueError(f"unsupported latent cache file: {file}")
+    if isinstance(value,dict):
+        keys=[key for key in ('latent','latents','video_latents','target_latents') if key in value]
+        if len(keys)!=1: raise ValueError(f"latent payload must contain exactly one supported key: {file}")
+        value=value[keys[0]]
+    if not isinstance(value,torch.Tensor) or value.ndim not in (4,5): raise ValueError(f"unsupported latent payload in {file}")
+    return value
+
+def _canonical_tensor(value, temporal_size):
+    if value.ndim==4:
+        temporal=identify_latent_temporal_axis(value.shape,temporal_size=temporal_size)+1; value=value.unsqueeze(0)
+    else: temporal=identify_latent_temporal_axis(value.shape,temporal_size=temporal_size)
+    if temporal!=2: value=value.movedim(temporal,2)
+    if value.shape[2]!=temporal_size: raise ValueError('latent temporal canonicalization failed')
+    return value.contiguous()
+
+def _latent_files(path):
+    path=Path(path)
+    if path.is_dir():
+        chunks=[path/f'chunk_{index:02d}.pt' for index in range(6)]
+        if all(file.is_file() for file in chunks): return 'overlap_chunks_6x9',chunks
+        files=sorted(file for file in path.iterdir() if file.suffix in ('.npy','.npz','.pt','.pth'))
+        if len(files)!=1: raise ValueError(f"latent cache directory must contain chunk_00..05.pt or one continuous tensor: {path}")
+        return 'continuous_49',files
+    return 'continuous_49',[path]
 @dataclass(frozen=True)
 class SightlineRecord:
     raw: dict; root: Path
@@ -56,30 +88,23 @@ def load_sightline_manifest(path: str|Path, *, expected_count: int|None=None) ->
         item=SightlineRecord(row,root); item.load_cameras(); item.rgb_paths(); item.validate_teacher_and_latent_caches(); result.append(item)
     return result
 
-def validate_latent_cache(path: str|Path, *, expected_frames=193):
+def validate_latent_cache(path: str|Path, *, schema=None):
     path=Path(path)
     if not path.exists(): raise FileNotFoundError(path)
-    files=sorted(path.glob("**/*")) if path.is_dir() else [path]
-    if not files: raise ValueError(f"empty latent cache: {path}")
-    for file in files:
-        if file.suffix not in (".npy",".npz",".pt",".pth"): continue
-        if file.suffix==".npy":
-            arr=np.load(file,mmap_mode="r")
-            if arr.ndim < 3: continue
-            identify_latent_temporal_axis(arr.shape,expected_frames=expected_frames)
-    return files
+    detected,files=_latent_files(path)
+    if schema is not None and schema!=detected: raise ValueError(f"latent schema mismatch: expected {schema}, found {detected}")
+    expected=9 if detected=='overlap_chunks_6x9' else 49
+    for file in files: _canonical_tensor(_payload_tensor(file),expected)
+    return detected,files
 
-def load_latent_tensor(path: str|Path, *, expected_frames=193):
+def load_latent_tensor(path: str|Path, *, schema=None):
     """Load an existing latent cache as canonical [B,C,T,H,W]."""
     import torch
-    path=Path(path); files=validate_latent_cache(path,expected_frames=expected_frames)
-    file=next((f for f in files if f.suffix in ('.npy','.pt','.pth')),None)
-    if file is None: raise ValueError(f"no supported latent tensor in {path}")
-    value=torch.load(file,map_location='cpu') if file.suffix in ('.pt','.pth') else torch.from_numpy(np.asarray(np.load(file)))
-    if isinstance(value,dict):
-        value=next((value[k] for k in ('latents','video_latents','target_latents') if k in value),None)
-    if not isinstance(value,torch.Tensor) or value.ndim not in (4,5): raise ValueError(f"unsupported latent payload in {file}")
-    if value.ndim==4: value=value.unsqueeze(0)
-    temporal=identify_latent_temporal_axis(value.shape,expected_frames=expected_frames)
-    if temporal!=2: value=value.movedim(temporal,2)
-    return value.contiguous()
+    detected,files=validate_latent_cache(path,schema=schema)
+    values=[_canonical_tensor(_payload_tensor(file),9 if detected=='overlap_chunks_6x9' else 49) for file in files]
+    if detected=='continuous_49': return values[0]
+    reference=values[0].shape[:2]+values[0].shape[3:]
+    if any(value.shape[:2]+value.shape[3:]!=reference for value in values): raise ValueError('overlap chunk latent shapes differ')
+    result=torch.cat([values[0]]+[value[:,:,1:] for value in values[1:]],dim=2)
+    if result.shape[2]!=49: raise RuntimeError('6x9 overlap latent cache did not produce 49 latents')
+    return result.contiguous()

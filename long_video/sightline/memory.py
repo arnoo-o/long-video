@@ -72,7 +72,8 @@ class LongTermKVMemory:
             mem_k=mem_k+delta.unflatten(-1,(attn.heads,-1))
         if timestamp_embedding is not None:
             ages=torch.tensor([max(0,current_chunk-t.chunk_index) for t in self.tokens],device=hidden.device,dtype=torch.long).clamp_max(timestamp_embedding.num_embeddings-1)
-            timestamp_embedding=timestamp_embedding.to(device=hidden.device)
+            if timestamp_embedding.weight.device != hidden.device or timestamp_embedding.weight.dtype != hidden.dtype:
+                raise RuntimeError('memory timestamp embedding must be moved to the runtime device/dtype before forward')
             age=timestamp_embedding(ages).to(mem_k.dtype).unsqueeze(0).unflatten(2,(attn.heads,-1))
             mem_k=mem_k+age
         return torch.cat((key,mem_k),1), torch.cat((value,mem_v),1), {"memory_tokens":mem_k.shape[1],"memory_chunk_count":len({t.chunk_index for t in self.tokens})}
@@ -95,6 +96,9 @@ class LayerKVMemoryBank(nn.Module):
 
     def set_enabled(self, enabled):
         for bank in self.banks.values(): bank.enabled=bool(enabled)
+
+    def reset(self):
+        for bank in self.banks.values(): bank.tokens.clear()
 
     def append_to_attention(self, *args, **kwargs):
         raise RuntimeError("select a layer bank with for_layer(); memory cannot be shared across layers")

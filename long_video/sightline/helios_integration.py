@@ -15,7 +15,7 @@ class SightlineHeliosAttnProcessor:
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
-        self.last_q=None; self.last_k=None; self.last_attention_meta={}; self.capture_diagnostics=False
+        self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.last_hidden_states=None; self.last_current_length=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
@@ -74,7 +74,8 @@ class SightlineHeliosAttnProcessor:
             if attention_mask is not None and attention_mask.shape[-1] != key.shape[1]:
                 raise RuntimeError('attention mask key axis must equal final K length')
         if self.capture_diagnostics:
-            self.last_q=query; self.last_k=key
+            self.last_q=query; self.last_k=key; self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
+            if len(self.last_key_identities)!=key.shape[1]: raise RuntimeError('key identity map length does not match attention K axis')
         else:
             self.last_q=None; self.last_k=None
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
@@ -87,9 +88,22 @@ class SightlineRayProvider:
     def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
         self.c2w=c2w; self.intrinsics=intrinsics; self.context=None
-    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
+    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_latent_ids=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
         if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
-        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_latent_ids':history_latent_ids,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+
+    def key_identities(self, current_length, memory=None):
+        context=self.context; identities=[]; shapes=context.get('history_token_shapes') or {}; latent_ids=context.get('history_latent_ids') or {}
+        for name in ('long','mid','short'):
+            if name not in shapes: continue
+            _,h,w=shapes[name]
+            for latent in latent_ids[name]: identities.extend(('native',int(latent),y,x,name) for y in range(h) for x in range(w))
+        T,H,W=next(shape for shape in context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current_length)
+        base=int(context['chunk_index'])*8
+        identities.extend(('current',base+t,y,x,'current') for t in range(T) for y in range(H) for x in range(W))
+        if memory is not None and memory.enabled:
+            identities.extend(('memory',token.chunk_index*8+token.temporal,token.pooled_y,token.pooled_x,'memory') for token in memory.tokens)
+        return tuple(identities)
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape
         context=self.context
@@ -106,10 +120,13 @@ class SightlineRayProvider:
         history=kwargs.get('history_rays',context.get('history_rays'))
         if history is None and context.get('history_groups') is not None:
             groups=context['history_groups']; rays_by_group=[]
-            for name,factor in (('long',4),('mid',2),('short',1)):
+            shapes=context.get('history_token_shapes')
+            if not shapes: raise RuntimeError('actual native history token shapes are required')
+            for name in ('long','mid','short'):
                 hc,hk=groups[name]
-                if H%factor or W%factor: raise RuntimeError(f'{name} history grid is incompatible with {(H,W)}')
-                rays_by_group.append(plucker_rays(hc,hk,H//factor,W//factor,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7))
+                ht,hh,hw=shapes[name]
+                if hc.shape[1]!=ht: raise RuntimeError(f'{name} camera count {hc.shape[1]} != native temporal tokens {ht}')
+                rays_by_group.append(plucker_rays(hc,hk,hh,hw,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7))
             history=torch.cat(rays_by_group,1)
         if history is None and context.get('history_cameras') is not None:
             hc=context['history_cameras']; hk=context.get('history_intrinsics')

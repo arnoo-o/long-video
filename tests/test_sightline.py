@@ -1,4 +1,5 @@
 import pytest
+import os, sys
 torch=pytest.importorskip('torch')
 from long_video.sightline.rays import plucker_rays, temporal_group_cameras
 from long_video.sightline.conditioning import SightlineConditioner
@@ -196,3 +197,89 @@ def test_shared_boundary_correspondence_identity_is_not_deduplicated():
     base={'query_chunk':0,'key_chunk':0,'query_latent_temporal':8,'key_latent_temporal':8,'query_y':1,'query_x':2,'key_y':3,'key_x':4}
     boundary=dict(base,query_chunk=1,query_latent_temporal=0)
     assert correspondence_identity(base)!=correspondence_identity(boundary)
+
+def test_six_overlap_chunks_assemble_49_latents():
+    from long_video.sightline.pipeline import SightlinePipeline
+    accumulated=None
+    for chunk in range(6):
+        values=torch.arange(chunk*8,chunk*8+9).view(1,1,9,1,1)
+        accumulated=SightlinePipeline.append_stride32_latents(accumulated,values)
+    assert accumulated.shape[2]==49
+    assert accumulated.flatten().tolist()==list(range(49))
+    assert 1+(accumulated.shape[2]-1)*4==193
+
+def test_overlap_chunk_cache_loads_all_six_and_drops_boundaries(tmp_path):
+    from long_video.training.sightline_data import load_latent_tensor
+    for chunk in range(6):
+        value=torch.arange(chunk*8,chunk*8+9).view(1,9,1,1).float()
+        torch.save({'latent':value},tmp_path/f'chunk_{chunk:02d}.pt')
+    loaded=load_latent_tensor(tmp_path,schema='overlap_chunks_6x9')
+    assert loaded.shape==(1,1,49,1,1) and loaded.flatten().tolist()==list(range(49))
+
+def test_continuous_latent_cache_accepts_tchw_and_rejects_rgb_frames(tmp_path):
+    from long_video.training.sightline_data import load_latent_tensor
+    good=tmp_path/'good.pt'; torch.save({'video_latents':torch.zeros(49,16,2,3)},good)
+    assert load_latent_tensor(good).shape==(1,16,49,2,3)
+    bad=tmp_path/'bad.pt'; torch.save({'latents':torch.zeros(16,193,2,3)},bad)
+    with pytest.raises(ValueError): load_latent_tensor(bad)
+
+def test_lora_and_timestamp_follow_requested_dtype_device():
+    from long_video.training.sightline import LoRALinear
+    from long_video.sightline.memory import LayerKVMemoryBank
+    base=torch.nn.Linear(4,4,dtype=torch.float64); lora=LoRALinear(base)
+    assert lora.lora_down.weight.dtype==base.weight.dtype and lora.lora_down.weight.device==base.weight.device
+    memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4).to(dtype=torch.float64)
+    assert memory.timestamp.weight.dtype==torch.float64
+
+def test_runner_reset_clears_camera_memory_and_processor_capture():
+    from types import SimpleNamespace
+    from long_video.sightline.pipeline import SightlinePipeline
+    class Processor: pass
+    processor=Processor(); processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=torch.ones(1); processor.last_attention_meta={'x':1}; processor.last_current_length=1
+    transformer=SimpleNamespace(_sightline_processors={0:processor}); helios=SimpleNamespace(transformer=transformer)
+    config=SimpleNamespace(memory_layers=(0,),memory_budget=8,memory_pool=2,pyramid_steps=(2,2,2))
+    runner=SightlinePipeline(helios,config=config); runner._active_chunk=4; runner.memory.banks[0].tokens.append(object()); runner.camera_history._items[1]=object()
+    runner.reset_sequence()
+    assert runner._active_chunk==0 and not runner.memory.banks[0].tokens and not runner.camera_history.indices()
+    assert processor.last_q is None and processor.last_key_identities is None and processor.last_attention_meta=={}
+
+@pytest.mark.skipif(not os.environ.get('HELIOS_ROOT'),reason='pinned Helios source is not configured')
+def test_native_helios_attention_equivalence_alpha_zero_cpu():
+    root=os.environ['HELIOS_ROOT']; sys.path.insert(0,root)
+    import helios.diffusers_version.transformer_helios_diffusers as native
+    torch.manual_seed(4); attention=native.HeliosAttention(dim=8,heads=2,dim_head=4,is_cross_attention=False,is_amplify_history=False).float(); hidden=torch.randn(1,5,8)
+    expected=native.HeliosAttnProcessor()(attention,hidden,original_context_length=5)
+    conditioner=SightlineConditioner(8).float(); conditioner.alpha.data.zero_()
+    provider=lambda states,**kwargs:(torch.zeros(states.shape[0],states.shape[1],7),torch.zeros(states.shape[0],kwargs['key_length'],7))
+    processor=SightlineHeliosAttnProcessor(conditioner,provider,qkv_projection=native._get_qkv_projections,rotary_apply=native.apply_rotary_emb_transposed,attention_dispatch=native.dispatch_attention_fn,attention_backend=native.HeliosAttnProcessor._attention_backend,parallel_config=native.HeliosAttnProcessor._parallel_config)
+    actual=processor(attention,hidden,original_context_length=5)
+    assert torch.allclose(actual,expected,rtol=1e-6,atol=1e-7)
+
+def test_selected_q_correspondence_never_allocates_full_query_axis():
+    from long_video.training.sightline import selected_qk_logits
+    query=torch.randn(1,100,2,4); key=torch.randn(1,70,2,4)
+    logits=selected_qk_logits(query,key,[3,91])
+    assert logits.shape==(1,2,2,70)
+    reference=torch.einsum('bqhd,bkhd->bhqk',query[:,[3,91]],key)/2
+    assert torch.allclose(logits,reference)
+
+def test_three_stage_current_and_native_history_ray_counts_match():
+    provider=SightlineRayProvider(source_height=32,source_width=32)
+    cameras=torch.eye(4).view(1,1,4,4).expand(1,9,-1,-1); K=torch.eye(3).view(1,1,3,3).expand(1,9,-1,-1)
+    history_shapes={'long':(4,1,1),'mid':(1,2,2),'short':(2,4,4)}; history_count=4+4+32
+    history=torch.randn(1,history_count,7); stages=((9,1,1),(9,2,2),(9,4,4))
+    provider.set_context(chunk_index=0,c2w=cameras,intrinsics=K,history_rays=history,stage_shapes=stages,token_shape=stages[0],history_token_shapes=history_shapes)
+    for shape in stages:
+        current=shape[0]*shape[1]*shape[2]; q,k=provider(torch.zeros(1,history_count+current,8),key_length=history_count+current,current_length=current)
+        assert q.shape[1]==k.shape[1]==history_count+current
+
+def test_key_identity_map_contains_native_current_and_memory():
+    from long_video.sightline.memory import LongTermKVMemory,MemoryToken
+    provider=SightlineRayProvider(source_height=8,source_width=8)
+    cameras=torch.eye(4).view(1,1,4,4).expand(1,9,-1,-1); K=torch.eye(3).view(1,1,3,3).expand(1,9,-1,-1)
+    shapes={'long':(1,1,1),'mid':(1,1,1),'short':(1,1,1)}; ids={'long':(1,),'mid':(2,),'short':(3,)}
+    provider.set_context(chunk_index=1,c2w=cameras,intrinsics=K,history_token_shapes=shapes,history_latent_ids=ids,stage_shapes=((9,1,1),),token_shape=(9,1,1))
+    memory=LongTermKVMemory(); memory.tokens=[MemoryToken(torch.zeros(1,1,4),torch.zeros(1,1,7),0,0,4,2,3)]
+    identities=provider.key_identities(9,memory)
+    assert identities[:3]==(('native',1,0,0,'long'),('native',2,0,0,'mid'),('native',3,0,0,'short'))
+    assert ('current',8,0,0,'current') in identities and identities[-1]==('memory',4,2,3,'memory')

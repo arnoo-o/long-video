@@ -32,51 +32,58 @@ class LongTermKVMemory:
         pooled_h,pooled_w=H//self.pool,W//self.pool
         for i in range(hh.shape[1]):
             t=i//(pooled_h*pooled_w); rem=i%(pooled_h*pooled_w); y,x=divmod(rem,pooled_w)
+            if chunk_index>0 and t==0: continue
             self.tokens.append(MemoryToken(hh[:,i:i+1].detach(),rr[:,i:i+1].detach(),chunk_index,i,t,y,x))
         if len(self.tokens)>self.budget: self.tokens=self.tokens[-self.budget:]
-    def get(self):
-        if not self.tokens: return None,None
-        return torch.cat([t.hidden for t in self.tokens],1), torch.cat([t.ray for t in self.tokens],1)
+    def active_tokens(self,current_global_start=None):
+        if current_global_start is None: return list(self.tokens)
+        return [token for token in self.tokens if token.chunk_index*8+token.temporal < current_global_start]
+    def get(self,current_global_start=None):
+        tokens=self.active_tokens(current_global_start)
+        if not tokens: return None,None
+        return torch.cat([t.hidden for t in tokens],1), torch.cat([t.ray for t in tokens],1)
     def __len__(self): return len(self.tokens)
 
-    def position_metadata(self, device):
-        if not self.tokens: return None
-        frame=torch.tensor([token.chunk_index*8+token.temporal for token in self.tokens],device=device,dtype=torch.float32)
+    def position_metadata(self, device, current_global_start):
+        tokens=self.active_tokens(current_global_start)
+        if not tokens: return None
+        global_ids=[token.chunk_index*8+token.temporal for token in tokens]
+        frame=torch.tensor([max(1,min(19,20-(current_global_start-global_id))) for global_id in global_ids],device=device,dtype=torch.float32)
         offset=(self.pool-1)/2
-        y=torch.tensor([token.pooled_y*self.pool+offset for token in self.tokens],device=device,dtype=torch.float32)
-        x=torch.tensor([token.pooled_x*self.pool+offset for token in self.tokens],device=device,dtype=torch.float32)
+        y=torch.tensor([token.pooled_y*self.pool+offset for token in tokens],device=device,dtype=torch.float32)
+        x=torch.tensor([token.pooled_x*self.pool+offset for token in tokens],device=device,dtype=torch.float32)
         return frame.view(1,-1,1,1),y.view(1,-1,1,1),x.view(1,-1,1,1)
-    def memory_rotary_emb(self, device):
+    def memory_rotary_emb(self, device, current_global_start):
         if self.rope is None: raise RuntimeError("Helios native RoPE module is not bound to memory")
-        positions=self.position_metadata(device)
+        positions=self.position_metadata(device,current_global_start)
         if positions is None: return None
         rotary=self.rope.forward_with_positions(*positions,device=device)
         return rotary.flatten(2).transpose(1,2)
 
-    def append_native_attention(self, attn, key, value, rotary_emb, rotary_apply, *, current_chunk=0, timestamp_embedding=None, sightline_projector=None, **kwargs):
-        hidden,rays=self.get()
+    def append_native_attention(self, attn, key, value, rotary_emb, rotary_apply, *, current_chunk, current_global_start, timestamp_embedding=None, sightline_projector=None, scale_delta=None, **kwargs):
+        tokens=self.active_tokens(current_global_start); hidden,rays=self.get(current_global_start)
         if not self.enabled or hidden is None: return key,value,{"memory_tokens":0}
         if hidden.shape[0] != key.shape[0]:
             if hidden.shape[0] == 1: hidden=hidden.expand(key.shape[0],-1,-1)
             else: raise ValueError("memory batch differs from attention batch")
         mem_k=attn.to_k(hidden); mem_v=attn.to_v(hidden)
         mem_k=attn.norm_k(mem_k).unflatten(2,(attn.heads,-1)); mem_v=mem_v.unflatten(2,(attn.heads,-1))
-        memory_rotary_emb=self.memory_rotary_emb(hidden.device)
+        memory_rotary_emb=self.memory_rotary_emb(hidden.device,current_global_start)
         memory_tokens=mem_k.shape[1]
         if memory_rotary_emb.ndim < 2 or memory_rotary_emb.shape[1] != memory_tokens:
             raise RuntimeError(f"memory rotary embedding must have exactly {memory_tokens} positions")
         memory_rotary=memory_rotary_emb.to(device=hidden.device,dtype=mem_k.dtype)
         mem_k=rotary_apply(mem_k,memory_rotary)
         if sightline_projector is not None:
-            delta=sightline_projector.project(rays.to(hidden),kind='k',training=sightline_projector.training)
+            delta=sightline_projector.project(rays.to(hidden),kind='k',training=sightline_projector.training,scale_delta=scale_delta)
             mem_k=mem_k+delta.unflatten(-1,(attn.heads,-1))
         if timestamp_embedding is not None:
-            ages=torch.tensor([max(0,current_chunk-t.chunk_index) for t in self.tokens],device=hidden.device,dtype=torch.long).clamp_max(timestamp_embedding.num_embeddings-1)
+            ages=torch.tensor([max(0,current_chunk-t.chunk_index) for t in tokens],device=hidden.device,dtype=torch.long).clamp_max(timestamp_embedding.num_embeddings-1)
             if timestamp_embedding.weight.device != hidden.device or timestamp_embedding.weight.dtype != hidden.dtype:
                 raise RuntimeError('memory timestamp embedding must be moved to the runtime device/dtype before forward')
             age=timestamp_embedding(ages).to(mem_k.dtype).unsqueeze(0).unflatten(2,(attn.heads,-1))
             mem_k=mem_k+age
-        return torch.cat((key,mem_k),1), torch.cat((value,mem_v),1), {"memory_tokens":mem_k.shape[1],"memory_chunk_count":len({t.chunk_index for t in self.tokens})}
+        return torch.cat((key,mem_k),1), torch.cat((value,mem_v),1), {"memory_tokens":mem_k.shape[1],"memory_chunk_count":len({t.chunk_index for t in tokens}),"memory_global_ids":[t.chunk_index*8+t.temporal for t in tokens]}
 
     def _memory_rays(self):
         return torch.cat([t.ray for t in self.tokens],1)

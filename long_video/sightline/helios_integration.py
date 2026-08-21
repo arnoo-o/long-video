@@ -32,7 +32,10 @@ class SightlineHeliosAttnProcessor:
             self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
         condition_dtype=next(self.conditioner.parameters()).dtype
-        dq,dk=self.conditioner(rays_q.to(condition_dtype),rays_k.to(condition_dtype),training=self.conditioner.training)
+        conditioned_q=rays_q.to(condition_dtype); conditioned_k=rays_k.to(condition_dtype)
+        scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
+        dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
+        dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
         dq=dq.unflatten(-1,(attn.heads,-1)); dk=dk.unflatten(-1,(attn.heads,-1))
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         query=query+dq; key=key+dk
@@ -58,11 +61,14 @@ class SightlineHeliosAttnProcessor:
             key=key[:,:history_len]; value=value[:,:history_len]
         if self.memory is not None:
             memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None); memory_kwargs.pop('memory_rotary_emb',None); memory_kwargs.pop('current_chunk',None)
+            if self.ray_provider.context is None: raise RuntimeError('memory attention requires active Sightline context')
+            active_chunk=int(self.ray_provider.context['chunk_index']); current_global_start=active_chunk*8
             key,value,self.last_attention_meta=self.memory.append_native_attention(
                 attn,key,value,rotary_emb,self.rotary_apply,
-                current_chunk=kwargs.get('current_chunk',0),
+                current_chunk=active_chunk,current_global_start=current_global_start,
                 timestamp_embedding=getattr(self.memory,'timestamp',None),
                 sightline_projector=self.conditioner,
+                scale_delta=scale_delta,
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:
@@ -88,21 +94,22 @@ class SightlineRayProvider:
     def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
         self.c2w=c2w; self.intrinsics=intrinsics; self.context=None
-    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_latent_ids=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
+    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_global_coverages=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
         if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
-        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_latent_ids':history_latent_ids,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_global_coverages':history_global_coverages,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
 
     def key_identities(self, current_length, memory=None):
-        context=self.context; identities=[]; shapes=context.get('history_token_shapes') or {}; latent_ids=context.get('history_latent_ids') or {}
+        context=self.context; identities=[]; shapes=context.get('history_token_shapes') or {}; coverages=context.get('history_global_coverages') or {}
         for name in ('long','mid','short'):
             if name not in shapes: continue
             _,h,w=shapes[name]
-            for latent in latent_ids[name]: identities.extend(('native',int(latent),y,x,name) for y in range(h) for x in range(w))
+            if len(coverages.get(name,())) != shapes[name][0]: raise RuntimeError(f'{name} identity coverage does not match temporal tokens')
+            for covered in coverages[name]: identities.extend(('native',tuple(int(x) for x in covered),y,x,name) for y in range(h) for x in range(w))
         T,H,W=next(shape for shape in context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current_length)
         base=int(context['chunk_index'])*8
-        identities.extend(('current',base+t,y,x,'current') for t in range(T) for y in range(H) for x in range(W))
+        identities.extend(('current',(base+t,),y,x,'current') for t in range(T) for y in range(H) for x in range(W))
         if memory is not None and memory.enabled:
-            identities.extend(('memory',token.chunk_index*8+token.temporal,token.pooled_y,token.pooled_x,'memory') for token in memory.tokens)
+            identities.extend(('memory',(token.chunk_index*8+token.temporal,),token.pooled_y,token.pooled_x,'memory') for token in memory.active_tokens(base))
         return tuple(identities)
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape

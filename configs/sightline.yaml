@@ -40,5 +40,5 @@ latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
 sightline_training_semantics_version: sightline-v1
-sightline_correspondence_schema_version: sightline-correspondence-v2
-sightline_checkpoint_schema_version: sightline-checkpoint-v2
+sightline_correspondence_schema_version: sightline-correspondence-v3
+sightline_checkpoint_schema_version: sightline-checkpoint-v3

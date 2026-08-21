@@ -1,10 +1,9 @@
 """Formal geometry-free Sightline runtime around native Helios."""
 from __future__ import annotations
 from dataclasses import dataclass
-from types import MethodType
 from types import SimpleNamespace
 import torch
-from .history import CameraHistoryState
+from .history import CameraHistoryState,NativeHistoryState,native_helios_indices
 from .memory import LayerKVMemoryBank
 from .rays import chunk_cameras, temporal_group_cameras
 
@@ -17,15 +16,21 @@ class SightlinePipeline:
         self.helios=helios_pipeline; self.config=config; self.conditioner=conditioner; self.ray_provider=ray_provider
         inner_dim=int(conditioner.q_proj[-1].out_features) if conditioner is not None else None
         self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim)
-        self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self._hooks_installed=False
+        self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None
 
     @staticmethod
     def append_stride32_latents(accumulated, chunk):
         if chunk.ndim!=5 or chunk.shape[2]!=9: raise ValueError('each Sightline chunk must contain 9 latent frames')
         return chunk if accumulated is None else torch.cat((accumulated,chunk[:,:,1:]),dim=2)
 
+    @staticmethod
+    def resolve_pyramid_steps(configured, override=None):
+        steps=tuple(int(x) for x in configured) if override is None else (int(override),)*3
+        if len(steps)!=3 or any(step<1 for step in steps): raise ValueError('Sightline requires three positive pyramid step counts')
+        return steps
+
     def reset_sequence(self):
-        self._active_chunk=0; self.runtime=SightlineRuntimeContext(); self.camera_history=CameraHistoryState(); self._pending_camera_chunk=None
+        self._active_chunk=0; self.runtime=SightlineRuntimeContext(); self.camera_history=CameraHistoryState(); self.history_state=None; self._pending_camera_chunk=None
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
@@ -40,26 +45,28 @@ class SightlinePipeline:
             shapes.append((t//patch[0],h//patch[1],w//patch[2])); h*=2; w*=2
         return tuple(shapes)
 
-    def _prepare_chunk(self, chunk_index, latents, attention_kwargs, history_token_shapes=None, history_latent_hw=None):
+    def _prepare_chunk(self, chunk_index, latents, attention_kwargs, *, history_global_coverages, history_token_shapes=None, history_latent_hw=None):
         if self._trajectory_c2w is None or self.ray_provider is None: raise RuntimeError('Sightline trajectory/provider is not bound')
         cameras,K=chunk_cameras(self._trajectory_c2w,self._trajectory_K,chunk_index); reps,repK=temporal_group_cameras(cameras,K)
         frame_ids=(torch.arange(9,device=cameras.device)*4 + chunk_index*32).tolist()
         source_camera=self._source_camera
         source_K=self._source_intrinsics
-        history_slots=self.camera_history.slots(source_camera,source_K)
-        long_all=history_slots[:16]; mid_all=history_slots[16:18]
-        long_slots=[long_all[i] for i in (3,7,11,15)]; mid_slots=[mid_all[-1]]; short_slots=[(source_camera,source_K),history_slots[18]]
+        def representative(covered):
+            identity=covered[-1] if covered else None
+            return self.camera_history.camera_for(identity,source_camera,source_K)
+        long_slots=[representative(covered) for covered in history_global_coverages['long']]
+        mid_slots=[representative(covered) for covered in history_global_coverages['mid']]
+        short_slots=[representative(covered) for covered in history_global_coverages['short']]
         history_groups={
             'long':(torch.stack([c for c,_ in long_slots],1),torch.stack([k for _,k in long_slots],1)),
             'mid':(torch.stack([c for c,_ in mid_slots],1),torch.stack([k for _,k in mid_slots],1)),
             'short':(torch.stack([c for c,_ in short_slots],1),torch.stack([k for _,k in short_slots],1)),
         }
-        latent_ids=self.camera_history.slot_latent_ids(); history_latent_ids={'long':tuple(latent_ids[i] for i in (3,7,11,15)),'mid':(latent_ids[17],),'short':(0,latent_ids[18])}
         shapes=self._stage_shapes(latents)
         if history_token_shapes is None:
             lh,lw=history_latent_hw or (int(latents.shape[-2]),int(latents.shape[-1]))
             history_token_shapes={'long':(4,(lh+7)//8,(lw+7)//8),'mid':(1,(lh+3)//4,(lw+3)//4),'short':(2,(lh+1)//2,(lw+1)//2)}
-        self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_latent_ids=history_latent_ids,stage_shapes=shapes,token_shape=shapes[0])
+        self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_global_coverages=history_global_coverages,stage_shapes=shapes,token_shape=shapes[0])
         self._pending_camera_chunk=(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))
         attention_kwargs['current_chunk']=chunk_index
         attention_kwargs['sightline_stage_shapes']=shapes
@@ -82,20 +89,7 @@ class SightlinePipeline:
             self.camera_history.append_chunk(*pending)
             self._pending_camera_chunk=None
 
-    def _install_chunk_hooks(self):
-        if self._hooks_installed: return
-        for name in ('stage1_sample','stage2_sample'):
-            original=getattr(self.helios,name)
-            def wrapped(instance,*args,_original=original,_name=name,**kwargs):
-                latents=kwargs.get('latents',args[0] if args else None)
-                attention_kwargs=kwargs.get('attention_kwargs') or {}
-                kwargs['attention_kwargs']=attention_kwargs; self._prepare_chunk(self._active_chunk,latents,attention_kwargs)
-                result=_original(*args,**kwargs); self._finalize_chunk(self._active_chunk); self._active_chunk+=1
-                return result
-            setattr(self.helios,name,MethodType(wrapped,self.helios))
-        self._hooks_installed=True
-
-    def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps, c2w, intrinsics, attention_kwargs=None):
+    def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps=None, c2w, intrinsics, attention_kwargs=None):
         self.reset_sequence()
         if not self._source_initialized: self._source_initialized=True
         if num_frames<33 or (num_frames-1)%32: raise ValueError('Sightline inference requires 1+32*N frames')
@@ -108,22 +102,18 @@ class SightlinePipeline:
         image_tensor=self.helios.video_processor.preprocess(image,height=height,width=width)
         vae=self.helios.vae; mean=torch.tensor(vae.config.latents_mean,device=device,dtype=vae.dtype).view(1,vae.config.z_dim,1,1,1); std=(1.0/torch.tensor(vae.config.latents_std,device=device,dtype=vae.dtype)).view(1,vae.config.z_dim,1,1,1)
         source,fake=self.helios.prepare_image_latents(image_tensor,latents_mean=mean,latents_std=std,num_latent_frames_per_chunk=9,dtype=torch.float32,device=device)
-        completed=[]; completed_ids=[]; accumulated=None
+        self.history_state=NativeHistoryState(source,fake); accumulated=None; stage_steps=list(self.resolve_pyramid_steps(self.config.pyramid_steps,steps))
         class Progress:
             def update(self): pass
         for chunk in range(chunks):
-            pairs=list(zip(completed_ids,completed))[-19:]; pairs=[(0,source)]*(19-len(pairs))+pairs
-            long_pairs=pairs[:16]; mid_pairs=pairs[16:18]; short_pairs=[(0,source),pairs[18]]
-            def pack(items):
-                return torch.cat([value for _,value in items],2),torch.tensor([identity for identity,_ in items],device=device,dtype=torch.long).view(1,-1)
-            long_history,long_ids=pack(long_pairs); mid_history,mid_ids=pack(mid_pairs); short_history,short_ids=pack(short_pairs)
+            history=self.history_state.groups(); coverage=self.history_state.coverage()
             latent=self.helios.prepare_latents(source.shape[0],self.helios.transformer.config.in_channels,height,width,33,dtype=torch.float32,device=device)
-            current_ids=torch.arange(chunk*8,chunk*8+9,device=device,dtype=torch.long).view(1,-1)
-            self._prepare_chunk(chunk,latent,runtime_kwargs,history_latent_hw=source.shape[-2:])
-            latent=self.helios.stage2_sample(latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=list(self.config.pyramid_steps),prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=short_ids,indices_latents_history_mid=mid_ids,indices_latents_history_long=long_ids,latents_history_short=short_history,latents_history_mid=mid_history,latents_history_long=long_history,attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
+            current_ids=native_helios_indices(device,source.shape[0])['current']
+            self._prepare_chunk(chunk,latent,runtime_kwargs,history_global_coverages=coverage,history_latent_hw=source.shape[-2:])
+            latent=self.helios.stage2_sample(latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
             if chunk==0: latent[:,:,0:1]=source.to(latent)
             accumulated=self.append_stride32_latents(accumulated,latent)
-            for local in range(1,9): completed.append(latent[:,:,local:local+1].detach()); completed_ids.append(chunk*8+local)
+            self.history_state.append_chunk(latent,chunk)
             self._finalize_chunk(chunk); self._active_chunk=chunk+1
         if accumulated is None or accumulated.shape[2]!=1+8*chunks: raise RuntimeError('stride-32 latent assembly failed')
         decoded=vae.decode(accumulated.to(vae.dtype)/std+mean,return_dict=False)[0]

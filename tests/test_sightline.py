@@ -57,24 +57,28 @@ def test_train_chunk_policy_is_single_and_causal():
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
 
-def test_native_history_order_matches_camera_slots():
-    from long_video.training.sightline import native_history_16_2_1
-    source=torch.zeros(1,1,1,1,1); latents=[torch.full_like(source,float(i)) for i in range(1,21)]
-    packed=native_history_16_2_1(latents,list(range(1,21)),source)
-    assert packed['long'][1].tolist()==[list(range(2,18))]
-    assert packed['mid'][1].tolist()==[[18,19]] and packed['short'][1].tolist()==[[0,20]]
+def test_native_history_zero_fake_initialization_and_fixed_rope_slots():
+    from long_video.sightline.history import NativeHistoryState,native_helios_indices
+    source=torch.ones(1,1,1,1,1); fake=torch.full_like(source,2); state=NativeHistoryState(source,fake); packed=state.groups(); indices=native_helios_indices()
+    assert torch.count_nonzero(packed['long'][0])==0 and torch.count_nonzero(packed['mid'][0])==0
+    assert torch.equal(packed['short'][0][:,:,:1],source) and torch.equal(packed['short'][0][:,:,1:],fake)
+    assert indices['long'].tolist()==[list(range(1,17))] and indices['mid'].tolist()==[[17,18]] and indices['short'].tolist()==[[0,19]] and indices['current'].tolist()==[list(range(20,29))]
+    chunk=torch.arange(9.).view(1,1,9,1,1); state.append_chunk(chunk,0)
+    assert state.global_ids()[-9:]==tuple(range(9))
 
 def test_memory_rope_uses_saved_metadata_and_second_chunk_reads():
     class Rope:
         def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
     m=LongTermKVMemory(budget=8,pool=1); m.rope=Rope()
-    x=torch.randn(1,2,4); r=torch.randn(1,2,7); m.capture(x,r,1,grid_shape=(1,1,2))
-    rope=m.memory_rotary_emb(x.device)
-    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([8.,8.]))
+    x=torch.randn(1,2,4); r=torch.randn(1,2,7); m.capture(x,r,0,grid_shape=(1,1,2))
+    rope=m.memory_rotary_emb(x.device,current_global_start=8)
+    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([12.,12.]))
+    older=m.memory_rotary_emb(x.device,current_global_start=16)
+    assert torch.equal(older[0,:,0],torch.tensor([4.,4.]))
     class Attn:
         heads=2; to_k=torch.nn.Linear(4,4); to_v=torch.nn.Linear(4,4); norm_k=torch.nn.Identity()
     key=torch.randn(1,3,2,2); value=torch.randn(1,3,2,2)
-    final_k,final_v,meta=m.append_native_attention(Attn(),key,value,None,lambda tensor,rotary:tensor,current_chunk=2)
+    final_k,final_v,meta=m.append_native_attention(Attn(),key,value,None,lambda tensor,rotary:tensor,current_chunk=1,current_global_start=8)
     assert final_k.shape[1]==final_v.shape[1]==5 and meta['memory_tokens']==2
 
 def test_memory_append_extends_attention_mask_to_final_key_length():
@@ -83,7 +87,11 @@ def test_memory_append_extends_attention_mask_to_final_key_length():
     memory=LongTermKVMemory(budget=4,pool=1); memory.rope=Rope(); memory.capture(torch.randn(1,1,8),torch.randn(1,1,7),0,grid_shape=(1,1,1))
     class A:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
-    attn=A(); conditioner=SightlineConditioner(8); provider=lambda h,**kw:(torch.zeros(h.shape[0],h.shape[1],7),torch.zeros(h.shape[0],h.shape[1],7))
+    attn=A(); conditioner=SightlineConditioner(8)
+    class Provider:
+        context={'chunk_index':1}
+        def __call__(self,h,**kw): return torch.zeros(h.shape[0],h.shape[1],7),torch.zeros(h.shape[0],h.shape[1],7)
+    provider=Provider()
     def dispatch(q,k,v,**kwargs): assert kwargs['attn_mask'].shape[-1]==k.shape[1]; return v[:,:q.shape[1]]
     proc=SightlineHeliosAttnProcessor(conditioner,provider,memory=memory,qkv_projection=lambda a,h,e:(a.to_q(h),a.to_k(h),a.to_v(h)),rotary_apply=lambda x,r:x,attention_dispatch=dispatch)
     proc(attn,torch.randn(1,2,8),attention_mask=torch.zeros(1,1,1,2),rotary_emb=torch.zeros(1,2,4),original_context_length=2,current_chunk=1)
@@ -149,7 +157,7 @@ def test_current_and_memory_share_same_lora_kv_modules():
     memory.tokens=[MemoryToken(torch.randn(1,1,4),torch.randn(1,1,7),0,0,0,0,0)]
     class Rope:
         def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
-    memory.rope=Rope(); memory.append_native_attention(attn,torch.randn(1,1,2,2),torch.randn(1,1,2,2),None,lambda x,r:x)
+    memory.rope=Rope(); memory.append_native_attention(attn,torch.randn(1,1,2,2),torch.randn(1,1,2,2),None,lambda x,r:x,current_chunk=1,current_global_start=8)
     assert seen==[('k',id(attn.to_k)),('v',id(attn.to_v)),('k',id(attn.to_k)),('v',id(attn.to_v))]
 
 def test_processor_qk_only_cpu_shape_and_v_unchanged():
@@ -277,9 +285,57 @@ def test_key_identity_map_contains_native_current_and_memory():
     from long_video.sightline.memory import LongTermKVMemory,MemoryToken
     provider=SightlineRayProvider(source_height=8,source_width=8)
     cameras=torch.eye(4).view(1,1,4,4).expand(1,9,-1,-1); K=torch.eye(3).view(1,1,3,3).expand(1,9,-1,-1)
-    shapes={'long':(1,1,1),'mid':(1,1,1),'short':(1,1,1)}; ids={'long':(1,),'mid':(2,),'short':(3,)}
-    provider.set_context(chunk_index=1,c2w=cameras,intrinsics=K,history_token_shapes=shapes,history_latent_ids=ids,stage_shapes=((9,1,1),),token_shape=(9,1,1))
+    shapes={'long':(1,1,1),'mid':(1,1,1),'short':(1,1,1)}; coverage={'long':((1,2,3,4),),'mid':((5,6),),'short':((7,),)}
+    provider.set_context(chunk_index=1,c2w=cameras,intrinsics=K,history_token_shapes=shapes,history_global_coverages=coverage,stage_shapes=((9,1,1),),token_shape=(9,1,1))
     memory=LongTermKVMemory(); memory.tokens=[MemoryToken(torch.zeros(1,1,4),torch.zeros(1,1,7),0,0,4,2,3)]
     identities=provider.key_identities(9,memory)
-    assert identities[:3]==(('native',1,0,0,'long'),('native',2,0,0,'mid'),('native',3,0,0,'short'))
-    assert ('current',8,0,0,'current') in identities and identities[-1]==('memory',4,2,3,'memory')
+    assert identities[:3]==(('native',(1,2,3,4),0,0,'long'),('native',(5,6),0,0,'mid'),('native',(7,),0,0,'short'))
+    assert ('current',(8,),0,0,'current') in identities and identities[-1]==('memory',(4,),2,3,'memory')
+
+def test_p3_corr_loss_selected_queries_forward_backward():
+    from types import SimpleNamespace
+    from scripts.train_sightline_dl3dv import _corr_loss
+    from long_video.training.sightline import SightlineTrainable
+    q=torch.randn(1,2,2,2,requires_grad=True); k=torch.randn(1,2,2,2,requires_grad=True)
+    context={'stage_shapes':((1,1,1),)}; provider=SimpleNamespace(context=context)
+    processor=SimpleNamespace(last_q=q,last_k=k,last_current_length=1,ray_provider=provider,last_key_identities=(('native',(0,),0,0,'short'),('current',(8,),0,0,'current')))
+    rows=[{'query_chunk':1,'query_latent_temporal':0,'query_y':0,'query_x':0,'key_chunk':0,'key_latent_temporal':0,'key_y':0,'key_x':0,'weight':.7}]
+    trainable=SightlineTrainable(4,heads=2); loss=_corr_loss(trainable,{3:processor},rows,1,(3,),8); loss.backward()
+    assert loss.ndim==0 and q.grad is not None and k.grad is not None and trainable.corr_head[0].weight.grad is not None
+
+def test_memory_shared_boundaries_are_unique_and_future_filtered():
+    memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,9,4); rays=torch.randn(1,9,7)
+    memory.capture(hidden,rays,0,grid_shape=(9,1,1)); memory.capture(hidden,rays,1,grid_shape=(9,1,1))
+    global_ids=[token.chunk_index*8+token.temporal for token in memory.tokens]
+    assert len(global_ids)==17 and len(set(global_ids))==17 and global_ids.count(8)==1
+    active=memory.active_tokens(16); assert [token.chunk_index*8+token.temporal for token in active]==list(range(16))
+
+def test_scale_augmentation_delta_is_reused_for_q_k_and_memory():
+    torch.manual_seed(2); conditioner=SightlineConditioner(8,scale_aug_prob=1.0); rays=torch.randn(1,3,7); delta=conditioner.sample_scale_delta(rays,True)
+    calls=[]
+    original=conditioner.project
+    def recorded(value,**kwargs): calls.append(kwargs['scale_delta']); return original(value,**kwargs)
+    conditioner.project=recorded
+    conditioner(rays,rays,training=True,scale_delta=delta); conditioner.project(rays,kind='k',training=True,scale_delta=delta)
+    assert len(calls)==3 and all(call is delta for call in calls)
+
+def test_steps_override_is_effective_and_symmetric():
+    from long_video.sightline.pipeline import SightlinePipeline
+    assert SightlinePipeline.resolve_pyramid_steps((2,2,2),None)==(2,2,2)
+    assert SightlinePipeline.resolve_pyramid_steps((2,2,2),4)==(4,4,4)
+
+def test_training_preflight_and_fixed_2500_warmup_schedule():
+    from types import SimpleNamespace
+    from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier
+    cfg=SimpleNamespace(sightline_layers=(0,),correspondence_layers=(),memory_layers=(0,),lora_layers=(),warmup_ratio=.04)
+    with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=301),())
+    cfg.lora_layers=(0,)
+    with pytest.raises(ValueError,match='P3'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
+    assert _lr_multiplier(0)==pytest.approx(.01) and _lr_multiplier(99)==pytest.approx(1.) and _lr_multiplier(100)==pytest.approx(1.) and _lr_multiplier(2499)<1e-5
+
+def test_teacher_pairs_are_bidirectional_and_token_dedup_keeps_max_weight():
+    from scripts.build_sightline_correspondences import PAIR_OFFSETS,aggregate_token_rows
+    assert {-64,-33,33,64}.issubset(PAIR_OFFSETS)
+    base={'query_chunk':1,'key_chunk':0,'query_latent_temporal':1,'key_latent_temporal':2,'query_y':3,'query_x':4,'key_y':5,'key_x':6}
+    rows=aggregate_token_rows([{**base,'weight':.2,'query_frame':33},{**base,'weight':.9,'query_frame':34}])
+    assert len(rows)==1 and rows[0]['weight']==.9 and rows[0]['query_frame']==34

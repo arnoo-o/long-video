@@ -50,16 +50,6 @@ def causal_chunk_plan(max_chunks: int, train_chunk: int):
     assert_single_backward_chunk(policies,train_chunk)
     return policies
 
-def native_history_16_2_1(latents, frame_ids, source_latent, source_frame_id=0):
-    """Build native long16/mid2/short(source+1) from completed latent slots."""
-    if len(latents)!=len(frame_ids): raise ValueError("latent/history identity mismatch")
-    pairs=list(zip(frame_ids,latents))[-19:]
-    pad=[(source_frame_id,source_latent)]*(19-len(pairs)); pairs=pad+pairs
-    long_pairs=pairs[:16]; mid_pairs=pairs[16:18]; short_pairs=[(source_frame_id,source_latent),pairs[18]]
-    def pack(items):
-        return torch.cat([latent for _,latent in items],dim=2),torch.tensor([frame for frame,_ in items],device=source_latent.device,dtype=torch.long).view(1,-1)
-    return {"long":pack(long_pairs),"mid":pack(mid_pairs),"short":pack(short_pairs)}
-
 def run_single_graph_chunks(max_chunks, train_chunk, forward_chunk):
     """Execute all causal chunks while retaining exactly one autograd graph."""
     policies=causal_chunk_plan(max_chunks,train_chunk); outputs=[]
@@ -87,7 +77,11 @@ class SightlineTrainable(nn.Module):
         if multi_positive is not None:
             rows=[]
             for q,keys in multi_positive: rows.append(-torch.logsumexp(z[:,q,keys],-1).mean())
-            return torch.stack(rows).mean() if rows else z.new_zeros(())
+            if not rows: return z.new_zeros(())
+            values=torch.stack(rows)
+            if weights is not None:
+                weights=weights.to(device=values.device,dtype=values.dtype); return (values*weights).sum()/weights.sum().clamp_min(1e-8)
+            return values.mean()
         return correspondence_loss(z.reshape(-1,z.shape[-1]),positives.reshape(-1),weights)
     @staticmethod
     def lambda_corr(progress, start=.4, initial=.02, final=.005):

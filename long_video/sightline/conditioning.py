@@ -11,12 +11,15 @@ class SightlineConditioner(nn.Module):
         self.gate=nn.Sequential(nn.Linear(1,32),nn.SiLU(),nn.Linear(32,1))
         self.alpha=nn.Parameter(torch.zeros(()))
         for seq in (self.q_proj,self.k_proj): nn.init.normal_(seq[-1].weight, std=1e-3); nn.init.zeros_(seq[-1].bias)
-    def project(self, rays, *, kind: str, training=None, s_aug=None):
+    def sample_scale_delta(self, rays, training=None):
+        if training is None: training=self.training
+        if training and torch.rand((),device=rays.device) < self.scale_aug_prob:
+            return torch.empty((),device=rays.device,dtype=rays.dtype).uniform_(*self.scale_aug_range)
+        return None
+    def project(self, rays, *, kind: str, training=None, scale_delta=None):
         if rays.shape[-1] != 7: raise ValueError("rays must contain d, m_hat, log_norm")
         if training is None: training=self.training
-        s=rays[...,6:7]; s_in=s if s_aug is None else s_aug
-        if s_aug is None and training and torch.rand((),device=rays.device) < self.scale_aug_prob:
-            s_in=s + torch.empty((),device=rays.device,dtype=rays.dtype).uniform_(*self.scale_aug_range)
+        s=rays[...,6:7]; s_in=s if scale_delta is None else s+scale_delta
         # Scale augmentation exclusively affects this gate. E_q/E_k always see
         # true Plücker scale s, never the perturbed value.
         g=torch.sigmoid(self.gate(s_in))
@@ -26,12 +29,8 @@ class SightlineConditioner(nn.Module):
         dim=self.q_proj[-1].out_features
         value=self.q_proj(q_in) if kind=='q' else self.k_proj(k_in)
         return self.alpha*g*torch.nn.functional.rms_norm(value, (dim,), eps=self.eps)
-    def forward(self, rays_q, rays_k=None, *, training=None):
+    def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None):
         rays_k = rays_q if rays_k is None else rays_k
-        s = rays_q[..., 6:7]
         if training is None: training=self.training
-        s_aug=s
-        if training and torch.rand((),device=s.device) < self.scale_aug_prob:
-            delta=torch.empty((),device=s.device,dtype=s.dtype).uniform_(*self.scale_aug_range)
-            s_aug=s+delta
-        return (self.project(rays_q,kind='q',training=training,s_aug=s_aug), self.project(rays_k,kind='k',training=training,s_aug=s_aug))
+        if scale_delta is None: scale_delta=self.sample_scale_delta(rays_q,training)
+        return (self.project(rays_q,kind='q',training=training,scale_delta=scale_delta), self.project(rays_k,kind='k',training=training,scale_delta=scale_delta))

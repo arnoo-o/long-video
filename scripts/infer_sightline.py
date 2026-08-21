@@ -17,7 +17,7 @@ def resize_source(image, K, height=384, width=640):
     return image,K
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int,default=2); p.add_argument('--layers',default=''); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int); p.add_argument('--layers',default=''); a=p.parse_args()
     if not 1<=a.chunks<=6: raise ValueError('--chunks must be 1..6')
     if bool(a.c2w)==bool(a.controls): raise ValueError('provide exactly one of --c2w or --controls')
     if bool(a.checkpoint)==bool(a.alpha_zero_baseline): raise ValueError('provide --checkpoint, or explicitly select --alpha-zero-baseline')
@@ -48,7 +48,7 @@ def main():
     if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
     elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
-    pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda')
+    pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16,revision=a.model_revision).to('cuda')
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
     trainable=SightlineTrainable(inner,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.bfloat16); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
     layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
@@ -59,7 +59,7 @@ def main():
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
-        provenance=runtime_provenance(pipe,a.model,a.helios_root)
+        provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision)
         restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget},provenance=provenance)
     else:
         runner.memory.set_enabled(False)

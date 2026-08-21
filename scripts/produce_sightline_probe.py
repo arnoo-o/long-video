@@ -8,7 +8,7 @@ import argparse, json, subprocess, sys, tempfile
 from pathlib import Path
 import torch
 
-REQUIRED=("attention_logits","corr_logits","positive_key_indices","memory_count","fm_loss","baseline_final_stage_loss","wrong_ray_loss","memory_zero_loss","memory_shuffle_loss","corr_loss","alpha","alpha_grad","vram_gb","step_time_sec","ablation_time_sec")
+REQUIRED=("attention_logits","positive_key_indices","memory_count","fm_loss","baseline_final_stage_loss","wrong_ray_loss","memory_zero_loss","memory_shuffle_loss","corr_loss","alpha","alpha_grad","vram_gb","step_time_sec","ablation_time_sec")
 
 def _ranking(logits,positive_lists):
     if logits.ndim==3: logits=logits[:,None]
@@ -25,20 +25,11 @@ def measured_row(capture):
     if missing: raise RuntimeError(f"real Helios probe capture missing {missing}")
     head_logits=capture['attention_logits'].float(); positives=capture["positive_key_indices"]; baseline=bool(capture.get('baseline',False))
     raw_mrr,raw_top1,raw_top5,mass=_ranking(head_logits,positives); native_attention=head_logits.softmax(-1)
-    if baseline: corr_mrr=corr_top1=corr_top5=None; logits=None
-    else:
-        if capture['corr_logits'] is None: raise RuntimeError('checkpoint probe is missing trained corr-head logits')
-        logits=capture['corr_logits'].float(); corr_mrr,corr_top1,corr_top5,_=_ranking(logits,positives)
+    corr_mrr=corr_top1=corr_top5=None
     memory_count=int(capture['memory_count'])
     if memory_count<0 or memory_count>head_logits.shape[-1]: raise RuntimeError('invalid captured memory token count')
-    if baseline: corr_gain=0.0
-    else:
-        logp=logits.log_softmax(-1); gains=[]
-        for query,keys in enumerate(positives):
-            gains.append(torch.log(torch.tensor(logits.shape[-1]/max(1,len(keys)),dtype=logits.dtype))+logp[...,query,keys].logsumexp(-1).mean())
-        corr_gain=float(torch.stack(gains).mean())
     baseline_final_stage_loss=float(capture['baseline_final_stage_loss'])
-    return {"layer":int(capture["layer"]),"sigma":float(capture["sigma"]),"ranking_source":"raw_qk" if baseline else "trained_corr_head","correspondence_mrr":raw_mrr if baseline else corr_mrr,"top1":raw_top1 if baseline else corr_top1,"top5":raw_top5 if baseline else corr_top5,"raw_qk_mrr":raw_mrr,"raw_qk_top1":raw_top1,"raw_qk_top5":raw_top5,"corr_head_mrr":None if baseline else corr_mrr,"corr_head_top1":None if baseline else corr_top1,"corr_head_top5":None if baseline else corr_top5,"corr_gain":corr_gain,
+    return {"layer":int(capture["layer"]),"sigma":float(capture["sigma"]),"ranking_source":"raw_qk","correspondence_mrr":raw_mrr,"top1":raw_top1,"top5":raw_top5,"raw_qk_mrr":raw_mrr,"raw_qk_top1":raw_top1,"raw_qk_top5":raw_top5,
          "positive_attention_mass":float(mass),"wrong_ray_delta":float(capture["wrong_ray_loss"]-baseline_final_stage_loss),
          "memory_attention_mass":0.0 if memory_count==0 else float(native_attention[...,-memory_count:].sum(-1).mean()),"memory_zero_delta":float(capture["memory_zero_loss"]-baseline_final_stage_loss),
          "memory_shuffle_delta":float(capture["memory_shuffle_loss"]-baseline_final_stage_loss),"fm_loss":float(capture["fm_loss"]),

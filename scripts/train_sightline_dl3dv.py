@@ -8,7 +8,7 @@ from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
 from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, selected_qk_logits
-from long_video.training.sightline_data import load_sightline_manifest, load_latent_tensor, validate_latent_cache, require_overlap_validation
+from long_video.training.sightline_data import load_sightline_manifest, load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
@@ -141,7 +141,7 @@ def _reset_sequence(runner):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True)
-    p.add_argument('--expected-records',type=int,default=100); p.add_argument('--max-steps',type=int,default=2500); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int,default=80)
+    p.add_argument('--expected-records',type=int,default=100); p.add_argument('--max-steps',type=int,default=2500); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int,default=80); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config); probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_sightline_manifest(args.manifest,expected_count=args.expected_records)
@@ -178,7 +178,8 @@ def main():
         phase=curriculum_phase(step); checkpointing=bool(cfg.gradient_checkpointing and phase['name']!='P3'); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         index=args.record_index if args.record_index is not None else random.randrange(len(records)); record=records[index]
-        latent_key='gt_latent_cache' if 'gt_latent_cache' in record.raw else 'latent_cache'; latent_path=record.path(latent_key); latent_schema,_=validate_latent_cache(latent_path)
+        latent_root=args.latent_cache_root or cfg.latent_cache_path or None
+        latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         latents=load_latent_tensor(latent_path).to('cuda',dtype=torch.bfloat16)
         if latents.shape[2]<49: raise ValueError('six chunks require at least 49 latent frames')
@@ -221,7 +222,6 @@ def main():
                     selected=selected[:cfg.correspondence_rows_per_batch]; positives=positives[:len(selected)]
                     memory_count=processor.last_attention_meta.get('memory_tokens',0); selected_q=processor.last_q[:,selected]; base_k=processor.last_k
                     head_logits=torch.einsum('bqhd,bkhd->bhqk',selected_q,base_k)*(selected_q.shape[-1]**-.5)
-                    corr_logits=None if args.alpha_zero_baseline else trainable.corr_head(head_logits.permute(0,2,3,1)).squeeze(-1)
                     base_context=dict(provider.context); normal_step_time=time.perf_counter()-started; ablation_started=time.perf_counter()
                     memory_enabled_by_layer={layer:bank.enabled for layer,bank in runner.memory.banks.items()}
                     with torch.no_grad():
@@ -240,7 +240,7 @@ def main():
                         provider.context=base_context
                     alpha=trainable.conditioner.alpha
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
-                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=layer,sigma=float(final['sigmas'].mean()),attention_logits=head_logits.detach().cpu(),corr_logits=None if corr_logits is None else corr_logits.detach().cpu(),positive_key_indices=positives,memory_count=memory_count,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=layer,sigma=float(final['sigmas'].mean()),attention_logits=head_logits.detach().cpu(),positive_key_indices=positives,memory_count=memory_count,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             if chunk==0: generated[:,:,0:1]=source
             history_state.append_chunk(generated,chunk)
             runner._finalize_chunk(chunk)
@@ -258,7 +258,7 @@ def main():
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
-                corr_grads=[p.grad for p in trainable.corr_head.parameters() if p.grad is not None]
+                corr_grads=[p.grad for p in trainable.conditioner.parameters() if p.grad is not None]
                 if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 correspondence gradient missing or non-finite')
             grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)

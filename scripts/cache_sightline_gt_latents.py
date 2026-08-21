@@ -13,7 +13,11 @@ def main():
     if len(paths)!=193: raise ValueError('continuous cache requires exactly 193 RGB frames')
     images=[Image.open(path).convert('RGB') for path in paths]
     processor=pipe.video_processor
-    try: pixels=processor.preprocess_video(images,height=a.height,width=a.width).to('cuda',dtype=pipe.vae.dtype)
+    try:
+        pixels=processor.preprocess_video(images,height=a.height,width=a.width)
+        if pixels.ndim==4: pixels=pixels.unsqueeze(0)
+        if pixels.ndim!=5: raise RuntimeError(f'preprocess_video returned {tuple(pixels.shape)}')
+        pixels=pixels.to('cuda',dtype=pipe.vae.dtype)
     except Exception as exc: raise RuntimeError('pinned Helios video_processor cannot batch 193 RGB frames') from exc
     mean=torch.tensor(pipe.vae.config.latents_mean,device='cuda',dtype=pipe.vae.dtype).view(1,pipe.vae.config.z_dim,1,1,1)
     std=(1.0/torch.tensor(pipe.vae.config.latents_std,device='cuda',dtype=pipe.vae.dtype)).view(1,pipe.vae.config.z_dim,1,1,1)

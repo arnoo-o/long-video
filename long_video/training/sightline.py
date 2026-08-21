@@ -1,7 +1,7 @@
 """Trainable Sightline components and correspondence supervision.
 
 Helios itself is frozen and supplied by the H100 adapter; this module owns only
-the trainable ray projections, alpha, timestamp, correspondence head and LoRA.
+the trainable ray projections, alpha, timestamp and LoRA.
 """
 from __future__ import annotations
 import math, torch
@@ -14,7 +14,7 @@ def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None
     return int(torch.randint(max_chunks,(1,),generator=generator).item())
 
 def assert_trainable_whitelist(module: nn.Module) -> None:
-    allowed=("conditioner.","corr_head.","memory.timestamp.","lora_")
+    allowed=("conditioner.","memory.timestamp.","lora_")
     bad=[name for name,p in module.named_parameters() if p.requires_grad and not name.startswith(allowed)]
     if bad: raise RuntimeError(f"Sightline trainable whitelist violation: {bad[:8]}")
 
@@ -70,10 +70,10 @@ def selected_qk_logits(query, key, query_indices):
 
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
-        super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
+        super().__init__(); self.conditioner=SightlineConditioner(inner_dim)
     def correspondence(self, logits, positives, weights=None, multi_positive=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
-        z=self.corr_head(logits.permute(0,2,3,1)).squeeze(-1); z=z.log_softmax(-1)
+        z=logits.log_softmax(-1)
         if multi_positive is not None:
             rows=[]
             for q,keys in multi_positive: rows.append(-torch.logsumexp(z[:,q,keys],-1).mean())
@@ -89,7 +89,8 @@ class SightlineTrainable(nn.Module):
         return initial+(final-initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
         alpha=self.conditioner.alpha.detach(); grad=self.conditioner.alpha.grad
-        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':float(self.conditioner.q_proj[0].weight.grad.norm()) if self.conditioner.q_proj[0].weight.grad is not None else 0.0,'ek_grad_norm':float(self.conditioner.k_proj[0].weight.grad.norm()) if self.conditioner.k_proj[0].weight.grad is not None else 0.0}
+        qg=self.conditioner.q_proj.weight.grad; kg=self.conditioner.k_proj.weight.grad
+        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':0.0 if qg is None else float(qg.norm()),'ek_grad_norm':0.0 if kg is None else float(kg.norm())}
 
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):

@@ -7,9 +7,8 @@ REQUIRED = {
     "layer", "sigma", "correspondence_mrr", "top1", "top5",
     "positive_attention_mass", "memory_attention_mass", "wrong_ray_delta",
     "memory_zero_delta", "memory_shuffle_delta", "fm_loss", "corr_loss",
-    "corr_gain", "alpha", "alpha_grad", "vram_gb", "step_time_sec", "ablation_time_sec",
+    "alpha", "alpha_grad", "vram_gb", "step_time_sec", "ablation_time_sec",
     "ranking_source", "raw_qk_mrr", "raw_qk_top1", "raw_qk_top5",
-    "corr_head_mrr", "corr_head_top1", "corr_head_top5",
 }
 
 def main() -> None:
@@ -38,7 +37,7 @@ def main() -> None:
         charts = {
             "loss_curve": (("fm_loss", "corr_loss"), "loss"),
             "sightline_signal": (("alpha", "alpha_grad", "wrong_ray_delta"), "signal"),
-            "correspondence": (("raw_qk_mrr", "raw_qk_top1", "raw_qk_top5", "corr_head_mrr", "corr_head_top1", "corr_head_top5", "corr_gain"), "score"),
+            "correspondence": (("raw_qk_mrr", "raw_qk_top1", "raw_qk_top5"), "score"),
             "memory_signal": (("memory_attention_mass", "memory_zero_delta", "memory_shuffle_delta"), "signal"),
             "efficiency": (("vram_gb", "step_time_sec", "ablation_time_sec"), "value"),
         }

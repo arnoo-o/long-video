@@ -6,11 +6,15 @@ class SightlineConditioner(nn.Module):
     def __init__(self, inner_dim: int, hidden_dim: int = 128, eps: float = 1e-6,
                  scale_aug_prob: float = .3, scale_aug_range=(-1.2, 1.6)):
         super().__init__(); self.eps=eps; self.scale_aug_prob=scale_aug_prob; self.scale_aug_range=scale_aug_range
-        self.q_proj=nn.Sequential(nn.Linear(7,hidden_dim),nn.SiLU(),nn.Linear(hidden_dim,inner_dim))
-        self.k_proj=nn.Sequential(nn.Linear(7,hidden_dim),nn.SiLU(),nn.Linear(hidden_dim,inner_dim))
-        self.gate=nn.Sequential(nn.Linear(1,32),nn.SiLU(),nn.Linear(32,1))
+        self.q_proj=nn.Linear(7,inner_dim)
+        self.k_proj=nn.Linear(7,inner_dim)
+        self.gate=nn.Linear(1,inner_dim)
+        self.rms_norm_q=nn.RMSNorm(inner_dim,eps=eps)
+        self.rms_norm_k=nn.RMSNorm(inner_dim,eps=eps)
         self.alpha=nn.Parameter(torch.zeros(()))
-        for seq in (self.q_proj,self.k_proj): nn.init.normal_(seq[-1].weight, std=1e-3); nn.init.zeros_(seq[-1].bias)
+        nn.init.normal_(self.q_proj.weight,std=1e-3); nn.init.zeros_(self.q_proj.bias)
+        nn.init.normal_(self.k_proj.weight,std=1e-3); nn.init.zeros_(self.k_proj.bias)
+        nn.init.zeros_(self.gate.weight); nn.init.zeros_(self.gate.bias)
     def sample_scale_delta(self, rays, training=None):
         if training is None: training=self.training
         if training and torch.rand((),device=rays.device) < self.scale_aug_prob:
@@ -26,9 +30,10 @@ class SightlineConditioner(nn.Module):
         if kind not in ('q','k'): raise ValueError("kind must be q or k")
         q_in=torch.cat((rays[...,:3],rays[...,3:6],s),-1)
         k_in=torch.cat((rays[...,3:6],rays[...,:3],s),-1)
-        dim=self.q_proj[-1].out_features
+        dim=self.q_proj.out_features
         value=self.q_proj(q_in) if kind=='q' else self.k_proj(k_in)
-        return self.alpha*g*torch.nn.functional.rms_norm(value, (dim,), eps=self.eps)
+        value=(self.rms_norm_q if kind=='q' else self.rms_norm_k)(value)
+        return self.alpha*g*value
     def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None):
         rays_k = rays_q if rays_k is None else rays_k
         if training is None: training=self.training

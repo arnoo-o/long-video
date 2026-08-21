@@ -150,7 +150,7 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
                 bias=processor.last_attention_bias
                 q_indices=selected[start:stop]
                 if bias.ndim==2: additive_bias=bias
-                elif bias.ndim==3: additive_bias=bias.unsqueeze(1)
+                elif bias.ndim==3: additive_bias=bias[:,q_indices,:].unsqueeze(1)
                 elif bias.ndim==4: additive_bias=bias[:,:,q_indices,:]
                 else: raise RuntimeError('unsupported captured attention bias shape')
             block_loss=trainable.correspondence(sampled,None,weight,multi_positive=block_positive,additive_bias=additive_bias)
@@ -284,7 +284,12 @@ def main():
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
                 if trainable.conditioner.alpha.abs().detach()>1e-6:
-                    corr_grads=[p.grad for p in trainable.conditioner.parameters() if p.grad is not None]
+                    geometry_params=(list(trainable.conditioner.q_proj.parameters())+
+                                     list(trainable.conditioner.k_proj.parameters())+
+                                     list(trainable.conditioner.gate.parameters())+
+                                     list(trainable.conditioner.rms_norm_q.parameters())+
+                                     list(trainable.conditioner.rms_norm_k.parameters()))
+                    corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
             grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)

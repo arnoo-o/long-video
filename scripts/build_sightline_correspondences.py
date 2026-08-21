@@ -39,16 +39,16 @@ def _token(pixel_index,height,width,token_height,token_width):
     y,x=divmod(int(pixel_index),width); return min(token_height-1,y*token_height//height),min(token_width-1,x*token_width//width)
 
 def screen_overlap(xyz,valid,confidence,query_frame,key_frame,*,screening_stride=8,screening_distance_threshold=.05,min_overlap_count=1,min_overlap_ratio=.01):
-    stride=max(1,int(screening_stride)); qvalid=valid[query_frame]&np.isfinite(xyz[query_frame]).all(-1)&np.isfinite(confidence[query_frame]); kvalid=valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&np.isfinite(confidence[key_frame]); qmask=qvalid[::stride,::stride]; kmask=kvalid[::stride,::stride]; q=xyz[query_frame][::stride,::stride][qmask]; k=xyz[key_frame][::stride,::stride][kmask]
+    stride=max(1,int(screening_stride)); qvalid=valid[query_frame]&np.isfinite(xyz[query_frame]).all(-1)&(np.linalg.norm(xyz[query_frame],axis=-1)>1e-8)&np.isfinite(confidence[query_frame]); kvalid=valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8)&np.isfinite(confidence[key_frame]); qmask=qvalid[::stride,::stride]; kmask=kvalid[::stride,::stride]; q=xyz[query_frame][::stride,::stride][qmask]; k=xyz[key_frame][::stride,::stride][kmask]
     if len(q)==0 or len(k)==0: return {'overlap_count':0,'overlap_ratio':0.,'query_valid_sample_count':int(len(q)),'accepted':False}
     distance,_=_nn(q,k); count=int((distance<=float(screening_distance_threshold)).sum()); ratio=float(count/len(q)); return {'overlap_count':count,'overlap_ratio':ratio,'query_valid_sample_count':int(len(q)),'accepted':bool(count>=min_overlap_count and ratio>=min_overlap_ratio)}
 
 def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_frame,c2w,K,token_height,token_width,distance_fraction):
-    height,width=valid.shape[1:]; qmask=valid[query_frame]&np.isfinite(xyz[query_frame]).all(-1); kmask=valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1); qi=np.flatnonzero(qmask); ki=np.flatnonzero(kmask)
+    height,width=valid.shape[1:]; qmask=valid[query_frame]&np.isfinite(xyz[query_frame]).all(-1)&(np.linalg.norm(xyz[query_frame],axis=-1)>1e-8); kmask=valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8); qi=np.flatnonzero(qmask); ki=np.flatnonzero(kmask)
     if not len(qi) or not len(ki): return []
     query=xyz[query_frame].reshape(-1,3)[qi]; key=xyz[key_frame].reshape(-1,3)[ki]; depth,_=_project(query,c2w[query_frame],K[query_frame]); positive=depth[np.isfinite(depth)&(depth>0)]
     if not len(positive): return []
-    threshold=float(distance_fraction*np.median(positive)); distance,q_to_k=_nn(query,key); _,k_to_q=_nn(key,query); keep=(q_to_k>=0)&(k_to_q[q_to_k]==np.arange(len(query)))&(distance<=threshold); selected=np.flatnonzero(keep); scene_mask=zbuffer_valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1); visible=_zbuffer_visible(key[q_to_k[selected]],xyz[key_frame][scene_mask],c2w[key_frame],K[key_frame],height,width) if len(selected) else []
+    threshold=float(distance_fraction*np.median(positive)); distance,q_to_k=_nn(query,key); _,k_to_q=_nn(key,query); keep=(q_to_k>=0)&(k_to_q[q_to_k]==np.arange(len(query)))&(distance<=threshold); selected=np.flatnonzero(keep); scene_mask=zbuffer_valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8); visible=_zbuffer_visible(key[q_to_k[selected]],xyz[key_frame][scene_mask],c2w[key_frame],K[key_frame],height,width) if len(selected) else []
     token_valid_counts={}
     for pixel in qi:
         token=_token(pixel,height,width,token_height,token_width); token_valid_counts[token]=token_valid_counts.get(token,0)+1

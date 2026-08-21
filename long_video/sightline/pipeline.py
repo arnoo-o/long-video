@@ -7,6 +7,17 @@ from .history import CameraHistoryState,NativeHistoryState,native_helios_indices
 from .memory import LayerKVMemoryBank
 from .rays import chunk_cameras, temporal_group_cameras
 
+def prepare_source_condition(helios, image, *, height, width, device=None):
+    """Use the pinned Helios image-conditioning path for training and inference."""
+    device=device or helios._execution_device
+    image_tensor=helios.video_processor.preprocess(image,height=height,width=width)
+    vae=helios.vae
+    mean=torch.tensor(vae.config.latents_mean,device=device,dtype=vae.dtype).view(1,vae.config.z_dim,1,1,1)
+    std=(1.0/torch.tensor(vae.config.latents_std,device=device,dtype=vae.dtype)).view(1,vae.config.z_dim,1,1,1)
+    with torch.no_grad():
+        source,fake=helios.prepare_image_latents(image_tensor,latents_mean=mean,latents_std=std,num_latent_frames_per_chunk=9,dtype=torch.float32,device=device)
+    return source.detach(),fake.detach(),mean,std
+
 @dataclass
 class SightlineRuntimeContext:
     chunk_index:int=0; stage:int=0; sigma:float=0.0; memory_write_allowed:bool=False
@@ -45,7 +56,7 @@ class SightlinePipeline:
             shapes.append((t//patch[0],h//patch[1],w//patch[2])); h*=2; w*=2
         return tuple(shapes)
 
-    def _prepare_chunk(self, chunk_index, latents, attention_kwargs, *, history_global_coverages, history_token_shapes=None, history_latent_hw=None):
+    def _prepare_chunk(self, chunk_index, latents, attention_kwargs, *, history_global_coverages, history_validity=None, history_token_shapes=None, history_latent_hw=None):
         if self._trajectory_c2w is None or self.ray_provider is None: raise RuntimeError('Sightline trajectory/provider is not bound')
         cameras,K=chunk_cameras(self._trajectory_c2w,self._trajectory_K,chunk_index); reps,repK=temporal_group_cameras(cameras,K)
         frame_ids=(torch.arange(9,device=cameras.device)*4 + chunk_index*32).tolist()
@@ -66,7 +77,9 @@ class SightlinePipeline:
         if history_token_shapes is None:
             lh,lw=history_latent_hw or (int(latents.shape[-2]),int(latents.shape[-1]))
             history_token_shapes={'long':(4,(lh+7)//8,(lw+7)//8),'mid':(1,(lh+3)//4,(lw+3)//4),'short':(2,(lh+1)//2,(lw+1)//2)}
-        self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_global_coverages=history_global_coverages,stage_shapes=shapes,token_shape=shapes[0])
+        if history_validity is None:
+            history_validity={'long':tuple(bool(c) for c in history_global_coverages.get('long',())), 'mid':tuple(bool(c) for c in history_global_coverages.get('mid',())), 'short':tuple(True for _ in history_global_coverages.get('short',()))}
+        self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_global_coverages=history_global_coverages,history_validity=history_validity,stage_shapes=shapes,token_shape=shapes[0])
         self._pending_camera_chunk=(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))
         attention_kwargs['current_chunk']=chunk_index
         attention_kwargs['sightline_stage_shapes']=shapes
@@ -89,6 +102,7 @@ class SightlinePipeline:
             self.camera_history.append_chunk(*pending)
             self._pending_camera_chunk=None
 
+    @torch.inference_mode()
     def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps=None, c2w, intrinsics, attention_kwargs=None):
         self.reset_sequence()
         if not self._source_initialized: self._source_initialized=True
@@ -96,20 +110,20 @@ class SightlinePipeline:
         if c2w.ndim!=4 or intrinsics.ndim!=4 or c2w.shape[:2]!=intrinsics.shape[:2]: raise ValueError('c2w/K must remain [B,F,...]')
         self._trajectory_c2w=c2w; self._trajectory_K=intrinsics; self._source_camera=c2w[:,0]; self._source_intrinsics=intrinsics[:,0]
         chunks=(num_frames-1)//32; device=self.helios._execution_device; transformer_dtype=self.helios.transformer.dtype; runtime_kwargs=dict(attention_kwargs or {})
+        for module in (self.helios.transformer,self.helios.text_encoder,self.helios.vae): module.eval()
+        if self.conditioner is not None: self.conditioner.eval()
         self.helios._guidance_scale=1.0; self.helios._attention_kwargs=runtime_kwargs; self.helios._current_timestep=None; self.helios._interrupt=False
         prompt_embeds,negative_embeds=self.helios.encode_prompt(prompt=prompt,negative_prompt=negative_prompt,do_classifier_free_guidance=False,num_videos_per_prompt=1,max_sequence_length=512,device=device)
         prompt_embeds=prompt_embeds.to(transformer_dtype); negative_embeds=None
-        image_tensor=self.helios.video_processor.preprocess(image,height=height,width=width)
-        vae=self.helios.vae; mean=torch.tensor(vae.config.latents_mean,device=device,dtype=vae.dtype).view(1,vae.config.z_dim,1,1,1); std=(1.0/torch.tensor(vae.config.latents_std,device=device,dtype=vae.dtype)).view(1,vae.config.z_dim,1,1,1)
-        source,fake=self.helios.prepare_image_latents(image_tensor,latents_mean=mean,latents_std=std,num_latent_frames_per_chunk=9,dtype=torch.float32,device=device)
+        vae=self.helios.vae; source,fake,mean,std=prepare_source_condition(self.helios,image,height=height,width=width,device=device)
         self.history_state=NativeHistoryState(source,fake); accumulated=None; stage_steps=list(self.resolve_pyramid_steps(self.config.pyramid_steps,steps))
         class Progress:
             def update(self): pass
         for chunk in range(chunks):
-            history=self.history_state.groups(); coverage=self.history_state.coverage()
+            history=self.history_state.groups(); coverage=self.history_state.coverage(); validity=self.history_state.validity()
             latent=self.helios.prepare_latents(source.shape[0],self.helios.transformer.config.in_channels,height,width,33,dtype=torch.float32,device=device)
             current_ids=native_helios_indices(device,source.shape[0])['current']
-            self._prepare_chunk(chunk,latent,runtime_kwargs,history_global_coverages=coverage,history_latent_hw=source.shape[-2:])
+            self._prepare_chunk(chunk,latent,runtime_kwargs,history_global_coverages=coverage,history_validity=validity,history_latent_hw=source.shape[-2:])
             latent=self.helios.stage2_sample(latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
             if chunk==0: latent[:,:,0:1]=source.to(latent)
             accumulated=self.append_stride32_latents(accumulated,latent)

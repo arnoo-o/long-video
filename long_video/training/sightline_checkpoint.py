@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib,json,random
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v1'; SCHEMA='sightline-checkpoint-v3'
+SEMANTICS='sightline-v2'; SCHEMA='sightline-checkpoint-v4'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def _file_sha(path): return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 def runtime_provenance(pipe, model_id, helios_root, model_revision=None):

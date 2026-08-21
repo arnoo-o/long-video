@@ -27,6 +27,11 @@ class NativeHistoryState:
         return {'long':tuple(tuple(x for x in ids[i:i+4] if x is not None) for i in range(0,16,4)),
                 'mid':(tuple(x for x in ids[16:18] if x is not None),),
                 'short':((0,),tuple(x for x in ids[18:19] if x is not None))}
+    def validity(self):
+        ids=[identity for identity,_ in self._entries]
+        return {'long':tuple(any(x is not None for x in ids[i:i+4]) for i in range(0,16,4)),
+                'mid':(any(x is not None for x in ids[16:18]),),
+                'short':(True,True)}
     def append_chunk(self, chunk, chunk_index):
         if chunk.ndim!=5 or chunk.shape[2]!=9: raise ValueError('history chunk must have 9 latents')
         start=0 if chunk_index==0 else 1

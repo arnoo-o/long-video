@@ -48,7 +48,7 @@ class LongTermKVMemory:
         tokens=self.active_tokens(current_global_start)
         if not tokens: return None
         global_ids=[token.chunk_index*8+token.temporal for token in tokens]
-        frame=torch.tensor([max(1,min(19,20-(current_global_start-global_id))) for global_id in global_ids],device=device,dtype=torch.float32)
+        frame=torch.tensor([max(1,min(18,19-(current_global_start-global_id))) for global_id in global_ids],device=device,dtype=torch.float32)
         offset=(self.pool-1)/2
         y=torch.tensor([token.pooled_y*self.pool+offset for token in tokens],device=device,dtype=torch.float32)
         x=torch.tensor([token.pooled_x*self.pool+offset for token in tokens],device=device,dtype=torch.float32)

@@ -72,14 +72,22 @@ def test_memory_rope_uses_saved_metadata_and_second_chunk_reads():
     m=LongTermKVMemory(budget=8,pool=1); m.rope=Rope()
     x=torch.randn(1,2,4); r=torch.randn(1,2,7); m.capture(x,r,0,grid_shape=(1,1,2))
     rope=m.memory_rotary_emb(x.device,current_global_start=8)
-    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([12.,12.]))
+    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([11.,11.]))
     older=m.memory_rotary_emb(x.device,current_global_start=16)
-    assert torch.equal(older[0,:,0],torch.tensor([4.,4.]))
+    assert torch.equal(older[0,:,0],torch.tensor([3.,3.]))
     class Attn:
         heads=2; to_k=torch.nn.Linear(4,4); to_v=torch.nn.Linear(4,4); norm_k=torch.nn.Identity()
     key=torch.randn(1,3,2,2); value=torch.randn(1,3,2,2)
     final_k,final_v,meta=m.append_native_attention(Attn(),key,value,None,lambda tensor,rotary:tensor,current_chunk=1,current_global_start=8)
     assert final_k.shape[1]==final_v.shape[1]==5 and meta['memory_tokens']==2
+
+def test_memory_rope_recent_past_latent_is_position_18():
+    memory=LongTermKVMemory(budget=8,pool=1)
+    class Rope:
+        def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
+    memory.rope=Rope(); memory.capture(torch.randn(1,8,4),torch.randn(1,8,7),0,grid_shape=(8,1,1))
+    rope=memory.memory_rotary_emb(torch.device('cpu'),8)
+    assert torch.equal(rope[0,:,0],torch.tensor([11.,12.,13.,14.,15.,16.,17.,18.]))
 
 def test_memory_append_extends_attention_mask_to_final_key_length():
     class Rope:

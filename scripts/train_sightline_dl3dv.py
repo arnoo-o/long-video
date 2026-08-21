@@ -4,14 +4,15 @@ import argparse, hashlib, json, random, sys, time
 from dataclasses import asdict
 from pathlib import Path
 import torch
+from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
 from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, selected_qk_logits
-from long_video.training.sightline_data import load_sightline_manifest, load_latent_tensor
+from long_video.training.sightline_data import load_sightline_manifest, load_latent_tensor, validate_latent_cache, require_overlap_validation
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
-from long_video.sightline.pipeline import SightlinePipeline
+from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
 
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
@@ -20,7 +21,7 @@ def _preflight(cfg,args,probe_layers):
     sightline=set(cfg.sightline_layers)
     if not set(cfg.correspondence_layers).issubset(sightline): raise ValueError('correspondence_layers must be a subset of sightline_layers')
     if not set(cfg.memory_layers).issubset(sightline): raise ValueError('memory_layers must be a subset of sightline_layers')
-    if not set(probe_layers).issubset(sightline): raise ValueError('probe candidate layers must be a subset of sightline_layers')
+    if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
     if int(TOTAL_TRAINING_STEPS*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('warmup_ratio must preserve the configured 100/2500-step warmup')
     if args.train and args.max_steps>300 and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty; run the layer probe and configure it first')
     if args.train and args.max_steps>1000 and not cfg.correspondence_layers: raise ValueError('training reaches P3 but correspondence_layers is empty; run the layer probe and configure it first')
@@ -77,7 +78,8 @@ def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk):
 
 def _load_correspondence(path):
     payload=json.loads(Path(path).read_text())
-    if payload.get('schema_version')!='sightline-correspondence-v3': raise RuntimeError('stale correspondence cache; rebuild with bidirectional causal rows')
+    if payload.get('schema_version')!='sightline-correspondence-v4': raise RuntimeError('stale correspondence cache; rebuild with long-memory rows')
+    if tuple(payload.get('pair_offsets',())) != (-128,-96,-64,-33,-1,1,33,64,96,128): raise RuntimeError('correspondence pair offset metadata mismatch')
     return payload['rows']
 
 def _mapped_correspondences(processor,rows,chunk):
@@ -107,10 +109,10 @@ def _mapped_correspondences(processor,rows,chunk):
         ki=candidates[0]
         if 0<=qi<q.shape[1] and 0<=ki<k.shape[1]:
             bucket=grouped.setdefault(qi,{})
-            bucket[ki]=max(bucket.get(ki,0.0),float(row['weight']))
+            bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(row['weight'])), 'memory' if memory and not native and not current_keys else ('native' if native else 'current'))
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
-    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(grouped[query].values()) for query in selected]
-    return selected,positives,weights
+    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]; sources=['memory' if any(value[1]=='memory' for value in grouped[query].values()) else ('native' if any(value[1]=='native' for value in grouped[query].values()) else 'current') for query in selected]
+    return selected,positives,weights,sources
 
 def _corr_loss(trainable,processors,rows,chunk,layers,max_rows):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
@@ -118,15 +120,20 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows):
     if missing: raise RuntimeError(f'correspondence layers have no Sightline processor: {missing}')
     losses=[]
     for layer in layers:
-        processor=processors[layer]; selected,positives,weights=_mapped_correspondences(processor,rows,chunk)
+        processor=processors[layer]; selected,positives,weights,sources=_mapped_correspondences(processor,rows,chunk)
         if len(selected)>max_rows:
-            choice=torch.randperm(len(selected),device=processor.last_q.device)[:max_rows].cpu().tolist()
+            memory_indices=[i for i,source in enumerate(sources) if source=='memory']; other_indices=[i for i,source in enumerate(sources) if source!='memory']
+            keep_memory=memory_indices[:1] if memory_indices else []; remaining=max_rows-len(keep_memory); pool=other_indices+memory_indices[len(keep_memory):]; choice=keep_memory+pool[:remaining]
             selected=[selected[i] for i in choice]; positives=[positives[i] for i in choice]; weights=[weights[i] for i in choice]
-        sampled=selected_qk_logits(processor.last_q,processor.last_k,selected)
-        if not sampled.requires_grad or not processor.last_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd; disable incompatible gradient checkpointing')
-        multi=[(index,keys) for index,keys in enumerate(positives)]
-        weight=torch.tensor(weights,device=sampled.device)
-        losses.append(trainable.correspondence(sampled,None,weight,multi_positive=multi))
+        numerator=processor.last_q.new_zeros(()); denominator=processor.last_q.new_zeros(())
+        for start in range(0,len(selected),64):
+            stop=min(start+64,len(selected)); sampled=selected_qk_logits(processor.last_q,processor.last_k,selected[start:stop])
+            if not sampled.requires_grad or not processor.last_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd; disable incompatible gradient checkpointing')
+            block_positive=[(index,keys) for index,keys in enumerate(positives[start:stop])]
+            weight=torch.tensor(weights[start:stop],device=sampled.device)
+            block_loss=trainable.correspondence(sampled,None,weight,multi_positive=block_positive)
+            numerator=numerator+block_loss*weight.sum(); denominator=denominator+weight.sum()
+        losses.append(numerator/denominator.clamp_min(1e-8))
     return torch.stack(losses).mean()
 
 def _reset_sequence(runner):
@@ -149,7 +156,8 @@ def main():
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     provider=SightlineRayProvider(source_height=cfg.source_height,source_width=cfg.source_width); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
-    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=cfg.sightline_layers,helios_module=helios_source,memory=runner.memory)
+    installed_layers=tuple(sorted(set(cfg.sightline_layers).union(probe_layers))) if args.probe_only else tuple(cfg.sightline_layers)
+    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters())+list(runner.memory.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
@@ -170,9 +178,13 @@ def main():
         phase=curriculum_phase(step); checkpointing=bool(cfg.gradient_checkpointing and phase['name']!='P3'); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         index=args.record_index if args.record_index is not None else random.randrange(len(records)); record=records[index]
-        latent_key='gt_latent_cache' if 'gt_latent_cache' in record.raw else 'latent_cache'; latents=load_latent_tensor(record.path(latent_key)).to('cuda',dtype=torch.bfloat16)
+        latent_key='gt_latent_cache' if 'gt_latent_cache' in record.raw else 'latent_cache'; latent_path=record.path(latent_key); latent_schema,_=validate_latent_cache(latent_path)
+        if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
+        latents=load_latent_tensor(latent_path).to('cuda',dtype=torch.bfloat16)
         if latents.shape[2]<49: raise ValueError('six chunks require at least 49 latent frames')
-        source=latents[:,:,:1]; c2w_np,K_np=record.load_cameras(); c2w=torch.from_numpy(c2w_np).to('cuda',dtype=torch.float32).unsqueeze(0); K=torch.from_numpy(K_np).to('cuda',dtype=torch.float32).unsqueeze(0)
+        source_gt=latents[:,:,:1]
+        source,fake,_,_=prepare_source_condition(pipe,Image.open(record.rgb_paths()[0]).convert('RGB'),height=cfg.source_height,width=cfg.source_width,device='cuda')
+        c2w_np,K_np=record.load_cameras(); c2w=torch.from_numpy(c2w_np).to('cuda',dtype=torch.float32).unsqueeze(0); K=torch.from_numpy(K_np).to('cuda',dtype=torch.float32).unsqueeze(0)
         _reset_sequence(runner); runner._trajectory_c2w=c2w; runner._trajectory_K=K; runner._source_camera=c2w[:,0]; runner._source_intrinsics=K[:,0]; runner.memory.set_enabled(phase['memory'])
         for name,parameter in pipe.transformer.named_parameters():
             if 'lora_' in name: parameter.requires_grad_(phase['lora'])
@@ -184,17 +196,17 @@ def main():
         else: corr_rows=None
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'])
         if not 0<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum')
-        history_state=NativeHistoryState(source); losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
+        history_state=NativeHistoryState(source,fake); losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
         if args.probe_capture: torch.cuda.reset_peak_memory_stats()
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
             history=history_state.groups(); coverage=history_state.coverage()
             if not keep_graph:
-                template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage)
+                template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk).detach()
             else:
                 target=latents[:,:,chunk*8:chunk*8+9]  # The sole non-source GT read in this step.
-                items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device); runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage)
+                items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device); runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 stage_losses=[]; final_prediction=None
                 for item in items:
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
@@ -205,7 +217,7 @@ def main():
                 losses.update(fm=fm,corr=corr,total=fm+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr,stage=stage_losses)
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
-                    layer=active_corr_layers[0]; processor=pipe.transformer._sightline_processors[layer]; selected,positives,_=_mapped_correspondences(processor,corr_rows,chunk)
+                    layer=active_corr_layers[0]; processor=pipe.transformer._sightline_processors[layer]; selected,positives,_,_=_mapped_correspondences(processor,corr_rows,chunk)
                     selected=selected[:cfg.correspondence_rows_per_batch]; positives=positives[:len(selected)]
                     memory_count=processor.last_attention_meta.get('memory_tokens',0); selected_q=processor.last_q[:,selected]; base_k=processor.last_k
                     head_logits=torch.einsum('bqhd,bkhd->bhqk',selected_q,base_k)*(selected_q.shape[-1]**-.5)
@@ -227,7 +239,8 @@ def main():
                             for token,hidden in zip(runner.memory.banks[bank_layer].tokens,hiddens): token.hidden=hidden
                         provider.context=base_context
                     alpha=trainable.conditioner.alpha
-                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=layer,sigma=float(final['sigmas'].mean()),attention_logits=head_logits.detach().cpu(),corr_logits=None if corr_logits is None else corr_logits.detach().cpu(),positive_key_indices=positives,memory_count=memory_count,fm_loss=float(fm.detach()),wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+                    final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
+                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=layer,sigma=float(final['sigmas'].mean()),attention_logits=head_logits.detach().cpu(),corr_logits=None if corr_logits is None else corr_logits.detach().cpu(),positive_key_indices=positives,memory_count=memory_count,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             if chunk==0: generated[:,:,0:1]=source
             history_state.append_chunk(generated,chunk)
             runner._finalize_chunk(chunk)
@@ -238,7 +251,16 @@ def main():
             alpha_grad=torch.autograd.grad(losses['total'],trainable.conditioner.alpha,retain_graph=True,allow_unused=True)[0]
             probe_payload['alpha_grad']=0.0 if alpha_grad is None else float(alpha_grad.detach().abs())
         if args.train:
-            losses['total'].backward(); grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
+            losses['total'].backward()
+            active_phase=curriculum_phase(step)
+            if active_phase['name']=='P1' and (trainable.conditioner.alpha.grad is None or not torch.isfinite(trainable.conditioner.alpha.grad).all()): raise RuntimeError('P1 alpha gradient missing or non-finite')
+            if active_phase['name']=='P2':
+                lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
+                if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
+            if active_phase['name']=='P3' and losses['corr'].requires_grad:
+                corr_grads=[p.grad for p in trainable.corr_head.parameters() if p.grad is not None]
+                if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 correspondence gradient missing or non-finite')
+            grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'train_chunk':train_chunk,'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
         with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')

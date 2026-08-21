@@ -8,7 +8,7 @@ import argparse, json, subprocess, sys, tempfile
 from pathlib import Path
 import torch
 
-REQUIRED=("attention_logits","corr_logits","positive_key_indices","memory_count","fm_loss","wrong_ray_loss","memory_zero_loss","memory_shuffle_loss","corr_loss","alpha","alpha_grad","vram_gb","step_time_sec","ablation_time_sec")
+REQUIRED=("attention_logits","corr_logits","positive_key_indices","memory_count","fm_loss","baseline_final_stage_loss","wrong_ray_loss","memory_zero_loss","memory_shuffle_loss","corr_loss","alpha","alpha_grad","vram_gb","step_time_sec","ablation_time_sec")
 
 def _ranking(logits,positive_lists):
     if logits.ndim==3: logits=logits[:,None]
@@ -31,11 +31,17 @@ def measured_row(capture):
         logits=capture['corr_logits'].float(); corr_mrr,corr_top1,corr_top5,_=_ranking(logits,positives)
     memory_count=int(capture['memory_count'])
     if memory_count<0 or memory_count>head_logits.shape[-1]: raise RuntimeError('invalid captured memory token count')
-    corr_gain=0.0 if baseline else float(torch.log(torch.tensor(logits.shape[-1],dtype=torch.float32))-torch.tensor(float(capture['corr_loss'])))
+    if baseline: corr_gain=0.0
+    else:
+        logp=logits.log_softmax(-1); gains=[]
+        for query,keys in enumerate(positives):
+            gains.append(torch.log(torch.tensor(logits.shape[-1]/max(1,len(keys)),dtype=logits.dtype))+logp[...,query,keys].logsumexp(-1).mean())
+        corr_gain=float(torch.stack(gains).mean())
+    baseline_final_stage_loss=float(capture['baseline_final_stage_loss'])
     return {"layer":int(capture["layer"]),"sigma":float(capture["sigma"]),"ranking_source":"raw_qk" if baseline else "trained_corr_head","correspondence_mrr":raw_mrr if baseline else corr_mrr,"top1":raw_top1 if baseline else corr_top1,"top5":raw_top5 if baseline else corr_top5,"raw_qk_mrr":raw_mrr,"raw_qk_top1":raw_top1,"raw_qk_top5":raw_top5,"corr_head_mrr":None if baseline else corr_mrr,"corr_head_top1":None if baseline else corr_top1,"corr_head_top5":None if baseline else corr_top5,"corr_gain":corr_gain,
-        "positive_attention_mass":float(mass),"wrong_ray_delta":float(capture["wrong_ray_loss"]-capture["fm_loss"]),
-        "memory_attention_mass":0.0 if memory_count==0 else float(native_attention[...,-memory_count:].sum(-1).mean()),"memory_zero_delta":float(capture["memory_zero_loss"]-capture["fm_loss"]),
-        "memory_shuffle_delta":float(capture["memory_shuffle_loss"]-capture["fm_loss"]),"fm_loss":float(capture["fm_loss"]),
+         "positive_attention_mass":float(mass),"wrong_ray_delta":float(capture["wrong_ray_loss"]-baseline_final_stage_loss),
+         "memory_attention_mass":0.0 if memory_count==0 else float(native_attention[...,-memory_count:].sum(-1).mean()),"memory_zero_delta":float(capture["memory_zero_loss"]-baseline_final_stage_loss),
+         "memory_shuffle_delta":float(capture["memory_shuffle_loss"]-baseline_final_stage_loss),"fm_loss":float(capture["fm_loss"]),
         "corr_loss":float(capture["corr_loss"]),"alpha":float(capture['alpha']),"alpha_grad":float(capture['alpha_grad']),"vram_gb":float(capture["vram_gb"]),"step_time_sec":float(capture["step_time_sec"]),"ablation_time_sec":float(capture['ablation_time_sec'])}
 
 def main():

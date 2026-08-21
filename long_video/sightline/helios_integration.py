@@ -37,6 +37,14 @@ class SightlineHeliosAttnProcessor:
         dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
         dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
         dq=dq.unflatten(-1,(attn.heads,-1)); dk=dk.unflatten(-1,(attn.heads,-1))
+        if key.shape[1] > current_len:
+            validity=self.ray_provider.context.get('history_validity') if self.ray_provider.context is not None else None
+            if validity is not None:
+                flags=[]; shapes=self.ray_provider.context.get('history_token_shapes') or {}
+                for name in ('long','mid','short'):
+                    _,h,w=shapes[name]; flags.extend(bool(flag) for flag in validity[name] for _ in range(h*w))
+                if len(flags)!=key.shape[1]-current_len: raise RuntimeError('history validity does not match native token count')
+                dk[:,:len(flags)]=dk[:,:len(flags)].masked_fill(~torch.tensor(flags,device=dk.device,dtype=torch.bool).view(1,-1,1,1),0)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         query=query+dq; key=key+dk
         history_len=max(0,key.shape[1]-current_len)
@@ -94,9 +102,9 @@ class SightlineRayProvider:
     def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
         self.c2w=c2w; self.intrinsics=intrinsics; self.context=None
-    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_global_coverages=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
+    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_global_coverages=None, history_validity=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
         if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
-        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_global_coverages':history_global_coverages,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_global_coverages':history_global_coverages,'history_validity':history_validity,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
 
     def key_identities(self, current_length, memory=None):
         context=self.context; identities=[]; shapes=context.get('history_token_shapes') or {}; coverages=context.get('history_global_coverages') or {}
@@ -152,7 +160,7 @@ class SightlineRayProvider:
     def current_rays(self, token_shape):
         T,H,W=token_shape; return token_rays_for_shape(self.context['c2w'],self.context['intrinsics'],(self.context['c2w'].shape[0],T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(self.context['c2w'].shape[0],-1,7)
 
-def install_sightline_attention(transformer, conditioner, ray_provider, *, layers, helios_module, memory=None):
+def install_sightline_attention(transformer, conditioner, ray_provider, *, layers, helios_module, memory=None, memory_layers=None):
     blocks=list(getattr(transformer,'transformer_blocks',getattr(transformer,'blocks',[])))
     if not layers: raise ValueError("Sightline selected layers must be explicit")
     installed=[]
@@ -161,7 +169,8 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         if not isinstance(index,int) or index<0 or index>=len(blocks): raise ValueError(f"invalid Helios layer {index}")
         attn=getattr(blocks[index],'attn1',None)
         if attn is None: raise RuntimeError(f"layer {index} has no self-attention")
-        layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') else memory
+        enabled_memory_layers=set(layers if memory_layers is None else memory_layers)
+        layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') and index in enabled_memory_layers else (memory if memory is not None and not hasattr(memory,'for_layer') and index in enabled_memory_layers else None)
         if layer_memory is not None and memory is not None:
             layer_memory.timestamp=memory.timestamp
         native=helios_module.HeliosAttnProcessor()

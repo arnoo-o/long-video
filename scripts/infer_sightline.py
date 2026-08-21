@@ -56,7 +56,7 @@ def main():
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
-    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory)
+    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
         provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision)

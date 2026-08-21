@@ -342,9 +342,18 @@ def test_training_preflight_and_fixed_2500_warmup_schedule():
     with pytest.raises(ValueError,match='P3'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
     assert _lr_multiplier(0)==pytest.approx(.01) and _lr_multiplier(99)==pytest.approx(1.) and _lr_multiplier(100)==pytest.approx(1.) and _lr_multiplier(2499)<1e-5
 
-def test_teacher_pairs_are_bidirectional_and_token_dedup_keeps_max_weight():
-    from scripts.build_sightline_correspondences import PAIR_OFFSETS,aggregate_token_rows
-    assert {-64,-33,33,64}.issubset(PAIR_OFFSETS)
-    base={'query_chunk':1,'key_chunk':0,'query_latent_temporal':1,'key_latent_temporal':2,'query_y':3,'query_x':4,'key_y':5,'key_x':6}
-    rows=aggregate_token_rows([{**base,'weight':.2,'query_frame':33},{**base,'weight':.9,'query_frame':34}])
-    assert len(rows)==1 and rows[0]['weight']==.9 and rows[0]['query_frame']==34
+def test_teacher_overlap_screening_is_deterministic_and_causal():
+    from scripts.build_sightline_correspondences import screen_overlap
+    xyz=torch.tensor([[[[0.,0.,1.],[1.,0.,1.]],[[0.,1.,1.],[1.,1.,1.]]]]).numpy()
+    valid=torch.ones((1,2,2),dtype=torch.bool).numpy(); confidence=torch.ones((1,2,2)).numpy()
+    first=screen_overlap(xyz,valid,confidence,0,0,screening_stride=1,screening_distance_threshold=.01)
+    second=screen_overlap(xyz,valid,confidence,0,0,screening_stride=1,screening_distance_threshold=.01)
+    assert first==second and first['accepted']
+
+def test_teacher_token_vote_keeps_multi_positive_and_no_membership_double_count():
+    from scripts.build_sightline_correspondences import token_vote_rows
+    rows=[{'query_frame':32,'key_frame':0,'query_pixel':0,'query_y':0,'query_x':0,'key_y':0,'key_x':0,'weight':.8},
+          {'query_frame':32,'key_frame':0,'query_pixel':0,'query_y':0,'query_x':0,'key_y':0,'key_x':1,'weight':.75},
+          {'query_frame':32,'key_frame':0,'query_pixel':1,'query_y':0,'query_x':0,'key_y':0,'key_x':0,'weight':.8}]
+    out=token_vote_rows(rows,token_height=1,token_width=2,near_top_ratio=.9,total_frames=193)
+    assert len(out)==4 and {row['key_x'] for row in out}=={0,1} and all(row['matched_count']==2 for row in out)

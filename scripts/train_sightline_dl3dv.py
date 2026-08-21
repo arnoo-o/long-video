@@ -24,14 +24,16 @@ def _prompt(pipe, text, device):
     result=pipe._get_t5_prompt_embeds(text,device=device,dtype=torch.bfloat16)
     if not isinstance(result,(tuple,list)) or len(result)!=2:
         raise RuntimeError("pinned Helios prompt API must return (prompt_embeds, prompt_mask)")
-    return result
+    embeds,mask=result
+    if mask.ndim!=2 or mask.shape[:2]!=embeds.shape[:2]: raise RuntimeError('pinned Helios prompt mask shape mismatch')
+    return embeds,mask
 
 def _model_prediction(pipe, noisy, item, prompt_embeds, prompt_mask, history, current_start):
     latent_t=noisy.shape[2]
     current_indices=torch.arange(current_start,current_start+latent_t,device=noisy.device).view(1,-1)
     output=pipe.transformer(
         hidden_states=noisy,timestep=item["timesteps"],encoder_hidden_states=prompt_embeds,
-        encoder_attention_mask=prompt_mask,indices_hidden_states=current_indices,
+        indices_hidden_states=current_indices,
         latents_history_long=history["long"][0],indices_latents_history_long=history["long"][1],
         latents_history_mid=history["mid"][0],indices_latents_history_mid=history["mid"][1],
         latents_history_short=history["short"][0],indices_latents_history_short=history["short"][1],
@@ -46,13 +48,10 @@ def _load_correspondence(path):
     if payload.get("schema_version")!="sightline-correspondence-v1": raise RuntimeError("stale correspondence cache")
     return payload["rows"]
 
-def _corr_loss(trainable, processors, rows, chunk, device):
+def _mapped_correspondences(processor,rows,chunk):
     candidates=[row for row in rows if chunk in row["query_chunk_memberships"]]
     if not candidates: raise RuntimeError(f"no correspondence rows for train chunk {chunk}")
-    processor=next((processors[layer] for layer in sorted(processors) if processors[layer].last_q is not None),None)
-    if processor is None: raise RuntimeError("selected correspondence layer did not expose real Q/K")
     q=processor.last_q; k=processor.last_k
-    logits=torch.einsum("bqhd,bkhd->bhqk",q,k)*(q.shape[-1]**-0.5)
     q_count=q.shape[1]; k_count=k.shape[1]; current_len=processor.last_current_length
     memory_count=processor.last_attention_meta.get('memory_tokens',0); native_key_len=k_count-memory_count
     selected=[]; positives=[]; weights=[]
@@ -68,6 +67,13 @@ def _corr_loss(trainable, processors, rows, chunk, device):
             ki=native_key_len+memory_index
         if qi<q_count and ki<k_count: selected.append(qi); positives.append(ki); weights.append(float(row["weight"]))
     if not selected: raise RuntimeError("correspondence identities do not map to the real attention axes")
+    return selected,positives,weights
+
+def _corr_loss(trainable, processors, rows, chunk, device):
+    processor=next((processors[layer] for layer in sorted(processors) if processors[layer].last_q is not None),None)
+    if processor is None: raise RuntimeError("selected correspondence layer did not expose real Q/K")
+    q=processor.last_q; k=processor.last_k; selected,positives,weights=_mapped_correspondences(processor,rows,chunk)
+    logits=torch.einsum("bqhd,bkhd->bhqk",q,k)*(q.shape[-1]**-0.5)
     sampled=logits[:,:,torch.tensor(selected,device=device)]
     positive=torch.tensor(positives,device=device).view(1,-1).expand(sampled.shape[0],-1)
     weight=torch.tensor(weights,device=device,dtype=torch.float32).view(1,-1).expand_as(positive)
@@ -78,10 +84,11 @@ def main():
     p.add_argument("--config",default="configs/sightline.yaml"); p.add_argument("--model",required=True)
     p.add_argument("--helios-root",required=True); p.add_argument("--manifest",required=True)
     p.add_argument("--expected-records",type=int,default=100); p.add_argument("--step",type=int,default=0)
-    p.add_argument("--record-index",type=int,default=0); p.add_argument("--prompt",default="A stable realistic view of the same scene.")
-    p.add_argument("--metrics",default="sightline_metrics.jsonl"); p.add_argument("--checkpoint-out"); p.add_argument("--train",action="store_true")
+    p.add_argument("--record-index",type=int,default=0); p.add_argument("--train-chunk",type=int); p.add_argument("--prompt",default="A stable realistic view of the same scene.")
+    p.add_argument("--metrics",default="sightline_metrics.jsonl"); p.add_argument("--checkpoint-out"); p.add_argument("--probe-capture"); p.add_argument("--probe-only",action="store_true"); p.add_argument("--train",action="store_true")
     args=p.parse_args()
-    if not args.train: raise SystemExit("training entrypoint validated; pass --train explicitly to start")
+    if not (args.train or args.probe_only): raise SystemExit("pass --train or --probe-only explicitly")
+    if args.train and args.probe_only: raise ValueError('--train and --probe-only are mutually exclusive')
     cfg=load_sightline_config(args.config); phase=curriculum_phase(args.step)
     records=load_sightline_manifest(args.manifest,expected_count=args.expected_records)
     record=records[args.record_index%len(records)]
@@ -112,8 +119,11 @@ def main():
     optimizer=torch.optim.AdamW([group for group in params if group["params"]],weight_decay=.01)
     prompt_embeds,prompt_mask=_prompt(pipe,args.prompt,"cuda")
     corr_rows=_load_correspondence(record.path("correspondence_cache")) if phase["correspondence"] else None
-    train_chunk=select_train_chunk(phase["max_chunks"]); completed=[]; completed_ids=[]
+    train_chunk=select_train_chunk(phase["max_chunks"]) if args.train_chunk is None else args.train_chunk
+    if not 0 <= train_chunk < phase['max_chunks']: raise ValueError('--train-chunk is outside the active curriculum')
+    completed=[]; completed_ids=[]
     source=latents[:,:,:1]; losses={}
+    probe_payload={}
     def forward_chunk(chunk,keep_graph):
         target=latents[:,:,chunk*8:chunk*8+9]
         history=native_history_16_2_1(completed,completed_ids,source)
@@ -125,16 +135,47 @@ def main():
         fm=(prediction.float()-item["target"].float()).square().mean()
         corr=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,target.device) if keep_graph and corr_rows else fm.new_zeros(())
         if keep_graph: losses.update(fm=fm,corr=corr,total=fm+trainable.lambda_corr(args.step/2500)*corr)
+        if keep_graph and args.probe_capture:
+            processor=pipe.transformer._sightline_processors[sorted(pipe.transformer._sightline_processors)[0]]
+            memory_count=processor.last_attention_meta.get('memory_tokens',0)
+            base_q=processor.last_q.detach().cpu(); base_k=processor.last_k.detach().cpu()
+            if not corr_rows: raise RuntimeError('real probe requires correspondence cache and a P3 step')
+            probe_queries,probe_positives,_=_mapped_correspondences(processor,corr_rows,chunk)
+            base_context=dict(provider.context); base_enabled=[bank.enabled for bank in runner.memory.banks.values()]
+            with torch.no_grad():
+                provider.context=dict(base_context); provider.context['c2w']=base_context['c2w'].flip(1)
+                wrong=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,prompt_mask,history,chunk*8)
+                runner.memory.set_enabled(False); provider.context=base_context
+                zero=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,prompt_mask,history,chunk*8)
+                runner.memory.set_enabled(True)
+                originals={layer:[token.hidden for token in bank.tokens] for layer,bank in runner.memory.banks.items()}
+                for bank in runner.memory.banks.values():
+                    shuffled_hidden=list(reversed([token.hidden for token in bank.tokens]))
+                    for token,hidden in zip(bank.tokens,shuffled_hidden): token.hidden=hidden
+                shuffled=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,prompt_mask,history,chunk*8)
+                for layer,hiddens in originals.items():
+                    for token,hidden in zip(runner.memory.banks[layer].tokens,hiddens): token.hidden=hidden
+                for enabled,bank in zip(base_enabled,runner.memory.banks.values()): bank.enabled=enabled
+                provider.context=base_context
+            probe_payload.update({'source':'real_helios_forward','layer':sorted(pipe.transformer._sightline_processors)[0],
+                'sigma':float(item['sigmas'].mean()),'q':base_q[:,probe_queries],'k':base_k,
+                'positive_key':torch.tensor(probe_positives,dtype=torch.long).view(1,-1).expand(base_q.shape[0],-1),
+                'k_memory':base_k[:,-memory_count:] if memory_count else base_k[:,:0],
+                'fm_loss':float(fm.detach()),'wrong_ray_loss':float((wrong.float()-item['target'].float()).square().mean()),
+                'memory_zero_loss':float((zero.float()-item['target'].float()).square().mean()),'memory_shuffle_loss':float((shuffled.float()-item['target'].float()).square().mean()),
+                'corr_loss':float(corr.detach()),'vram_gb':float(torch.cuda.max_memory_allocated()/2**30)})
         estimate=(item["noisy_latents"]-item["sigmas"].view(-1,1,1,1,1)*prediction).detach()
         for local in range(1,estimate.shape[2]): completed.append(estimate[:,:,local:local+1]); completed_ids.append(chunk*8+local)
         runner._finalize_chunk(chunk)
         return estimate
     started=time.perf_counter(); _,policies=run_single_graph_chunks(phase["max_chunks"],train_chunk,forward_chunk)
-    losses["total"].backward(); optimizer.step()
+    if args.train: losses["total"].backward(); optimizer.step()
     record_out={"step":args.step,"phase":phase["name"],"max_chunks":phase["max_chunks"],"train_chunk":train_chunk,
         "policies":policies,"flow_loss":float(losses["fm"].detach()),"corr_loss":float(losses["corr"].detach()),
         "total_loss":float(losses["total"].detach()),"step_time_sec":time.perf_counter()-started,"uses_future_gt":False}
     with Path(args.metrics).open("a") as handle: handle.write(json.dumps(record_out)+"\n")
+    if args.probe_capture:
+        probe_payload['step_time_sec']=record_out['step_time_sec']; Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
     if args.checkpoint_out:
         source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'
         fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()

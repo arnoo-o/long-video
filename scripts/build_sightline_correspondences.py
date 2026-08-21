@@ -49,20 +49,23 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
     query=xyz[query_frame].reshape(-1,3)[qi]; key=xyz[key_frame].reshape(-1,3)[ki]; depth,_=_project(query,c2w[query_frame],K[query_frame]); positive=depth[np.isfinite(depth)&(depth>0)]
     if not len(positive): return []
     threshold=float(distance_fraction*np.median(positive)); distance,q_to_k=_nn(query,key); _,k_to_q=_nn(key,query); keep=(q_to_k>=0)&(k_to_q[q_to_k]==np.arange(len(query)))&(distance<=threshold); selected=np.flatnonzero(keep); scene_mask=zbuffer_valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1); visible=_zbuffer_visible(key[q_to_k[selected]],xyz[key_frame][scene_mask],c2w[key_frame],K[key_frame],height,width) if len(selected) else []
+    token_valid_counts={}
+    for pixel in qi:
+        token=_token(pixel,height,width,token_height,token_width); token_valid_counts[token]=token_valid_counts.get(token,0)+1
     rows=[]
     for local,seen in zip(selected,visible):
         if not seen: continue
         qpixel=int(qi[local]); kpixel=int(ki[q_to_k[local]]); qy,qx=_token(qpixel,height,width,token_height,token_width); ky,kx=_token(kpixel,height,width,token_height,token_width); conf=float(np.sqrt(max(0.,confidence[query_frame].reshape(-1)[qpixel])*max(0.,confidence[key_frame].reshape(-1)[kpixel])))
-        rows.append({'query_frame':query_frame,'key_frame':key_frame,'query_pixel':qpixel,'key_pixel':kpixel,'query_y':qy,'query_x':qx,'key_y':ky,'key_x':kx,'weight':float(conf*np.exp(-float(distance[local])/max(threshold,1e-8))),'cycle_consistent':True,'cycle_type':'mutual_two_view'})
+        rows.append({'query_frame':query_frame,'key_frame':key_frame,'query_pixel':qpixel,'key_pixel':kpixel,'query_y':qy,'query_x':qx,'key_y':ky,'key_x':kx,'valid_count':token_valid_counts[(qy,qx)],'weight':float(conf*np.exp(-float(distance[local])/max(threshold,1e-8))),'cycle_consistent':True,'cycle_type':'mutual_two_view'})
     return rows
 
 def token_vote_rows(point_rows,*,token_height,token_width,min_count=1,min_coverage=0.,near_top_ratio=.9,total_frames=193):
     groups={}
     for row in point_rows:
-        key=(row['query_frame'],row['key_frame'],row['query_y'],row['query_x']); group=groups.setdefault(key,{'pixels':set(),'votes':{}}); group['pixels'].add(row['query_pixel']); target=(row['key_y'],row['key_x']); group['votes'][target]=group['votes'].get(target,0.)+float(row['weight'])
+        key=(row['query_frame'],row['key_frame'],row['query_y'],row['query_x']); group=groups.setdefault(key,{'pixels':set(),'valid_count':0,'votes':{}}); group['pixels'].add(row['query_pixel']); group['valid_count']=max(group['valid_count'],int(row.get('valid_count',0))); target=(row['key_y'],row['key_x']); group['votes'][target]=group['votes'].get(target,0.)+float(row['weight'])
     result=[]
     for (qf,kf,qy,qx),group in sorted(groups.items()):
-        matched=len(group['pixels']); valid_count=matched; coverage=matched/max(valid_count,1)
+        matched=len(group['pixels']); valid_count=group['valid_count']; coverage=matched/max(valid_count,1)
         if matched<min_count or coverage<min_coverage or not group['votes']: continue
         max_vote=max(group['votes'].values()); positives=[target for target,vote in sorted(group['votes'].items()) if vote>=max_vote*near_top_ratio]; qmembers=rgb_frame_latent_memberships(qf,total_frames=total_frames); kmembers=rgb_frame_latent_memberships(kf,total_frames=total_frames)
         for qchunk,qt in qmembers:

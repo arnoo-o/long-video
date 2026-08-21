@@ -10,6 +10,7 @@ def main():
     p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True)
     p.add_argument('--manifest',required=True,help='JSON list or records with trajectory_id and rgb_dir/rgb_path')
     p.add_argument('--out-root',required=True); p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640)
+    p.add_argument('--limit',type=int,default=0)
     a=p.parse_args(); import sys; sys.path.insert(0,a.helios_root)
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda'); pipe.vae.eval()
@@ -23,7 +24,7 @@ def main():
     provenance={'model_identity':model_identity,'vae_config':vae_config,'preprocessing':{'height':a.height,'width':a.width,'normalization':'pinned Helios video_processor'},'latent_normalization':{'mean':list(pipe.vae.config.latents_mean),'std':list(pipe.vae.config.latents_std)},'encode_mode':'mode','encoding_dtype':str(pipe.vae.dtype)}
     provenance['fingerprint']=hashlib.sha256(json.dumps(provenance,sort_keys=True,default=str).encode()).hexdigest()
     mean=torch.tensor(pipe.vae.config.latents_mean,device='cuda',dtype=pipe.vae.dtype).view(1,pipe.vae.config.z_dim,1,1,1); std=(1.0/torch.tensor(pipe.vae.config.latents_std,device='cuda',dtype=pipe.vae.dtype)).view(1,pipe.vae.config.z_dim,1,1,1)
-    for rec in records:
+    for rec in records[:a.limit or None]:
         tid=rec.get('trajectory_id') or rec.get('id')
         rgb=rec.get('rgb_dir') or rec.get('rgb_path') or rec.get('video_dir')
         if not rgb and rec.get('path'): rgb=str(Path(rec['path']).parent/'rgb_24fps')

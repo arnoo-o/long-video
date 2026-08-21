@@ -63,7 +63,6 @@ class SightlineHeliosAttnProcessor:
                 current_chunk=kwargs.get('current_chunk',0),
                 timestamp_embedding=getattr(self.memory,'timestamp',None),
                 sightline_projector=self.conditioner,
-                memory_rotary_emb=kwargs.get('memory_rotary_emb'),
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:
@@ -84,9 +83,9 @@ class SightlineRayProvider:
     def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
         self.c2w=c2w; self.intrinsics=intrinsics; self.context=None
-    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
+    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
         if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
-        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape
         context=self.context
@@ -101,6 +100,13 @@ class SightlineRayProvider:
         rays=token_rays_for_shape(c2w,intrinsics,(B,T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(B,current_count,7)
         if key_length == current_count: return rays,rays
         history=kwargs.get('history_rays',context.get('history_rays'))
+        if history is None and context.get('history_groups') is not None:
+            groups=context['history_groups']; rays_by_group=[]
+            for name,factor in (('long',4),('mid',2),('short',1)):
+                hc,hk=groups[name]
+                if H%factor or W%factor: raise RuntimeError(f'{name} history grid is incompatible with {(H,W)}')
+                rays_by_group.append(plucker_rays(hc,hk,H//factor,W//factor,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7))
+            history=torch.cat(rays_by_group,1)
         if history is None and context.get('history_cameras') is not None:
             hc=context['history_cameras']; hk=context.get('history_intrinsics')
             if hk is None: hk=intrinsics[:, :hc.shape[1]]
@@ -122,6 +128,7 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
     blocks=list(getattr(transformer,'transformer_blocks',getattr(transformer,'blocks',[])))
     if not layers: raise ValueError("Sightline selected layers must be explicit")
     installed=[]
+    if memory is not None and hasattr(memory,'bind_rope'): memory.bind_rope(transformer.rope)
     for index in layers:
         if not isinstance(index,int) or index<0 or index>=len(blocks): raise ValueError(f"invalid Helios layer {index}")
         attn=getattr(blocks[index],'attn1',None)

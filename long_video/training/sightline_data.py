@@ -65,3 +65,20 @@ def validate_latent_cache(path: str|Path, *, expected_frames=193):
             if arr.shape[temporal_axes[0]] not in (expected_frames, expected_frames-1,9,33):
                 raise ValueError(f"invalid temporal axis in {file}")
     return files
+
+def load_latent_tensor(path: str|Path, *, expected_frames=193):
+    """Load an existing latent cache as canonical [B,C,T,H,W]."""
+    import torch
+    path=Path(path); files=validate_latent_cache(path,expected_frames=expected_frames)
+    file=next((f for f in files if f.suffix in ('.npy','.pt','.pth')),None)
+    if file is None: raise ValueError(f"no supported latent tensor in {path}")
+    value=torch.load(file,map_location='cpu') if file.suffix in ('.pt','.pth') else torch.from_numpy(np.asarray(np.load(file)))
+    if isinstance(value,dict):
+        value=next((value[k] for k in ('latents','video_latents','target_latents') if k in value),None)
+    if not isinstance(value,torch.Tensor) or value.ndim not in (4,5): raise ValueError(f"unsupported latent payload in {file}")
+    if value.ndim==4: value=value.unsqueeze(0)
+    candidates=[axis for axis,size in enumerate(value.shape) if axis>0 and size in (expected_frames,expected_frames-1,49,9)]
+    if not candidates: raise ValueError(f"cannot identify latent temporal axis: {tuple(value.shape)}")
+    temporal=2 if value.shape[2] in (expected_frames,expected_frames-1,49,9) else candidates[0]
+    if temporal!=2: value=value.movedim(temporal,2)
+    return value.contiguous()

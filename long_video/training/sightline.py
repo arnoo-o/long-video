@@ -14,7 +14,7 @@ def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None
     return int(torch.randint(max_chunks,(1,),generator=generator).item())
 
 def assert_trainable_whitelist(module: nn.Module) -> None:
-    allowed=("conditioner.","timestamp.","corr_head.","lora_")
+    allowed=("conditioner.","corr_head.","memory.timestamp.","lora_")
     bad=[name for name,p in module.named_parameters() if p.requires_grad and not name.startswith(allowed)]
     if bad: raise RuntimeError(f"Sightline trainable whitelist violation: {bad[:8]}")
 
@@ -29,6 +29,15 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
         raise ValueError("invalid curriculum arguments")
     return min(maximum, 1 + step // warmup_steps)
 
+def curriculum_phase(step: int):
+    """Exact 2500-step Sightline curriculum requested by the training spec."""
+    if step < 0: raise ValueError("step must be non-negative")
+    if step < 300: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
+    if step < 1000: return {"name":"P2","max_chunks":1,"lora":True,"correspondence":True,"memory":False}
+    bounds=((1500,2),(1800,3),(2100,4),(2300,5))
+    max_chunks=next((chunks for end,chunks in bounds if step < end),6)
+    return {"name":"P3","max_chunks":max_chunks,"lora":True,"correspondence":True,"memory":True}
+
 def assert_single_backward_chunk(policies, train_chunk: int) -> None:
     if sum(policy == "backward" for policy in policies) != 1 or policies[train_chunk] != "backward":
         raise RuntimeError("exactly one train chunk may retain autograd")
@@ -41,9 +50,30 @@ def causal_chunk_plan(max_chunks: int, train_chunk: int):
     assert_single_backward_chunk(policies,train_chunk)
     return policies
 
+def native_history_16_2_1(latents, frame_ids, source_latent, source_frame_id=0):
+    """Build native long16/mid2/short(source+1) from completed latent slots."""
+    if len(latents)!=len(frame_ids): raise ValueError("latent/history identity mismatch")
+    pairs=list(zip(frame_ids,latents))[-19:]
+    pad=[(source_frame_id,source_latent)]*(19-len(pairs)); pairs=pad+pairs
+    long_pairs=pairs[:16]; mid_pairs=pairs[16:18]; short_pairs=[(source_frame_id,source_latent),pairs[18]]
+    def pack(items):
+        return torch.cat([latent for _,latent in items],dim=2),torch.tensor([frame for frame,_ in items],device=source_latent.device,dtype=torch.long).view(1,-1)
+    return {"long":pack(long_pairs),"mid":pack(mid_pairs),"short":pack(short_pairs)}
+
+def run_single_graph_chunks(max_chunks, train_chunk, forward_chunk):
+    """Execute all causal chunks while retaining exactly one autograd graph."""
+    policies=causal_chunk_plan(max_chunks,train_chunk); outputs=[]
+    for chunk,policy in enumerate(policies):
+        if policy=="backward": output=forward_chunk(chunk,True)
+        else:
+            with torch.no_grad(): output=forward_chunk(chunk,False)
+            if isinstance(output,torch.Tensor): output=output.detach()
+        outputs.append(output)
+    return outputs,policies
+
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
-        super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.timestamp=nn.Embedding(timestamp_buckets,inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
+        super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
     def correspondence(self, logits, positives, weights=None, multi_positive=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
         z=self.corr_head(logits.permute(0,2,3,1)).squeeze(-1); z=z.log_softmax(-1)

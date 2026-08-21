@@ -1,6 +1,7 @@
 """Geometry-free Sightline inference using the pinned Helios pipeline."""
 from __future__ import annotations
 import argparse, hashlib, json, sys
+from dataclasses import asdict
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -12,12 +13,14 @@ def resize_source(image, K, height=384, width=640):
     K=np.asarray(K,np.float32).copy(); K[0]*=sx; K[1]*=sy; return image,K
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int,default=2); p.add_argument('--layers',default=''); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int,default=2); p.add_argument('--layers',default=''); a=p.parse_args()
     if not 1<=a.chunks<=6: raise ValueError('--chunks must be 1..6')
     if bool(a.c2w)==bool(a.controls): raise ValueError('provide exactly one of --c2w or --controls')
+    if bool(a.checkpoint)==bool(a.alpha_zero_baseline): raise ValueError('provide --checkpoint, or explicitly select --alpha-zero-baseline')
     sys.path.insert(0,a.helios_root)
     from long_video.config import load_sightline_config
-    from long_video.sightline.conditioning import SightlineConditioner
+    from long_video.training.sightline import SightlineTrainable, install_lora
+    from long_video.training.sightline_checkpoint import restore_runtime_checkpoint
     from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
     from long_video.sightline.pipeline import SightlinePipeline
     from long_video.sightline.rays import canonicalize_c2w, temporal_group_cameras
@@ -43,11 +46,18 @@ def main():
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda')
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
-    conditioner=SightlineConditioner(inner).to('cuda',dtype=torch.bfloat16); provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
+    trainable=SightlineTrainable(inner,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.bfloat16); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
     layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
+    install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory)
+    if a.checkpoint:
+        payload=torch.load(a.checkpoint,map_location='cpu')
+        restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget})
+    else:
+        runner.memory.set_enabled(False)
+        if float(conditioner.alpha.detach()) != 0.0: raise RuntimeError('alpha-zero baseline must have alpha=0')
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K)
     frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))

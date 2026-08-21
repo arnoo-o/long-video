@@ -14,6 +14,18 @@ def latent_camera_indices(device=None) -> torch.Tensor:
     """
     return torch.tensor([group[-1] for group in TEMPORAL_GROUPS], device=device, dtype=torch.long)
 
+def rgb_frame_latent_memberships(frame_index: int, total_frames: int = 193):
+    """Map an RGB frame to all valid stride-32 chunk/latent identities."""
+    if not 0 <= frame_index < total_frames: raise ValueError("RGB frame index out of range")
+    memberships=[]
+    for chunk in range(6):
+        start=chunk*32
+        if start <= frame_index <= start+32:
+            local=frame_index-start
+            temporal=0 if local==0 else (local+3)//4
+            memberships.append((chunk,min(8,temporal)))
+    return tuple(memberships)
+
 def chunk_frame_slice(chunk_index: int) -> slice:
     if chunk_index < 0 or chunk_index > 5: raise ValueError("chunk index must be 0..5")
     return slice(32 * chunk_index, 32 * chunk_index + 33)

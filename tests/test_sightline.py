@@ -43,15 +43,53 @@ def test_history_ray_count_must_be_exact():
         provider(torch.zeros(1,4,8),key_length=9,current_length=4)
 
 def test_train_chunk_policy_is_single_and_causal():
-    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan
+    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan, run_single_graph_chunks
     train_chunk=2; policies=[chunk_grad_policy(i,train_chunk) for i in range(6)]
     assert policies[:2]==["forward_detached"]*2 and policies[2]=="backward"
     assert policies[3:]==["rollout_detached"]*3
     assert_single_backward_chunk(policies,train_chunk)
     assert causal_chunk_plan(6,2)==tuple(policies)
+    weight=torch.nn.Parameter(torch.tensor(2.)); seen=[]
+    outputs,_=run_single_graph_chunks(4,2,lambda chunk,grad: seen.append((chunk,grad)) or weight*(chunk+1))
+    assert [out.requires_grad for out in outputs]==[False,False,True,False]
 
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
+
+def test_native_history_order_matches_camera_slots():
+    from long_video.training.sightline import native_history_16_2_1
+    source=torch.zeros(1,1,1,1,1); latents=[torch.full_like(source,float(i)) for i in range(1,21)]
+    packed=native_history_16_2_1(latents,list(range(1,21)),source)
+    assert packed['long'][1].tolist()==[list(range(2,18))]
+    assert packed['mid'][1].tolist()==[[18,19]] and packed['short'][1].tolist()==[[0,20]]
+
+def test_memory_rope_uses_saved_metadata_and_second_chunk_reads():
+    class Rope:
+        def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
+    m=LongTermKVMemory(budget=8,pool=1); m.rope=Rope()
+    x=torch.randn(1,2,4); r=torch.randn(1,2,7); m.capture(x,r,1,grid_shape=(1,1,2))
+    rope=m.memory_rotary_emb(x.device)
+    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([8.,8.]))
+
+def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
+    from long_video.training.sightline import SightlineTrainable, install_lora
+    from long_video.sightline.memory import LayerKVMemoryBank
+    from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint
+    class Attn(torch.nn.Module):
+        def __init__(self): super().__init__(); self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4); self.to_out=torch.nn.ModuleList([torch.nn.Linear(4,4),torch.nn.Identity()])
+    class Block(torch.nn.Module):
+        def __init__(self): super().__init__(); self.attn1=Attn()
+    class Transformer(torch.nn.Module):
+        def __init__(self): super().__init__(); self.transformer_blocks=torch.nn.ModuleList([Block()])
+    config={'version':1}; memory_config={'layers':[0],'pool':2,'budget':8}; layers=(0,)
+    trainable=SightlineTrainable(4,heads=1); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); transformer=Transformer(); install_lora(transformer,[0])
+    trainable.conditioner.alpha.data.fill_(.7); memory.timestamp.weight.data.fill_(.3)
+    next(p for n,p in transformer.named_parameters() if 'lora_up' in n).data.fill_(.2)
+    path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,None,None,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config)
+    target=SightlineTrainable(4,heads=1); target_memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); target_transformer=Transformer(); install_lora(target_transformer,[0])
+    step=restore_runtime_checkpoint(torch.load(path),target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config)
+    assert step==12 and torch.allclose(target.conditioner.alpha,torch.tensor(.7)) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
+    assert torch.allclose(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),torch.full_like(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),.2))
 
 def test_temporal_group_camera_shapes():
     c=torch.eye(4).repeat(2,33,1,1); k=torch.eye(3).repeat(2,33,1,1); cg,kg=temporal_group_cameras(c,k); assert cg.shape==(2,9,4,4) and kg.shape==(2,9,3,3)

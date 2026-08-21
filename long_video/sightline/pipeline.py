@@ -34,10 +34,15 @@ class SightlinePipeline:
         source_camera=self._source_camera
         source_K=self._source_intrinsics
         history_slots=self.camera_history.slots(source_camera,source_K)
-        history_cameras=torch.stack([source_camera]+[camera for camera,_ in history_slots],1)
-        history_K=torch.stack([source_K]+[K for _,K in history_slots],1)
+        long_all=history_slots[:16]; mid_all=history_slots[16:18]
+        long_slots=[long_all[i] for i in (3,7,11,15)]; mid_slots=[mid_all[-1]]; short_slots=[(source_camera,source_K),history_slots[18]]
+        history_groups={
+            'long':(torch.stack([c for c,_ in long_slots],1),torch.stack([k for _,k in long_slots],1)),
+            'mid':(torch.stack([c for c,_ in mid_slots],1),torch.stack([k for _,k in mid_slots],1)),
+            'short':(torch.stack([c for c,_ in short_slots],1),torch.stack([k for _,k in short_slots],1)),
+        }
         shapes=self._stage_shapes(latents)
-        self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_cameras=history_cameras,history_intrinsics=history_K,stage_shapes=shapes,token_shape=shapes[0])
+        self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,stage_shapes=shapes,token_shape=shapes[0])
         self._pending_camera_chunk=(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))
         attention_kwargs['current_chunk']=chunk_index
         attention_kwargs['sightline_stage_shapes']=shapes

@@ -55,7 +55,8 @@ def _frame_cache(xyz, valid, confidence, c2w, K, stride=1):
         sx=np.floor(scene_uv[:,0]).astype(int) if len(points) else np.empty(0,int); sy=np.floor(scene_uv[:,1]).astype(int) if len(points) else np.empty(0,int)
         inside=(scene_z>0)&(sx>=0)&(sx<width)&(sy>=0)&(sy<height); depth=np.full((height,width),np.inf,np.float32)
         if len(points): np.minimum.at(depth,(sy[inside],sx[inside]),scene_z[inside])
-        out.append({'pixels':pixels,'points':points,'confidence':conf,'tree':tree,'median_depth':median,'depth':depth})
+        pixel_to_index=np.full(height*width,-1,np.int64); pixel_to_index[pixels]=np.arange(len(pixels),dtype=np.int64)
+        out.append({'pixels':pixels,'points':points,'confidence':conf,'tree':tree,'median_depth':median,'depth':depth,'pixel_to_index':pixel_to_index})
     return out
 
 def _token(pixel_index,height,width,token_height,token_width):
@@ -77,7 +78,7 @@ def screen_overlap(xyz,valid,confidence,query_frame,key_frame,*,screening_stride
     else: distance,_=_nn(q,k)
     count=int((distance<=float(screening_distance_threshold)).sum()); ratio=float(count/len(q)); return {'overlap_count':count,'overlap_ratio':ratio,'query_valid_sample_count':int(len(q)),'accepted':bool(count>=min_overlap_count and ratio>=min_overlap_ratio)}
 
-def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_frame,c2w,K,token_height,token_width,distance_fraction,point_stride=1,frames_cache=None):
+def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_frame,c2w,K,token_height,token_width,distance_fraction,point_stride=1,frames_cache=None,projection_radius=1,cycle_pixel_threshold=2.0):
     height,width=valid.shape[1:]; qmask=valid[query_frame]&np.isfinite(xyz[query_frame]).all(-1)&(np.linalg.norm(xyz[query_frame],axis=-1)>1e-8); kmask=valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8); qi=np.flatnonzero(qmask); ki=np.flatnonzero(kmask)
     stride=max(1,int(point_stride))
     if stride>1:
@@ -94,12 +95,24 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
     if not median: return []
     threshold=float(distance_fraction*median)
     if frames_cache is not None:
-        distance,q_to_k=kcache['tree'].query(query,k=1); reverse,_=qcache['tree'].query(key,k=1); keep=(q_to_k>=0)&(reverse[q_to_k] <= distance+1e-7)&(distance<=threshold)
+        # Geometry-directed correspondence: project query points into the key
+        # view, then choose the nearest valid 3D point in a small pixel window.
+        _, projected=_project(query,c2w[key_frame],K[key_frame]); centers=np.rint(projected).astype(np.int64)
+        best_dist=np.full(len(query),np.inf,np.float32); q_to_k=np.full(len(query),-1,np.int64)
+        radius=max(0,int(projection_radius)); key_map=kcache['pixel_to_index']
+        for dy in range(-radius,radius+1):
+            for dx in range(-radius,radius+1):
+                px=centers[:,0]+dx; py=centers[:,1]+dy; inside=(px>=0)&(px<width)&(py>=0)&(py<height)
+                flat=np.clip(py,0,height-1)*width+np.clip(px,0,width-1); indices=np.where(inside,key_map[flat],-1)
+                candidate=np.maximum(indices,0); d=np.linalg.norm(key[candidate]-query,axis=1); take=(indices>=0)&(d<best_dist)
+                best_dist=np.where(take,d,best_dist); q_to_k=np.where(take,indices,q_to_k)
+        distance=best_dist; keep=(q_to_k>=0)&(distance<=threshold)
     else:
         distance,q_to_k=_nn(query,key); _,k_to_q=_nn(key,query); keep=(q_to_k>=0)&(k_to_q[q_to_k]==np.arange(len(query)))&(distance<=threshold)
     selected=np.flatnonzero(keep)
     if len(selected) and frames_cache is not None:
         pts=key[q_to_k[selected]]; z,uv=_project(pts,c2w[key_frame],K[key_frame]); x=np.floor(uv[:,0]).astype(int); y=np.floor(uv[:,1]).astype(int); visible=(z>0)&(x>=0)&(x<width)&(y>=0)&(y<height)&(z<=kcache['depth'][np.clip(y,0,height-1),np.clip(x,0,width-1)]+1e-4)
+        _,back_uv=_project(pts,c2w[query_frame],K[query_frame]); qflat=qi[selected]; qy_pix,qx_pix=np.divmod(qflat,width); cycle=np.linalg.norm(back_uv-np.stack([qx_pix,qy_pix],axis=1),axis=1)<=float(cycle_pixel_threshold); visible &= cycle
     else:
         scene_mask=zbuffer_valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8); visible=_zbuffer_visible(key[q_to_k[selected]],xyz[key_frame][scene_mask],c2w[key_frame],K[key_frame],height,width) if len(selected) else []
     token_valid_counts={}
@@ -131,7 +144,7 @@ def _fingerprint(path):
     digest=hashlib.sha256(); digest.update(Path(path).read_bytes()); return digest.hexdigest()
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--xyz',type=Path,required=True); p.add_argument('--valid',type=Path,required=True); p.add_argument('--confidence',type=Path,required=True); p.add_argument('--out',type=Path,required=True); p.add_argument('--c2w',type=Path,required=True); p.add_argument('--intrinsics',type=Path,required=True); p.add_argument('--confidence-threshold',type=float,default=0.); p.add_argument('--distance-fraction',type=float,default=.015); p.add_argument('--token-height',type=int,required=True); p.add_argument('--token-width',type=int,required=True); p.add_argument('--min-frame-gap',type=int,default=1); p.add_argument('--screening-stride',type=int,default=32); p.add_argument('--screening-distance-threshold',type=float,default=.05); p.add_argument('--min-overlap-count',type=int,default=1); p.add_argument('--min-overlap-ratio',type=float,default=.01); p.add_argument('--min-count',type=int,default=1); p.add_argument('--min-coverage',type=float,default=0.); p.add_argument('--near-top-ratio',type=float,default=.9); p.add_argument('--point-stride',type=int,default=1); p.add_argument('--stage-a-cache',type=Path); p.add_argument('--trajectory-id',default=''); p.add_argument('--screen-only',action='store_true'); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--xyz',type=Path,required=True); p.add_argument('--valid',type=Path,required=True); p.add_argument('--confidence',type=Path,required=True); p.add_argument('--out',type=Path,required=True); p.add_argument('--c2w',type=Path,required=True); p.add_argument('--intrinsics',type=Path,required=True); p.add_argument('--confidence-threshold',type=float,default=0.); p.add_argument('--distance-fraction',type=float,default=.015); p.add_argument('--token-height',type=int,required=True); p.add_argument('--token-width',type=int,required=True); p.add_argument('--min-frame-gap',type=int,default=1); p.add_argument('--screening-stride',type=int,default=32); p.add_argument('--screening-distance-threshold',type=float,default=.05); p.add_argument('--min-overlap-count',type=int,default=1); p.add_argument('--min-overlap-ratio',type=float,default=.01); p.add_argument('--min-count',type=int,default=1); p.add_argument('--min-coverage',type=float,default=0.); p.add_argument('--near-top-ratio',type=float,default=.9); p.add_argument('--point-stride',type=int,default=1); p.add_argument('--projection-radius',type=int,default=1); p.add_argument('--cycle-pixel-threshold',type=float,default=2.0); p.add_argument('--stage-a-cache',type=Path); p.add_argument('--trajectory-id',default=''); p.add_argument('--screen-only',action='store_true'); a=p.parse_args()
     xyz=np.load(a.xyz,mmap_mode='r'); valid=np.load(a.valid,mmap_mode='r').astype(bool); confidence=np.load(a.confidence,mmap_mode='r');
     if xyz.shape[:3]!=valid.shape or confidence.shape!=valid.shape: raise ValueError('teacher arrays must share [F,H,W] shape')
     zbuffer_valid=valid.copy(); valid &= np.isfinite(confidence)&(confidence>=a.confidence_threshold); frames=valid.shape[0]; c2w=_camera_sequence(np.load(a.c2w),'c2w',frames); K=_camera_sequence(np.load(a.intrinsics),'K',frames); points=[]; candidates=[]; accepted=0
@@ -146,15 +159,15 @@ def main():
             candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
             if candidate['accepted']:
                 accepted+=1
-                if not a.screen_only: points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,query,key,c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache))
+                if not a.screen_only: points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,query,key,c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))
     if a.stage_a_cache and not a.stage_a_cache.exists() and candidates:
         a.stage_a_cache.parent.mkdir(parents=True,exist_ok=True); tmp=a.stage_a_cache.with_suffix('.tmp'); tmp.write_text(json.dumps({'metadata':cache_meta,'candidates':candidates},separators=(',',':'))); os.replace(tmp,a.stage_a_cache)
     if candidates and not a.screen_only and not points:
         for candidate in candidates:
             if candidate.get('accepted'):
-                points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,int(candidate['query_frame']),int(candidate['key_frame']),c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache))
+                points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,int(candidate['query_frame']),int(candidate['key_frame']),c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))
     rows=token_vote_rows(points,token_height=a.token_height,token_width=a.token_width,min_count=a.min_count,min_coverage=a.min_coverage,near_top_ratio=a.near_top_ratio,total_frames=frames); a.out.parent.mkdir(parents=True,exist_ok=True)
-    metadata={'schema_version':SCHEMA,'trajectory_id':a.trajectory_id,'source_height':int(valid.shape[1]),'source_width':int(valid.shape[2]),'token_grid':{'token_height':a.token_height,'token_width':a.token_width},'c2w_fingerprint':_fingerprint(a.c2w),'intrinsics_fingerprint':_fingerprint(a.intrinsics),'xyz_fingerprint':_fingerprint(a.xyz),'valid_fingerprint':_fingerprint(a.valid),'confidence_fingerprint':_fingerprint(a.confidence),'overlap_mining':{'min_frame_gap':a.min_frame_gap,'screening_stride':a.screening_stride,'screening_distance_threshold':a.screening_distance_threshold,'min_overlap_count':a.min_overlap_count,'min_overlap_ratio':a.min_overlap_ratio,'point_stride':a.point_stride},'vote':{'min_count':a.min_count,'min_coverage':a.min_coverage,'near_top_ratio':a.near_top_ratio},'candidate_pair_count':len(candidates),'accepted_pair_count':accepted,'row_count':len(rows)}
+    metadata={'schema_version':SCHEMA,'trajectory_id':a.trajectory_id,'source_height':int(valid.shape[1]),'source_width':int(valid.shape[2]),'token_grid':{'token_height':a.token_height,'token_width':a.token_width},'c2w_fingerprint':_fingerprint(a.c2w),'intrinsics_fingerprint':_fingerprint(a.intrinsics),'xyz_fingerprint':_fingerprint(a.xyz),'valid_fingerprint':_fingerprint(a.valid),'confidence_fingerprint':_fingerprint(a.confidence),'overlap_mining':{'min_frame_gap':a.min_frame_gap,'screening_stride':a.screening_stride,'screening_distance_threshold':a.screening_distance_threshold,'min_overlap_count':a.min_overlap_count,'min_overlap_ratio':a.min_overlap_ratio,'point_stride':a.point_stride,'projection_radius':a.projection_radius,'cycle_pixel_threshold':a.cycle_pixel_threshold},'vote':{'min_count':a.min_count,'min_coverage':a.min_coverage,'near_top_ratio':a.near_top_ratio},'candidate_pair_count':len(candidates),'accepted_pair_count':accepted,'row_count':len(rows)}
     tmp=a.out.with_suffix(a.out.suffix+'.tmp'); tmp.write_text(json.dumps({**metadata,'rows':rows},separators=(',',':'))); os.replace(tmp,a.out)
 
 if __name__=='__main__': main()

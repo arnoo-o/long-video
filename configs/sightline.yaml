@@ -6,8 +6,8 @@ alpha_init: 0.0
 history_sizes: [16, 2, 1]
 chunk_length: 33
 chunk_stride: 32
-sightline_layers: [0]
-memory_layers: [0]
+sightline_layers: []
+memory_layers: []
 correspondence_layers: []
 lora_layers: []
 lora_rank: 8
@@ -22,10 +22,6 @@ warmup_ratio: 0.04
 grad_clip: 1.0
 bf16: true
 accumulation_steps: 1
-high_noise_bias: 0.0
-teacher_forcing_ratio: 1.0
-self_rollout_ratio: 0.0
-memory_write_sigma: 0.0
 correspondence_rows_per_batch: 1024
 gradient_checkpointing: true
 diagnostics_frequency: 10
@@ -39,6 +35,6 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v1
-sightline_correspondence_schema_version: sightline-correspondence-v2
-sightline_checkpoint_schema_version: sightline-checkpoint-v2
+sightline_training_semantics_version: sightline-v3
+sightline_correspondence_schema_version: sightline-correspondence-v5
+sightline_checkpoint_schema_version: sightline-checkpoint-v5

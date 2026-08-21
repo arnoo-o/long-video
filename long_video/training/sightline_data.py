@@ -108,3 +108,21 @@ def load_latent_tensor(path: str|Path, *, schema=None):
     result=torch.cat([values[0]]+[value[:,:,1:] for value in values[1:]],dim=2)
     if result.shape[2]!=49: raise RuntimeError('6x9 overlap latent cache did not produce 49 latents')
     return result.contiguous()
+
+def require_overlap_validation(path: str|Path, *, expected_provenance: str) -> dict:
+    """Reject overlap caches unless a matching continuous-VAE validation passed."""
+    path=Path(path); candidate=path/'latent_validation.json' if path.is_dir() else path.with_suffix('.validation.json')
+    if not candidate.is_file(): raise RuntimeError(f'overlap_chunks_6x9 requires a passed validation file: {candidate}')
+    payload=json.loads(candidate.read_text())
+    if payload.get('passed') is not True or payload.get('model_provenance')!=expected_provenance:
+        raise RuntimeError('overlap latent validation is missing, failed, or belongs to another VAE/model provenance')
+    return payload
+
+def resolve_continuous_latent_cache(record: SightlineRecord, *, cache_root: str|Path|None = None) -> Path:
+    """Resolve the canonical continuous-49 cache for manifests without inline cache keys."""
+    if 'gt_latent_cache' in record.raw: return record.path('gt_latent_cache')
+    if 'latent_cache' in record.raw: return record.path('latent_cache')
+    if cache_root:
+        path=Path(cache_root)/record.trajectory_id/'continuous_49.pt'
+        if path.is_file(): return path
+    raise FileNotFoundError(f'{record.trajectory_id}: no continuous_49 latent cache; set --latent-cache-root or config latent_cache_path')

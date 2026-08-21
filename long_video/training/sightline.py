@@ -14,7 +14,7 @@ def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None
     return int(torch.randint(max_chunks,(1,),generator=generator).item())
 
 def assert_trainable_whitelist(module: nn.Module) -> None:
-    allowed=("conditioner.","corr_head.","memory.timestamp.","lora_")
+    allowed=("conditioner.","memory.timestamp.","lora_")
     bad=[name for name,p in module.named_parameters() if p.requires_grad and not name.startswith(allowed)]
     if bad: raise RuntimeError(f"Sightline trainable whitelist violation: {bad[:8]}")
 
@@ -50,16 +50,6 @@ def causal_chunk_plan(max_chunks: int, train_chunk: int):
     assert_single_backward_chunk(policies,train_chunk)
     return policies
 
-def native_history_16_2_1(latents, frame_ids, source_latent, source_frame_id=0):
-    """Build native long16/mid2/short(source+1) from completed latent slots."""
-    if len(latents)!=len(frame_ids): raise ValueError("latent/history identity mismatch")
-    pairs=list(zip(frame_ids,latents))[-19:]
-    pad=[(source_frame_id,source_latent)]*(19-len(pairs)); pairs=pad+pairs
-    long_pairs=pairs[:16]; mid_pairs=pairs[16:18]; short_pairs=[(source_frame_id,source_latent),pairs[18]]
-    def pack(items):
-        return torch.cat([latent for _,latent in items],dim=2),torch.tensor([frame for frame,_ in items],device=source_latent.device,dtype=torch.long).view(1,-1)
-    return {"long":pack(long_pairs),"mid":pack(mid_pairs),"short":pack(short_pairs)}
-
 def run_single_graph_chunks(max_chunks, train_chunk, forward_chunk):
     """Execute all causal chunks while retaining exactly one autograd graph."""
     policies=causal_chunk_plan(max_chunks,train_chunk); outputs=[]
@@ -80,14 +70,18 @@ def selected_qk_logits(query, key, query_indices):
 
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
-        super().__init__(); self.conditioner=SightlineConditioner(inner_dim); self.corr_head=nn.Sequential(nn.Linear(heads,heads),nn.SiLU(),nn.Linear(heads,1))
+        super().__init__(); self.conditioner=SightlineConditioner(inner_dim)
     def correspondence(self, logits, positives, weights=None, multi_positive=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
-        z=self.corr_head(logits.permute(0,2,3,1)).squeeze(-1); z=z.log_softmax(-1)
+        z=torch.logsumexp(logits.log_softmax(-1),dim=1)-math.log(logits.shape[1])
         if multi_positive is not None:
             rows=[]
             for q,keys in multi_positive: rows.append(-torch.logsumexp(z[:,q,keys],-1).mean())
-            return torch.stack(rows).mean() if rows else z.new_zeros(())
+            if not rows: return z.new_zeros(())
+            values=torch.stack(rows)
+            if weights is not None:
+                weights=weights.to(device=values.device,dtype=values.dtype); return (values*weights).sum()/weights.sum().clamp_min(1e-8)
+            return values.mean()
         return correspondence_loss(z.reshape(-1,z.shape[-1]),positives.reshape(-1),weights)
     @staticmethod
     def lambda_corr(progress, start=.4, initial=.02, final=.005):
@@ -95,7 +89,7 @@ class SightlineTrainable(nn.Module):
         return initial+(final-initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
         alpha=self.conditioner.alpha.detach(); grad=self.conditioner.alpha.grad
-        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':float(self.conditioner.q_proj[0].weight.grad.norm()) if self.conditioner.q_proj[0].weight.grad is not None else 0.0,'ek_grad_norm':float(self.conditioner.k_proj[0].weight.grad.norm()) if self.conditioner.k_proj[0].weight.grad is not None else 0.0}
+        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':float(self.conditioner.q_proj.weight.grad.norm()) if self.conditioner.q_proj.weight.grad is not None else 0.0,'ek_grad_norm':float(self.conditioner.k_proj.weight.grad.norm()) if self.conditioner.k_proj.weight.grad is not None else 0.0}
 
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):

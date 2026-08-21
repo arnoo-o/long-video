@@ -5,6 +5,40 @@ from typing import Any, Iterable
 import torch
 from .rays import latent_camera_indices
 
+def native_helios_indices(device=None, batch_size=1):
+    """Pinned Helios source/history/current RoPE slots, independent of global identity."""
+    def row(values): return torch.tensor(values,device=device,dtype=torch.long).view(1,-1).expand(batch_size,-1)
+    return {'long':row(range(1,17)),'mid':row((17,18)),'short':row((0,19)),'current':row(range(20,29))}
+
+class NativeHistoryState:
+    """One causal FIFO shared by training, rollout and inference."""
+    def __init__(self, source_latent, fake_image_latent=None):
+        if source_latent.ndim!=5 or source_latent.shape[2]!=1: raise ValueError('source latent must be [B,C,1,H,W]')
+        self.source=source_latent; zero=torch.zeros_like(source_latent); tail=zero if fake_image_latent is None else fake_image_latent
+        if tail.shape!=source_latent.shape: raise ValueError('fake image latent must match source latent')
+        self._entries=[(None,zero) for _ in range(18)]+[(None,tail)]
+    def groups(self):
+        long=self._entries[:16]; mid=self._entries[16:18]; short=[(0,self.source),self._entries[18]]
+        indices=native_helios_indices(self.source.device,self.source.shape[0])
+        def pack(entries,name): return (torch.cat([value for _,value in entries],2),indices[name])
+        return {'long':pack(long,'long'),'mid':pack(mid,'mid'),'short':pack(short,'short')}
+    def coverage(self):
+        ids=[identity for identity,_ in self._entries]
+        return {'long':tuple(tuple(x for x in ids[i:i+4] if x is not None) for i in range(0,16,4)),
+                'mid':(tuple(x for x in ids[16:18] if x is not None),),
+                'short':((0,),tuple(x for x in ids[18:19] if x is not None))}
+    def validity(self):
+        ids=[identity for identity,_ in self._entries]
+        return {'long':tuple(any(x is not None for x in ids[i:i+4]) for i in range(0,16,4)),
+                'mid':(any(x is not None for x in ids[16:18]),),
+                'short':(True,True)}
+    def append_chunk(self, chunk, chunk_index):
+        if chunk.ndim!=5 or chunk.shape[2]!=9: raise ValueError('history chunk must have 9 latents')
+        start=0 if chunk_index==0 else 1
+        for temporal in range(start,9): self._entries.append((chunk_index*8+temporal,chunk[:,:,temporal:temporal+1].detach()))
+        self._entries=self._entries[-19:]
+    def global_ids(self): return tuple(identity for identity,_ in self._entries)
+
 @dataclass(frozen=True)
 class HistoryLayout:
     source: int
@@ -77,3 +111,6 @@ class CameraHistoryState:
         last=max(self._items); keys=list(range(max(0,last-18),last+1))
         return tuple([0]*(19-len(keys))+keys)
     def indices(self): return tuple(sorted(self._items))
+    def camera_for(self, global_id, source_camera, source_intrinsics=None):
+        if global_id is None or global_id not in self._items: return source_camera,source_intrinsics
+        _,camera,K=self._items[global_id]; return camera,K if K is not None else source_intrinsics

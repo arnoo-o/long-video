@@ -5,10 +5,18 @@ from pathlib import Path
 import numpy as np
 from long_video.sightline.rays import rgb_frame_latent_memberships
 
-SCHEMA='sightline-correspondence-v2'
+SCHEMA='sightline-correspondence-v4'
+PAIR_OFFSETS=(-128,-96,-64,-33,-1,1,33,64,96,128)
 
 def correspondence_identity(row):
     return tuple(row[key] for key in ('query_chunk','key_chunk','query_latent_temporal','key_latent_temporal','query_y','query_x','key_y','key_x'))
+
+def aggregate_token_rows(rows):
+    aggregated={}
+    for row in rows:
+        identity=correspondence_identity(row); previous=aggregated.get(identity)
+        if previous is None or row['weight']>previous['weight']: aggregated[identity]=row
+    return [aggregated[key] for key in sorted(aggregated)]
 
 def _camera_sequence(array,name,frames=193):
     array=np.asarray(array)
@@ -63,6 +71,8 @@ def _point_rows(xyz,valid,zbuffer_valid,confidence,frame_x,frame_y,c2w,K,token_h
     visible=_zbuffer_visible(key[q_to_k[selected]],xyz[frame_y][scene_mask],c2w[frame_y],K[frame_y],height,width); rows=[]
     for local,seen in zip(selected,visible):
         if not seen: continue
+        cycle_consistent=bool(k_to_q[q_to_k[local]]==local)
+        if not cycle_consistent: continue
         qpixel=int(qi[local]); kpixel=int(ki[q_to_k[local]])
         qy,qx=_token(qpixel,height,width,token_height,token_width); ky,kx=_token(kpixel,height,width,token_height,token_width)
         qmembers=rgb_frame_latent_memberships(frame_x,total_frames=valid.shape[0]); kmembers=rgb_frame_latent_memberships(frame_y,total_frames=valid.shape[0])
@@ -73,7 +83,11 @@ def _point_rows(xyz,valid,zbuffer_valid,confidence,frame_x,frame_y,c2w,K,token_h
                 rows.append({'query_frame':frame_x,'key_frame':frame_y,'query_chunk_memberships':[x[0] for x in qmembers],'key_chunk_memberships':[x[0] for x in kmembers],
                     'query_chunk':qchunk,'key_chunk':kchunk,'query_latent_temporal':qt,'key_latent_temporal':kt,'query_y':qy,'query_x':qx,'key_y':ky,'key_x':kx,
                     'query_token_index':qy*token_width+qx,'positive_key_index':ky*token_width+kx,'stage':{'token_height':token_height,'token_width':token_width},
-                    'weight':float(weight),'cycle_consistent':True,'pair_type':'long_gap_revisit' if abs(frame_x-frame_y)>32 else ('cross_chunk' if qchunk!=kchunk else 'intra_chunk')})
+                    'weight':float(weight),'cycle_consistent':cycle_consistent,'cycle_type':'mutual_two_view',
+                    'query_global':int(qchunk*8+qt),'key_global':int(kchunk*8+kt),
+                    'latent_gap':int(abs(qchunk*8+qt-(kchunk*8+kt))),
+                    'memory_only':bool((qchunk*8+qt)>(kchunk*8+kt) and (qchunk*8+qt-(kchunk*8+kt))>19 and (kchunk*8+kt)!=0),
+                    'pair_type':'long_gap_revisit' if abs(frame_x-frame_y)>32 else ('cross_chunk' if qchunk!=kchunk else 'intra_chunk')})
     return rows
 
 def main():
@@ -83,9 +97,10 @@ def main():
     zbuffer_valid=valid.copy(); valid &= np.isfinite(confidence)&(confidence>=args.confidence_threshold)
     frames=valid.shape[0]; c2w=_camera_sequence(np.load(args.c2w),'c2w',frames); K=_camera_sequence(np.load(args.intrinsics),'K',frames); rows=[]
     for query_frame in range(frames):
-        for key_frame in (query_frame+1,query_frame+33,query_frame+64):
-            if key_frame<frames: rows.extend(_point_rows(xyz,valid,zbuffer_valid,confidence,query_frame,key_frame,c2w,K,args.token_height,args.token_width,args.distance_fraction))
-    rows=list({correspondence_identity(row):row for row in rows}.values()); args.out.parent.mkdir(parents=True,exist_ok=True)
-    args.out.write_text(json.dumps({'schema_version':SCHEMA,'token_grid':{'source_height':valid.shape[1],'source_width':valid.shape[2],'token_height':args.token_height,'token_width':args.token_width},'rows':rows},separators=(',',':')))
+        for offset in PAIR_OFFSETS:
+            key_frame=query_frame+offset
+            if 0<=key_frame<frames: rows.extend(_point_rows(xyz,valid,zbuffer_valid,confidence,query_frame,key_frame,c2w,K,args.token_height,args.token_width,args.distance_fraction))
+    rows=aggregate_token_rows(rows); args.out.parent.mkdir(parents=True,exist_ok=True)
+    args.out.write_text(json.dumps({'schema_version':SCHEMA,'pair_offsets':list(PAIR_OFFSETS),'token_grid':{'source_height':valid.shape[1],'source_width':valid.shape[2],'token_height':args.token_height,'token_width':args.token_width},'rows':rows},separators=(',',':')))
 
 if __name__=='__main__': main()

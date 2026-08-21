@@ -3,13 +3,31 @@ from __future__ import annotations
 import hashlib,json,random
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v1'; SCHEMA='sightline-checkpoint-v2'
+SEMANTICS='sightline-v2'; SCHEMA='sightline-checkpoint-v4'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
-def runtime_provenance(pipe, model_id, helios_root):
+def _file_sha(path): return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+def runtime_provenance(pipe, model_id, helios_root, model_revision=None):
     root=Path(helios_root); transformer=root/'helios/diffusers_version/transformer_helios_diffusers.py'; pipeline=root/'helios/diffusers_version/pipeline_helios_diffusers.py'
     if not transformer.is_file() or not pipeline.is_file(): raise FileNotFoundError('pinned Helios source files are required for provenance')
-    model_path=Path(model_id); identity_file=model_path/'model_index.json'
-    model_identity=hashlib.sha256(identity_file.read_bytes()).hexdigest() if identity_file.is_file() else hashlib.sha256(str(model_id).encode()).hexdigest()
+    model_path=Path(model_id); local=model_path.is_dir(); transformer_config=config_fingerprint(dict(pipe.transformer.config))
+    if local:
+        model_index=_file_sha(model_path/'model_index.json')
+        if model_index is None: raise RuntimeError('local model provenance requires model_index.json')
+        weight_indices=sorted(model_path.rglob('*.safetensors.index.json'))+sorted(model_path.rglob('*.bin.index.json'))
+        if weight_indices:
+            weight_identity=[(str(path.relative_to(model_path)),_file_sha(path)) for path in weight_indices]
+            weight_identity_kind='weight_index'
+        else:
+            weight_files=sorted((*model_path.rglob('*.safetensors'),*model_path.rglob('*.bin')))
+            if not weight_files: raise RuntimeError('local model provenance found no weight index or weight files')
+            weight_identity=[(str(path.relative_to(model_path)),path.stat().st_size) for path in weight_files]
+            weight_identity_kind='weight_layout'
+        weight_fingerprint=config_fingerprint(weight_identity)
+        model_identity={'kind':'local','model_index_sha256':model_index,'transformer_config_sha256':transformer_config,'weight_identity_kind':weight_identity_kind,'weight_identity_sha256':weight_fingerprint}
+    else:
+        revision=model_revision or getattr(pipe.config,'_commit_hash',None)
+        if not revision: raise RuntimeError('HF model provenance requires an explicit revision/commit')
+        model_identity={'kind':'huggingface','revision':str(revision),'transformer_config_sha256':transformer_config}
     scheduler_config=dict(pipe.scheduler.config)
     return {'transformer_source_sha256':hashlib.sha256(transformer.read_bytes()).hexdigest(),'pipeline_source_sha256':hashlib.sha256(pipeline.read_bytes()).hexdigest(),'scheduler_class':type(pipe.scheduler).__module__+'.'+type(pipe.scheduler).__qualname__,'scheduler_config_sha256':config_fingerprint(scheduler_config),'model_id':str(model_id),'model_identity':model_identity}
 def save_checkpoint(path, model, optimizer, scheduler, step, *, config, helios_fingerprint, layers, memory_config):

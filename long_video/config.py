@@ -7,7 +7,7 @@ class SightlineConfig:
     ray_epsilon: float; scale_augmentation_probability: float; scale_augmentation_range: tuple[float,float]; sightline_enabled:bool; alpha_init:float
     history_sizes: tuple[int,int,int]; chunk_length:int; chunk_stride:int; sightline_layers:tuple[int,...]; memory_layers:tuple[int,...]; correspondence_layers:tuple[int,...]
     lora_layers:tuple[int,...]; lora_rank:int; memory_pool:int; memory_budget:int; lambda_corr:float; lambda_corr_final:float
-    lambda_corr_decay_start:float; learning_rate:float; lora_learning_rate:float; warmup_ratio:float; grad_clip:float; bf16:bool; accumulation_steps:int; high_noise_bias:float; teacher_forcing_ratio:float; self_rollout_ratio:float; memory_write_sigma:float; correspondence_rows_per_batch:int; gradient_checkpointing:bool; diagnostics_frequency:int; phase:str; model_id:str; source_height:int; source_width:int; chunk_count:int; pyramid_steps:tuple[int,...]; data_path:str; latent_cache_path:str; correspondence_cache_path:str; output_path:str
+    lambda_corr_decay_start:float; learning_rate:float; lora_learning_rate:float; warmup_ratio:float; grad_clip:float; bf16:bool; accumulation_steps:int; correspondence_rows_per_batch:int; gradient_checkpointing:bool; diagnostics_frequency:int; phase:str; model_id:str; source_height:int; source_width:int; chunk_count:int; pyramid_steps:tuple[int,...]; data_path:str; latent_cache_path:str; correspondence_cache_path:str; output_path:str
     sightline_training_semantics_version:str; sightline_correspondence_schema_version:str; sightline_checkpoint_schema_version:str
 def load_sightline_config(path: str|Path) -> SightlineConfig:
     raw=yaml.safe_load(Path(path).read_text()) or {}; allowed=set(SightlineConfig.__dataclass_fields__)

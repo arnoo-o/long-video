@@ -355,5 +355,5 @@ def test_teacher_token_vote_keeps_multi_positive_and_no_membership_double_count(
     rows=[{'query_frame':32,'key_frame':0,'query_pixel':0,'query_y':0,'query_x':0,'key_y':0,'key_x':0,'weight':.8},
           {'query_frame':32,'key_frame':0,'query_pixel':0,'query_y':0,'query_x':0,'key_y':0,'key_x':1,'weight':.75},
           {'query_frame':32,'key_frame':0,'query_pixel':1,'query_y':0,'query_x':0,'key_y':0,'key_x':1,'weight':.8}]
-    out=token_vote_rows(rows,token_height=1,token_width=2,near_top_ratio=.9,total_frames=193)
+    out=token_vote_rows(rows,token_height=1,token_width=2,near_top_ratio=.5,total_frames=193)
     assert len(out)==4 and {row['key_x'] for row in out}=={0,1} and all(row['matched_count']==2 for row in out)

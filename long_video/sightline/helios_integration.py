@@ -57,7 +57,7 @@ class SightlineHeliosAttnProcessor:
         if getattr(attn,'restrict_self_attn',False) and history_len:
             key=key[:,:history_len]; value=value[:,:history_len]
         if self.memory is not None:
-            memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None); memory_kwargs.pop('memory_rotary_emb',None)
+            memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None); memory_kwargs.pop('memory_rotary_emb',None); memory_kwargs.pop('current_chunk',None)
             key,value,self.last_attention_meta=self.memory.append_native_attention(
                 attn,key,value,rotary_emb,self.rotary_apply,
                 current_chunk=kwargs.get('current_chunk',0),
@@ -71,6 +71,8 @@ class SightlineHeliosAttnProcessor:
                     raise ValueError('attention mask key axis does not match key length before memory')
                 pad=torch.zeros((*attention_mask.shape[:-1],mem_count),device=attention_mask.device,dtype=attention_mask.dtype)
                 attention_mask=torch.cat((attention_mask,pad),dim=-1)
+            if attention_mask is not None and attention_mask.shape[-1] != key.shape[1]:
+                raise RuntimeError('attention mask key axis must equal final K length')
         self.last_q=query; self.last_k=key
         self.last_value=value
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)

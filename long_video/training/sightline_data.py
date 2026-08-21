@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 REQUIRED_RECORD_KEYS=("trajectory_id","rgb_dir","target_c2w_local","intrinsics")
-OPTIONAL_CACHE_KEYS=("latent_cache","gt_latent_cache","recal_xyz","recal_valid","recal_confidence","recal_pointmap")
+OPTIONAL_CACHE_KEYS=("latent_cache","gt_latent_cache","recal_xyz","recal_valid","recal_confidence","recal_pointmap","correspondence_cache")
 @dataclass(frozen=True)
 class SightlineRecord:
     raw: dict; root: Path

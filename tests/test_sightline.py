@@ -70,6 +70,22 @@ def test_memory_rope_uses_saved_metadata_and_second_chunk_reads():
     x=torch.randn(1,2,4); r=torch.randn(1,2,7); m.capture(x,r,1,grid_shape=(1,1,2))
     rope=m.memory_rotary_emb(x.device)
     assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([8.,8.]))
+    class Attn:
+        heads=2; to_k=torch.nn.Linear(4,4); to_v=torch.nn.Linear(4,4); norm_k=torch.nn.Identity()
+    key=torch.randn(1,3,2,2); value=torch.randn(1,3,2,2)
+    final_k,final_v,meta=m.append_native_attention(Attn(),key,value,None,lambda tensor,rotary:tensor,current_chunk=2)
+    assert final_k.shape[1]==final_v.shape[1]==5 and meta['memory_tokens']==2
+
+def test_memory_append_extends_attention_mask_to_final_key_length():
+    class Rope:
+        def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
+    memory=LongTermKVMemory(budget=4,pool=1); memory.rope=Rope(); memory.capture(torch.randn(1,1,8),torch.randn(1,1,7),0,grid_shape=(1,1,1))
+    class A:
+        heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
+    attn=A(); conditioner=SightlineConditioner(8); provider=lambda h,**kw:(torch.zeros(h.shape[0],h.shape[1],7),torch.zeros(h.shape[0],h.shape[1],7))
+    def dispatch(q,k,v,**kwargs): assert kwargs['attn_mask'].shape[-1]==k.shape[1]; return v[:,:q.shape[1]]
+    proc=SightlineHeliosAttnProcessor(conditioner,provider,memory=memory,qkv_projection=lambda a,h,e:(a.to_q(h),a.to_k(h),a.to_v(h)),rotary_apply=lambda x,r:x,attention_dispatch=dispatch)
+    proc(attn,torch.randn(1,2,8),attention_mask=torch.zeros(1,1,1,2),rotary_emb=torch.zeros(1,2,4),original_context_length=2,current_chunk=1)
 
 def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     from long_video.training.sightline import SightlineTrainable, install_lora

@@ -16,11 +16,12 @@ class SightlineHeliosAttnProcessor:
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
-        self.last_hidden_states=None; self.last_current_length=None
+        self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
         if self.qkv_projection is None or self.rotary_apply is None or self.attention_dispatch is None:
             raise RuntimeError("Sightline processor is not bound to pinned Helios primitives")
+        self.last_attention_bias=None
         query,key,value=self.qkv_projection(attn,hidden_states,encoder_hidden_states)
         query=attn.norm_q(query); key=attn.norm_k(key)
         query=query.unflatten(2,(attn.heads,-1)); key=key.unflatten(2,(attn.heads,-1)); value=value.unflatten(2,(attn.heads,-1))
@@ -44,7 +45,9 @@ class SightlineHeliosAttnProcessor:
                 for name in ('long','mid','short'):
                     _,h,w=shapes[name]; flags.extend(bool(flag) for flag in validity[name] for _ in range(h*w))
                 if len(flags)!=key.shape[1]-current_len: raise RuntimeError('history validity does not match native token count')
-                dk[:,:len(flags)]=dk[:,:len(flags)].masked_fill(~torch.tensor(flags,device=dk.device,dtype=torch.bool).view(1,-1,1,1),0)
+                valid_mask=torch.tensor(flags,device=dk.device,dtype=torch.bool).view(1,-1,1,1)
+                dk=torch.cat((dk[:,:len(flags)].masked_fill(~valid_mask,0),dk[:,len(flags):]),dim=1)
+                dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         query=query+dq; key=key+dk
         history_len=max(0,key.shape[1]-current_len)
@@ -64,6 +67,7 @@ class SightlineHeliosAttnProcessor:
             if history_bias.ndim==1: history_bias=history_bias.unsqueeze(0)
             if history_bias.shape != (query.shape[0],key.shape[1]): raise ValueError('native history bias does not match key length')
             additive=history_bias[:,None,None,:]
+            self.last_attention_bias=history_bias
             attention_mask=additive if attention_mask is None else attention_mask.to(additive)+additive
         if getattr(attn,'restrict_self_attn',False) and history_len:
             key=key[:,:history_len]; value=value[:,:history_len]

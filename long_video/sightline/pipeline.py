@@ -45,6 +45,7 @@ class SightlinePipeline:
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
+            processor.last_attention_bias=None
             processor.last_attention_meta={}; processor.last_current_length=None
 
     def _stage_shapes(self, latents):

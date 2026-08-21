@@ -54,14 +54,9 @@ def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), devi
         timesteps=scheduler.timesteps_per_stage[stage][cpu_indices].to(device=device)
         sigmas=scheduler.sigmas_per_stage[stage][cpu_indices].to(device=device,dtype=start_point.dtype)
         while sigmas.ndim<start_point.ndim: sigmas=sigmas.unsqueeze(-1)
-        if bool(scheduler.config.get('use_dynamic_shifting',False)):
-            sigmas=_apply_schedule_shift(sigmas,start_point,scheduler.config)
-            stage_timesteps=scheduler.timesteps_per_stage[stage].to(device=device,dtype=sigmas.dtype)
-            timesteps=stage_timesteps.min()+sigmas*(stage_timesteps.max()-stage_timesteps.min())
-            while timesteps.ndim>1: timesteps=timesteps.squeeze(-1)
         sigma=sigmas
         noisy=sigma*start_point+(1-sigma)*end_point
         for name,tensor in {'noisy':noisy,'target':start_point-end_point,'start':start_point,'end':end_point}.items():
             if tensor.shape!=current.shape: raise RuntimeError(f'stage {stage} {name} shape mismatch: {tensor.shape} vs {current.shape}')
-        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'use_dynamic_shifting':bool(scheduler.config.get('use_dynamic_shifting',False))})
+        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'use_dynamic_shifting':False})
     return items

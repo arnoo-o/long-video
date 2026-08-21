@@ -74,7 +74,7 @@ def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk):
         latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
         latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
         latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],
-        attention_kwargs={'current_chunk':chunk},device=source.device,transformer_dtype=source.dtype,progress_bar=Progress())
+        attention_kwargs={'current_chunk':chunk},device=source.device,transformer_dtype=pipe.transformer.dtype,progress_bar=Progress())
 
 def _load_correspondence(path):
     payload=json.loads(Path(path).read_text())
@@ -104,36 +104,59 @@ def _mapped_correspondences(processor,rows,chunk):
         native.sort(key=lambda index:{'short':0,'mid':1,'long':2}[identities[index][4]])
         memory=[i for i,identity in enumerate(identities) if identity[0]=='memory' and identity[1]==(global_key,) and identity[2:4]==(ky//2,kx//2)]
         current_keys=[i for i,identity in enumerate(identities) if identity[0]=='current' and identity[1]==(global_key,) and identity[2:4]==(ky,kx)]
-        candidates=native or current_keys or memory
+        source_keys=[i for i,identity in enumerate(identities) if identity[0]=='source' and global_key in identity[1] and identity[2:4]==(ky,kx)]
+        # Preserve every legal representation of the teacher identity on the
+        # actual key axis.  Source/native/current/memory are diagnostics only.
+        candidates=sorted(set(native + current_keys + source_keys + memory))
         if not candidates: continue
-        ki=candidates[0]
-        if 0<=qi<q.shape[1] and 0<=ki<k.shape[1]:
+        if 0<=qi<q.shape[1]:
             bucket=grouped.setdefault(qi,{})
-            bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(row['weight'])), 'memory' if memory and not native and not current_keys else ('native' if native else 'current'))
+            for ki in candidates:
+                if 0<=ki<k.shape[1]:
+                    source='memory' if ki in memory else ('native' if ki in native else ('source' if ki in source_keys else 'current'))
+                    bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(row['weight'])),source)
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
-    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]; sources=['memory' if any(value[1]=='memory' for value in grouped[query].values()) else ('native' if any(value[1]=='native' for value in grouped[query].values()) else 'current') for query in selected]
+    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]; sources=['memory' if any(value[1]=='memory' for value in grouped[query].values()) and not any(value[1] in ('source','native','current') for value in grouped[query].values()) else ('native' if any(value[1]=='native' for value in grouped[query].values()) else ('source' if any(value[1]=='source' for value in grouped[query].values()) else 'current')) for query in selected]
     return selected,positives,weights,sources
 
-def _corr_loss(trainable,processors,rows,chunk,layers,max_rows):
+def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
     missing=[layer for layer in layers if layer not in processors]
     if missing: raise RuntimeError(f'correspondence layers have no Sightline processor: {missing}')
     losses=[]
     for layer in layers:
-        processor=processors[layer]; selected,positives,weights,sources=_mapped_correspondences(processor,rows,chunk)
+        processor=processors[layer]
+        try:
+            selected,positives,weights,sources=_mapped_correspondences(processor,rows,chunk)
+        except RuntimeError as exc:
+            if 'do not map' not in str(exc): raise
+            continue
         if len(selected)>max_rows:
             memory_indices=[i for i,source in enumerate(sources) if source=='memory']; other_indices=[i for i,source in enumerate(sources) if source!='memory']
-            keep_memory=memory_indices[:1] if memory_indices else []; remaining=max_rows-len(keep_memory); pool=other_indices+memory_indices[len(keep_memory):]; choice=keep_memory+pool[:remaining]
+            generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed) & ((1<<63)-1))
+            order=torch.randperm(len(selected),generator=generator).tolist()
+            choice=([memory_indices[0]] if memory_indices else []) + [i for i in order if i not in memory_indices[:1]]
+            choice=choice[:max_rows]
             selected=[selected[i] for i in choice]; positives=[positives[i] for i in choice]; weights=[weights[i] for i in choice]
+        if not selected: continue
         numerator=processor.last_q.new_zeros(()); denominator=processor.last_q.new_zeros(())
         for start in range(0,len(selected),64):
             stop=min(start+64,len(selected)); sampled=selected_qk_logits(processor.last_q,processor.last_k,selected[start:stop])
             if not sampled.requires_grad or not processor.last_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd; disable incompatible gradient checkpointing')
             block_positive=[(index,keys) for index,keys in enumerate(positives[start:stop])]
             weight=torch.tensor(weights[start:stop],device=sampled.device)
-            block_loss=trainable.correspondence(sampled,None,weight,multi_positive=block_positive)
+            additive_bias=None
+            if getattr(processor,'last_attention_bias',None) is not None:
+                bias=processor.last_attention_bias
+                q_indices=selected[start:stop]
+                if bias.ndim==2: additive_bias=bias
+                elif bias.ndim==3: additive_bias=bias.unsqueeze(1)
+                elif bias.ndim==4: additive_bias=bias[:,:,q_indices,:]
+                else: raise RuntimeError('unsupported captured attention bias shape')
+            block_loss=trainable.correspondence(sampled,None,weight,multi_positive=block_positive,additive_bias=additive_bias)
             numerator=numerator+block_loss*weight.sum(); denominator=denominator+weight.sum()
         losses.append(numerator/denominator.clamp_min(1e-8))
+    if not losses: return processor.last_q.new_zeros(())
     return torch.stack(losses).mean()
 
 def _reset_sequence(runner):
@@ -213,7 +236,7 @@ def main():
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
                     stage_losses.append((prediction.float()-item['target'].float()).square().mean())
                 fm=torch.stack(stage_losses).mean()
-                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch) if (corr_rows and not args.alpha_zero_baseline) else fm.new_zeros(())
+                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)) if (corr_rows and not args.alpha_zero_baseline) else fm.new_zeros(())
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
                 losses.update(fm=fm,corr=corr,total=fm+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr,stage=stage_losses)
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
@@ -244,7 +267,9 @@ def main():
             if chunk==0: generated[:,:,0:1]=source
             history_state.append_chunk(generated,chunk)
             runner._finalize_chunk(chunk)
-            for processor in pipe.transformer._sightline_processors.values(): processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
+            for processor in pipe.transformer._sightline_processors.values():
+                processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
+                processor.last_attention_bias=None
             return generated
         _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         if args.probe_capture:
@@ -258,8 +283,9 @@ def main():
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
-                corr_grads=[p.grad for p in trainable.conditioner.parameters() if p.grad is not None]
-                if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 correspondence gradient missing or non-finite')
+                if trainable.conditioner.alpha.abs().detach()>1e-6:
+                    corr_grads=[p.grad for p in trainable.conditioner.parameters() if p.grad is not None]
+                    if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
             grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'train_chunk':train_chunk,'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}

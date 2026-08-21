@@ -71,9 +71,13 @@ def selected_qk_logits(query, key, query_indices):
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
         super().__init__(); self.conditioner=SightlineConditioner(inner_dim)
-    def correspondence(self, logits, positives, weights=None, multi_positive=None):
+    def correspondence(self, logits, positives=None, weights=None, multi_positive=None, additive_bias=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
-        z=logits.log_softmax(-1)
+        if additive_bias is not None:
+            if additive_bias.ndim not in (2,4): raise ValueError('additive bias must be [B,K] or [B,H,Q,K]')
+            if additive_bias.ndim==2: additive_bias=additive_bias[:,None,None,:]
+            logits=logits+additive_bias
+        z=torch.logsumexp(logits.log_softmax(-1),dim=1)-math.log(logits.shape[1])
         if multi_positive is not None:
             rows=[]
             for q,keys in multi_positive: rows.append(-torch.logsumexp(z[:,q,keys],-1).mean())
@@ -82,6 +86,7 @@ class SightlineTrainable(nn.Module):
             if weights is not None:
                 weights=weights.to(device=values.device,dtype=values.dtype); return (values*weights).sum()/weights.sum().clamp_min(1e-8)
             return values.mean()
+        if positives is None: raise ValueError('positives are required without multi_positive')
         return correspondence_loss(z.reshape(-1,z.shape[-1]),positives.reshape(-1),weights)
     @staticmethod
     def lambda_corr(progress, start=.4, initial=.02, final=.005):

@@ -27,6 +27,8 @@ def main():
         tid=rec.get('trajectory_id') or rec.get('id')
         rgb=rec.get('rgb_dir') or rec.get('rgb_path') or rec.get('video_dir')
         if not rgb and rec.get('path'): rgb=str(Path(rec['path']).parent/'rgb_24fps')
+        if rgb and not Path(rgb).is_absolute():
+            rgb=str(Path(a.manifest).parent/rgb)
         if not tid or not rgb: continue
         paths=sorted(Path(rgb).glob('*')); out=Path(a.out_root)/tid/'continuous_49.pt'; out.parent.mkdir(parents=True,exist_ok=True)
         if out.exists():

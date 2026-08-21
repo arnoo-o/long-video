@@ -92,7 +92,8 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     from long_video.sightline.memory import LayerKVMemoryBank
     from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint
     class Attn(torch.nn.Module):
-        def __init__(self): super().__init__(); self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4); self.to_out=torch.nn.ModuleList([torch.nn.Linear(4,4),torch.nn.Identity()])
+        def __init__(self): super().__init__(); self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4); self.to_out=torch.nn.ModuleList([torch.nn.Linear(4,4),torch.nn.Identity()]); self.to_qkv=None; self.fused_projections=False
+        def unfuse_projections(self): self.to_qkv=None; self.fused_projections=False
     class Block(torch.nn.Module):
         def __init__(self): super().__init__(); self.attn1=Attn()
     class Transformer(torch.nn.Module):
@@ -101,11 +102,14 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     trainable=SightlineTrainable(4,heads=1); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); transformer=Transformer(); install_lora(transformer,[0])
     trainable.conditioner.alpha.data.fill_(.7); memory.timestamp.weight.data.fill_(.3)
     next(p for n,p in transformer.named_parameters() if 'lora_up' in n).data.fill_(.2)
-    path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,None,None,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config)
+    optimizer=torch.optim.AdamW(list(trainable.parameters())+list(memory.parameters())); scheduler=torch.optim.lr_scheduler.StepLR(optimizer,1); optimizer.step(); scheduler.step()
+    torch.manual_seed(123); path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,optimizer,scheduler,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config); expected_random=torch.rand(1)
     target=SightlineTrainable(4,heads=1); target_memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); target_transformer=Transformer(); install_lora(target_transformer,[0])
-    step=restore_runtime_checkpoint(torch.load(path),target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config)
+    target_optimizer=torch.optim.AdamW(list(target.parameters())+list(target_memory.parameters())); target_scheduler=torch.optim.lr_scheduler.StepLR(target_optimizer,1)
+    step=restore_runtime_checkpoint(torch.load(path),target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,optimizer=target_optimizer,scheduler=target_scheduler,restore_rng=True)
     assert step==12 and torch.allclose(target.conditioner.alpha,torch.tensor(.7)) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
     assert torch.allclose(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),torch.full_like(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),.2))
+    assert torch.equal(torch.rand(1),expected_random) and target_scheduler.last_epoch==scheduler.last_epoch
 
 def test_temporal_group_camera_shapes():
     c=torch.eye(4).repeat(2,33,1,1); k=torch.eye(3).repeat(2,33,1,1); cg,kg=temporal_group_cameras(c,k); assert cg.shape==(2,9,4,4) and kg.shape==(2,9,3,3)
@@ -115,20 +119,37 @@ def test_lora_fused_and_unfused_change_real_projection():
     class Attn(torch.nn.Module):
         def __init__(self, fused):
             super().__init__()
-            if fused: self.to_qkv=torch.nn.Linear(4,12)
-            else:
-                self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4)
+            self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4); self.fused_projections=fused
+            self.to_qkv=torch.nn.Linear(4,12) if fused else None
             self.to_out=torch.nn.ModuleList([torch.nn.Linear(4,4),torch.nn.Identity()])
+        def unfuse_projections(self): self.to_qkv=None; self.fused_projections=False
     class Block(torch.nn.Module):
         def __init__(self,fused): super().__init__(); self.attn1=Attn(fused)
     class T(torch.nn.Module):
         def __init__(self,fused): super().__init__(); self.transformer_blocks=torch.nn.ModuleList([Block(fused)])
     for fused in (False,True):
         model=T(fused); assert install_lora(model,[0])==(0,)
-        target=model.transformer_blocks[0].attn1.to_qkv if fused else model.transformer_blocks[0].attn1.to_q
+        target=model.transformer_blocks[0].attn1.to_q
         assert isinstance(target,LoRALinear)
         with torch.no_grad(): target.lora_up.weight.fill_(0.1)
         assert not torch.equal(target(torch.ones(1,4)),target.base(torch.ones(1,4)))
+
+def test_current_and_memory_share_same_lora_kv_modules():
+    from long_video.training.sightline import LoRALinear
+    class Attn:
+        heads=2; norm_k=torch.nn.Identity()
+        to_k=LoRALinear(torch.nn.Linear(4,4)); to_v=LoRALinear(torch.nn.Linear(4,4))
+    attn=Attn(); seen=[]
+    attn.to_k.register_forward_hook(lambda module,args,out: seen.append(('k',id(module))))
+    attn.to_v.register_forward_hook(lambda module,args,out: seen.append(('v',id(module))))
+    attn.to_k(torch.randn(1,2,4)); attn.to_v(torch.randn(1,2,4))
+    memory=LongTermKVMemory(4,1); memory.tokens=[]
+    from long_video.sightline.memory import MemoryToken
+    memory.tokens=[MemoryToken(torch.randn(1,1,4),torch.randn(1,1,7),0,0,0,0,0)]
+    class Rope:
+        def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
+    memory.rope=Rope(); memory.append_native_attention(attn,torch.randn(1,1,2,2),torch.randn(1,1,2,2),None,lambda x,r:x)
+    assert seen==[('k',id(attn.to_k)),('v',id(attn.to_v)),('k',id(attn.to_k)),('v',id(attn.to_v))]
 
 def test_processor_qk_only_cpu_shape_and_v_unchanged():
     class A:
@@ -136,5 +157,36 @@ def test_processor_qk_only_cpu_shape_and_v_unchanged():
     a=A(); c=SightlineConditioner(8); provider=lambda h,**kw:(torch.zeros(h.shape[0],h.shape[1],7),torch.zeros(h.shape[0],h.shape[1],7))
     def qkv(attn,h,e): return attn.to_q(h),attn.to_k(h),attn.to_v(h)
     def rope(x,r): return x
-    def dispatch(q,k,v,**kw): return torch.nn.functional.scaled_dot_product_attention(q.transpose(1,2),k.transpose(1,2),v.transpose(1,2)).transpose(1,2)
-    proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=rope,attention_dispatch=dispatch); h=torch.randn(1,4,8); out=proc(a,h,rotary_emb=torch.zeros(1,4,1,2)); assert out.shape==h.shape; assert torch.equal(proc.last_value,proc.last_value_native.unflatten(2,(a.heads,-1)))
+    h=torch.randn(1,4,8); expected_v=a.to_v(h).unflatten(2,(a.heads,-1)); observed=[]
+    def dispatch(q,k,v,**kw): observed.append(v.detach().clone()); return torch.nn.functional.scaled_dot_product_attention(q.transpose(1,2),k.transpose(1,2),v.transpose(1,2)).transpose(1,2)
+    proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=rope,attention_dispatch=dispatch); out=proc(a,h,rotary_emb=torch.zeros(1,4,1,2)); assert out.shape==h.shape; assert torch.equal(observed[0],expected_v)
+    assert not hasattr(proc,'last_value_native') and not hasattr(proc,'last_value')
+
+def test_exact_flow_matching_three_stage_shapes_and_noise_scale():
+    from types import SimpleNamespace
+    from long_video.training.flow_matching_exact import exact_flow_matching_items
+    class Scheduler:
+        config={'stages':3,'num_train_timesteps':4}; start_sigmas=[1.,.8,.4]; end_sigmas=[.8,.4,0.]
+        timesteps_per_stage=[torch.arange(4.)]*3; sigmas_per_stage=[torch.linspace(1,0,4)]*3
+    pipe=SimpleNamespace(scheduler=Scheduler()); target=torch.randn(1,2,3,16,20); generator=torch.Generator().manual_seed(7)
+    items=exact_flow_matching_items(pipe,target,generator=generator)
+    assert [item['noisy_latents'].shape[-2:] for item in items]==[(4,5),(8,10),(16,20)]
+    for item in items:
+        assert item['noisy_latents'].shape==item['target'].shape==item['start_point'].shape==item['end_point'].shape==item['noise'].shape
+        assert item['sigmas'].shape==(1,1,1,1,1)
+    assert items[0]['noise'].std()>items[-1]['noise'].std()
+
+def test_detached_autoregressive_chunk_has_no_gt_argument():
+    from types import SimpleNamespace
+    from scripts.train_sightline_dl3dv import _generate_detached_chunk
+    calls=[]
+    class Pipe:
+        def stage2_sample(self,**kwargs): calls.append(kwargs); return kwargs['latents']
+    source=torch.zeros(1,2,1,4,4); history={name:(torch.zeros(1,2,n,4,4),torch.arange(n).view(1,-1)) for name,n in [('long',16),('mid',2),('short',2)]}
+    result=_generate_detached_chunk(Pipe(),source,history,torch.zeros(1,2,3),SimpleNamespace(pyramid_steps=(2,2,2)),1)
+    assert result.shape==(1,2,9,4,4) and 'target' not in calls[0] and calls[0]['latents'].requires_grad is False
+
+def test_single_pose_canonicalization():
+    from long_video.sightline.rays import canonicalize_c2w
+    pose=torch.eye(4).repeat(2,1,1); pose[:,0,3]=torch.tensor([2.,3.])
+    assert torch.allclose(canonicalize_c2w(pose),torch.eye(4).repeat(2,1,1))

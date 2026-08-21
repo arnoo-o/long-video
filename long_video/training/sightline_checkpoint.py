@@ -17,16 +17,27 @@ def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, sch
     lora={name:value for name,value in transformer.state_dict().items() if 'lora_' in name}
     payload={'trainable':trainable.state_dict(),'memory':memory.state_dict(),'lora':lora,
         'optimizer':optimizer.state_dict() if optimizer else None,'scheduler':scheduler.state_dict() if scheduler else None,
-        'step':int(step),'sightline_training_semantics_version':SEMANTICS,'sightline_checkpoint_schema_version':SCHEMA,
+        'step':int(step),'rng_torch':torch.get_rng_state(),'rng_python':random.getstate(),
+        'rng_cuda':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        'sightline_training_semantics_version':SEMANTICS,'sightline_checkpoint_schema_version':SCHEMA,
         'config':config,'config_fingerprint':config_fingerprint(config),'helios_fingerprint':helios_fingerprint,
         'layers':list(layers),'memory_config':memory_config}
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
 
-def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config):
+def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config, optimizer=None, scheduler=None, restore_rng=False):
     validate_checkpoint(payload,config=config,helios_fingerprint=helios_fingerprint,layers=layers,memory_config=memory_config)
     trainable.load_state_dict(payload['trainable'],strict=True); memory.load_state_dict(payload['memory'],strict=True)
     missing,unexpected=transformer.load_state_dict(payload.get('lora',{}),strict=False)
     unexpected=[name for name in unexpected if 'lora_' in name]
     expected={name for name,_ in transformer.named_parameters() if 'lora_' in name}
     if unexpected or not expected.issubset(payload.get('lora',{})): raise RuntimeError('checkpoint LoRA parameter set mismatch')
+    if optimizer is not None:
+        if payload.get('optimizer') is None: raise RuntimeError('checkpoint has no optimizer state')
+        optimizer.load_state_dict(payload['optimizer'])
+    if scheduler is not None:
+        if payload.get('scheduler') is None: raise RuntimeError('checkpoint has no scheduler state')
+        scheduler.load_state_dict(payload['scheduler'])
+    if restore_rng:
+        torch.set_rng_state(payload['rng_torch']); random.setstate(payload['rng_python'])
+        if torch.cuda.is_available() and payload.get('rng_cuda') is not None: torch.cuda.set_rng_state_all(payload['rng_cuda'])
     return int(payload['step'])

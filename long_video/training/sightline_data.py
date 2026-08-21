@@ -7,6 +7,16 @@ import numpy as np
 
 REQUIRED_RECORD_KEYS=("trajectory_id","rgb_dir","target_c2w_local","intrinsics")
 OPTIONAL_CACHE_KEYS=("latent_cache","gt_latent_cache","recal_xyz","recal_valid","recal_confidence","recal_pointmap","correspondence_cache")
+LEGAL_LATENT_FRAMES=(49,193,192,33,9)
+
+def identify_latent_temporal_axis(shape, *, expected_frames=None):
+    legal=set(LEGAL_LATENT_FRAMES)
+    if expected_frames is not None: legal.add(int(expected_frames))
+    candidates=[axis for axis,size in enumerate(shape) if size in legal]
+    if len(shape)==5: candidates=[axis for axis in candidates if axis not in (0,1)]
+    elif len(shape)==4: candidates=[axis for axis in candidates if axis!=1 or shape[0] not in legal]
+    if len(candidates)!=1: raise ValueError(f"cannot uniquely identify temporal axis in latent shape {tuple(shape)}: {candidates}")
+    return candidates[0]
 @dataclass(frozen=True)
 class SightlineRecord:
     raw: dict; root: Path
@@ -56,14 +66,7 @@ def validate_latent_cache(path: str|Path, *, expected_frames=193):
         if file.suffix==".npy":
             arr=np.load(file,mmap_mode="r")
             if arr.ndim < 3: continue
-            temporal_axes=[axis for axis,size in enumerate(arr.shape) if size in (expected_frames, expected_frames-1, 9, 33)]
-            if not temporal_axes:
-                raise ValueError(f"cannot identify temporal axis in latent cache {file} shape={arr.shape}")
-            if len(temporal_axes)>1 and expected_frames in arr.shape:
-                temporal_axes=[axis for axis in temporal_axes if arr.shape[axis] == expected_frames]
-            # Record the detected axis for callers without imposing C/T order.
-            if arr.shape[temporal_axes[0]] not in (expected_frames, expected_frames-1,9,33):
-                raise ValueError(f"invalid temporal axis in {file}")
+            identify_latent_temporal_axis(arr.shape,expected_frames=expected_frames)
     return files
 
 def load_latent_tensor(path: str|Path, *, expected_frames=193):
@@ -77,8 +80,6 @@ def load_latent_tensor(path: str|Path, *, expected_frames=193):
         value=next((value[k] for k in ('latents','video_latents','target_latents') if k in value),None)
     if not isinstance(value,torch.Tensor) or value.ndim not in (4,5): raise ValueError(f"unsupported latent payload in {file}")
     if value.ndim==4: value=value.unsqueeze(0)
-    candidates=[axis for axis,size in enumerate(value.shape) if axis>0 and size in (expected_frames,expected_frames-1,49,9)]
-    if not candidates: raise ValueError(f"cannot identify latent temporal axis: {tuple(value.shape)}")
-    temporal=2 if value.shape[2] in (expected_frames,expected_frames-1,49,9) else candidates[0]
+    temporal=identify_latent_temporal_axis(value.shape,expected_frames=expected_frames)
     if temporal!=2: value=value.movedim(temporal,2)
     return value.contiguous()

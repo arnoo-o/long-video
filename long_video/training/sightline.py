@@ -33,7 +33,7 @@ def curriculum_phase(step: int):
     """Exact 2500-step Sightline curriculum requested by the training spec."""
     if step < 0: raise ValueError("step must be non-negative")
     if step < 300: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
-    if step < 1000: return {"name":"P2","max_chunks":1,"lora":True,"correspondence":True,"memory":False}
+    if step < 1000: return {"name":"P2","max_chunks":1,"lora":True,"correspondence":False,"memory":False}
     bounds=((1500,2),(1800,3),(2100,4),(2300,5))
     max_chunks=next((chunks for end,chunks in bounds if step < end),6)
     return {"name":"P3","max_chunks":max_chunks,"lora":True,"correspondence":True,"memory":True}
@@ -98,9 +98,6 @@ class LoRALinear(nn.Module):
         for parameter in self.base.parameters(): parameter.requires_grad_(False)
     def forward(self,x): return self.base(x)+self.lora_up(self.lora_down(x))*self.scale
 
-class LoRAFusedQKV(LoRALinear):
-    """LoRA over Helios fused QKV output; preserves the native fused call."""
-
 def install_lora(transformer: nn.Module, layers, rank=8):
     """Wrap only Q/K/V/O of explicitly selected self-attention blocks."""
     if rank not in (8,16): raise ValueError("LoRA rank must be 8 or 16")
@@ -109,12 +106,16 @@ def install_lora(transformer: nn.Module, layers, rank=8):
         if not 0 <= int(index) < len(blocks): raise ValueError(f"invalid LoRA layer {index}")
         attn=getattr(blocks[int(index)],"attn1",None)
         if attn is None: raise RuntimeError(f"layer {index} has no self-attention")
-        fused=getattr(attn,"to_qkv",None)
-        if isinstance(fused,nn.Linear):
-            attn.to_qkv=LoRAFusedQKV(fused,rank)
+        if hasattr(attn,'unfuse_projections'): attn.unfuse_projections()
+        elif hasattr(attn,'fuse_projections'): attn.fuse_projections(fuse=False)
+        else: raise RuntimeError(f'layer {index} cannot explicitly disable fused projections')
+        attn.to_qkv=None
+        if getattr(attn,'fused_projections',False):
+            raise RuntimeError(f"layer {index} remained fused after unfuse_projections(); LoRA would be bypassed")
         for name in ("to_q","to_k","to_v"):
             module=getattr(attn,name,None)
-            if isinstance(module,nn.Linear) and not isinstance(module,LoRALinear): setattr(attn,name,LoRALinear(module,rank))
+            if not isinstance(module,nn.Linear): raise RuntimeError(f'layer {index} missing unfused {name}')
+            if not isinstance(module,LoRALinear): setattr(attn,name,LoRALinear(module,rank))
         output=getattr(attn,"to_out",None)
         if output is not None and isinstance(output[0],nn.Linear): output[0]=LoRALinear(output[0],rank)
         installed.append(int(index))

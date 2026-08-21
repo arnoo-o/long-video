@@ -15,21 +15,21 @@ class SightlineHeliosAttnProcessor:
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
-        self.last_q=None; self.last_k=None; self.last_value_native=None; self.last_value=None; self.last_attention_meta={}
+        self.last_q=None; self.last_k=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.last_hidden_states=None; self.last_current_length=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
         if self.qkv_projection is None or self.rotary_apply is None or self.attention_dispatch is None:
             raise RuntimeError("Sightline processor is not bound to pinned Helios primitives")
         query,key,value=self.qkv_projection(attn,hidden_states,encoder_hidden_states)
-        self.last_value_native=value.detach().clone()
         query=attn.norm_q(query); key=attn.norm_k(key)
         query=query.unflatten(2,(attn.heads,-1)); key=key.unflatten(2,(attn.heads,-1)); value=value.unflatten(2,(attn.heads,-1))
         if rotary_emb is not None:
             query=self.rotary_apply(query,rotary_emb); key=self.rotary_apply(key,rotary_emb)
         current_len=original_context_length or query.shape[1]
-        self.last_hidden_states=hidden_states
-        self.last_current_length=current_len
+        if (self.memory is not None and self.memory.enabled) or self.capture_diagnostics:
+            self.last_hidden_states=hidden_states
+            self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
         condition_dtype=next(self.conditioner.parameters()).dtype
         dq,dk=self.conditioner(rays_q.to(condition_dtype),rays_k.to(condition_dtype),training=self.conditioner.training)
@@ -73,8 +73,10 @@ class SightlineHeliosAttnProcessor:
                 attention_mask=torch.cat((attention_mask,pad),dim=-1)
             if attention_mask is not None and attention_mask.shape[-1] != key.shape[1]:
                 raise RuntimeError('attention mask key axis must equal final K length')
-        self.last_q=query; self.last_k=key
-        self.last_value=value
+        if self.capture_diagnostics:
+            self.last_q=query; self.last_k=key
+        else:
+            self.last_q=None; self.last_k=None
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)

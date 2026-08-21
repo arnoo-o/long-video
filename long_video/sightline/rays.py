@@ -39,7 +39,8 @@ def chunk_cameras(c2w: torch.Tensor, intrinsics: torch.Tensor, chunk_index: int)
 def canonicalize_c2w(c2w: torch.Tensor) -> torch.Tensor:
     """Express trajectory poses in the first-frame coordinate system."""
     if c2w.ndim == 3:
-        return torch.linalg.inv(c2w[:, :1]) @ c2w[:, :1]
+        if c2w.shape[-2:] != (4,4): raise ValueError('single c2w must be [B,4,4]')
+        return torch.linalg.inv(c2w) @ c2w
     if c2w.ndim != 4:
         raise ValueError("c2w must be [B,4,4] or [B,T,4,4]")
     return torch.linalg.inv(c2w[:, :1]) @ c2w

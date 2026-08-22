@@ -12,11 +12,14 @@ REQUIRED=("attention_logits","positive_key_indices","memory_count","fm_loss","ba
 
 def _ranking(logits,positive_lists):
     if logits.ndim==3: logits=logits[:,None]
-    order=logits.argsort(-1,descending=True); probabilities=logits.softmax(-1); ranks=[]; masses=[]
+    ranks=[]; masses=[]
     for query,keys in enumerate(positive_lists):
         keys=torch.tensor(keys,device=logits.device,dtype=torch.long)
-        positions=(order[:,:,query,:,None]==keys.view(1,1,1,-1)).any(-1).float().argmax(-1)
-        ranks.append(positions.reshape(-1)); masses.append(probabilities[:,:,query].index_select(-1,keys).sum(-1).reshape(-1))
+        query_logits=logits[:,:,query]
+        positive_logits=query_logits.index_select(-1,keys)
+        best_positive=positive_logits.max(-1,keepdim=True).values
+        ranks.append((query_logits>best_positive).sum(-1).reshape(-1))
+        masses.append((positive_logits.logsumexp(-1)-query_logits.logsumexp(-1)).exp().reshape(-1))
     ranks=torch.cat(ranks); mass=torch.cat(masses).mean()
     return float((1/(ranks.float()+1)).mean()),float((ranks==0).float().mean()),float((ranks<5).float().mean()),float(mass)
 

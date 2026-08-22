@@ -68,7 +68,11 @@ def _frame_cache(xyz, valid, confidence, c2w, K, stride=1):
 def _token(pixel_index,height,width,token_height,token_width):
     y,x=divmod(int(pixel_index),width); return min(token_height-1,y*token_height//height),min(token_width-1,x*token_width//width)
 
-def screen_overlap(xyz,valid,confidence,query_frame,key_frame,*,screening_stride=32,screening_distance_threshold=.05,min_overlap_count=1,min_overlap_ratio=.01,tree_cache=None):
+def screen_overlap(xyz,valid,confidence,query_frame,key_frame,*,screening_stride=32,screening_distance_threshold=.05,min_overlap_count=1,min_overlap_ratio=.01,tree_cache=None,frame_cache=None):
+    if frame_cache is not None:
+        q=frame_cache[query_frame]['points']; k=frame_cache[key_frame]['points']
+        if len(q)==0 or len(k)==0: return {'overlap_count':0,'overlap_ratio':0.,'query_valid_sample_count':int(len(q)),'accepted':False}
+        distance,_=frame_cache[key_frame]['tree'].query(q,k=1); count=int((distance<=float(screening_distance_threshold)).sum()); ratio=float(count/len(q)); return {'overlap_count':count,'overlap_ratio':ratio,'query_valid_sample_count':int(len(q)),'accepted':bool(count>=min_overlap_count and ratio>=min_overlap_ratio)}
     stride=max(1,int(screening_stride)); qvalid=valid[query_frame]&np.isfinite(xyz[query_frame]).all(-1)&(np.linalg.norm(xyz[query_frame],axis=-1)>1e-8)&np.isfinite(confidence[query_frame]); kvalid=valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8)&np.isfinite(confidence[key_frame]); qmask=qvalid[::stride,::stride]; kmask=kvalid[::stride,::stride]; q=xyz[query_frame][::stride,::stride][qmask]; k=xyz[key_frame][::stride,::stride][kmask]
     if len(q)==0 or len(k)==0: return {'overlap_count':0,'overlap_ratio':0.,'query_valid_sample_count':int(len(q)),'accepted':False}
     if tree_cache is not None:
@@ -165,10 +169,10 @@ def main():
     if a.stage_a_cache and a.stage_a_cache.exists():
         cached=json.loads(a.stage_a_cache.read_text())
         if cached.get('metadata')==cache_meta: candidates=cached['candidates']; accepted=sum(int(x['accepted']) for x in candidates)
-    screen_tree_cache={}
+    screen_tree_cache={}; screen_frame_cache=_frame_cache(xyz,valid,confidence,c2w,K,a.screening_stride)
     for query in range(frames) if not candidates else []:
         for key in range(0,max(0,query-a.min_frame_gap+1)):
-            candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
+            candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache,frame_cache=screen_frame_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
             if candidate['accepted']:
                 accepted+=1
                 if not a.screen_only: points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,query,key,c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))

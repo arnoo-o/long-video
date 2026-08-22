@@ -66,6 +66,12 @@ def test_selected_layers_have_independent_geometry_and_one_global_alpha():
     assert all(layer.alpha is trainable.conditioner.alpha for layer in conditioners)
     assert [name for name,_ in trainable.named_parameters() if name.endswith('alpha')]==['conditioner.alpha']
 
+def test_scheduler_provenance_ignores_default_field_order():
+    from long_video.training.sightline_checkpoint import scheduler_config_fingerprint
+    left={'stages':3,'_use_default_values':['solver_order','predict_x0','thresholding']}
+    right={'_use_default_values':['thresholding','solver_order','predict_x0'],'stages':3}
+    assert scheduler_config_fingerprint(left)==scheduler_config_fingerprint(right)
+
 def test_native_history_zero_fake_initialization_and_fixed_rope_slots():
     from long_video.sightline.history import NativeHistoryState,native_helios_indices
     source=torch.ones(1,1,1,1,1); fake=torch.full_like(source,2); state=NativeHistoryState(source,fake); packed=state.groups(); indices=native_helios_indices()

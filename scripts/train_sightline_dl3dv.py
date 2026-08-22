@@ -32,9 +32,14 @@ def _average_gradients(parameters,world_size):
     for parameter in parameters:
         present=torch.tensor(parameter.grad is not None,device=parameter.device,dtype=torch.int32)
         dist.all_reduce(present)
-        if int(present.item()) not in (0,world_size): raise RuntimeError('DDP gradient set mismatch')
-        if parameter.grad is not None:
-            dist.all_reduce(parameter.grad); parameter.grad.div_(world_size)
+        count=int(present.item())
+        if count==0:
+            continue
+        # Unused parameters on a rank contribute an explicit zero.  This is
+        # required for sparse correspondence rows and keeps all ranks in the
+        # same collective sequence.
+        grad=parameter.grad if parameter.grad is not None else torch.zeros_like(parameter)
+        dist.all_reduce(grad); grad.div_(world_size); parameter.grad=grad
 
 def _ddp_record_index(step,rank,world_size,count,seed=20260823):
     if world_size==1: return random.randrange(count)

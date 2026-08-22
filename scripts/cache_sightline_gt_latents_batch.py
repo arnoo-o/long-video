@@ -9,12 +9,16 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True)
     p.add_argument('--manifest',required=True,help='JSON list or records with trajectory_id and rgb_dir/rgb_path')
+    p.add_argument('--selection-manifest',help='Optional JSON containing trajectory_ids to encode')
     p.add_argument('--out-root',required=True); p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640)
     p.add_argument('--limit',type=int,default=0)
     a=p.parse_args(); import sys; sys.path.insert(0,a.helios_root)
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16).to('cuda'); pipe.vae.eval()
     raw=json.loads(Path(a.manifest).read_text()); records=raw if isinstance(raw,list) else raw.get('records',raw.get('items',[]))
+    if a.selection_manifest:
+        selected=set(json.loads(Path(a.selection_manifest).read_text()).get('trajectory_ids',()))
+        records=[record for record in records if record.get('trajectory_id') in selected]
     model_files=[]
     for pattern in ('config.json','model_index.json','transformer/config.json','transformer/*.index.json','vae/config.json','vae/*.index.json'):
         model_files.extend(glob.glob(str(Path(a.model)/pattern)))

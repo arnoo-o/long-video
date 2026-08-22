@@ -6,7 +6,7 @@ the trainable ray projections, alpha, timestamp and LoRA.
 from __future__ import annotations
 import math, torch
 from torch import nn
-from ..sightline.conditioning import SightlineConditioner
+from ..sightline.conditioning import LayeredSightlineConditioner
 from ..sightline.correspondence import correspondence_loss
 
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None) -> int:
@@ -69,8 +69,8 @@ def selected_qk_logits(query, key, query_indices):
     return torch.einsum('bqhd,bkhd->bhqk',selected,key)*(selected.shape[-1]**-.5)
 
 class SightlineTrainable(nn.Module):
-    def __init__(self, inner_dim, layers=(), timestamp_buckets=64, heads=16):
-        super().__init__(); self.conditioner=SightlineConditioner(inner_dim)
+    def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16):
+        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers)
     def correspondence(self, logits, positives=None, weights=None, multi_positive=None, additive_bias=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
         if additive_bias is not None:
@@ -94,8 +94,9 @@ class SightlineTrainable(nn.Module):
         return initial+(final-initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
         alpha=self.conditioner.alpha.detach(); grad=self.conditioner.alpha.grad
-        qg=self.conditioner.q_proj.weight.grad; kg=self.conditioner.k_proj.weight.grad
-        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':0.0 if qg is None else float(qg.norm()),'ek_grad_norm':0.0 if kg is None else float(kg.norm())}
+        qgrads=[layer.q_proj.weight.grad for layer in self.conditioner.layers.values()]; kgrads=[layer.k_proj.weight.grad for layer in self.conditioner.layers.values()]
+        qnorm=sum(float(value.norm()) for value in qgrads if value is not None); knorm=sum(float(value.norm()) for value in kgrads if value is not None)
+        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':qnorm,'ek_grad_norm':knorm}
 
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):

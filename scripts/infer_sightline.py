@@ -50,9 +50,9 @@ def main():
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
     pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16,revision=a.model_revision).to('cuda')
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
-    trainable=SightlineTrainable(inner,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.bfloat16); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
     layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
+    trainable=SightlineTrainable(inner,layers=layers,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.bfloat16); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None

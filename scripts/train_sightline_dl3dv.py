@@ -185,7 +185,7 @@ def main():
     source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'; fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
     pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to('cuda'); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
-    trainable=SightlineTrainable(inner,heads=heads).to('cuda',dtype=torch.bfloat16)
+    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to('cuda',dtype=torch.bfloat16)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     provider=SightlineRayProvider(source_height=cfg.source_height,source_width=cfg.source_width); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
@@ -308,17 +308,14 @@ def main():
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
                 if trainable.conditioner.alpha.abs().detach()>1e-6:
-                    geometry_params=(list(trainable.conditioner.q_proj.parameters())+
-                                     list(trainable.conditioner.k_proj.parameters())+
-                                     list(trainable.conditioner.gate.parameters())+
-                                     list(trainable.conditioner.rms_norm_q.parameters())+
-                                     list(trainable.conditioner.rms_norm_k.parameters()))
+                    geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
             grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'train_chunk':train_chunk,'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
-        with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
+        if (step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop:
+            with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
         if args.train and ((step+1)%args.save_every==0 or step+1==args.max_steps): save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance)

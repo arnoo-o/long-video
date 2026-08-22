@@ -57,6 +57,15 @@ def test_train_chunk_policy_is_single_and_causal():
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
 
+def test_selected_layers_have_independent_geometry_and_one_global_alpha():
+    from long_video.training.sightline import SightlineTrainable
+    trainable=SightlineTrainable(8,layers=(16,20,24),heads=2)
+    conditioners=[trainable.conditioner.for_layer(layer) for layer in (16,20,24)]
+    for name in ('q_proj','k_proj','gate','rms_norm_q','rms_norm_k'):
+        assert len({id(getattr(layer,name).weight) for layer in conditioners})==3
+    assert all(layer.alpha is trainable.conditioner.alpha for layer in conditioners)
+    assert [name for name,_ in trainable.named_parameters() if name.endswith('alpha')]==['conditioner.alpha']
+
 def test_native_history_zero_fake_initialization_and_fixed_rope_slots():
     from long_video.sightline.history import NativeHistoryState,native_helios_indices
     source=torch.ones(1,1,1,1,1); fake=torch.full_like(source,2); state=NativeHistoryState(source,fake); packed=state.groups(); indices=native_helios_indices()

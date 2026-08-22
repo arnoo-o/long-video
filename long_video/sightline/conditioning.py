@@ -4,14 +4,19 @@ from torch import nn
 
 class SightlineConditioner(nn.Module):
     def __init__(self, inner_dim: int, hidden_dim: int = 128, eps: float = 1e-6,
-                 scale_aug_prob: float = .3, scale_aug_range=(-1.2, 1.6)):
+                 scale_aug_prob: float = .3, scale_aug_range=(-1.2, 1.6), shared_alpha=None):
         super().__init__(); self.eps=eps; self.scale_aug_prob=scale_aug_prob; self.scale_aug_range=scale_aug_range
         self.q_proj=nn.Linear(7,inner_dim)
         self.k_proj=nn.Linear(7,inner_dim)
         self.gate=nn.Linear(1,inner_dim)
         self.rms_norm_q=nn.RMSNorm(inner_dim,eps=eps)
         self.rms_norm_k=nn.RMSNorm(inner_dim,eps=eps)
-        self.alpha=nn.Parameter(torch.zeros(()))
+        if shared_alpha is None:
+            self.alpha=nn.Parameter(torch.zeros(()))
+        else:
+            # The owning layered conditioner registers the sole global alpha.
+            # Bypass Module.__setattr__ so it is not duplicated in state_dict.
+            object.__setattr__(self,'alpha',shared_alpha)
         nn.init.normal_(self.q_proj.weight,std=1e-3); nn.init.zeros_(self.q_proj.bias)
         nn.init.normal_(self.k_proj.weight,std=1e-3); nn.init.zeros_(self.k_proj.bias)
         nn.init.zeros_(self.gate.weight); nn.init.zeros_(self.gate.bias)
@@ -39,3 +44,19 @@ class SightlineConditioner(nn.Module):
         if training is None: training=self.training
         if scale_delta is None: scale_delta=self.sample_scale_delta(rays_q,training)
         return (self.project(rays_q,kind='q',training=training,scale_delta=scale_delta), self.project(rays_k,kind='k',training=training,scale_delta=scale_delta))
+
+class LayeredSightlineConditioner(nn.Module):
+    """One geometry projection per selected layer and one global alpha."""
+    def __init__(self, inner_dim: int, layers, **conditioner_kwargs):
+        super().__init__(); layers=tuple(int(layer) for layer in layers)
+        if not layers or len(set(layers))!=len(layers): raise ValueError('Sightline geometry layers must be non-empty and unique')
+        self.inner_dim=int(inner_dim); self.alpha=nn.Parameter(torch.zeros(()))
+        self.layers=nn.ModuleDict({str(layer):SightlineConditioner(inner_dim,shared_alpha=self.alpha,**conditioner_kwargs) for layer in layers})
+    def for_layer(self, layer):
+        key=str(int(layer))
+        if key not in self.layers: raise KeyError(f'layer {layer} has no Sightline geometry conditioner')
+        return self.layers[key]
+    def geometry_parameters(self):
+        for layer in self.layers.values():
+            yield from layer.q_proj.parameters(); yield from layer.k_proj.parameters(); yield from layer.gate.parameters()
+            yield from layer.rms_norm_q.parameters(); yield from layer.rms_norm_k.parameters()

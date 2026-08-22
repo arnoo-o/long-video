@@ -25,7 +25,7 @@ class SightlineRuntimeContext:
 class SightlinePipeline:
     def __init__(self, helios_pipeline, *, config, conditioner=None, ray_provider=None):
         self.helios=helios_pipeline; self.config=config; self.conditioner=conditioner; self.ray_provider=ray_provider
-        inner_dim=int(conditioner.q_proj.out_features) if conditioner is not None else None
+        inner_dim=int(getattr(conditioner,'inner_dim',conditioner.q_proj.out_features if conditioner is not None and hasattr(conditioner,'q_proj') else 0)) if conditioner is not None else None
         self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim)
         self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None
 

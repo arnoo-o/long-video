@@ -177,8 +177,9 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') and index in enabled_memory_layers else (memory if memory is not None and not hasattr(memory,'for_layer') and index in enabled_memory_layers else None)
         if layer_memory is not None and memory is not None:
             layer_memory.timestamp=memory.timestamp
+        layer_conditioner=conditioner.for_layer(index) if hasattr(conditioner,'for_layer') else conditioner
         native=helios_module.HeliosAttnProcessor()
-        processor=SightlineHeliosAttnProcessor(conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
+        processor=SightlineHeliosAttnProcessor(layer_conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
         if hasattr(attn,'set_processor'): attn.set_processor(processor)
         else: attn.processor=processor
         installed.append(index)

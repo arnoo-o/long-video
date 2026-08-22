@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 import numpy as np
 import torch
+import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
@@ -17,6 +18,28 @@ from long_video.sightline.pipeline import SightlinePipeline, prepare_source_cond
 
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
+
+def _distributed_context():
+    world_size=int(__import__('os').environ.get('WORLD_SIZE','1'))
+    if world_size==1: return 0,1,torch.device('cuda')
+    if not dist.is_available(): raise RuntimeError('torch.distributed is required for DDP')
+    local_rank=int(__import__('os').environ['LOCAL_RANK']); torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl',init_method='env://')
+    return dist.get_rank(),world_size,torch.device('cuda',local_rank)
+
+def _average_gradients(parameters,world_size):
+    if world_size==1: return
+    for parameter in parameters:
+        present=torch.tensor(parameter.grad is not None,device=parameter.device,dtype=torch.int32)
+        dist.all_reduce(present)
+        if int(present.item()) not in (0,world_size): raise RuntimeError('DDP gradient set mismatch')
+        if parameter.grad is not None:
+            dist.all_reduce(parameter.grad); parameter.grad.div_(world_size)
+
+def _ddp_record_index(step,rank,world_size,count,seed=20260823):
+    if world_size==1: return random.randrange(count)
+    if world_size>count: raise ValueError('DDP world size exceeds record count')
+    return random.Random(int(seed)+int(step)).sample(range(count),count)[rank]
 
 def _preflight(cfg,args,probe_layers):
     sightline=set(cfg.sightline_layers)
@@ -183,25 +206,27 @@ def main():
     p.add_argument('--expected-records',type=int,default=100); p.add_argument('--max-steps',type=int,default=2500); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int,default=80); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
+    rank,world_size,device=_distributed_context()
+    if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
     cfg=load_sightline_config(args.config); probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_sightline_manifest(args.manifest,expected_count=args.expected_records)
     sys.path.insert(0,args.helios_root)
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
     source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'; fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
-    pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to('cuda'); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
+    pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
-    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to('cuda',dtype=torch.float32)
+    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     provider=SightlineRayProvider(source_height=cfg.source_height,source_width=cfg.source_width); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
-    runner.memory.to(device='cuda',dtype=torch.bfloat16)
-    installed_layers=tuple(sorted(set(cfg.sightline_layers).union(probe_layers))) if args.probe_only else tuple(cfg.sightline_layers)
+    runner.memory.to(device=device,dtype=torch.bfloat16)
+    installed_layers=tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers).union(probe_layers))) if args.probe_only else tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers)))
     install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,_lr_multiplier)
-    prompt_embeds,_=_prompt(pipe,args.prompt,'cuda'); config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
+    prompt_embeds,_=_prompt(pipe,args.prompt,device); config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     if args.resume:
@@ -211,12 +236,15 @@ def main():
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
     elif args.alpha_zero_baseline:
         trainable.conditioner.alpha.data.zero_(); runner.memory.timestamp.weight.data.zero_()
+    if world_size>1:
+        rank_seed=20260823+1000003*rank+9176*start_step
+        random.seed(rank_seed); np.random.seed(rank_seed%(2**32-1)); torch.manual_seed(rank_seed); torch.cuda.manual_seed_all(rank_seed)
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
         phase=curriculum_phase(step); checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
-        index=args.record_index if args.record_index is not None else random.randrange(len(records)); record=records[index]
+        index=args.record_index if args.record_index is not None else _ddp_record_index(step,rank,world_size,len(records)); record=records[index]
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
@@ -224,13 +252,13 @@ def main():
         if all_latents.shape[2]<49: raise ValueError('six chunks require at least 49 latent frames')
         window_start=select_chunk_window(phase['max_chunks'])
         latent_start=window_start*8; frame_start=window_start*32
-        latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to('cuda',dtype=torch.bfloat16)
+        latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to(device,dtype=torch.bfloat16)
         rgb_paths=record.rgb_paths()
         if len(rgb_paths)<=frame_start: raise RuntimeError('trajectory RGB frames do not cover sampled chunk window')
-        source,fake,_,_=prepare_source_condition(pipe,Image.open(rgb_paths[frame_start]).convert('RGB'),height=cfg.source_height,width=cfg.source_width,device='cuda')
+        source,fake,_,_=prepare_source_condition(pipe,Image.open(rgb_paths[frame_start]).convert('RGB'),height=cfg.source_height,width=cfg.source_width,device=device)
         c2w_np,K_np=record.load_cameras(); c2w_np=np.array(c2w_np[frame_start:frame_start+1+phase['max_chunks']*32],copy=True); K_np=np.array(K_np[frame_start:frame_start+1+phase['max_chunks']*32],copy=True)
-        c2w=torch.from_numpy(c2w_np).to('cuda',dtype=torch.float32).unsqueeze(0); c2w=torch.linalg.inv(c2w[:,:1])@c2w
-        K=torch.from_numpy(K_np).to('cuda',dtype=torch.float32).unsqueeze(0)
+        c2w=torch.from_numpy(c2w_np).to(device,dtype=torch.float32).unsqueeze(0); c2w=torch.linalg.inv(c2w[:,:1])@c2w
+        K=torch.from_numpy(K_np).to(device,dtype=torch.float32).unsqueeze(0)
         _reset_sequence(runner); runner._trajectory_c2w=c2w; runner._trajectory_K=K; runner._source_camera=c2w[:,0]; runner._source_intrinsics=K[:,0]; runner.memory.set_enabled(phase['memory'])
         for name,parameter in pipe.transformer.named_parameters():
             if 'lora_' in name: parameter.requires_grad_(phase['lora'])
@@ -324,13 +352,16 @@ def main():
                     geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
-            grad_norm=torch.nn.utils.clip_grad_norm_([p for group in optimizer.param_groups for p in group['params'] if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
+            optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
-        if (step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop:
+        if rank==0 and ((step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
-        if args.train and ((step+1)%args.save_every==0 or step+1==args.max_steps): save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance)
+        if args.train and ((step+1)%args.save_every==0 or step+1==args.max_steps):
+            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance)
+            if world_size>1: dist.barrier()
+    if world_size>1: dist.destroy_process_group()
 
 if __name__=='__main__': main()

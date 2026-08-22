@@ -30,10 +30,11 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
     return min(maximum, 1 + step // warmup_steps)
 
 def curriculum_phase(step: int):
-    """Camera-first curriculum with Memory and correspondence disabled."""
+    """Camera-first curriculum: 2 chunks at step 300, P3 at 900, then +1/200."""
     if step < 0: raise ValueError("step must be non-negative")
-    if step < 400: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
-    return {"name":"P2","max_chunks":1 if step < 800 else 2,"lora":True,"correspondence":False,"memory":False}
+    if step < 300: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
+    if step < 900: return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False}
+    return {"name":"P3","max_chunks":min(6,2+(step-900)//200),"lora":True,"correspondence":True,"memory":True}
 
 def select_chunk_window(window_chunks: int, total_chunks: int = 6,
                         generator: torch.Generator | None = None) -> int:

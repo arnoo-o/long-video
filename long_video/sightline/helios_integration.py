@@ -32,11 +32,14 @@ class SightlineHeliosAttnProcessor:
             self.last_hidden_states=hidden_states
             self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
-        condition_dtype=next(self.conditioner.parameters()).dtype
-        conditioned_q=rays_q.to(condition_dtype); conditioned_k=rays_k.to(condition_dtype)
-        scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
-        dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
-        dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
+        if self.conditioner is None:
+            scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
+        else:
+            condition_dtype=next(self.conditioner.parameters()).dtype
+            conditioned_q=rays_q.to(condition_dtype); conditioned_k=rays_k.to(condition_dtype)
+            scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
+            dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
+            dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
         dq=dq.to(query.dtype).unflatten(-1,(attn.heads,-1)); dk=dk.to(key.dtype).unflatten(-1,(attn.heads,-1))
         if key.shape[1] > current_len:
             validity=self.ray_provider.context.get('history_validity') if self.ray_provider.context is not None else None
@@ -177,7 +180,7 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') and index in enabled_memory_layers else (memory if memory is not None and not hasattr(memory,'for_layer') and index in enabled_memory_layers else None)
         if layer_memory is not None and memory is not None:
             layer_memory.timestamp=memory.timestamp
-        layer_conditioner=conditioner.for_layer(index) if hasattr(conditioner,'for_layer') else conditioner
+        layer_conditioner=conditioner.for_layer(index) if hasattr(conditioner,'for_layer') and str(index) in conditioner.layers else None
         native=helios_module.HeliosAttnProcessor()
         processor=SightlineHeliosAttnProcessor(layer_conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
         if hasattr(attn,'set_processor'): attn.set_processor(processor)

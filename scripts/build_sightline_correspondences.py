@@ -49,7 +49,7 @@ def _frame_cache(xyz, valid, confidence, c2w, K, stride=1):
         mask=valid[f]&np.isfinite(xyz[f]).all(-1)&(np.linalg.norm(xyz[f],axis=-1)>1e-8)&np.isfinite(confidence[f])
         pixels=flat_grid[mask]
         if stride>1:
-            keep=(pixels//width % stride==0)&(pixels % width==0); pixels=pixels[keep]
+            keep=(pixels//width % stride==0)&(pixels % width % stride==0); pixels=pixels[keep]
         points=xyz[f].reshape(-1,3)[pixels]
         conf=confidence[f].reshape(-1)[pixels]
         tree=cKDTree(points) if len(points) else None
@@ -158,7 +158,7 @@ def _fingerprint(path):
     digest=hashlib.sha256(); digest.update(Path(path).read_bytes()); return digest.hexdigest()
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--xyz',type=Path,required=True); p.add_argument('--valid',type=Path,required=True); p.add_argument('--confidence',type=Path,required=True); p.add_argument('--out',type=Path,required=True); p.add_argument('--c2w',type=Path,required=True); p.add_argument('--intrinsics',type=Path,required=True); p.add_argument('--confidence-threshold',type=float,default=0.); p.add_argument('--distance-fraction',type=float,default=.015); p.add_argument('--token-height',type=int,required=True); p.add_argument('--token-width',type=int,required=True); p.add_argument('--min-frame-gap',type=int,default=1); p.add_argument('--screening-stride',type=int,default=32); p.add_argument('--screening-distance-threshold',type=float,default=.05); p.add_argument('--min-overlap-count',type=int,default=1); p.add_argument('--min-overlap-ratio',type=float,default=.01); p.add_argument('--min-count',type=int,default=1); p.add_argument('--min-coverage',type=float,default=0.); p.add_argument('--near-top-ratio',type=float,default=.9); p.add_argument('--point-stride',type=int,default=1); p.add_argument('--projection-radius',type=int,default=1); p.add_argument('--cycle-pixel-threshold',type=float,default=2.0); p.add_argument('--stage-a-cache',type=Path); p.add_argument('--trajectory-id',default=''); p.add_argument('--screen-only',action='store_true'); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--xyz',type=Path,required=True); p.add_argument('--valid',type=Path,required=True); p.add_argument('--confidence',type=Path,required=True); p.add_argument('--out',type=Path,required=True); p.add_argument('--c2w',type=Path,required=True); p.add_argument('--intrinsics',type=Path,required=True); p.add_argument('--confidence-threshold',type=float,default=0.); p.add_argument('--distance-fraction',type=float,default=.015); p.add_argument('--token-height',type=int,required=True); p.add_argument('--token-width',type=int,required=True); p.add_argument('--min-frame-gap',type=int,default=1); p.add_argument('--screening-stride',type=int,default=32); p.add_argument('--screening-distance-threshold',type=float,default=.05); p.add_argument('--min-overlap-count',type=int,default=1); p.add_argument('--min-overlap-ratio',type=float,default=.01); p.add_argument('--min-count',type=int,default=1); p.add_argument('--min-coverage',type=float,default=0.); p.add_argument('--near-top-ratio',type=float,default=.9); p.add_argument('--point-stride',type=int,default=1); p.add_argument('--projection-radius',type=int,default=1); p.add_argument('--cycle-pixel-threshold',type=float,default=2.0); p.add_argument('--probe-subset',action='store_true'); p.add_argument('--probe-keys-per-query',type=int,default=2); p.add_argument('--stage-a-cache',type=Path); p.add_argument('--trajectory-id',default=''); p.add_argument('--screen-only',action='store_true'); a=p.parse_args()
     xyz=np.load(a.xyz,mmap_mode='r'); valid=np.load(a.valid,mmap_mode='r').astype(bool); confidence=np.load(a.confidence,mmap_mode='r');
     if xyz.shape[:3]!=valid.shape or confidence.shape!=valid.shape: raise ValueError('teacher arrays must share [F,H,W] shape')
     zbuffer_valid=valid.copy(); valid &= np.isfinite(confidence)&(confidence>=a.confidence_threshold); frames=valid.shape[0]; c2w=_camera_sequence(np.load(a.c2w),'c2w',frames); K=_camera_sequence(np.load(a.intrinsics),'K',frames); points=[]; candidates=[]; accepted=0
@@ -169,21 +169,27 @@ def main():
     if a.stage_a_cache and a.stage_a_cache.exists():
         cached=json.loads(a.stage_a_cache.read_text())
         if cached.get('metadata')==cache_meta: candidates=cached['candidates']; accepted=sum(int(x['accepted']) for x in candidates)
-    screen_tree_cache={}
+    screen_tree_cache={}; screen_frame_cache=_frame_cache(xyz,valid,confidence,c2w,K,a.screening_stride) if a.probe_subset else None
     for query in range(frames) if not candidates else []:
         for key in range(0,max(0,query-a.min_frame_gap+1)):
-            candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
+            candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache,frame_cache=screen_frame_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
             if candidate['accepted']:
                 accepted+=1
-                if not a.screen_only: points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,query,key,c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))
+                if not a.screen_only and not a.probe_subset: points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,query,key,c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))
     if a.stage_a_cache and not a.stage_a_cache.exists() and candidates:
         a.stage_a_cache.parent.mkdir(parents=True,exist_ok=True); tmp=a.stage_a_cache.with_suffix('.tmp'); tmp.write_text(json.dumps({'metadata':cache_meta,'candidates':candidates},separators=(',',':'))); os.replace(tmp,a.stage_a_cache)
+    if a.probe_subset:
+        selected=[]
+        for query in range(frames):
+            accepted_for_query=[row for row in candidates if row['query_frame']==query and row.get('accepted')]
+            selected.extend(sorted(accepted_for_query,key=lambda row:(-row['overlap_ratio'],-row['overlap_count'],row['key_frame']))[:max(1,a.probe_keys_per_query)])
+        candidates=selected; accepted=len(selected)
     if candidates and not a.screen_only and not points:
         for candidate in candidates:
             if candidate.get('accepted'):
                 points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,int(candidate['query_frame']),int(candidate['key_frame']),c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))
     rows=token_vote_rows(points,token_height=a.token_height,token_width=a.token_width,min_count=a.min_count,min_coverage=a.min_coverage,near_top_ratio=a.near_top_ratio,total_frames=frames); a.out.parent.mkdir(parents=True,exist_ok=True)
-    metadata={'schema_version':SCHEMA,'trajectory_id':a.trajectory_id,'source_height':int(valid.shape[1]),'source_width':int(valid.shape[2]),'token_grid':{'token_height':a.token_height,'token_width':a.token_width},'c2w_fingerprint':_fingerprint(a.c2w),'intrinsics_fingerprint':_fingerprint(a.intrinsics),'xyz_fingerprint':_fingerprint(a.xyz),'valid_fingerprint':_fingerprint(a.valid),'confidence_fingerprint':_fingerprint(a.confidence),'overlap_mining':{'min_frame_gap':a.min_frame_gap,'screening_stride':a.screening_stride,'screening_distance_threshold':a.screening_distance_threshold,'min_overlap_count':a.min_overlap_count,'min_overlap_ratio':a.min_overlap_ratio,'point_stride':a.point_stride,'projection_radius':a.projection_radius,'cycle_pixel_threshold':a.cycle_pixel_threshold},'vote':{'min_count':a.min_count,'min_coverage':a.min_coverage,'near_top_ratio':a.near_top_ratio},'candidate_pair_count':len(candidates),'accepted_pair_count':accepted,'row_count':len(rows)}
+    metadata={'schema_version':SCHEMA,'trajectory_id':a.trajectory_id,'source_height':int(valid.shape[1]),'source_width':int(valid.shape[2]),'token_grid':{'token_height':a.token_height,'token_width':a.token_width},'c2w_fingerprint':_fingerprint(a.c2w),'intrinsics_fingerprint':_fingerprint(a.intrinsics),'xyz_fingerprint':_fingerprint(a.xyz),'valid_fingerprint':_fingerprint(a.valid),'confidence_fingerprint':_fingerprint(a.confidence),'probe_subset':bool(a.probe_subset),'probe_keys_per_query':a.probe_keys_per_query if a.probe_subset else None,'overlap_mining':{'min_frame_gap':a.min_frame_gap,'screening_stride':a.screening_stride,'screening_distance_threshold':a.screening_distance_threshold,'min_overlap_count':a.min_overlap_count,'min_overlap_ratio':a.min_overlap_ratio,'point_stride':a.point_stride,'projection_radius':a.projection_radius,'cycle_pixel_threshold':a.cycle_pixel_threshold},'vote':{'min_count':a.min_count,'min_coverage':a.min_coverage,'near_top_ratio':a.near_top_ratio},'candidate_pair_count':len(candidates),'accepted_pair_count':accepted,'row_count':len(rows)}
     tmp=a.out.with_suffix(a.out.suffix+'.tmp'); tmp.write_text(json.dumps({**metadata,'rows':rows},separators=(',',':'))); os.replace(tmp,a.out)
 
 if __name__=='__main__': main()

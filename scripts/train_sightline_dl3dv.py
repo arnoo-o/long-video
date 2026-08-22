@@ -292,9 +292,12 @@ def main():
                 processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
                 processor.last_attention_bias=None
             return generated
-        _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
+        if args.probe_only and args.alpha_zero_baseline:
+            with torch.no_grad(): _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
+        else:
+            _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         if args.probe_capture:
-            alpha_grad=torch.autograd.grad(losses['total'],trainable.conditioner.alpha,retain_graph=True,allow_unused=True)[0]
+            alpha_grad=None if not losses['total'].requires_grad else torch.autograd.grad(losses['total'],trainable.conditioner.alpha,retain_graph=True,allow_unused=True)[0]
             probe_payload['alpha_grad']=0.0 if alpha_grad is None else float(alpha_grad.detach().abs())
         if args.train:
             losses['total'].backward()

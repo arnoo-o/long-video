@@ -13,10 +13,18 @@ REQUIRED=("attention_logits","positive_key_indices","memory_count","fm_loss","ba
 def _ranking(logits,positive_lists):
     if logits.ndim==3: logits=logits[:,None]
     ranks=[]; masses=[]
-    for query,keys in enumerate(positive_lists):
-        keys=torch.tensor(keys,device=logits.device,dtype=torch.long)
-        query_logits=logits[:,:,query]
-        positive_logits=query_logits.index_select(-1,keys)
+    for start in range(0,len(positive_lists),64):
+        positive_block=positive_lists[start:start+64]
+        width=max(len(keys) for keys in positive_block)
+        key_indices=torch.zeros((len(positive_block),width),device=logits.device,dtype=torch.long)
+        key_valid=torch.zeros_like(key_indices,dtype=torch.bool)
+        for offset,keys in enumerate(positive_block):
+            if not keys: raise RuntimeError(f'probe query {start+offset} has no positive key')
+            key_indices[offset,:len(keys)]=torch.as_tensor(keys,device=logits.device,dtype=torch.long)
+            key_valid[offset,:len(keys)]=True
+        query_logits=logits[:,:,start:start+len(positive_block)]
+        gather_indices=key_indices.view(1,1,*key_indices.shape).expand(*query_logits.shape[:-1],width)
+        positive_logits=query_logits.gather(-1,gather_indices).masked_fill(~key_valid.view(1,1,*key_valid.shape),-torch.inf)
         best_positive=positive_logits.max(-1,keepdim=True).values
         ranks.append((query_logits>best_positive).sum(-1).reshape(-1))
         masses.append((positive_logits.logsumexp(-1)-query_logits.logsumexp(-1)).exp().reshape(-1))

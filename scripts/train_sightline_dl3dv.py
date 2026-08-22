@@ -219,7 +219,7 @@ def main():
         if latents.shape[2]<49: raise ValueError('six chunks require at least 49 latent frames')
         source_gt=latents[:,:,:1]
         source,fake,_,_=prepare_source_condition(pipe,Image.open(record.rgb_paths()[0]).convert('RGB'),height=cfg.source_height,width=cfg.source_width,device='cuda')
-        c2w_np,K_np=record.load_cameras(); c2w=torch.from_numpy(c2w_np).to('cuda',dtype=torch.float32).unsqueeze(0); K=torch.from_numpy(K_np).to('cuda',dtype=torch.float32).unsqueeze(0)
+        c2w_np,K_np=record.load_cameras(); c2w=torch.from_numpy(np.array(c2w_np,copy=True)).to('cuda',dtype=torch.float32).unsqueeze(0); K=torch.from_numpy(np.array(K_np,copy=True)).to('cuda',dtype=torch.float32).unsqueeze(0)
         _reset_sequence(runner); runner._trajectory_c2w=c2w; runner._trajectory_K=K; runner._source_camera=c2w[:,0]; runner._source_intrinsics=K[:,0]; runner.memory.set_enabled(phase['memory'])
         for name,parameter in pipe.transformer.named_parameters():
             if 'lora_' in name: parameter.requires_grad_(phase['lora'])

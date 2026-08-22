@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib,json,random
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v3'; SCHEMA='sightline-checkpoint-v5'
+SEMANTICS='sightline-v4'; SCHEMA='sightline-checkpoint-v6'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)

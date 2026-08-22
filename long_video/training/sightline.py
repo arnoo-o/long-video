@@ -30,13 +30,15 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
     return min(maximum, 1 + step // warmup_steps)
 
 def curriculum_phase(step: int):
-    """Exact 2500-step Sightline curriculum requested by the training spec."""
+    """Camera-first curriculum with Memory and correspondence disabled."""
     if step < 0: raise ValueError("step must be non-negative")
-    if step < 300: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
-    if step < 1000: return {"name":"P2","max_chunks":1,"lora":True,"correspondence":False,"memory":False}
-    bounds=((1500,2),(1800,3),(2100,4),(2300,5))
-    max_chunks=next((chunks for end,chunks in bounds if step < end),6)
-    return {"name":"P3","max_chunks":max_chunks,"lora":True,"correspondence":True,"memory":True}
+    if step < 400: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
+    return {"name":"P2","max_chunks":1 if step < 800 else 2,"lora":True,"correspondence":False,"memory":False}
+
+def select_chunk_window(window_chunks: int, total_chunks: int = 6,
+                        generator: torch.Generator | None = None) -> int:
+    if not 1 <= window_chunks <= total_chunks: raise ValueError('invalid chunk window')
+    return int(torch.randint(total_chunks-window_chunks+1,(1,),generator=generator).item())
 
 def assert_single_backward_chunk(policies, train_chunk: int) -> None:
     if sum(policy == "backward" for policy in policies) != 1 or policies[train_chunk] != "backward":

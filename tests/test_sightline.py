@@ -54,6 +54,16 @@ def test_train_chunk_policy_is_single_and_causal():
     outputs,_=run_single_graph_chunks(4,2,lambda chunk,grad: seen.append((chunk,grad)) or weight*(chunk+1))
     assert [out.requires_grad for out in outputs]==[False,False,True,False]
 
+def test_camera_first_curriculum_uses_random_two_chunk_window():
+    from long_video.training.sightline import curriculum_phase, select_chunk_window
+    assert curriculum_phase(0)=={'name':'P1','max_chunks':1,'lora':False,'correspondence':False,'memory':False}
+    assert curriculum_phase(399)['max_chunks']==1
+    assert curriculum_phase(400)['lora'] and curriculum_phase(400)['max_chunks']==1
+    assert curriculum_phase(799)['max_chunks']==1
+    assert curriculum_phase(800)['max_chunks']==2
+    generator=torch.Generator().manual_seed(7)
+    assert 0 <= select_chunk_window(2,generator=generator) <= 4
+
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
 

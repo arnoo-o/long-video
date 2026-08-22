@@ -39,7 +39,8 @@ def _apply_schedule_shift(sigmas,reference,config):
     if config.get('time_shift_type','linear')=='exponential': mu=torch.exp(torch.tensor(min(mu,torch.log(torch.tensor(7.)).item()),device=sigmas.device,dtype=sigmas.dtype))
     return (sigmas*mu)/(1+(mu-1)*sigmas)
 
-def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), device=None, generator=None):
+def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), device=None, generator=None,
+                              sigma_range=None):
     device=device or target_latents.device; stages=len(stage_steps)
     scheduler=pipe.scheduler
     if int(scheduler.config.get('stages',stages)) != stages: raise ValueError('scheduler stage count mismatch')
@@ -49,7 +50,15 @@ def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), devi
         current=clean[stage]; start=float(scheduler.start_sigmas[stage]); end=float(scheduler.end_sigmas[stage])
         start_point=noise[stage] if stage==0 else start*noise[stage]+(1-start)*_upsample(clean[stage-1],current)
         end_point=current if stage==stages-1 else end*noise[stage]+(1-end)*current
-        indices=(_density(target_latents.shape[0],device)*train_steps).long().clamp(0,train_steps-1)
+        if sigma_range is None:
+            indices=(_density(target_latents.shape[0],device)*train_steps).long().clamp(0,train_steps-1)
+        else:
+            low,high=(float(value) for value in sigma_range)
+            stage_sigmas=torch.as_tensor(scheduler.sigmas_per_stage[stage]).flatten()
+            eligible=torch.nonzero((stage_sigmas>low)&(stage_sigmas<=high),as_tuple=False).flatten()
+            if not len(eligible): raise RuntimeError(f'stage {stage} has no scheduler sigma in ({low}, {high}]')
+            picks=torch.randint(len(eligible),(target_latents.shape[0],),generator=generator,device='cpu')
+            indices=eligible.index_select(0,picks)
         cpu_indices=indices.detach().cpu()
         timesteps=scheduler.timesteps_per_stage[stage][cpu_indices].to(device=device)
         sigmas=scheduler.sigmas_per_stage[stage][cpu_indices].to(device=device,dtype=start_point.dtype)

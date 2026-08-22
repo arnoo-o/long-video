@@ -37,7 +37,7 @@ class SightlineHeliosAttnProcessor:
         scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
         dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
         dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
-        dq=dq.unflatten(-1,(attn.heads,-1)); dk=dk.unflatten(-1,(attn.heads,-1))
+        dq=dq.to(query.dtype).unflatten(-1,(attn.heads,-1)); dk=dk.to(key.dtype).unflatten(-1,(attn.heads,-1))
         if key.shape[1] > current_len:
             validity=self.ray_provider.context.get('history_validity') if self.ray_provider.context is not None else None
             if validity is not None:

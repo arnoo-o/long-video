@@ -36,7 +36,7 @@ def measured_row(capture):
         "corr_loss":float(capture["corr_loss"]),"alpha":float(capture['alpha']),"alpha_grad":float(capture['alpha_grad']),"vram_gb":float(capture["vram_gb"]),"step_time_sec":float(capture["step_time_sec"]),"ablation_time_sec":float(capture['ablation_time_sec'])}
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument("--model",required=True); parser.add_argument('--model-revision'); parser.add_argument("--helios-root",required=True); parser.add_argument("--manifest",required=True); parser.add_argument("--config",default="configs/sightline.yaml"); parser.add_argument("--checkpoint"); parser.add_argument("--alpha-zero-baseline",action="store_true"); parser.add_argument('--candidate-layers',default=''); parser.add_argument("--samples",type=int,default=10); parser.add_argument("--expected-records",type=int,default=100); parser.add_argument("--out",required=True); args=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument("--model",required=True); parser.add_argument('--model-revision'); parser.add_argument("--helios-root",required=True); parser.add_argument("--manifest",required=True); parser.add_argument("--config",default="configs/sightline.yaml"); parser.add_argument("--checkpoint"); parser.add_argument("--alpha-zero-baseline",action="store_true"); parser.add_argument('--candidate-layers',default=''); parser.add_argument("--samples",type=int,default=10); parser.add_argument("--expected-records",type=int,default=100); parser.add_argument('--latent-cache-root'); parser.add_argument("--out",required=True); args=parser.parse_args()
     if bool(args.checkpoint)==bool(args.alpha_zero_baseline): raise ValueError('provide --checkpoint or explicitly select --alpha-zero-baseline')
     rows=[]; train_script=Path(__file__).with_name('train_sightline_dl3dv.py')
     if args.checkpoint:
@@ -54,12 +54,16 @@ def main():
         capture=Path(directory)/f'{index}.pt'; metrics=Path(directory)/f'{index}.jsonl'
         command=[sys.executable,str(train_script),'--model',args.model,'--helios-root',args.helios_root,'--manifest',args.manifest,'--config',args.config,'--expected-records',str(args.expected_records),'--record-index',str(index),'--train-chunk',str(train_chunk),'--probe-only','--probe-step',str(probe_step),'--probe-layers',args.candidate_layers,'--probe-capture',str(capture),'--output-dir',directory]
         if args.model_revision: command.extend(['--model-revision',args.model_revision])
+        if args.latent_cache_root: command.extend(['--latent-cache-root',args.latent_cache_root])
         if args.checkpoint: command.extend(['--probe-checkpoint',args.checkpoint])
         else: command.append('--alpha-zero-baseline')
         subprocess.run(command,check=True)
         payload=torch.load(capture,map_location='cpu')
         if payload.get("source")!="real_helios_forward": raise RuntimeError(f"{capture} is not a real Helios capture")
-        rows.append(measured_row(payload))
+        captures=payload.get('layer_captures') or [payload]
+        for layer_capture in captures:
+            merged=dict(payload); merged.update(layer_capture); merged.pop('layer_captures',None)
+            rows.append(measured_row(merged))
     Path(args.out).write_text("".join(json.dumps(row)+"\n" for row in rows))
 
 if __name__=="__main__": main()

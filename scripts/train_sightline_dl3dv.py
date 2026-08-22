@@ -251,10 +251,19 @@ def main():
                 losses.update(fm=fm,corr=corr,total=fm+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr,stage=stage_losses)
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
-                    layer=active_corr_layers[0]; processor=pipe.transformer._sightline_processors[layer]; selected,positives,_,_=_mapped_correspondences(processor,corr_rows,chunk)
-                    selected=selected[:cfg.correspondence_rows_per_batch]; positives=positives[:len(selected)]
-                    memory_count=processor.last_attention_meta.get('memory_tokens',0); selected_q=processor.last_q[:,selected]; base_k=processor.last_k
-                    head_logits=torch.einsum('bqhd,bkhd->bhqk',selected_q,base_k)*(selected_q.shape[-1]**-.5)
+                    layer_captures=[]
+                    for layer in active_corr_layers:
+                        processor=pipe.transformer._sightline_processors[layer]
+                        try: selected,positives,_,_=_mapped_correspondences(processor,corr_rows,chunk)
+                        except RuntimeError as exc:
+                            if 'do not map' in str(exc): continue
+                            raise
+                        selected=selected[:cfg.correspondence_rows_per_batch]; positives=positives[:len(selected)]
+                        selected_q=processor.last_q[:,selected]; base_k=processor.last_k
+                        head_logits=torch.einsum('bqhd,bkhd->bhqk',selected_q,base_k)*(selected_q.shape[-1]**-.5)
+                        layer_captures.append({'layer':layer,'attention_logits':head_logits.detach().cpu(),'positive_key_indices':positives,'memory_count':processor.last_attention_meta.get('memory_tokens',0)})
+                    if not layer_captures: raise RuntimeError('probe candidates have no mapped correspondence rows')
+                    layer=layer_captures[0]['layer']; processor=pipe.transformer._sightline_processors[layer]
                     base_context=dict(provider.context); normal_step_time=time.perf_counter()-started; ablation_started=time.perf_counter()
                     memory_enabled_by_layer={layer:bank.enabled for layer,bank in runner.memory.banks.items()}
                     with torch.no_grad():
@@ -273,7 +282,8 @@ def main():
                         provider.context=base_context
                     alpha=trainable.conditioner.alpha
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
-                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=layer,sigma=float(final['sigmas'].mean()),attention_logits=head_logits.detach().cpu(),positive_key_indices=positives,memory_count=memory_count,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+                    first=layer_captures[0]
+                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             if chunk==0: generated[:,:,0:1]=source
             history_state.append_chunk(generated,chunk)
             runner._finalize_chunk(chunk)

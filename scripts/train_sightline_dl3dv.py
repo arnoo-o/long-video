@@ -243,13 +243,16 @@ def main():
                 target=latents[:,:,chunk*8:chunk*8+9]  # The sole non-source GT read in this step.
                 items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device); runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 stage_losses=[]; final_prediction=None
-                for item in items:
+                for stage_index,item in enumerate(items):
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
-                    stage_losses.append((prediction.float()-item['target'].float()).square().mean())
-                fm=torch.stack(stage_losses).mean()
+                    stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
+                    if args.train and stage_index+1<len(items): (stage_loss/len(items)).backward()
+                fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)) if (corr_rows and not args.alpha_zero_baseline) else fm.new_zeros(())
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
-                losses.update(fm=fm,corr=corr,total=fm+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr,stage=stage_losses)
+                total=stage_losses[-1]/len(items)+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr if args.train else fm+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr
+                losses.update(fm=fm,corr=corr,total=total,stage=stage_losses)
+                if args.train: total.backward()
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -300,7 +303,6 @@ def main():
             alpha_grad=None if not losses['total'].requires_grad else torch.autograd.grad(losses['total'],trainable.conditioner.alpha,retain_graph=True,allow_unused=True)[0]
             probe_payload['alpha_grad']=0.0 if alpha_grad is None else float(alpha_grad.detach().abs())
         if args.train:
-            losses['total'].backward()
             active_phase=curriculum_phase(step)
             if active_phase['name']=='P1' and (trainable.conditioner.alpha.grad is None or not torch.isfinite(trainable.conditioner.alpha.grad).all()): raise RuntimeError('P1 alpha gradient missing or non-finite')
             if active_phase['name']=='P2':

@@ -27,6 +27,8 @@ def main():
     digest=hashlib.sha256(); [digest.update(Path(f).read_bytes()) for f in sorted(set(model_files))]
     model_identity={'model_ref':str(a.model),'config_fingerprint':digest.hexdigest()}
     vae_config=dict(vae.config) if hasattr(vae.config,'items') else str(vae.config)
+    if isinstance(vae_config,dict) and isinstance(vae_config.get('_use_default_values'),list):
+        vae_config['_use_default_values']=sorted(vae_config['_use_default_values'])
     provenance={'model_identity':model_identity,'vae_config':vae_config,'preprocessing':{'height':a.height,'width':a.width,'normalization':'pinned Helios video_processor'},'latent_normalization':{'mean':list(vae.config.latents_mean),'std':list(vae.config.latents_std)},'encode_mode':'mode','encoding_dtype':str(vae.dtype)}
     provenance['fingerprint']=hashlib.sha256(json.dumps(provenance,sort_keys=True,default=str).encode()).hexdigest()
     mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,vae.config.z_dim,1,1,1); std=(1.0/torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype)).view(1,vae.config.z_dim,1,1,1)

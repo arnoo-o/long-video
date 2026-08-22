@@ -58,7 +58,8 @@ def test_camera_first_curriculum_uses_random_two_chunk_window():
     from long_video.training.sightline import curriculum_phase, select_chunk_window
     assert curriculum_phase(0)=={'name':'P1','max_chunks':1,'lora':False,'correspondence':False,'memory':False}
     assert curriculum_phase(299)['max_chunks']==1
-    assert curriculum_phase(300)['lora'] and curriculum_phase(300)['max_chunks']==2
+    assert not curriculum_phase(300)['lora'] and curriculum_phase(300)['max_chunks']==2
+    assert curriculum_phase(400)['lora'] and curriculum_phase(400)['max_chunks']==2
     assert curriculum_phase(899)['max_chunks']==2
     assert curriculum_phase(900)['memory'] and curriculum_phase(900)['correspondence'] and curriculum_phase(900)['max_chunks']==2
     assert curriculum_phase(1100)['max_chunks']==3

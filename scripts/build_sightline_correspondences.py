@@ -169,7 +169,7 @@ def main():
     if a.stage_a_cache and a.stage_a_cache.exists():
         cached=json.loads(a.stage_a_cache.read_text())
         if cached.get('metadata')==cache_meta: candidates=cached['candidates']; accepted=sum(int(x['accepted']) for x in candidates)
-    screen_tree_cache={}; screen_frame_cache=_frame_cache(xyz,valid,confidence,c2w,K,a.screening_stride) if a.probe_subset else None
+    screen_tree_cache={}; screen_frame_cache=_frame_cache(xyz,valid,confidence,c2w,K,a.screening_stride)
     for query in range(frames) if not candidates else []:
         for key in range(0,max(0,query-a.min_frame_gap+1)):
             candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache,frame_cache=screen_frame_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})

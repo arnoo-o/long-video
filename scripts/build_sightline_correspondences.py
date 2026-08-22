@@ -169,10 +169,10 @@ def main():
     if a.stage_a_cache and a.stage_a_cache.exists():
         cached=json.loads(a.stage_a_cache.read_text())
         if cached.get('metadata')==cache_meta: candidates=cached['candidates']; accepted=sum(int(x['accepted']) for x in candidates)
-    screen_tree_cache={}; screen_frame_cache=_frame_cache(xyz,valid,confidence,c2w,K,a.screening_stride)
+    screen_tree_cache={}
     for query in range(frames) if not candidates else []:
         for key in range(0,max(0,query-a.min_frame_gap+1)):
-            candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache,frame_cache=screen_frame_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
+            candidate=screen_overlap(xyz,valid,confidence,query,key,screening_stride=a.screening_stride,screening_distance_threshold=a.screening_distance_threshold,min_overlap_count=a.min_overlap_count,min_overlap_ratio=a.min_overlap_ratio,tree_cache=screen_tree_cache); candidates.append({'query_frame':query,'key_frame':key,**candidate})
             if candidate['accepted']:
                 accepted+=1
                 if not a.screen_only: points.extend(_point_correspondences(xyz,valid,zbuffer_valid,confidence,query,key,c2w,K,a.token_height,a.token_width,a.distance_fraction,a.point_stride,frames_cache,a.projection_radius,a.cycle_pixel_threshold))

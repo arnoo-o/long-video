@@ -100,7 +100,7 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
         qi,ki=qcache['pixels'],kcache['pixels']; query,key=qcache['points'],kcache['points']
         qconfidence=qcache['confidence']
         if int(point_stride)>1:
-            height,width=valid.shape[1:]; keep=(qi//width % int(point_stride)==0)&(qi % width==0)
+            height,width=valid.shape[1:]; keep=(qi//width % int(point_stride)==0)&(qi % width % int(point_stride)==0)
             qi=qi[keep]; query=query[keep]; qconfidence=qconfidence[keep]
     if not len(qi) or not len(ki): return []
     if frames_cache is None: query=xyz[query_frame].reshape(-1,3)[qi]; key=xyz[key_frame].reshape(-1,3)[ki]

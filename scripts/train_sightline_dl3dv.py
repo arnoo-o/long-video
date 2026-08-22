@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse, hashlib, json, random, sys, time
 from dataclasses import asdict
 from pathlib import Path
+import numpy as np
 import torch
 from PIL import Image
 from long_video.config import load_sightline_config

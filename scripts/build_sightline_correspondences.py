@@ -88,6 +88,10 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
     if frames_cache is not None:
         qcache,kcache=frames_cache[query_frame],frames_cache[key_frame]
         qi,ki=qcache['pixels'],kcache['pixels']; query,key=qcache['points'],kcache['points']
+        qconfidence=qcache['confidence']
+        if int(point_stride)>1:
+            height,width=valid.shape[1:]; keep=(qi//width % int(point_stride)==0)&(qi % width==0)
+            qi=qi[keep]; query=query[keep]; qconfidence=qconfidence[keep]
     if not len(qi) or not len(ki): return []
     if frames_cache is None: query=xyz[query_frame].reshape(-1,3)[qi]; key=xyz[key_frame].reshape(-1,3)[ki]
     positive=(frames_cache[query_frame]['median_depth'],) if frames_cache is not None else _project(query,c2w[query_frame],K[query_frame])[0]
@@ -121,7 +125,7 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
     rows=[]
     for local,seen in zip(selected,visible):
         if not seen: continue
-        qpixel=int(qi[local]); kpixel=int(ki[q_to_k[local]]); qy,qx=_token(qpixel,height,width,token_height,token_width); ky,kx=_token(kpixel,height,width,token_height,token_width); qconf=frames_cache[query_frame]['confidence'][local] if frames_cache is not None else confidence[query_frame].reshape(-1)[qpixel]; kconf=frames_cache[key_frame]['confidence'][q_to_k[local]] if frames_cache is not None else confidence[key_frame].reshape(-1)[kpixel]; conf=float(np.sqrt(max(0.,qconf)*max(0.,kconf)))
+        qpixel=int(qi[local]); kpixel=int(ki[q_to_k[local]]); qy,qx=_token(qpixel,height,width,token_height,token_width); ky,kx=_token(kpixel,height,width,token_height,token_width); qconf=qconfidence[local] if frames_cache is not None else confidence[query_frame].reshape(-1)[qpixel]; kconf=frames_cache[key_frame]['confidence'][q_to_k[local]] if frames_cache is not None else confidence[key_frame].reshape(-1)[kpixel]; conf=float(np.sqrt(max(0.,qconf)*max(0.,kconf)))
         rows.append({'query_frame':query_frame,'key_frame':key_frame,'query_pixel':qpixel,'key_pixel':kpixel,'query_y':qy,'query_x':qx,'key_y':ky,'key_x':kx,'valid_count':token_valid_counts[(qy,qx)],'weight':float(conf*np.exp(-float(distance[local])/max(threshold,1e-8))),'cycle_consistent':True,'cycle_type':'mutual_two_view'})
     return rows
 
@@ -148,7 +152,9 @@ def main():
     xyz=np.load(a.xyz,mmap_mode='r'); valid=np.load(a.valid,mmap_mode='r').astype(bool); confidence=np.load(a.confidence,mmap_mode='r');
     if xyz.shape[:3]!=valid.shape or confidence.shape!=valid.shape: raise ValueError('teacher arrays must share [F,H,W] shape')
     zbuffer_valid=valid.copy(); valid &= np.isfinite(confidence)&(confidence>=a.confidence_threshold); frames=valid.shape[0]; c2w=_camera_sequence(np.load(a.c2w),'c2w',frames); K=_camera_sequence(np.load(a.intrinsics),'K',frames); points=[]; candidates=[]; accepted=0
-    frames_cache=None if a.screen_only else _frame_cache(xyz,valid,confidence,c2w,K,a.point_stride)
+    # Keep dense key pixels for projection neighborhoods; point_stride only
+    # reduces query samples inside Stage-B.
+    frames_cache=None if a.screen_only else _frame_cache(xyz,valid,confidence,c2w,K,1)
     cache_meta={'xyz':_fingerprint(a.xyz),'valid':_fingerprint(a.valid),'confidence':_fingerprint(a.confidence),'c2w':_fingerprint(a.c2w),'intrinsics':_fingerprint(a.intrinsics),'screening_stride':a.screening_stride,'screening_distance_threshold':a.screening_distance_threshold,'min_overlap_count':a.min_overlap_count,'min_overlap_ratio':a.min_overlap_ratio,'min_frame_gap':a.min_frame_gap}
     if a.stage_a_cache and a.stage_a_cache.exists():
         cached=json.loads(a.stage_a_cache.read_text())

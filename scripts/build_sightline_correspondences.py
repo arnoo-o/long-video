@@ -32,6 +32,11 @@ def _nn(a,b):
 def _project(points,c2w,K):
     camera=(np.c_[points,np.ones(len(points),np.float32)]@np.linalg.inv(c2w).T)[:,:3]; uv=camera@K.T; return camera[:,2],uv[:,:2]/np.maximum(uv[:,2:3],1e-8)
 
+def _project_cached(points, inv_c2w, K):
+    camera=(np.c_[points,np.ones(len(points),np.float32)]@inv_c2w.T)[:,:3]
+    uv=camera@K.T
+    return camera[:,2],uv[:,:2]/np.maximum(uv[:,2:3],1e-8)
+
 def _zbuffer_visible(points,scene,c2w,K,height,width):
     scene_z,scene_uv=_project(scene,c2w,K); sx=np.floor(scene_uv[:,0]).astype(int); sy=np.floor(scene_uv[:,1]).astype(int); inside=(scene_z>0)&(sx>=0)&(sx<width)&(sy>=0)&(sy<height); depth=np.full((height,width),np.inf,np.float32); np.minimum.at(depth,(sy[inside],sx[inside]),scene_z[inside]); z,uv=_project(points,c2w,K); x=np.floor(uv[:,0]).astype(int); y=np.floor(uv[:,1]).astype(int); inside=(z>0)&(x>=0)&(x<width)&(y>=0)&(y<height); return inside&(z<=depth[np.clip(y,0,height-1),np.clip(x,0,width-1)]+1e-4)
 
@@ -48,15 +53,16 @@ def _frame_cache(xyz, valid, confidence, c2w, K, stride=1):
         points=xyz[f].reshape(-1,3)[pixels]
         conf=confidence[f].reshape(-1)[pixels]
         tree=cKDTree(points) if len(points) else None
-        _,uv=_project(points,c2w[f],K[f]) if len(points) else (np.empty(0),np.empty((0,2)))
-        z,_=_project(points,c2w[f],K[f]) if len(points) else (np.empty(0),np.empty((0,2)))
+        inv_c2w=np.linalg.inv(c2w[f]).astype(np.float32)
+        _,uv=_project_cached(points,inv_c2w,K[f]) if len(points) else (np.empty(0),np.empty((0,2)))
+        z,_=_project_cached(points,inv_c2w,K[f]) if len(points) else (np.empty(0),np.empty((0,2)))
         positive=z[np.isfinite(z)&(z>0)]; median=float(np.median(positive)) if len(positive) else 0.0
-        scene_z,scene_uv=_project(points,c2w[f],K[f]) if len(points) else (np.empty(0),np.empty((0,2)))
+        scene_z,scene_uv=_project_cached(points,inv_c2w,K[f]) if len(points) else (np.empty(0),np.empty((0,2)))
         sx=np.floor(scene_uv[:,0]).astype(int) if len(points) else np.empty(0,int); sy=np.floor(scene_uv[:,1]).astype(int) if len(points) else np.empty(0,int)
         inside=(scene_z>0)&(sx>=0)&(sx<width)&(sy>=0)&(sy<height); depth=np.full((height,width),np.inf,np.float32)
         if len(points): np.minimum.at(depth,(sy[inside],sx[inside]),scene_z[inside])
         pixel_to_index=np.full(height*width,-1,np.int64); pixel_to_index[pixels]=np.arange(len(pixels),dtype=np.int64)
-        out.append({'pixels':pixels,'points':points,'confidence':conf,'tree':tree,'median_depth':median,'depth':depth,'pixel_to_index':pixel_to_index})
+        out.append({'pixels':pixels,'points':points,'confidence':conf,'tree':tree,'median_depth':median,'depth':depth,'pixel_to_index':pixel_to_index,'inv_c2w':inv_c2w,'K':K[f]})
     return out
 
 def _token(pixel_index,height,width,token_height,token_width):
@@ -101,7 +107,7 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
     if frames_cache is not None:
         # Geometry-directed correspondence: project query points into the key
         # view, then choose the nearest valid 3D point in a small pixel window.
-        _, projected=_project(query,c2w[key_frame],K[key_frame]); centers=np.rint(projected).astype(np.int64)
+        _, projected=_project_cached(query,kcache['inv_c2w'],kcache['K']); centers=np.rint(projected).astype(np.int64)
         best_dist=np.full(len(query),np.inf,np.float32); q_to_k=np.full(len(query),-1,np.int64)
         radius=max(0,int(projection_radius)); key_map=kcache['pixel_to_index']
         for dy in range(-radius,radius+1):
@@ -115,8 +121,8 @@ def _point_correspondences(xyz,valid,zbuffer_valid,confidence,query_frame,key_fr
         distance,q_to_k=_nn(query,key); _,k_to_q=_nn(key,query); keep=(q_to_k>=0)&(k_to_q[q_to_k]==np.arange(len(query)))&(distance<=threshold)
     selected=np.flatnonzero(keep)
     if len(selected) and frames_cache is not None:
-        pts=key[q_to_k[selected]]; z,uv=_project(pts,c2w[key_frame],K[key_frame]); x=np.floor(uv[:,0]).astype(int); y=np.floor(uv[:,1]).astype(int); visible=(z>0)&(x>=0)&(x<width)&(y>=0)&(y<height)&(z<=kcache['depth'][np.clip(y,0,height-1),np.clip(x,0,width-1)]+1e-4)
-        _,back_uv=_project(pts,c2w[query_frame],K[query_frame]); qflat=qi[selected]; qy_pix,qx_pix=np.divmod(qflat,width); cycle=np.linalg.norm(back_uv-np.stack([qx_pix,qy_pix],axis=1),axis=1)<=float(cycle_pixel_threshold); visible &= cycle
+        pts=key[q_to_k[selected]]; z,uv=_project_cached(pts,kcache['inv_c2w'],kcache['K']); x=np.floor(uv[:,0]).astype(int); y=np.floor(uv[:,1]).astype(int); visible=(z>0)&(x>=0)&(x<width)&(y>=0)&(y<height)&(z<=kcache['depth'][np.clip(y,0,height-1),np.clip(x,0,width-1)]+1e-4)
+        _,back_uv=_project_cached(pts,qcache['inv_c2w'],qcache['K']); qflat=qi[selected]; qy_pix,qx_pix=np.divmod(qflat,width); cycle=np.linalg.norm(back_uv-np.stack([qx_pix,qy_pix],axis=1),axis=1)<=float(cycle_pixel_threshold); visible &= cycle
     else:
         scene_mask=zbuffer_valid[key_frame]&np.isfinite(xyz[key_frame]).all(-1)&(np.linalg.norm(xyz[key_frame],axis=-1)>1e-8); visible=_zbuffer_visible(key[q_to_k[selected]],xyz[key_frame][scene_mask],c2w[key_frame],K[key_frame],height,width) if len(selected) else []
     token_valid_counts={}

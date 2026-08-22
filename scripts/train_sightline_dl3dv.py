@@ -209,7 +209,7 @@ def main():
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
-        phase=curriculum_phase(step); checkpointing=bool(cfg.gradient_checkpointing and phase['name']!='P3'); _set_gradient_checkpointing(pipe.transformer,checkpointing)
+        phase=curriculum_phase(step); checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         index=args.record_index if args.record_index is not None else random.randrange(len(records)); record=records[index]
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None

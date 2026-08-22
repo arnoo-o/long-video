@@ -36,6 +36,12 @@ def runtime_provenance(pipe, model_id, helios_root, model_revision=None):
         model_identity={'kind':'huggingface','revision':str(revision),'transformer_config_sha256':transformer_config}
     scheduler_config=dict(pipe.scheduler.config)
     return {'transformer_source_sha256':hashlib.sha256(transformer.read_bytes()).hexdigest(),'pipeline_source_sha256':hashlib.sha256(pipeline.read_bytes()).hexdigest(),'scheduler_class':type(pipe.scheduler).__module__+'.'+type(pipe.scheduler).__qualname__,'scheduler_config_sha256':scheduler_config_fingerprint(scheduler_config),'model_id':str(model_id),'model_identity':model_identity}
+
+def _provenance_matches(saved, current):
+    """Permit relocating an identical local model while preserving strict fingerprints."""
+    if not isinstance(saved,dict) or not isinstance(current,dict): return False
+    keys=('transformer_source_sha256','pipeline_source_sha256','scheduler_class','scheduler_config_sha256','model_identity')
+    return all(saved.get(key)==current.get(key) for key in keys)
 def save_checkpoint(path, model, optimizer, scheduler, step, *, config, helios_fingerprint, layers, memory_config):
     payload={'model':model.state_dict(),'optimizer':optimizer.state_dict() if optimizer else None,'scheduler':scheduler.state_dict() if scheduler else None,'step':int(step),'rng_torch':torch.get_rng_state(),'rng_python':random.getstate(),'sightline_training_semantics_version':SEMANTICS,'sightline_checkpoint_schema_version':SCHEMA,'config':config,'config_fingerprint':config_fingerprint(config),'helios_fingerprint':helios_fingerprint,'layers':list(layers),'memory_config':memory_config}
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
@@ -57,7 +63,7 @@ def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, sch
 
 def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config, optimizer=None, scheduler=None, restore_rng=False, provenance=None):
     validate_checkpoint(payload,config=config,helios_fingerprint=helios_fingerprint,layers=layers,memory_config=memory_config)
-    if provenance is not None and payload.get('runtime_provenance')!=provenance: raise RuntimeError('Sightline checkpoint runtime provenance mismatch')
+    if provenance is not None and not _provenance_matches(payload.get('runtime_provenance'),provenance): raise RuntimeError('Sightline checkpoint runtime provenance mismatch')
     trainable.load_state_dict(payload['trainable'],strict=True); memory.load_state_dict(payload['memory'],strict=True)
     missing,unexpected=transformer.load_state_dict(payload.get('lora',{}),strict=False)
     unexpected=[name for name in unexpected if 'lora_' in name]

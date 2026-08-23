@@ -59,8 +59,8 @@ def _preflight(cfg,args,probe_layers):
         raise ValueError('formal training requires non-empty sightline_layers')
     if tuple(cfg.camera_layers)!=(1,2,3,4,5,6) or not set(cfg.camera_layers).issubset(set(cfg.sightline_layers)):
         raise ValueError('camera_layers must be exactly 1..6 and belong to sightline_layers')
-    if tuple(cfg.memory_layers)!=tuple(range(17,25)) or tuple(cfg.correspondence_layers)!=(16,20,24):
-        raise ValueError('Memory layers must be 17..24; correspondence layers must be 16/20/24')
+    if tuple(cfg.memory_layers)!=(16,20,24) or tuple(cfg.correspondence_layers)!=(16,20,24):
+        raise ValueError('Memory/correspondence layers must be 16/20/24')
     if args.train and (cfg.memory_layers or cfg.correspondence_layers):
         # These modules remain reserved but are intentionally disabled in the
         # camera-only retraining curriculum.
@@ -242,7 +242,7 @@ def _all_rank_rng_states(world_size):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True)
-    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
+    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
@@ -277,7 +277,7 @@ def main():
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     if args.resume:
-        payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank); start_step=completed_step+1
+        payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=None if args.allow_memory_layer_migration else optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,allow_memory_layer_migration=args.allow_memory_layer_migration); start_step=completed_step+1
     elif args.probe_checkpoint:
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step

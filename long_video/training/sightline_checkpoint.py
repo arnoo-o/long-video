@@ -46,11 +46,18 @@ def _provenance_matches(saved, current):
 def save_checkpoint(path, model, optimizer, scheduler, step, *, config, helios_fingerprint, layers, memory_config):
     payload={'model':model.state_dict(),'optimizer':optimizer.state_dict() if optimizer else None,'scheduler':scheduler.state_dict() if scheduler else None,'step':int(step),'rng_torch':torch.get_rng_state(),'rng_python':random.getstate(),'sightline_training_semantics_version':SEMANTICS,'sightline_checkpoint_schema_version':SCHEMA,'config':config,'config_fingerprint':config_fingerprint(config),'helios_fingerprint':helios_fingerprint,'layers':list(layers),'memory_config':memory_config}
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
-def validate_checkpoint(payload, *, config, helios_fingerprint, layers, memory_config):
+def validate_checkpoint(payload, *, config, helios_fingerprint, layers, memory_config, allow_memory_layer_migration=False):
     if payload.get('sightline_training_semantics_version')!=SEMANTICS or payload.get('sightline_checkpoint_schema_version')!=SCHEMA:
         raise RuntimeError(f'incompatible Sightline checkpoint: expected {SEMANTICS}/{SCHEMA} for all-layer geometry, camera residual, and rank-16 LoRA; got {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")}')
-    if payload.get('helios_fingerprint')!=helios_fingerprint or payload.get('config_fingerprint')!=config_fingerprint(config): raise RuntimeError('Sightline checkpoint provenance/config mismatch')
-    if tuple(payload.get('layers',()))!=tuple(layers) or payload.get('memory_config')!=memory_config: raise RuntimeError('Sightline checkpoint layer/memory mismatch')
+    if payload.get('helios_fingerprint')!=helios_fingerprint: raise RuntimeError('Sightline checkpoint provenance mismatch')
+    saved_config=payload.get('config',{})
+    config_match=payload.get('config_fingerprint')==config_fingerprint(config)
+    if allow_memory_layer_migration and not config_match:
+        old=dict(saved_config); new=dict(config); old.pop('memory_layers',None); new.pop('memory_layers',None)
+        config_match=old==new
+    if not config_match: raise RuntimeError('Sightline checkpoint config mismatch')
+    if tuple(payload.get('layers',()))!=tuple(layers): raise RuntimeError('Sightline checkpoint layer mismatch')
+    if not allow_memory_layer_migration and payload.get('memory_config')!=memory_config: raise RuntimeError('Sightline checkpoint memory mismatch')
 
 def _numpy_rng_state():
     kind, values, position, has_gauss, cached = np.random.get_state()
@@ -79,10 +86,11 @@ def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, sch
         'layers':list(layers),'memory_config':memory_config,'runtime_provenance':provenance}
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
 
-def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config, optimizer=None, scheduler=None, restore_rng=False, provenance=None, rank=0):
-    validate_checkpoint(payload,config=config,helios_fingerprint=helios_fingerprint,layers=layers,memory_config=memory_config)
+def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config, optimizer=None, scheduler=None, restore_rng=False, provenance=None, rank=0, allow_memory_layer_migration=False):
+    validate_checkpoint(payload,config=config,helios_fingerprint=helios_fingerprint,layers=layers,memory_config=memory_config,allow_memory_layer_migration=allow_memory_layer_migration)
     if provenance is not None and not _provenance_matches(payload.get('runtime_provenance'),provenance): raise RuntimeError('Sightline checkpoint runtime provenance mismatch')
-    trainable.load_state_dict(payload['trainable'],strict=True); memory.load_state_dict(payload['memory'],strict=True)
+    trainable.load_state_dict(payload['trainable'],strict=True)
+    if not allow_memory_layer_migration: memory.load_state_dict(payload['memory'],strict=True)
     missing,unexpected=transformer.load_state_dict(payload.get('lora',{}),strict=False)
     unexpected=[name for name in unexpected if 'lora_' in name]
     expected={name for name,_ in transformer.named_parameters() if 'lora_' in name}

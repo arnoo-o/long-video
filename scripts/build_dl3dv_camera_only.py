@@ -110,20 +110,26 @@ def _rotation_components(local: np.ndarray):
 
 
 def _motion_type(yaw, pitch, translation, forward, lateral, vertical):
-    values = {"yaw": abs(yaw), "pitch": abs(pitch), "forward": abs(forward),
-              "lateral": abs(lateral), "vertical": abs(vertical)}
-    dominant = max(values, key=values.get)
-    if max(values.values()) < 1e-3:
+    # Rotation is in degrees and translation is in scene units, so never
+    # compare their raw magnitudes.  The thresholds form the stable motion
+    # buckets used for corpus balancing and metadata.
+    if abs(yaw) < 0.5 and abs(pitch) < 0.5 and translation < 0.03:
         return "static"
-    if dominant == "yaw":
+    rotating = abs(yaw) >= 12.0 or abs(pitch) >= 10.0
+    translating = translation >= 0.7
+    if rotating and translating:
+        return "rotation_translation"
+    if abs(yaw) >= max(abs(pitch), 8.0):
         return "left_yaw" if yaw < 0 else "right_yaw"
-    if dominant == "pitch":
+    if abs(pitch) >= 5.0:
         return "pitch_up" if pitch < 0 else "pitch_down"
-    if dominant == "forward":
+    if abs(forward) >= max(abs(lateral), abs(vertical), 0.3):
         return "forward" if forward > 0 else "backward"
-    if dominant == "lateral":
+    if abs(lateral) >= max(abs(vertical), 0.08):
         return "left" if lateral < 0 else "right"
-    return "vertical"
+    if abs(vertical) >= 0.1:
+        return "vertical"
+    return "other"
 
 
 def _quality(rgb_paths):

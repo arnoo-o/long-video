@@ -204,6 +204,10 @@ def process_window(scene, start: int, output: Path, record: dict, *, interpolato
     if not np.allclose(np.linalg.det(rotations), 1.0, atol=2e-2):
         raise ValueError("invalid rotation matrix")
     local_raw = c2w.astype(np.float32)
+    # The first output pose defines the local frame.  Force the exact identity
+    # after SLERP/float conversion so downstream loaders do not inherit tiny
+    # scene-dependent numerical drift.
+    local_raw[0] = np.eye(4, dtype=np.float32)
     translation_distance = float(np.linalg.norm(local_raw[-1, :3, 3]))
     translation_scale = max(float(np.max(np.linalg.norm(local_raw[:, :3, 3], axis=1))), 1e-6)
     local = local_raw.copy(); local[:, :3, 3] /= translation_scale

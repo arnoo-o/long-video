@@ -380,7 +380,7 @@ def test_training_preflight_and_fixed_2500_warmup_schedule():
     with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
     cfg.memory_layers=(); cfg.correspondence_layers=()
-    with pytest.raises(ValueError,match='reserved Memory'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
+    with pytest.raises(ValueError,match='Memory layers'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
     assert _lr_multiplier(0)==pytest.approx(.01) and _lr_multiplier(99)==pytest.approx(1.) and _lr_multiplier(100)==pytest.approx(1.) and _lr_multiplier(2499)<1e-5
 
 def test_teacher_overlap_screening_is_deterministic_and_causal():

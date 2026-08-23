@@ -18,7 +18,7 @@ def test_all_layer_conditioner_has_independent_geometry_and_camera_only_1_to_6()
     assert len(trainable.conditioner.layers)==40
     assert set(trainable.conditioner.camera_residuals)=={str(x) for x in range(1,7)}
     assert trainable.conditioner.for_layer(0).q_proj is not trainable.conditioner.for_layer(1).q_proj
-    assert all(alpha.ndim==0 and float(alpha)==1.0 for alpha in trainable.conditioner.alpha_parameters())
+    assert all(alpha.ndim==0 and float(alpha.detach())==1.0 for alpha in trainable.conditioner.alpha_parameters())
 
 def test_attention_install_prefers_nonempty_pinned_blocks_container():
     from long_video.training.sightline import install_lora

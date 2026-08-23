@@ -58,6 +58,10 @@ def load_camera_only_manifest(path: str | Path, *, expected_count: int | None = 
         missing = [key for key in required if key not in row]
         if missing:
             raise ValueError(f"camera-only record missing keys: {missing}")
+        if int(row.get("chunk_count", 2)) != 2 or int(row.get("fps", 24)) != 24:
+            raise ValueError(f"{row.get('trajectory_id')}: camera-only records must be 2 chunks at 24 fps")
+        if int(row.get("height", 384)) != 384 or int(row.get("width", 640)) != 640:
+            raise ValueError(f"{row.get('trajectory_id')}: camera-only records must be 384x640")
         record = CameraOnlyRecord(row, path.parent)
         record.rgb_paths()
         record.load_cameras()

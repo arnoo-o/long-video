@@ -267,6 +267,12 @@ def test_continuous_latent_cache_accepts_tchw_and_rejects_rgb_frames(tmp_path):
     bad=tmp_path/'bad.pt'; torch.save({'latents':torch.zeros(16,193,2,3)},bad)
     with pytest.raises(ValueError): load_latent_tensor(bad)
 
+def test_rgbd_continuous_25_latent_cache(tmp_path):
+    from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache
+    cache=tmp_path/'continuous_25.pt'; torch.save({'latents':torch.zeros(1,16,25,60,104)},cache)
+    assert validate_latent_cache(cache)[0]=='continuous_25'
+    assert load_latent_tensor(cache).shape==(1,16,25,60,104)
+
 def test_lora_and_timestamp_follow_requested_dtype_device():
     from long_video.training.sightline import LoRALinear
     from long_video.sightline.memory import LayerKVMemoryBank

@@ -32,9 +32,9 @@ gradient_checkpointing: true
 diagnostics_frequency: 10
 phase: P1
 model_id: ""
-source_height: 384
-source_width: 640
-chunk_count: 6
+source_height: 480
+source_width: 832
+chunk_count: 3
 pyramid_steps: [2, 2, 2]
 data_path: ""
 latent_cache_path: ""

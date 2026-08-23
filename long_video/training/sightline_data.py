@@ -7,7 +7,7 @@ import numpy as np
 
 REQUIRED_RECORD_KEYS=("trajectory_id","rgb_dir","target_c2w_local","intrinsics")
 OPTIONAL_CACHE_KEYS=("latent_cache","gt_latent_cache","recal_xyz","recal_valid","recal_confidence","recal_pointmap","correspondence_cache")
-LATENT_SCHEMAS=("continuous_49","overlap_chunks_6x9")
+LATENT_SCHEMAS=("continuous_25","continuous_49","overlap_chunks_6x9")
 
 def identify_latent_temporal_axis(shape, *, temporal_size):
     candidates=[axis for axis,size in enumerate(shape) if size == int(temporal_size)]
@@ -92,8 +92,15 @@ def validate_latent_cache(path: str|Path, *, schema=None):
     path=Path(path)
     if not path.exists(): raise FileNotFoundError(path)
     detected,files=_latent_files(path)
+    if detected=='continuous_49':
+        value=_payload_tensor(files[0]); candidates=[]
+        for temporal_size in (25,49):
+            try: identify_latent_temporal_axis(value.shape,temporal_size=temporal_size); candidates.append(temporal_size)
+            except ValueError: pass
+        if len(candidates)!=1: raise ValueError(f'continuous latent must have a unique temporal axis of 25 or 49: {files[0]}')
+        detected=f'continuous_{candidates[0]}'
     if schema is not None and schema!=detected: raise ValueError(f"latent schema mismatch: expected {schema}, found {detected}")
-    expected=9 if detected=='overlap_chunks_6x9' else 49
+    expected=9 if detected=='overlap_chunks_6x9' else int(detected.rsplit('_',1)[1])
     for file in files: _canonical_tensor(_payload_tensor(file),expected)
     return detected,files
 
@@ -101,8 +108,8 @@ def load_latent_tensor(path: str|Path, *, schema=None):
     """Load an existing latent cache as canonical [B,C,T,H,W]."""
     import torch
     detected,files=validate_latent_cache(path,schema=schema)
-    values=[_canonical_tensor(_payload_tensor(file),9 if detected=='overlap_chunks_6x9' else 49) for file in files]
-    if detected=='continuous_49': return values[0]
+    values=[_canonical_tensor(_payload_tensor(file),9 if detected=='overlap_chunks_6x9' else int(detected.rsplit('_',1)[1])) for file in files]
+    if detected.startswith('continuous_'): return values[0]
     reference=values[0].shape[:2]+values[0].shape[3:]
     if any(value.shape[:2]+value.shape[3:]!=reference for value in values): raise ValueError('overlap chunk latent shapes differ')
     result=torch.cat([values[0]]+[value[:,:,1:] for value in values[1:]],dim=2)
@@ -123,6 +130,8 @@ def resolve_continuous_latent_cache(record: SightlineRecord, *, cache_root: str|
     if 'gt_latent_cache' in record.raw: return record.path('gt_latent_cache')
     if 'latent_cache' in record.raw: return record.path('latent_cache')
     if cache_root:
-        path=Path(cache_root)/record.trajectory_id/'continuous_49.pt'
-        if path.is_file(): return path
-    raise FileNotFoundError(f'{record.trajectory_id}: no continuous_49 latent cache')
+        root=Path(cache_root)/record.trajectory_id
+        for name in ('continuous_25.pt','continuous_49.pt'):
+            path=root/name
+            if path.is_file(): return path
+    raise FileNotFoundError(f'{record.trajectory_id}: no continuous latent cache')

@@ -6,7 +6,7 @@ from PIL import Image
 import torch
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--rgb-dir',required=True); p.add_argument('--out',required=True); p.add_argument('--height',type=int,default=384); p.add_argument('--width',type=int,default=640); p.add_argument('--expected-frames',type=int,default=193); p.add_argument('--expected-latents',type=int,default=49); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--model',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--rgb-dir',required=True); p.add_argument('--out',required=True); p.add_argument('--height',type=int,default=480); p.add_argument('--width',type=int,default=832); p.add_argument('--expected-frames',type=int,default=97); p.add_argument('--expected-latents',type=int,default=25); a=p.parse_args()
     import sys; sys.path.insert(0,a.helios_root)
     from diffusers import AutoencoderKLWan
     from diffusers.video_processor import VideoProcessor

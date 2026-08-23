@@ -48,6 +48,9 @@ def parse_args():
     p.add_argument("--device", default="cuda:1")
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--seed", type=int, default=20260823)
+    p.add_argument("--candidate-shard-index", type=int, default=0)
+    p.add_argument("--candidate-shard-count", type=int, default=1)
+    p.add_argument("--manifest", type=Path)
     return p.parse_args()
 
 
@@ -246,6 +249,8 @@ def _atomic_json(path: Path, payload):
 
 def main():
     args = parse_args()
+    if not 0 <= args.candidate_shard_index < args.candidate_shard_count:
+        raise ValueError("candidate shard index must be in [0, candidate shard count)")
     metadata_root = args.metadata_root or args.raw_root / "official_metadata"
     csv_path, html_path = official_metadata(metadata_root)
     candidates = ranked_candidates(read_official_metadata(csv_path, html_path))
@@ -259,7 +264,9 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = args.device.split(":", 1)[1]
     interpolator = RifeInterpolator(args.rife_root, args.rife_checkpoint, args.device)
     batch_counter = 0
-    for record in candidates:
+    for candidate_index, record in enumerate(candidates):
+        if candidate_index % args.candidate_shard_count != args.candidate_shard_index:
+            continue
         if len(state["records"]) >= args.target_clips: break
         scene_hash = record["scene_hash"]
         if scene_hash in done_scenes: continue
@@ -302,7 +309,7 @@ def main():
             print(json.dumps({"scene_hash": scene_hash, "error": f"{type(exc).__name__}: {exc}"}))
     manifest = {"schema_version": "camera-only-v1", "fps": 24, "height": 384, "width": 640,
                 "chunk_count": 2, "records": state["records"]}
-    _atomic_json(args.output_root / "camera_only_manifest.json", manifest)
+    _atomic_json(args.manifest or args.output_root / "camera_only_manifest.json", manifest)
     if len(state["records"]) < args.target_clips:
         raise RuntimeError(f"only built {len(state['records'])}/{args.target_clips} camera-only clips")
 

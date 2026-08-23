@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 import os, sys
 torch=pytest.importorskip('torch')
 from long_video.sightline.rays import plucker_rays, temporal_group_cameras
@@ -44,7 +45,7 @@ def test_history_ray_count_must_be_exact():
         provider(torch.zeros(1,4,8),key_length=9,current_length=4)
 
 def test_train_chunk_policy_is_single_and_causal():
-    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan, run_single_graph_chunks
+    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan, run_single_graph_chunks, run_causal_prefix_chunks
     train_chunk=2; policies=[chunk_grad_policy(i,train_chunk) for i in range(6)]
     assert policies[:2]==["forward_detached"]*2 and policies[2]=="backward"
     assert policies[3:]==["rollout_detached"]*3
@@ -53,6 +54,8 @@ def test_train_chunk_policy_is_single_and_causal():
     weight=torch.nn.Parameter(torch.tensor(2.)); seen=[]
     outputs,_=run_single_graph_chunks(4,2,lambda chunk,grad: seen.append((chunk,grad)) or weight*(chunk+1))
     assert [out.requires_grad for out in outputs]==[False,False,True,False]
+    seen=[]; outputs,policies=run_causal_prefix_chunks(3,2,lambda chunk,grad: seen.append((chunk,grad)) or weight*(chunk+1))
+    assert seen==[(0,False),(1,False),(2,True)] and len(outputs)==3 and policies==('forward_detached','forward_detached','backward')
 
 def test_camera_first_curriculum_uses_random_two_chunk_window():
     from long_video.training.sightline import curriculum_phase, select_chunk_window
@@ -60,9 +63,9 @@ def test_camera_first_curriculum_uses_random_two_chunk_window():
     assert curriculum_phase(299)['max_chunks']==1
     assert not curriculum_phase(300)['lora'] and curriculum_phase(300)['max_chunks']==2
     assert curriculum_phase(400)['lora'] and curriculum_phase(400)['max_chunks']==2
-    assert curriculum_phase(899)['max_chunks']==2
-    assert curriculum_phase(900)['memory'] and curriculum_phase(900)['correspondence'] and curriculum_phase(900)['max_chunks']==2
-    assert curriculum_phase(1100)['max_chunks']==3
+    assert curriculum_phase(999)['max_chunks']==2
+    assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==3
+    assert curriculum_phase(2499)['max_chunks']==3
     generator=torch.Generator().manual_seed(7)
     assert 0 <= select_chunk_window(2,generator=generator) <= 4
 
@@ -147,13 +150,15 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     trainable.conditioner.alpha.data.fill_(.7); memory.timestamp.weight.data.fill_(.3)
     next(p for n,p in transformer.named_parameters() if 'lora_up' in n).data.fill_(.2)
     optimizer=torch.optim.AdamW(list(trainable.parameters())+list(memory.parameters())); scheduler=torch.optim.lr_scheduler.StepLR(optimizer,1); optimizer.step(); scheduler.step()
-    torch.manual_seed(123); path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,optimizer,scheduler,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config); expected_random=torch.rand(1)
+    torch.manual_seed(123); np.random.seed(456); path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,optimizer,scheduler,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config); expected_random=torch.rand(1); expected_numpy=np.random.rand()
     target=SightlineTrainable(4,heads=1); target_memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); target_transformer=Transformer(); install_lora(target_transformer,[0])
     target_optimizer=torch.optim.AdamW(list(target.parameters())+list(target_memory.parameters())); target_scheduler=torch.optim.lr_scheduler.StepLR(target_optimizer,1)
-    step=restore_runtime_checkpoint(torch.load(path),target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,optimizer=target_optimizer,scheduler=target_scheduler,restore_rng=True)
+    payload=torch.load(path)
+    assert {'trainable','memory','lora','optimizer','scheduler','step','rng_torch','rng_python','rng_numpy','rng_cuda','rng_states'}.issubset(payload)
+    step=restore_runtime_checkpoint(payload,target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,optimizer=target_optimizer,scheduler=target_scheduler,restore_rng=True)
     assert step==12 and torch.allclose(target.conditioner.alpha,torch.tensor(.7)) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
     assert torch.allclose(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),torch.full_like(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),.2))
-    assert torch.equal(torch.rand(1),expected_random) and target_scheduler.last_epoch==scheduler.last_epoch
+    assert torch.equal(torch.rand(1),expected_random) and np.random.rand()==expected_numpy and target_scheduler.last_epoch==scheduler.last_epoch
 
 def test_temporal_group_camera_shapes():
     c=torch.eye(4).repeat(2,33,1,1); k=torch.eye(3).repeat(2,33,1,1); cg,kg=temporal_group_cameras(c,k); assert cg.shape==(2,9,4,4) and kg.shape==(2,9,3,3)

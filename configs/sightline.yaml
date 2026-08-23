@@ -29,7 +29,7 @@ self_rollout_ratio: 0.0
 memory_write_sigma: 0.0
 correspondence_rows_per_batch: 1024
 gradient_checkpointing: true
-diagnostics_frequency: 10
+diagnostics_frequency: 5
 phase: P1
 model_id: ""
 source_height: 480
@@ -40,6 +40,11 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v5
+sightline_training_semantics_version: sightline-v6
 sightline_correspondence_schema_version: sightline-correspondence-v5
-sightline_checkpoint_schema_version: sightline-checkpoint-v7
+sightline_checkpoint_schema_version: sightline-checkpoint-v8
+p1_steps: 400
+p2_steps: 600
+p3_steps: 1500
+ddp_world_size: 4
+checkpoint_every: 100

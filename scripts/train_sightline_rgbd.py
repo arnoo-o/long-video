@@ -13,10 +13,10 @@ import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, select_chunk_window, run_single_graph_chunks, selected_qk_logits
+from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, select_chunk_window, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache
-from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance
+from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, capture_rng_state
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
 from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
@@ -52,6 +52,8 @@ def _ddp_record_index(step,rank,world_size,count,seed=20260823):
     return random.Random(int(seed)+int(step)).sample(range(count),count)[rank]
 
 def _preflight(cfg,args,probe_layers):
+    p1_steps=getattr(cfg,'p1_steps',400); p2_steps=getattr(cfg,'p2_steps',600); p3_steps=getattr(cfg,'p3_steps',1500)
+    total_steps=p1_steps+p2_steps+p3_steps
     sightline=set(cfg.sightline_layers)
     if not cfg.sightline_layers:
         raise ValueError('formal training requires non-empty sightline_layers')
@@ -66,14 +68,14 @@ def _preflight(cfg,args,probe_layers):
     if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
     if not set(cfg.lora_layers).issubset(sightline): raise ValueError('lora_layers must be a subset of sightline_layers')
     if not set(cfg.memory_layers).issubset(sightline) or not set(cfg.correspondence_layers).issubset(sightline): raise ValueError('memory/correspondence layers must be a subset of sightline_layers')
-    if int(TOTAL_TRAINING_STEPS*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('warmup_ratio must preserve the configured 100/2500-step warmup')
-    if args.train and args.max_steps>400 and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty')
-    if args.train and args.max_steps>900 and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches P3 but Memory/correspondence layers are empty')
-    if not 1<=args.max_steps<=TOTAL_TRAINING_STEPS: raise ValueError('--max-steps must be in 1..2500')
+    if total_steps!=TOTAL_TRAINING_STEPS or int(total_steps*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('formal schedule must preserve the configured 100/2500-step warmup')
+    if args.train and args.max_steps>p1_steps and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty')
+    if args.train and args.max_steps>p1_steps+p2_steps and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches P3 but Memory/correspondence layers are empty')
+    if not 1<=args.max_steps<=total_steps: raise ValueError(f'--max-steps must be in 1..{total_steps}')
 
-def _lr_multiplier(step):
+def _lr_multiplier(step,total_steps=TOTAL_TRAINING_STEPS):
     if step<WARMUP_STEPS: return float(step+1)/WARMUP_STEPS
-    progress=min(1.0,max(0.0,(step-WARMUP_STEPS)/(TOTAL_TRAINING_STEPS-WARMUP_STEPS)))
+    progress=min(1.0,max(0.0,(step-WARMUP_STEPS)/(total_steps-WARMUP_STEPS)))
     return 0.5*(1.0+__import__('math').cos(__import__('math').pi*progress))
 
 def _set_gradient_checkpointing(transformer,enabled):
@@ -208,14 +210,30 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
 def _reset_sequence(runner):
     runner.reset_sequence()
 
+def _local_rng_state():
+    return capture_rng_state()
+
+def _all_rank_rng_states(world_size):
+    local=_local_rng_state()
+    if world_size==1: return [local]
+    gathered=[None]*world_size
+    dist.all_gather_object(gathered,local)
+    return gathered
+
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True)
-    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int,default=2500); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int,default=80); p.add_argument('--latent-cache-root')
+    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
+    cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
+    args.max_steps=args.max_steps or total_steps
+    save_every=args.save_every or cfg.checkpoint_every
+    if args.train and save_every!=cfg.checkpoint_every: raise ValueError(f'formal training checkpoint interval is fixed at {cfg.checkpoint_every}')
     rank,world_size,device=_distributed_context()
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
-    cfg=load_sightline_config(args.config); probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
+    if args.train and world_size!=cfg.ddp_world_size: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
+    probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
+    if args.train and len(records)!=400: raise ValueError(f'formal training requires exactly 400 train records, got {len(records)}')
     if cfg.chunk_count!=3 or cfg.chunk_length!=33 or cfg.chunk_stride!=32 or (cfg.source_height,cfg.source_width)!=(480,832): raise ValueError('formal RGB-D training requires 3 chunks, 97 frames, and 480x832 geometry')
     sys.path.insert(0,args.helios_root)
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
@@ -234,24 +252,24 @@ def main():
     memory_params=list(runner.memory.parameters())
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
-    scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,_lr_multiplier)
+    scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
     prompt_embeds,_=_prompt(pipe,args.prompt,device); config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     if args.resume:
-        payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance); start_step=completed_step+1
+        payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank); start_step=completed_step+1
     elif args.probe_checkpoint:
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
     elif args.alpha_zero_baseline:
         trainable.conditioner.alpha.data.zero_(); runner.memory.timestamp.weight.data.zero_()
-    if world_size>1:
+    if world_size>1 and not args.resume:
         rank_seed=20260823+1000003*rank+9176*start_step
         random.seed(rank_seed); np.random.seed(rank_seed%(2**32-1)); torch.manual_seed(rank_seed); torch.cuda.manual_seed_all(rank_seed)
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
-        phase=curriculum_phase(step); phase={**phase,'max_chunks':min(int(cfg.chunk_count),int(phase['max_chunks']))}; checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
+        phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps); phase={**phase,'max_chunks':min(int(cfg.chunk_count),int(phase['max_chunks']))}; checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         eligible_records=[record for record in records if record.memory_eligible] if (phase['memory'] or phase['correspondence'] or bool(args.probe_capture)) else records
         if not eligible_records: raise RuntimeError(f"{phase['name']} requires at least one memory-eligible RGB-D record")
@@ -265,7 +283,7 @@ def main():
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
         if all_latents.shape[2]<25: raise ValueError('three 33-frame chunks require at least 25 latent frames')
-        window_start=select_chunk_window(phase['max_chunks'],total_chunks=cfg.chunk_count)
+        window_start=0 if phase['name']=='P3' else select_chunk_window(phase['max_chunks'],total_chunks=cfg.chunk_count)
         latent_start=window_start*8; frame_start=window_start*32
         latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to(device,dtype=torch.bfloat16)
         rgb_paths=record.rgb_paths()
@@ -305,7 +323,7 @@ def main():
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)) if (corr_rows and not args.alpha_zero_baseline) else fm.new_zeros(())
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
-                total=stage_losses[-1]/len(items)+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr if args.train else fm+trainable.lambda_corr(step/TOTAL_TRAINING_STEPS)*corr
+                total=stage_losses[-1]/len(items)+trainable.lambda_corr(step/total_steps)*corr if args.train else fm+trainable.lambda_corr(step/total_steps)*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
                 if args.train: total.backward()
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
@@ -350,7 +368,9 @@ def main():
                 processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
                 processor.last_attention_bias=None
             return generated
-        if args.probe_only and args.alpha_zero_baseline:
+        if phase['name']=='P3':
+            _,policies=run_causal_prefix_chunks(3,train_chunk,forward_chunk)
+        elif args.probe_only and args.alpha_zero_baseline:
             with torch.no_grad(): _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         else:
             _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
@@ -358,7 +378,7 @@ def main():
             alpha_grad=None if not losses['total'].requires_grad else torch.autograd.grad(losses['total'],trainable.conditioner.alpha,retain_graph=True,allow_unused=True)[0]
             probe_payload['alpha_grad']=0.0 if alpha_grad is None else float(alpha_grad.detach().abs())
         if args.train:
-            active_phase=curriculum_phase(step)
+            active_phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
             if active_phase['name']=='P1' and (trainable.conditioner.alpha.grad is None or not torch.isfinite(trainable.conditioner.alpha.grad).all()): raise RuntimeError('P1 alpha gradient missing or non-finite')
             if active_phase['name']=='P2':
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
@@ -372,13 +392,14 @@ def main():
                     if not camera_grads or not all(torch.isfinite(g).all() for g in camera_grads): raise RuntimeError('P3 camera residual gradient missing or non-finite')
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
         if rank==0 and ((step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
-        if args.train and ((step+1)%args.save_every==0 or step+1==args.max_steps):
-            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance)
+        if args.train and ((step+1)%save_every==0 or step+1==args.max_steps):
+            rng_states=_all_rank_rng_states(world_size)
+            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states)
             if world_size>1: dist.barrier()
     if world_size>1: dist.destroy_process_group()
 

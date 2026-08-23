@@ -1,4 +1,5 @@
 import json
+import importlib.util
 from pathlib import Path
 
 import numpy as np
@@ -69,3 +70,18 @@ def test_camera_only_record_does_not_require_correspondence(tmp_path):
     assert not record.memory_eligible
     assert record.load_correspondences() == {}
     assert list(record.correspondence_rows()) == []
+
+
+def test_sequence_split_hits_exact_train_count_without_leakage():
+    script = Path(__file__).parents[1] / "scripts" / "split_rgbd_train_val.py"
+    spec = importlib.util.spec_from_file_location("rgbd_split", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    records = []
+    for dataset, sizes in {"tum": (3, 7), "bonn": (3, 7), "nrgbd": (3, 7)}.items():
+        for sequence_index, size in enumerate(sizes):
+            records.extend({"dataset": dataset, "sequence_id": f"seq-{sequence_index}", "record_id": f"{dataset}-{sequence_index}-{clip}"} for clip in range(size))
+    all_rows, train, val = module.split_records(records, 21)
+    assert len(all_rows) == 30 and len(train) == 21 and len(val) == 9
+    assert {(row["dataset"], row["sequence_id"]) for row in train}.isdisjoint({(row["dataset"], row["sequence_id"]) for row in val})

@@ -13,6 +13,7 @@ Formal entrypoints:
 ```text
 scripts/infer_sightline.py
 scripts/train_sightline_rgbd.py --manifest /path/to/rgbd_memory_dataset/manifest_train.json
+scripts/launch_sightline_rgbd_4gpu.sh MODEL HELIOS_ROOT DATASET_ROOT OUTPUT_DIR LATENT_CACHE_ROOT
 ```
 
 The formal training path consumes canonical 97-frame RGB-D records (three
@@ -20,6 +21,9 @@ overlapping 33-frame chunks) through `long_video.training.rgbd_memory_data`.
 Records marked `training_scope=camera_only` (currently 7Scenes) are eligible
 only before the P3 Memory/correspondence phase. The trainer automatically
 restricts P3 to `memory_eligible=true` records with calibrated RGB-D geometry.
+The formal schedule is P1/P2/P3 = 400/600/1500 optimizer steps per DDP rank;
+P3 always uses the complete three-chunk camera timeline but executes only the
+causal prefix through its single randomly selected backward chunk.
 The older DL3DV builders and `train_sightline_dl3dv.py` filename are retained
 only for compatibility; formal manifests contain no DL3DV or ReCal3R teacher
 geometry dependency.

@@ -29,13 +29,19 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
         raise ValueError("invalid curriculum arguments")
     return min(maximum, 1 + step // warmup_steps)
 
-def curriculum_phase(step: int):
-    """Camera-first curriculum: 2 chunks at step 300, P3 at 900, then +1/200."""
-    if step < 0: raise ValueError("step must be non-negative")
-    if step < 300: return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
-    if step < 400: return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False}
-    if step < 900: return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False}
-    return {"name":"P3","max_chunks":min(6,2+(step-900)//200),"lora":True,"correspondence":True,"memory":True}
+def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_steps: int = 1500):
+    """Formal 400/600/1500 curriculum; P3 always exposes all three chunks."""
+    if step < 0 or min(p1_steps, p2_steps, p3_steps) < 1:
+        raise ValueError("invalid curriculum schedule")
+    if step < p1_steps - 100:
+        return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
+    if step < p1_steps:
+        return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False}
+    if step < p1_steps + p2_steps:
+        return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False}
+    if step < p1_steps + p2_steps + p3_steps:
+        return {"name":"P3","max_chunks":3,"lora":True,"correspondence":True,"memory":True}
+    raise ValueError("step is outside the configured training schedule")
 
 def select_chunk_window(window_chunks: int, total_chunks: int = 6,
                         generator: torch.Generator | None = None) -> int:
@@ -63,6 +69,19 @@ def run_single_graph_chunks(max_chunks, train_chunk, forward_chunk):
             with torch.no_grad(): output=forward_chunk(chunk,False)
             if isinstance(output,torch.Tensor): output=output.detach()
         outputs.append(output)
+    return outputs,policies
+
+def run_causal_prefix_chunks(max_chunks, train_chunk, forward_chunk):
+    """Run chunk 0 through the sole backward chunk, never any future chunk."""
+    policies=causal_chunk_plan(max_chunks,train_chunk)[:train_chunk+1]
+    outputs=[]
+    for chunk,policy in enumerate(policies):
+        if policy=="backward": output=forward_chunk(chunk,True)
+        else:
+            with torch.no_grad(): output=forward_chunk(chunk,False)
+            if isinstance(output,torch.Tensor): output=output.detach()
+        outputs.append(output)
+    assert_single_backward_chunk(policies,train_chunk)
     return outputs,policies
 
 def selected_qk_logits(query, key, query_indices):

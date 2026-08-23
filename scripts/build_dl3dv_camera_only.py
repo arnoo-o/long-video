@@ -218,7 +218,10 @@ def process_window(scene, start: int, output: Path, record: dict, *, interpolato
     translation_scale = max(float(np.max(np.linalg.norm(local_raw[:, :3, 3], axis=1))), 1e-6)
     local = local_raw.copy(); local[:, :3, 3] /= translation_scale
     yaw, pitch, roll, total = _rotation_components(local_raw)
-    forward, lateral, vertical = map(float, local_raw[-1, :3, 3])
+    # ``local_raw`` is OpenCV c2w in the source-camera coordinate system:
+    # X points right, Y points down, and Z points forward.  Keep these named
+    # motion components in that convention instead of treating XYZ as F/L/V.
+    lateral, vertical, forward = map(float, local_raw[-1, :3, 3])
     motion = _motion_type(yaw, pitch, translation_distance, forward, lateral, vertical)
     if motion == "static" or (total < 1.0 and translation_distance < 0.01):
         raise ValueError("nearly static window")

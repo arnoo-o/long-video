@@ -115,8 +115,8 @@ def _motion_type(yaw, pitch, translation, forward, lateral, vertical):
     # buckets used for corpus balancing and metadata.
     if abs(yaw) < 0.5 and abs(pitch) < 0.5 and translation < 0.03:
         return "static"
-    rotating = abs(yaw) >= 12.0 or abs(pitch) >= 10.0
-    translating = translation >= 0.7
+    rotating = abs(yaw) >= 8.0 or abs(pitch) >= 5.0
+    translating = translation >= 0.5
     if rotating and translating:
         return "rotation_translation"
     if abs(yaw) >= max(abs(pitch), 8.0):
@@ -126,7 +126,7 @@ def _motion_type(yaw, pitch, translation, forward, lateral, vertical):
     if abs(forward) >= max(abs(lateral), abs(vertical), 0.3):
         return "forward" if forward > 0 else "backward"
     if abs(lateral) >= max(abs(vertical), 0.08):
-        return "left" if lateral < 0 else "right"
+        return "left_lateral" if lateral < 0 else "right_lateral"
     if abs(vertical) >= 0.1:
         return "vertical"
     return "other"

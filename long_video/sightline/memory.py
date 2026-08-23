@@ -94,6 +94,9 @@ class LayerKVMemoryBank(nn.Module):
         super().__init__()
         self.banks={int(layer): LongTermKVMemory(budget=budget,pool=pool) for layer in layers}
         self.timestamp=nn.Embedding(64,hidden_dim) if hidden_dim is not None else None
+        if self.timestamp is not None:
+            # Timestamp is a trainable age signal, but must start neutral.
+            nn.init.zeros_(self.timestamp.weight)
     def for_layer(self, layer):
         if int(layer) not in self.banks: raise KeyError(f"memory layer {layer} is not selected")
         return self.banks[int(layer)]

@@ -105,6 +105,18 @@ def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
         latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
         latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
     prediction=output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
+    # Helios' coarsest pyramid decoder rounds an odd 15-row grid down to 14
+    # rows for 480px inputs.  Keep the canonical 480x832 RGB-D geometry and
+    # align its velocity field back to the target latent grid before the
+    # flow-matching loss; temporal/channel/batch dimensions must remain exact.
+    if prediction.shape!=noisy.shape:
+        if prediction.shape[:3]!=noisy.shape[:3]:
+            raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
+        batch,channels,frames,height,width=prediction.shape
+        prediction=torch.nn.functional.interpolate(
+            prediction.permute(0,2,1,3,4).reshape(batch*frames,channels,height,width).float(),
+            size=noisy.shape[-2:],mode='bilinear',align_corners=False,
+        ).reshape(batch,frames,channels,*noisy.shape[-2:]).permute(0,2,1,3,4).to(dtype=noisy.dtype)
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
 

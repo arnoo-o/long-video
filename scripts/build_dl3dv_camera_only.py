@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -42,6 +43,9 @@ def parse_args():
     p.add_argument("--scene-batch", type=int, default=32)
     p.add_argument("--max-clips-per-scene", type=int, default=3)
     p.add_argument("--source-fps", type=float, default=30.0)
+    p.add_argument("--rife-root", type=Path, required=True)
+    p.add_argument("--rife-checkpoint", type=Path, required=True)
+    p.add_argument("--device", default="cuda:1")
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--seed", type=int, default=20260823)
     return p.parse_args()
@@ -134,11 +138,54 @@ def _quality(rgb_paths):
     return float(np.mean(brightness)), float(np.mean(sharpness)), float(max(transitions, default=0.0))
 
 
-def process_window(scene, start: int, output: Path, record: dict, *, seed: int):
+class RifeInterpolator:
+    """Pinned Practical-RIFE adapter, loaded once for the whole corpus run."""
+    def __init__(self, root: Path, checkpoint: Path, device: str):
+        import torch
+        if not (checkpoint / "flownet.pkl").is_file():
+            raise FileNotFoundError(f"missing Practical-RIFE checkpoint: {checkpoint / 'flownet.pkl'}")
+        self.torch, self.device = torch, torch.device("cuda")
+        sys.path.insert(0, str(root.resolve()))
+        from train_log.RIFE_HDv3 import Model
+        self.model = Model(); self.model.load_model(str(checkpoint), -1); self.model.eval()
+        self.cache = {}
+
+    def _image(self, scene, index: int, crop):
+        key = (str(scene.root), int(index), tuple(crop))
+        if key not in self.cache:
+            from PIL import Image
+            with Image.open(scene.image_paths[int(index)]) as image:
+                self.cache[key] = np.asarray(image.convert("RGB").crop(crop).resize(
+                    (TARGET_HW[1], TARGET_HW[0]), Image.Resampling.LANCZOS), np.uint8)
+        return self.cache[key]
+
+    def render(self, scene, timeline, crop):
+        from PIL import Image
+        frames, sources = [], []
+        with self.torch.inference_mode():
+            for output_index, (left, right, alpha, real, real_index) in enumerate(zip(
+                    timeline["left_real_indices"], timeline["right_real_indices"], timeline["alpha"],
+                    timeline["is_real"], timeline["rgb_real_indices"])):
+                if real:
+                    frame, kind = self._image(scene, real_index, crop), "real"
+                else:
+                    def tensor(value):
+                        return self.torch.from_numpy(value.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).to(self.device)
+                    predicted = self.model.inference(tensor(self._image(scene, left, crop)),
+                                                     tensor(self._image(scene, right, crop)),
+                                                     timestep=float(alpha))
+                    frame = np.rint(predicted[0].clamp(0, 1).permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
+                    kind = "rife"
+                frames.append(frame)
+                sources.append({"output_index": output_index, "timestamp": float(timeline["timestamps"][output_index]),
+                                "source": kind, "left_real_index": int(left), "right_real_index": int(right),
+                                "alpha": float(alpha)})
+        return frames, sources
+
+
+def process_window(scene, start: int, output: Path, record: dict, *, interpolator: RifeInterpolator):
     timeline = build_interpolated_timeline(scene.frame_times, start, 65, TARGET_FPS)
     indices = np.asarray(timeline["rgb_real_indices"], dtype=np.int64)
-    if len(np.unique(indices)) != 65:
-        raise ValueError("timeline maps to duplicate source RGB frames")
     if not np.all(np.diff(timeline["timestamps"]) > 0):
         raise ValueError("non-monotonic timestamps")
     crop, k_dense = center_crop_resize_geometry(scene.source_hw, scene.intrinsics)
@@ -165,17 +212,18 @@ def process_window(scene, start: int, output: Path, record: dict, *, seed: int):
     output.mkdir(parents=True, exist_ok=False)
     rgb = output / "rgb"; rgb.mkdir()
     from PIL import Image
-    for out_index, source_index in enumerate(indices):
-        with Image.open(scene.image_paths[int(source_index)]) as image:
-            image = image.convert("RGB").crop(crop).resize((TARGET_HW[1], TARGET_HW[0]), Image.Resampling.LANCZOS)
-            image.save(rgb / f"{out_index:06d}.jpg", quality=95, subsampling=0)
+    frames, sources = interpolator.render(scene, timeline, crop)
+    if len(frames) != 65:
+        raise RuntimeError("RIFE timeline did not yield exactly 65 frames")
+    for out_index, frame in enumerate(frames):
+        Image.fromarray(frame).save(rgb / f"{out_index:06d}.jpg", quality=95, subsampling=0)
     np.save(output / "target_c2w_local.npy", local)
     np.save(output / "target_c2w_local_raw.npy", local_raw)
     np.save(output / "intrinsics.npy", np.asarray(k, np.float32))
     metadata = {
         "trajectory_id": f"{record['scene_hash']}_camera2_{start:06d}",
         "scene_hash": record["scene_hash"], "source_frame_range": [int(indices[0]), int(indices[-1])],
-        "source_indices": indices.tolist(), "fps": 24, "height": 384, "width": 640,
+        "source_indices": indices.tolist(), "frame_sources": sources, "fps": 24, "height": 384, "width": 640,
         "chunk_count": 2, "translation_scale": translation_scale,
         "total_rotation_deg": total, "yaw_deg": yaw, "pitch_deg": pitch,
         "roll_deg": roll, "translation_distance": translation_distance,
@@ -183,7 +231,8 @@ def process_window(scene, start: int, output: Path, record: dict, *, seed: int):
         "vertical_translation": vertical, "motion_type": motion,
         "quality": {"brightness_mean": brightness, "sharpness_mean": sharpness,
                     "max_sample_transition": max_transition},
-        "rgb_unique": True, "uses_depth": False, "uses_pointcloud": False,
+        "rgb_unique": True, "rife_interpolated": any(item["source"] == "rife" for item in sources),
+        "uses_depth": False, "uses_pointcloud": False,
     }
     (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     return metadata
@@ -205,6 +254,10 @@ def main():
     if args.state.exists():
         state = json.loads(args.state.read_text(encoding="utf-8"))
     done_scenes = set(state.get("processed_scenes", [])); args.output_root.mkdir(parents=True, exist_ok=True)
+    if not args.device.startswith("cuda:"):
+        raise ValueError("camera-only RIFE preprocessing requires an explicit cuda:N device")
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.device.split(":", 1)[1]
+    interpolator = RifeInterpolator(args.rife_root, args.rife_checkpoint, args.device)
     batch_counter = 0
     for record in candidates:
         if len(state["records"]) >= args.target_clips: break
@@ -222,7 +275,7 @@ def main():
                 out = args.output_root / f"{scene_hash}_camera2_{int(start):06d}"
                 if out.exists(): continue
                 try:
-                    item = process_window(scene, int(start), out, record, seed=args.seed)
+                    item = process_window(scene, int(start), out, record, interpolator=interpolator)
                     item["rgb_dir"] = str(out.relative_to(args.output_root).joinpath("rgb"))
                     item["target_c2w_local"] = str(out.relative_to(args.output_root).joinpath("target_c2w_local.npy"))
                     item["target_c2w_local_raw"] = str(out.relative_to(args.output_root).joinpath("target_c2w_local_raw.npy"))

@@ -200,7 +200,8 @@ def main():
     metadata_root = args.metadata_root or args.raw_root / "official_metadata"
     csv_path, html_path = official_metadata(metadata_root)
     candidates = ranked_candidates(read_official_metadata(csv_path, html_path))
-    state = {"schema_version": 1, "official_repo": OFFICIAL_REPO, "processed_scenes": [], "records": []}
+    state = {"schema_version": 1, "official_repo": OFFICIAL_REPO, "processed_scenes": [],
+             "failed_scenes": {}, "records": []}
     if args.state.exists():
         state = json.loads(args.state.read_text(encoding="utf-8"))
     done_scenes = set(state.get("processed_scenes", [])); args.output_root.mkdir(parents=True, exist_ok=True)
@@ -209,8 +210,8 @@ def main():
         if len(state["records"]) >= args.target_clips: break
         scene_hash = record["scene_hash"]
         if scene_hash in done_scenes: continue
-        scene_root = download_scene(record, args.raw_root, args.retries)
         try:
+            scene_root = download_scene(record, args.raw_root, args.retries)
             scene = load_dl3dv_scene(scene_root, source_fps=args.source_fps, duration=record.get("duration"))
             # Widely spaced starts maximize diversity while allowing up to 3 clips/scene.
             max_start = len(scene.frame_times) - 2
@@ -240,6 +241,11 @@ def main():
             if batch_counter >= args.scene_batch:
                 batch_counter = 0
         except Exception as exc:
+            failures = state.setdefault("failed_scenes", {})
+            previous = failures.get(scene_hash, {})
+            failures[scene_hash] = {"attempts": int(previous.get("attempts", 0)) + 1,
+                                    "last_error": f"{type(exc).__name__}: {exc}"}
+            _atomic_json(args.state, state)
             print(json.dumps({"scene_hash": scene_hash, "error": f"{type(exc).__name__}: {exc}"}))
     manifest = {"schema_version": "camera-only-v1", "fps": 24, "height": 384, "width": 640,
                 "chunk_count": 2, "records": state["records"]}

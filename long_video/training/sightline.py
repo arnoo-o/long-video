@@ -116,10 +116,11 @@ class SightlineTrainable(nn.Module):
         if progress <= start: return initial
         return initial+(final-initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
-        alpha=self.conditioner.alpha.detach(); grad=self.conditioner.alpha.grad
+        alpha_q,alpha_k=self.conditioner.alpha_values()
+        alpha_grads={name:0.0 if parameter.grad is None else float(parameter.grad.detach().abs()) for name,parameter in self.conditioner.layers.items() for name,parameter in ((f'{name}.q',parameter.alpha_q),(f'{name}.k',parameter.alpha_k))}
         qgrads=[layer.q_proj.weight.grad for layer in self.conditioner.layers.values()]; kgrads=[layer.k_proj.weight.grad for layer in self.conditioner.layers.values()]
         qnorm=sum(float(value.norm()) for value in qgrads if value is not None); knorm=sum(float(value.norm()) for value in kgrads if value is not None)
-        return {'alpha':float(alpha),'alpha_grad':0.0 if grad is None else float(grad.detach().abs()),'eq_grad_norm':qnorm,'ek_grad_norm':knorm}
+        return {'alpha_q':alpha_q,'alpha_k':alpha_k,'alpha_grad':alpha_grads,'eq_grad_norm':qnorm,'ek_grad_norm':knorm}
 
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):

@@ -69,7 +69,7 @@ def main():
             runner.memory.timestamp.weight.data.zero_()
     else:
         runner.memory.set_enabled(False)
-        if float(conditioner.alpha.detach()) != 0.0: raise RuntimeError('alpha-zero baseline must have alpha=0')
+        if any(float(alpha.detach()) != 0.0 for alpha in conditioner.alpha_parameters()): raise RuntimeError('alpha-zero baseline must have all Q/K alphas at zero')
     trainable.eval(); conditioner.eval()
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K)

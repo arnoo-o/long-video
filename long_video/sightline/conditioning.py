@@ -4,21 +4,18 @@ from torch import nn
 
 class SightlineConditioner(nn.Module):
     def __init__(self, inner_dim: int, hidden_dim: int = 128, eps: float = 1e-6,
-                 scale_aug_prob: float = .3, scale_aug_range=(-1.2, 1.6), shared_alpha=None):
+                 scale_aug_prob: float = .3, scale_aug_range=(-1.2, 1.6)):
         super().__init__(); self.eps=eps; self.scale_aug_prob=scale_aug_prob; self.scale_aug_range=scale_aug_range
         self.q_proj=nn.Linear(7,inner_dim)
         self.k_proj=nn.Linear(7,inner_dim)
         self.gate=nn.Linear(1,inner_dim)
         self.rms_norm_q=nn.RMSNorm(inner_dim,eps=eps)
         self.rms_norm_k=nn.RMSNorm(inner_dim,eps=eps)
-        if shared_alpha is None:
-            self.alpha=nn.Parameter(torch.zeros(()))
-        else:
-            # The owning layered conditioner registers the sole global alpha.
-            # Bypass Module.__setattr__ so it is not duplicated in state_dict.
-            object.__setattr__(self,'alpha',shared_alpha)
-        nn.init.normal_(self.q_proj.weight,std=1e-3); nn.init.zeros_(self.q_proj.bias)
-        nn.init.normal_(self.k_proj.weight,std=1e-3); nn.init.zeros_(self.k_proj.bias)
+        # Separate per-layer Q/K gains.  The terminal projections start at
+        # zero, so alpha=1 still yields an exact native-Helios forward pass.
+        self.alpha_q=nn.Parameter(torch.ones(())); self.alpha_k=nn.Parameter(torch.ones(()))
+        nn.init.zeros_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+        nn.init.zeros_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
         nn.init.zeros_(self.gate.weight); nn.init.zeros_(self.gate.bias)
     def sample_scale_delta(self, rays, training=None):
         if training is None: training=self.training
@@ -38,7 +35,8 @@ class SightlineConditioner(nn.Module):
         dim=self.q_proj.out_features
         value=self.q_proj(q_in) if kind=='q' else self.k_proj(k_in)
         value=(self.rms_norm_q if kind=='q' else self.rms_norm_k)(value)
-        return self.alpha*g*value
+        alpha=self.alpha_q if kind=='q' else self.alpha_k
+        return alpha*g*value
     def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None):
         rays_k = rays_q if rays_k is None else rays_k
         if training is None: training=self.training
@@ -63,15 +61,15 @@ class CameraValueResidual(nn.Module):
         return value.repeat_interleave(spatial,dim=1)
 
 class LayeredSightlineConditioner(nn.Module):
-    """One geometry projection per selected layer and one global alpha."""
+    """Independent Q/K geometry projections and gains for every selected layer."""
     def __init__(self, inner_dim: int, layers, camera_layers=(), **conditioner_kwargs):
         super().__init__(); layers=tuple(int(layer) for layer in layers)
         if not layers or len(set(layers))!=len(layers): raise ValueError('Sightline geometry layers must be non-empty and unique')
-        self.inner_dim=int(inner_dim); self.alpha=nn.Parameter(torch.zeros(()))
+        self.inner_dim=int(inner_dim)
         camera_layers=tuple(int(layer) for layer in camera_layers)
         if not set(camera_layers).issubset(layers): raise ValueError('camera_layers must be a subset of sightline_layers')
         self.camera_layers=tuple(camera_layers)
-        self.layers=nn.ModuleDict({str(layer):SightlineConditioner(inner_dim,shared_alpha=self.alpha,**conditioner_kwargs) for layer in layers})
+        self.layers=nn.ModuleDict({str(layer):SightlineConditioner(inner_dim,**conditioner_kwargs) for layer in layers})
         self.camera_residuals=nn.ModuleDict({str(layer):CameraValueResidual(inner_dim) for layer in camera_layers})
     def for_layer(self, layer):
         key=str(int(layer))
@@ -79,6 +77,7 @@ class LayeredSightlineConditioner(nn.Module):
         return self.layers[key]
     def geometry_parameters(self):
         for layer in self.layers.values():
+            yield layer.alpha_q; yield layer.alpha_k
             yield from layer.q_proj.parameters(); yield from layer.k_proj.parameters(); yield from layer.gate.parameters()
             yield from layer.rms_norm_q.parameters(); yield from layer.rms_norm_k.parameters()
     def camera_for_layer(self, layer):
@@ -86,3 +85,8 @@ class LayeredSightlineConditioner(nn.Module):
         return self.camera_residuals[key] if key in self.camera_residuals else None
     def camera_parameters(self):
         for module in self.camera_residuals.values(): yield from module.parameters()
+    def alpha_parameters(self):
+        for layer in self.layers.values(): yield layer.alpha_q; yield layer.alpha_k
+    def alpha_values(self):
+        return ({key:float(layer.alpha_q.detach()) for key,layer in self.layers.items()},
+                {key:float(layer.alpha_k.detach()) for key,layer in self.layers.items()})

@@ -72,14 +72,15 @@ def test_camera_first_curriculum_uses_random_two_chunk_window():
 def test_memory_is_kv_only_and_eviction():
     m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
 
-def test_selected_layers_have_independent_geometry_and_one_global_alpha():
+def test_selected_layers_have_independent_qk_geometry_and_alphas():
     from long_video.training.sightline import SightlineTrainable
     trainable=SightlineTrainable(8,layers=(16,20,24),heads=2)
     conditioners=[trainable.conditioner.for_layer(layer) for layer in (16,20,24)]
     for name in ('q_proj','k_proj','gate','rms_norm_q','rms_norm_k'):
         assert len({id(getattr(layer,name).weight) for layer in conditioners})==3
-    assert all(layer.alpha is trainable.conditioner.alpha for layer in conditioners)
-    assert [name for name,_ in trainable.named_parameters() if name.endswith('alpha')]==['conditioner.alpha']
+    assert all(float(layer.alpha_q)==1.0 and float(layer.alpha_k)==1.0 for layer in conditioners)
+    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
+    assert all(torch.count_nonzero(layer.q_proj.weight)==0 and torch.count_nonzero(layer.k_proj.weight)==0 for layer in conditioners)
 
 def test_scheduler_provenance_ignores_default_field_order():
     from long_video.training.sightline_checkpoint import scheduler_config_fingerprint
@@ -147,7 +148,8 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
         def __init__(self): super().__init__(); self.transformer_blocks=torch.nn.ModuleList([Block()])
     config={'version':1}; memory_config={'layers':[0],'pool':2,'budget':8}; layers=(0,)
     trainable=SightlineTrainable(4,heads=1); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); transformer=Transformer(); install_lora(transformer,[0])
-    trainable.conditioner.alpha.data.fill_(.7); memory.timestamp.weight.data.fill_(.3)
+    for alpha in trainable.conditioner.alpha_parameters(): alpha.data.fill_(.7)
+    memory.timestamp.weight.data.fill_(.3)
     next(p for n,p in transformer.named_parameters() if 'lora_up' in n).data.fill_(.2)
     optimizer=torch.optim.AdamW(list(trainable.parameters())+list(memory.parameters())); scheduler=torch.optim.lr_scheduler.StepLR(optimizer,1); optimizer.step(); scheduler.step()
     torch.manual_seed(123); np.random.seed(456); path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,optimizer,scheduler,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config); expected_random=torch.rand(1); expected_numpy=np.random.rand()
@@ -156,7 +158,7 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     payload=torch.load(path)
     assert {'trainable','memory','lora','optimizer','scheduler','step','rng_torch','rng_python','rng_numpy','rng_cuda','rng_states'}.issubset(payload)
     step=restore_runtime_checkpoint(payload,target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,optimizer=target_optimizer,scheduler=target_scheduler,restore_rng=True)
-    assert step==12 and torch.allclose(target.conditioner.alpha,torch.tensor(.7)) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
+    assert step==12 and all(torch.allclose(alpha,torch.tensor(.7)) for alpha in target.conditioner.alpha_parameters()) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
     assert torch.allclose(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),torch.full_like(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),.2))
     assert torch.equal(torch.rand(1),expected_random) and np.random.rand()==expected_numpy and target_scheduler.last_epoch==scheduler.last_epoch
 

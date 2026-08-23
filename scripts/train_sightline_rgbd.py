@@ -59,8 +59,8 @@ def _preflight(cfg,args,probe_layers):
         raise ValueError('formal training requires non-empty sightline_layers')
     if tuple(cfg.camera_layers)!=(1,2,3,4,5,6) or not set(cfg.camera_layers).issubset(set(cfg.sightline_layers)):
         raise ValueError('camera_layers must be exactly 1..6 and belong to sightline_layers')
-    if tuple(cfg.memory_layers)!=(16,20,24) or tuple(cfg.correspondence_layers)!=(16,20,24):
-        raise ValueError('reserved Memory/correspondence layers must remain (16,20,24)')
+    if tuple(cfg.memory_layers)!=tuple(range(17,25)) or tuple(cfg.correspondence_layers)!=(16,20,24):
+        raise ValueError('Memory layers must be 17..24; correspondence layers must be 16/20/24')
     if args.train and (cfg.memory_layers or cfg.correspondence_layers):
         # These modules remain reserved but are intentionally disabled in the
         # camera-only retraining curriculum.
@@ -77,6 +77,14 @@ def _lr_multiplier(step,total_steps=TOTAL_TRAINING_STEPS):
     if step<WARMUP_STEPS: return float(step+1)/WARMUP_STEPS
     progress=min(1.0,max(0.0,(step-WARMUP_STEPS)/(total_steps-WARMUP_STEPS)))
     return 0.5*(1.0+__import__('math').cos(__import__('math').pi*progress))
+
+def _sigma_band(step, phase):
+    if phase=='P1': return (0.9,1.0),'high_0.9_1.0'
+    if phase=='P2': return (0.7,1.0),'mid_high_0.7_1.0'
+    if phase=='P3':
+        high=(hashlib.sha256(f'sightline-sigma-band:{step}'.encode()).digest()[0]&1)==0
+        return ((0.8,1.0),'high_0.8_1.0') if high else ((0.4,0.8),'mid_0.4_0.8')
+    raise ValueError(f'unknown phase {phase}')
 
 def _set_gradient_checkpointing(transformer,enabled):
     method=getattr(transformer,'enable_gradient_checkpointing' if enabled else 'disable_gradient_checkpointing',None)
@@ -274,7 +282,8 @@ def main():
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
     elif args.alpha_zero_baseline:
-        trainable.conditioner.alpha.data.zero_(); runner.memory.timestamp.weight.data.zero_()
+        for alpha in trainable.conditioner.alpha_parameters(): alpha.data.zero_()
+        runner.memory.timestamp.weight.data.zero_()
     if world_size>1 and not args.resume:
         rank_seed=20260823+1000003*rank+9176*start_step
         random.seed(rank_seed); np.random.seed(rank_seed%(2**32-1)); torch.manual_seed(rank_seed); torch.cuda.manual_seed_all(rank_seed)
@@ -316,6 +325,7 @@ def main():
         else: corr_rows=None
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'])
         if not 0<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum')
+        sigma_range,sigma_band=_sigma_band(step,phase['name'])
         history_state=NativeHistoryState(source,fake); losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
         if args.probe_capture: torch.cuda.reset_peak_memory_stats()
         started=time.perf_counter()
@@ -326,7 +336,7 @@ def main():
                 generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk).detach()
             else:
                 target=latents[:,:,chunk*8:chunk*8+9]  # The sole non-source GT read in this step.
-                items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=(.9,1.0)); runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
+                items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range); runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 stage_losses=[]; final_prediction=None
                 for stage_index,item in enumerate(items):
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
@@ -369,10 +379,10 @@ def main():
                         for bank_layer,hiddens in originals.items():
                             for token,hidden in zip(runner.memory.banks[bank_layer].tokens,hiddens): token.hidden=hidden
                         provider.context=base_context
-                    alpha=trainable.conditioner.alpha
+                    alpha_q,alpha_k=trainable.conditioner.alpha_values()
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
                     first=layer_captures[0]
-                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha=float(alpha.detach()),alpha_grad=0.0 if alpha.grad is None else float(alpha.grad.detach().abs()),vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha_q=alpha_q,alpha_k=alpha_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             if chunk==0: generated[:,:,0:1]=source
             history_state.append_chunk(generated,chunk)
             runner._finalize_chunk(chunk)
@@ -387,16 +397,16 @@ def main():
         else:
             _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         if args.probe_capture:
-            alpha_grad=None if not losses['total'].requires_grad else torch.autograd.grad(losses['total'],trainable.conditioner.alpha,retain_graph=True,allow_unused=True)[0]
-            probe_payload['alpha_grad']=0.0 if alpha_grad is None else float(alpha_grad.detach().abs())
+            probe_payload['alpha_grad']={name:0.0 if alpha.grad is None else float(alpha.grad.detach().abs()) for name,alpha in ((f'{index}.q',layer.alpha_q) for index,layer in trainable.conditioner.layers.items())}
         if args.train:
             active_phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
-            if active_phase['name']=='P1' and (trainable.conditioner.alpha.grad is None or not torch.isfinite(trainable.conditioner.alpha.grad).all()): raise RuntimeError('P1 alpha gradient missing or non-finite')
+            alpha_grads=[alpha.grad for alpha in trainable.conditioner.alpha_parameters()]
+            if active_phase['name']=='P1' and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
             if active_phase['name']=='P2':
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
-                if trainable.conditioner.alpha.abs().detach()>1e-6:
+                if any(alpha.abs().detach()>1e-6 for alpha in trainable.conditioner.alpha_parameters()):
                     geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
@@ -404,7 +414,8 @@ def main():
                     if not camera_grads or not all(torch.isfinite(g).all() for g in camera_grads): raise RuntimeError('P3 camera residual gradient missing or non-finite')
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
+        alpha_q,alpha_k=trainable.conditioner.alpha_values()
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
         if rank==0 and ((step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

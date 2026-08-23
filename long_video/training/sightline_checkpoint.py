@@ -4,7 +4,7 @@ import hashlib,json,random
 import numpy as np
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v6'; SCHEMA='sightline-checkpoint-v8'
+SEMANTICS='sightline-v7'; SCHEMA='sightline-checkpoint-v9'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)

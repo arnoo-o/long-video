@@ -16,7 +16,7 @@ def test_plucker_ray_geometry():
 
 def test_scale_augmentation_gate_only_and_zero_alpha():
     torch.manual_seed(1); m=SightlineConditioner(16); r=torch.randn(2,3,7); q,k=m(r,training=False); assert q.shape==k.shape==(2,3,16)
-    m.alpha.data.zero_(); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
+    m.alpha_q.data.zero_(); m.alpha_k.data.zero_(); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
 
 def test_history_six_chunks_causal_and_shared_boundary():
     h=HistoryManager(); src=torch.zeros(1); h.set_source(src)
@@ -78,7 +78,7 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
     conditioners=[trainable.conditioner.for_layer(layer) for layer in (16,20,24)]
     for name in ('q_proj','k_proj','gate','rms_norm_q','rms_norm_k'):
         assert len({id(getattr(layer,name).weight) for layer in conditioners})==3
-    assert all(float(layer.alpha_q)==1.0 and float(layer.alpha_k)==1.0 for layer in conditioners)
+    assert all(float(layer.alpha_q.detach())==1.0 and float(layer.alpha_k.detach())==1.0 for layer in conditioners)
     assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
     assert all(torch.count_nonzero(layer.q_proj.weight)==0 and torch.count_nonzero(layer.k_proj.weight)==0 for layer in conditioners)
 
@@ -306,7 +306,7 @@ def test_native_helios_attention_equivalence_alpha_zero_cpu():
     import helios.diffusers_version.transformer_helios_diffusers as native
     torch.manual_seed(4); attention=native.HeliosAttention(dim=8,heads=2,dim_head=4,is_cross_attention=False,is_amplify_history=False).float(); hidden=torch.randn(1,5,8)
     expected=native.HeliosAttnProcessor()(attention,hidden,original_context_length=5)
-    conditioner=SightlineConditioner(8).float(); conditioner.alpha.data.zero_()
+    conditioner=SightlineConditioner(8).float(); conditioner.alpha_q.data.zero_(); conditioner.alpha_k.data.zero_()
     provider=lambda states,**kwargs:(torch.zeros(states.shape[0],states.shape[1],7),torch.zeros(states.shape[0],kwargs['key_length'],7))
     processor=SightlineHeliosAttnProcessor(conditioner,provider,qkv_projection=native._get_qkv_projections,rotary_apply=native.apply_rotary_emb_transposed,attention_dispatch=native.dispatch_attention_fn,attention_backend=native.HeliosAttnProcessor._attention_backend,parallel_config=native.HeliosAttnProcessor._parallel_config)
     actual=processor(attention,hidden,original_context_length=5)
@@ -376,7 +376,7 @@ def test_steps_override_is_effective_and_symmetric():
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
     from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier
-    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),camera_layers=(1,2,3,4,5,6),correspondence_layers=(16,20,24),memory_layers=(16,20,24),lora_layers=(),warmup_ratio=.04)
+    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),camera_layers=(1,2,3,4,5,6),correspondence_layers=(16,20,24),memory_layers=tuple(range(17,25)),lora_layers=(),warmup_ratio=.04)
     with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
     cfg.memory_layers=(); cfg.correspondence_layers=()

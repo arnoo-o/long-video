@@ -4,7 +4,7 @@ The historical filename is retained as a legacy compatibility entry point.
 Formal training data is loaded exclusively through RGBDMemoryRecord.
 """
 from __future__ import annotations
-import argparse, hashlib, json, random, sys, time
+import argparse, hashlib, json, pickle, random, sys, time
 from dataclasses import asdict
 from pathlib import Path
 import numpy as np
@@ -236,9 +236,13 @@ def _local_rng_state():
 def _all_rank_rng_states(world_size):
     local=_local_rng_state()
     if world_size==1: return [local]
+    # PyTorch 2.11 cannot deserialize nested Tensor storages sent directly by
+    # all_gather_object.  Gather an opaque pickle byte string instead, then
+    # reconstruct the rank-local RNG dictionaries after the collective.
+    wire=pickle.dumps(local,protocol=pickle.HIGHEST_PROTOCOL)
     gathered=[None]*world_size
-    dist.all_gather_object(gathered,local)
-    return gathered
+    dist.all_gather_object(gathered,wire)
+    return [pickle.loads(value) for value in gathered]
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True)

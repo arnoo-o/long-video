@@ -363,10 +363,11 @@ def test_steps_override_is_effective_and_symmetric():
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
     from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier
-    cfg=SimpleNamespace(sightline_layers=(0,),correspondence_layers=(),memory_layers=(0,),lora_layers=(),warmup_ratio=.04)
-    with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=301),())
+    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),camera_layers=(1,2,3,4,5,6),correspondence_layers=(16,20,24),memory_layers=(16,20,24),lora_layers=(),warmup_ratio=.04)
+    with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
-    with pytest.raises(ValueError,match='P3'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
+    cfg.memory_layers=(); cfg.correspondence_layers=()
+    with pytest.raises(ValueError,match='reserved Memory'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
     assert _lr_multiplier(0)==pytest.approx(.01) and _lr_multiplier(99)==pytest.approx(1.) and _lr_multiplier(100)==pytest.approx(1.) and _lr_multiplier(2499)<1e-5
 
 def test_teacher_overlap_screening_is_deterministic_and_causal():

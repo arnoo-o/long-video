@@ -45,13 +45,34 @@ class SightlineConditioner(nn.Module):
         if scale_delta is None: scale_delta=self.sample_scale_delta(rays_q,training)
         return (self.project(rays_q,kind='q',training=training,scale_delta=scale_delta), self.project(rays_k,kind='k',training=training,scale_delta=scale_delta))
 
+class CameraValueResidual(nn.Module):
+    """Frame-level camera residual for current V tokens only."""
+    def __init__(self, inner_dim: int):
+        super().__init__()
+        self.proj=nn.Linear(7,inner_dim)
+        self.gate=nn.Linear(7,inner_dim)
+        nn.init.normal_(self.proj.weight,std=1e-3); nn.init.zeros_(self.proj.bias)
+        nn.init.zeros_(self.gate.weight); nn.init.zeros_(self.gate.bias)
+    def forward(self, rays, *, temporal_tokens=None):
+        if rays.ndim != 3 or rays.shape[-1] != 7: raise ValueError('camera residual rays must be [B,N,7]')
+        if temporal_tokens is None or rays.shape[1] % temporal_tokens:
+            raise ValueError('camera residual requires the native temporal token count')
+        spatial=rays.shape[1]//temporal_tokens
+        feature=rays.float().reshape(rays.shape[0],temporal_tokens,spatial,7).mean(dim=2)
+        value=self.proj(feature)*torch.sigmoid(self.gate(feature))
+        return value.repeat_interleave(spatial,dim=1)
+
 class LayeredSightlineConditioner(nn.Module):
     """One geometry projection per selected layer and one global alpha."""
-    def __init__(self, inner_dim: int, layers, **conditioner_kwargs):
+    def __init__(self, inner_dim: int, layers, camera_layers=(), **conditioner_kwargs):
         super().__init__(); layers=tuple(int(layer) for layer in layers)
         if not layers or len(set(layers))!=len(layers): raise ValueError('Sightline geometry layers must be non-empty and unique')
         self.inner_dim=int(inner_dim); self.alpha=nn.Parameter(torch.zeros(()))
+        camera_layers=tuple(int(layer) for layer in camera_layers)
+        if not set(camera_layers).issubset(layers): raise ValueError('camera_layers must be a subset of sightline_layers')
+        self.camera_layers=tuple(camera_layers)
         self.layers=nn.ModuleDict({str(layer):SightlineConditioner(inner_dim,shared_alpha=self.alpha,**conditioner_kwargs) for layer in layers})
+        self.camera_residuals=nn.ModuleDict({str(layer):CameraValueResidual(inner_dim) for layer in camera_layers})
     def for_layer(self, layer):
         key=str(int(layer))
         if key not in self.layers: raise KeyError(f'layer {layer} has no Sightline geometry conditioner')
@@ -60,3 +81,8 @@ class LayeredSightlineConditioner(nn.Module):
         for layer in self.layers.values():
             yield from layer.q_proj.parameters(); yield from layer.k_proj.parameters(); yield from layer.gate.parameters()
             yield from layer.rms_norm_q.parameters(); yield from layer.rms_norm_k.parameters()
+    def camera_for_layer(self, layer):
+        key=str(int(layer))
+        return self.camera_residuals[key] if key in self.camera_residuals else None
+    def camera_parameters(self):
+        for module in self.camera_residuals.values(): yield from module.parameters()

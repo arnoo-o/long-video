@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib,json,random
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v4'; SCHEMA='sightline-checkpoint-v6'
+SEMANTICS='sightline-v5'; SCHEMA='sightline-checkpoint-v7'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)
@@ -46,7 +46,8 @@ def save_checkpoint(path, model, optimizer, scheduler, step, *, config, helios_f
     payload={'model':model.state_dict(),'optimizer':optimizer.state_dict() if optimizer else None,'scheduler':scheduler.state_dict() if scheduler else None,'step':int(step),'rng_torch':torch.get_rng_state(),'rng_python':random.getstate(),'sightline_training_semantics_version':SEMANTICS,'sightline_checkpoint_schema_version':SCHEMA,'config':config,'config_fingerprint':config_fingerprint(config),'helios_fingerprint':helios_fingerprint,'layers':list(layers),'memory_config':memory_config}
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
 def validate_checkpoint(payload, *, config, helios_fingerprint, layers, memory_config):
-    if payload.get('sightline_training_semantics_version')!=SEMANTICS or payload.get('sightline_checkpoint_schema_version')!=SCHEMA: raise RuntimeError('stale Sightline checkpoint semantics')
+    if payload.get('sightline_training_semantics_version')!=SEMANTICS or payload.get('sightline_checkpoint_schema_version')!=SCHEMA:
+        raise RuntimeError(f'incompatible Sightline checkpoint: expected {SEMANTICS}/{SCHEMA} for all-layer geometry, camera residual, and rank-16 LoRA; got {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")}')
     if payload.get('helios_fingerprint')!=helios_fingerprint or payload.get('config_fingerprint')!=config_fingerprint(config): raise RuntimeError('Sightline checkpoint provenance/config mismatch')
     if tuple(payload.get('layers',()))!=tuple(layers) or payload.get('memory_config')!=memory_config: raise RuntimeError('Sightline checkpoint layer/memory mismatch')
 

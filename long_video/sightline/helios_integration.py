@@ -11,10 +11,11 @@ def helio_source_fingerprint(source_text: str) -> str:
 class SightlineHeliosAttnProcessor:
     def __init__(self, conditioner: SightlineConditioner, ray_provider, *, memory=None,
                  qkv_projection=None, rotary_apply=None, attention_dispatch=None,
-                 attention_backend=None, parallel_config=None):
+                 attention_backend=None, parallel_config=None, camera_projector=None):
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
+        self.camera_projector=camera_projector
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
@@ -53,6 +54,13 @@ class SightlineHeliosAttnProcessor:
                 dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         query=query+dq; key=key+dk
+        if self.camera_projector is not None and current_len:
+            # Only current V receives the frame-level camera residual. Native
+            # history and Memory V remain pure Helios content.
+            current_shape=next((shape for shape in self.ray_provider.context.get('stage_shapes',()) if shape[0]*shape[1]*shape[2]==current_len),None)
+            if current_shape is None: raise RuntimeError('camera residual cannot identify the current native token grid')
+            camera_delta=self.camera_projector(rays_q[:, -current_len:],temporal_tokens=current_shape[0]).to(value.dtype)
+            value=torch.cat((value[:,:-current_len], value[:,-current_len:]+camera_delta.unflatten(-1,(attn.heads,-1))),1) if value.shape[1]>current_len else value+camera_delta.unflatten(-1,(attn.heads,-1))
         history_len=max(0,key.shape[1]-current_len)
         if getattr(attn,'is_amplify_history',False) and history_len:
             scale=1.0+__import__('torch').sigmoid(attn.history_key_scale)*(attn.max_scale-1.0)
@@ -167,8 +175,8 @@ class SightlineRayProvider:
     def current_rays(self, token_shape):
         T,H,W=token_shape; return token_rays_for_shape(self.context['c2w'],self.context['intrinsics'],(self.context['c2w'].shape[0],T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(self.context['c2w'].shape[0],-1,7)
 
-def install_sightline_attention(transformer, conditioner, ray_provider, *, layers, helios_module, memory=None, memory_layers=None):
-    blocks=list(getattr(transformer,'transformer_blocks',getattr(transformer,'blocks',[])))
+def install_sightline_attention(transformer, conditioner, ray_provider, *, layers, helios_module, memory=None, memory_layers=None, camera_layers=()):
+    blocks=list(getattr(transformer,'transformer_blocks',None) or getattr(transformer,'blocks',()))
     if not layers: raise ValueError("Sightline selected layers must be explicit")
     installed=[]
     if memory is not None and hasattr(memory,'bind_rope'): memory.bind_rope(transformer.rope)
@@ -181,8 +189,9 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         if layer_memory is not None and memory is not None:
             layer_memory.timestamp=memory.timestamp
         layer_conditioner=conditioner.for_layer(index) if hasattr(conditioner,'for_layer') and str(index) in conditioner.layers else None
+        camera_projector=conditioner.camera_for_layer(index) if hasattr(conditioner,'camera_for_layer') and index in set(camera_layers) else None
         native=helios_module.HeliosAttnProcessor()
-        processor=SightlineHeliosAttnProcessor(layer_conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
+        processor=SightlineHeliosAttnProcessor(layer_conditioner,ray_provider,memory=layer_memory,camera_projector=camera_projector,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
         if hasattr(attn,'set_processor'): attn.set_processor(processor)
         else: attn.processor=processor
         installed.append(index)

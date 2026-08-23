@@ -48,8 +48,10 @@ def _ddp_record_index(step,rank,world_size,count,seed=20260823):
 
 def _preflight(cfg,args,probe_layers):
     sightline=set(cfg.sightline_layers)
-    if tuple(cfg.sightline_layers)!=(1,2,3,4,5,6):
-        raise ValueError('camera-control Sightline layers must be exactly 1..6 for this training run')
+    if not cfg.sightline_layers:
+        raise ValueError('formal training requires non-empty sightline_layers')
+    if tuple(cfg.camera_layers)!=(1,2,3,4,5,6) or not set(cfg.camera_layers).issubset(set(cfg.sightline_layers)):
+        raise ValueError('camera_layers must be exactly 1..6 and belong to sightline_layers')
     if tuple(cfg.memory_layers)!=(16,20,24) or tuple(cfg.correspondence_layers)!=(16,20,24):
         raise ValueError('reserved Memory/correspondence layers must remain (16,20,24)')
     if args.train and (cfg.memory_layers or cfg.correspondence_layers):
@@ -57,8 +59,11 @@ def _preflight(cfg,args,probe_layers):
         # camera-only retraining curriculum.
         pass
     if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
+    if not set(cfg.lora_layers).issubset(sightline): raise ValueError('lora_layers must be a subset of sightline_layers')
+    if not set(cfg.memory_layers).issubset(sightline) or not set(cfg.correspondence_layers).issubset(sightline): raise ValueError('memory/correspondence layers must be a subset of sightline_layers')
     if int(TOTAL_TRAINING_STEPS*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('warmup_ratio must preserve the configured 100/2500-step warmup')
     if args.train and args.max_steps>400 and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty')
+    if args.train and args.max_steps>900 and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches P3 but Memory/correspondence layers are empty')
     if not 1<=args.max_steps<=TOTAL_TRAINING_STEPS: raise ValueError('--max-steps must be in 1..2500')
 
 def _lr_multiplier(step):
@@ -75,8 +80,8 @@ def _set_gradient_checkpointing(transformer,enabled):
 
 def _assert_optimizer_scope(optimizer,trainable,memory,transformer,text_encoder,vae):
     actual={id(parameter) for group in optimizer.param_groups for parameter in group['params']}
-    expected={id(parameter) for parameter in trainable.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' in name}
-    forbidden={id(parameter) for module in (text_encoder,vae,memory) for parameter in module.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' not in name}
+    expected={id(parameter) for parameter in trainable.parameters()}|{id(parameter) for parameter in memory.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' in name}
+    forbidden={id(parameter) for module in (text_encoder,vae) for parameter in module.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' not in name}
     if actual!=expected or actual&forbidden: raise RuntimeError('optimizer contains frozen text/VAE/native Helios parameters or misses a Sightline trainable')
 
 def _prompt(pipe,text,device):
@@ -220,13 +225,13 @@ def main():
     source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'; fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
     pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
-    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to(device,dtype=torch.float32)
+    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,camera_layers=cfg.camera_layers,heads=heads).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     provider=SightlineRayProvider(source_height=cfg.source_height,source_width=cfg.source_width); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
     runner.memory.to(device=device,dtype=torch.bfloat16)
     installed_layers=tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers).union(probe_layers))) if args.probe_only else tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers)))
-    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
+    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers,camera_layers=cfg.camera_layers)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     memory_params=list(runner.memory.parameters())
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.learning_rate}],weight_decay=.01)
@@ -358,6 +363,8 @@ def main():
                     geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
+                    camera_grads=[p.grad for p in trainable.conditioner.camera_parameters() if p.grad is not None]
+                    if not camera_grads or not all(torch.isfinite(g).all() for g in camera_grads): raise RuntimeError('P3 camera residual gradient missing or non-finite')
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}

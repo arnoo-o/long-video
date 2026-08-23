@@ -73,8 +73,8 @@ def selected_qk_logits(query, key, query_indices):
     return torch.einsum('bqhd,bkhd->bhqk',selected,key)*(selected.shape[-1]**-.5)
 
 class SightlineTrainable(nn.Module):
-    def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16):
-        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers)
+    def __init__(self, inner_dim, layers=(0,), camera_layers=(), timestamp_buckets=64, heads=16):
+        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,camera_layers=camera_layers)
     def correspondence(self, logits, positives=None, weights=None, multi_positive=None, additive_bias=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
         if additive_bias is not None:
@@ -114,7 +114,7 @@ class LoRALinear(nn.Module):
 def install_lora(transformer: nn.Module, layers, rank=8):
     """Wrap only Q/K/V/O of explicitly selected self-attention blocks."""
     if rank not in (8,16): raise ValueError("LoRA rank must be 8 or 16")
-    blocks=list(getattr(transformer,"transformer_blocks",getattr(transformer,"blocks",[]))); installed=[]
+    blocks=list(getattr(transformer,"transformer_blocks",None) or getattr(transformer,"blocks",())); installed=[]
     for index in layers:
         if not 0 <= int(index) < len(blocks): raise ValueError(f"invalid LoRA layer {index}")
         attn=getattr(blocks[int(index)],"attn1",None)

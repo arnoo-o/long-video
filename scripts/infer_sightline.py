@@ -52,12 +52,14 @@ def main():
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
     geometry_layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not geometry_layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
+    if tuple(geometry_layers) != tuple(cfg.sightline_layers):
+        raise RuntimeError('formal inference requires the configured all-layer geometry set; refusing partial Sightline layer installation')
     layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers)))
-    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
+    trainable=SightlineTrainable(inner,layers=geometry_layers,camera_layers=cfg.camera_layers,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
-    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
+    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers,camera_layers=cfg.camera_layers)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
         provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision)

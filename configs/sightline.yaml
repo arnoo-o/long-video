@@ -6,11 +6,12 @@ alpha_init: 0.0
 history_sizes: [16, 2, 1]
 chunk_length: 33
 chunk_stride: 32
-sightline_layers: [1, 2, 3, 4, 5, 6]
+sightline_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39]
+camera_layers: [1, 2, 3, 4, 5, 6]
 memory_layers: [16, 20, 24]
 correspondence_layers: [16, 20, 24]
-lora_layers: [1, 2, 3, 4, 5, 6]
-lora_rank: 8
+lora_layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+lora_rank: 16
 memory_pool: 2
 memory_budget: 12960
 lambda_corr: 0.02
@@ -39,6 +40,6 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v4
+sightline_training_semantics_version: sightline-v5
 sightline_correspondence_schema_version: sightline-correspondence-v5
-sightline_checkpoint_schema_version: sightline-checkpoint-v6
+sightline_checkpoint_schema_version: sightline-checkpoint-v7

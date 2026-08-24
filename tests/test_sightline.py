@@ -398,3 +398,15 @@ def test_teacher_token_vote_keeps_multi_positive_and_no_membership_double_count(
           {'query_frame':32,'key_frame':0,'query_pixel':1,'query_y':0,'query_x':0,'key_y':0,'key_x':1,'weight':.8}]
     out=token_vote_rows(rows,token_height=1,token_width=2,near_top_ratio=.5,total_frames=193)
     assert len(out)==4 and {row['key_x'] for row in out}=={0,1} and all(row['matched_count']==2 for row in out)
+
+def test_odd_grid_alignment_covers_detached_rollout_scheduler():
+    from types import SimpleNamespace
+    from scripts.train_sightline_rgbd import _install_odd_grid_scheduler_alignment
+    class Scheduler:
+        def convert_flow_pred_to_x0(self,flow_pred,xt,timestep,sigmas,timesteps):
+            return xt-flow_pred
+    pipe=SimpleNamespace(scheduler=Scheduler())
+    _install_odd_grid_scheduler_alignment(pipe)
+    flow=torch.randn(1,2,9,14,26); latents=torch.randn(1,2,9,15,26)
+    output=pipe.scheduler.convert_flow_pred_to_x0(flow,latents,None,None,None)
+    assert output.shape==latents.shape

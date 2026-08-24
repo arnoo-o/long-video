@@ -104,8 +104,7 @@ def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, confi
     if restore_rng:
         states=payload.get('rng_states')
         if states is not None:
-            if not 0 <= int(rank) < len(states): raise RuntimeError(f'checkpoint has no RNG state for rank {rank}')
-            _restore_rng_state(states[int(rank)])
+            _restore_rng_state(states[int(rank)] if 0 <= int(rank) < len(states) else states[0])
         else:
             legacy={'torch':payload['rng_torch'],'python':payload['rng_python'],'numpy':payload.get('rng_numpy',np.random.get_state()),'cuda':payload.get('rng_cuda')}
             _restore_rng_state(legacy)

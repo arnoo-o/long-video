@@ -55,8 +55,10 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     atomic_json(root/'metadata.json',meta)
     return True
 
-def shard_targets(total,capacities):
-    targets=[0]*len(capacities); cursor=0
+def shard_targets(total,capacities,minimums=None):
+    targets=list(minimums or [0]*len(capacities)); cursor=0
+    if len(targets)!=len(capacities) or any(target>capacity for target,capacity in zip(targets,capacities)) or sum(targets)>total:
+        raise ValueError('existing shard counts are incompatible with target/capacity')
     while sum(targets)<total:
         eligible=[i for i,capacity in enumerate(capacities) if targets[i]<capacity]
         if not eligible: raise ValueError(f'shard capacity {sum(capacities)} is below target {total}')
@@ -70,9 +72,10 @@ def arkit(root,out,shard_index=0,shard_count=1):
       videos=all_videos[shard_index::shard_count]
       video_ids={video.name for video in videos}
       capacities=[sum(len((video/'lowres_wide.traj').read_text().splitlines())//193 for video in all_videos[i::shard_count]) for i in range(shard_count)]
-      target=shard_targets({'train':350,'val':50}[split],capacities)[shard_index]
-      built=sum(1 for path in (out/'records'/'arkitscenes').glob('*/metadata.json')
-                if (lambda meta:meta.get('split')==split and meta.get('scene_id') in video_ids)(json.loads(path.read_text())))
+      metadata=[json.loads(path.read_text()) for path in (out/'records'/'arkitscenes').glob('*/metadata.json')]
+      minimums=[sum(meta.get('split')==split and meta.get('scene_id') in {video.name for video in all_videos[i::shard_count]} for meta in metadata) for i in range(shard_count)]
+      target=shard_targets({'train':350,'val':50}[split],capacities,minimums)[shard_index]
+      built=minimums[shard_index]
       for video in videos:
         if built >= target: break
         traj={}
@@ -133,16 +136,17 @@ def tartan_depth(path):
 def tartanground(root,out,shard_index=0,shard_count=1):
     all_trajectories=sorted(root.glob('*/Data_*/P*'))
     trajectories=all_trajectories[shard_index::shard_count]
-    prefixes={f'{trajectory.parents[1].name}/{trajectory.parent.name}/{trajectory.name}' for trajectory in trajectories}
     capacities=[]
     for i in range(shard_count):
         capacity=0
         for trajectory in all_trajectories[i::shard_count]:
             capacity+=min(len(list((trajectory/'image_lcam_front').glob('*.png'))),len(list((trajectory/'depth_lcam_front').glob('*.png'))))//193
         capacities.append(capacity)
-    target=shard_targets(400,capacities)[shard_index]
-    built=sum(1 for path in (out/'records'/'tartanground').glob('*/metadata.json')
-              if json.loads(path.read_text()).get('sequence_id','').rsplit('/',1)[0] in prefixes)
+    metadata=[json.loads(path.read_text()) for path in (out/'records'/'tartanground').glob('*/metadata.json')]
+    shard_prefixes=[{f'{trajectory.parents[1].name}/{trajectory.parent.name}/{trajectory.name}' for trajectory in all_trajectories[i::shard_count]} for i in range(shard_count)]
+    minimums=[sum(meta.get('sequence_id','').rsplit('/',1)[0] in values for meta in metadata) for values in shard_prefixes]
+    target=shard_targets(400,capacities,minimums)[shard_index]
+    built=minimums[shard_index]
     for trajectory in trajectories:
         if built >= target: break
         rgbdir=trajectory/'image_lcam_front'; depdir=trajectory/'depth_lcam_front'

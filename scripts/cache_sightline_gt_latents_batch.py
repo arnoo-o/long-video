@@ -1,4 +1,4 @@
-"""Sequential continuous-25 cache generation for canonical 97-frame RGB-D records."""
+"""Sequential continuous latent caching for mixed 97/193-frame RGB-D records."""
 from __future__ import annotations
 import argparse, glob, hashlib, json
 from pathlib import Path
@@ -34,26 +34,31 @@ def main():
     mean=torch.tensor(vae.config.latents_mean,device='cuda',dtype=vae.dtype).view(1,vae.config.z_dim,1,1,1); std=(1.0/torch.tensor(vae.config.latents_std,device='cuda',dtype=vae.dtype)).view(1,vae.config.z_dim,1,1,1)
     for rec in records[:a.limit or None]:
         tid=rec.get('record_id') or rec.get('trajectory_id') or rec.get('id')
+        frame_count=int(rec.get('frame_count',97)); expected_latents=1+(frame_count-1)//4
+        if frame_count not in (97,193) or expected_latents not in (25,49):
+            raise ValueError(f'{tid}: unsupported record geometry {frame_count} frames')
+        schema=f'continuous_{expected_latents}'
         rgb=rec.get('rgb_dir') or rec.get('rgb_path') or rec.get('video_dir')
         if not rgb and rec.get('path'): rgb=str(Path(rec['path']).parent/'rgb_24fps')
         if rgb and not Path(rgb).is_absolute():
             rgb=str(Path(a.manifest).parent/rgb)
         if not tid or not rgb: continue
-        paths=sorted(Path(rgb).glob('*')); out=Path(a.out_root)/tid/'continuous_25.pt'; out.parent.mkdir(parents=True,exist_ok=True)
+        paths=sorted(p for p in Path(rgb).glob('*') if p.suffix.lower() in ('.png','.jpg','.jpeg'))
+        out=Path(a.out_root)/tid/f'{schema}.pt'; out.parent.mkdir(parents=True,exist_ok=True)
         if out.exists():
             try:
                 old=torch.load(out,map_location='cpu',weights_only=False)
-                if old.get('schema')=='continuous_25' and old.get('provenance',{}).get('fingerprint')==provenance['fingerprint'] and tuple(old['latents'].shape)==(1,16,25,60,104) and torch.isfinite(old['latents']).all(): print(json.dumps({'trajectory_id':tid,'status':'skip'})); continue
+                if old.get('schema')==schema and old.get('provenance',{}).get('fingerprint')==provenance['fingerprint'] and tuple(old['latents'].shape)==(1,16,expected_latents,60,104) and torch.isfinite(old['latents']).all(): print(json.dumps({'trajectory_id':tid,'status':'skip'})); continue
             except Exception: pass
-        if len(paths)!=97: print(json.dumps({'trajectory_id':tid,'status':'blocked','reason':f'expected 97 RGB, got {len(paths)}'})); continue
+        if len(paths)!=frame_count: print(json.dumps({'trajectory_id':tid,'status':'blocked','reason':f'expected {frame_count} RGB, got {len(paths)}'})); continue
         images=[Image.open(x).convert('RGB') for x in paths]; pixels=processor.preprocess_video(images,height=a.height,width=a.width)
         if pixels.ndim==4: pixels=pixels.unsqueeze(0)
         if pixels.ndim!=5: raise RuntimeError(f'{tid}: invalid preprocessed shape {tuple(pixels.shape)}')
         with torch.inference_mode():
             latent=(vae.encode(pixels.to('cuda',dtype=vae.dtype)).latent_dist.mode()-mean)*std
-        axes=[i for i,s in enumerate(latent.shape) if s in (25,97)]
+        axes=[i for i,s in enumerate(latent.shape) if s in (expected_latents,frame_count)]
         if len(axes)!=1: raise RuntimeError(f'{tid}: cannot identify temporal axis {tuple(latent.shape)}')
         latent=latent.movedim(axes[0],2)
-        if tuple(latent.shape)!=(1,16,25,60,104) or not torch.isfinite(latent).all(): raise RuntimeError(f'{tid}: invalid native continuous latent {tuple(latent.shape)}')
-        tmp=out.with_suffix('.tmp'); torch.save({'latents':latent.cpu(),'schema':'continuous_25','provenance':provenance},tmp); tmp.replace(out); del pixels,latent,images; torch.cuda.empty_cache(); print(json.dumps({'trajectory_id':tid,'status':'generated','shape':[1,16,25,60,104],'provenance_fingerprint':provenance['fingerprint']}),flush=True)
+        if tuple(latent.shape)!=(1,16,expected_latents,60,104) or not torch.isfinite(latent).all(): raise RuntimeError(f'{tid}: invalid native continuous latent {tuple(latent.shape)}')
+        tmp=out.with_suffix('.tmp'); torch.save({'latents':latent.cpu(),'schema':schema,'provenance':provenance},tmp); tmp.replace(out); del pixels,latent,images; torch.cuda.empty_cache(); print(json.dumps({'trajectory_id':tid,'status':'generated','schema':schema,'shape':[1,16,expected_latents,60,104],'provenance_fingerprint':provenance['fingerprint']}),flush=True)
 if __name__=='__main__': main()

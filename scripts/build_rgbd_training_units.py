@@ -5,11 +5,11 @@ Six-chunk records are never resampled: their two views are exact [0,96] and
 cache, so it can be consumed independently without future identities.
 """
 from __future__ import annotations
-import argparse, json
+import argparse, json, sys
 from pathlib import Path
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
-from long_video.data.rgbd_memory import build_causal_correspondence_cache
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -25,9 +25,12 @@ def unit_row(record, output_root: Path, offset: int) -> dict:
     cache_dir = output_root / "unit_correspondence"
     cache = cache_dir / f"{row['record_id'].replace(':', '_')}.npz"
     if not cache.is_file():
-        rgb = record.rgb_paths(); depth = list(record.depth_paths())
-        abs_c2w, K = record.load_cameras(local=False)
-        build_causal_correspondence_cache(depth[offset:offset + 97], np.asarray(abs_c2w[offset:offset + 97]), np.asarray(K[offset:offset + 97]), cache, chunk_count=3)
+        arrays=record.load_correspondences(); stop=offset+97; chunk_offset=offset//32
+        keep=(arrays['query_frame']>=offset)&(arrays['query_frame']<stop)&(arrays['key_frame']>=offset)&(arrays['key_frame']<stop)
+        sliced={key:value[keep].copy() for key,value in arrays.items()}
+        sliced['query_frame']-=offset; sliced['key_frame']-=offset
+        sliced['query_chunk']-=chunk_offset; sliced['key_chunk']-=chunk_offset
+        cache.parent.mkdir(parents=True,exist_ok=True); np.savez_compressed(cache,**sliced)
     row["correspondence_cache"] = str(cache.relative_to(output_root))
     return row
 

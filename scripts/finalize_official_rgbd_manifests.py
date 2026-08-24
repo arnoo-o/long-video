@@ -91,6 +91,7 @@ def main() -> None:
     parser.add_argument("--existing-manifest", type=Path, required=True)
     parser.add_argument("--additions-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--latent-cache-root", type=Path, required=True)
     parser.add_argument("--ddad", type=int, default=132)
     parser.add_argument("--arkit-train", type=int, default=350)
     parser.add_argument("--arkit-val", type=int, default=50)
@@ -115,6 +116,12 @@ def main() -> None:
 
     train = [row for row in existing if row["split"] == "train"] + ddad + arkit_train + tartan_train
     val = [row for row in existing if row["split"] == "val"] + arkit_val + tartan_val
+    for row in train + val:
+        temporal=1+(int(row["frame_count"])-1)//4
+        cache=args.latent_cache_root/row["record_id"]/f"continuous_{temporal}.pt"
+        if not cache.is_file():
+            raise FileNotFoundError(f'missing latent cache: {cache}')
+        row["latent_cache"]=str(cache)
     assert_disjoint(train, val)
     if len({row["record_id"] for row in train + val}) != len(train) + len(val):
         raise ValueError("record ids are not unique")

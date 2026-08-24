@@ -383,6 +383,10 @@ def test_training_preflight_and_fixed_2500_warmup_schedule():
     with pytest.raises(ValueError,match='Memory layers'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
     assert _lr_multiplier(0)==pytest.approx(.01) and _lr_multiplier(99)==pytest.approx(1.) and _lr_multiplier(100)==pytest.approx(1.) and _lr_multiplier(2499)<1e-5
 
+def test_p3_chunk_curriculum_has_fixed_global_step_boundaries():
+    from long_video.training.sightline import curriculum_phase
+    assert [curriculum_phase(step)['max_chunks'] for step in (1000, 1399, 1400, 1699, 1700, 1899, 1900, 2099, 2100, 2299, 2300, 2499)] == [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
+
 def test_teacher_overlap_screening_is_deterministic_and_causal():
     from scripts.build_sightline_correspondences import screen_overlap
     xyz=torch.tensor([[[[0.,0.,1.],[1.,0.,1.]],[[0.,1.,1.],[1.,1.,1.]]]]).numpy()

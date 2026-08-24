@@ -7,6 +7,22 @@ import numpy as np
 from PIL import Image
 import torch
 
+def _match_spatial_grid(value,target):
+    if value.shape==target.shape: return value
+    if value.ndim!=5 or target.ndim!=5 or value.shape[:3]!=target.shape[:3]:
+        raise RuntimeError(f'cannot align flow grid {value.shape} to latent grid {target.shape}')
+    batch,channels,frames,height,width=value.shape
+    return torch.nn.functional.interpolate(
+        value.permute(0,2,1,3,4).reshape(batch*frames,channels,height,width).float(),
+        size=target.shape[-2:],mode='bilinear',align_corners=False,
+    ).reshape(batch,frames,channels,*target.shape[-2:]).permute(0,2,1,3,4).to(dtype=value.dtype)
+
+def _install_odd_grid_scheduler_alignment(pipe):
+    original=pipe.scheduler.convert_flow_pred_to_x0
+    def aligned(flow_pred,xt,timestep,sigmas,timesteps):
+        return original(_match_spatial_grid(flow_pred,xt),xt,timestep,sigmas,timesteps)
+    pipe.scheduler.convert_flow_pred_to_x0=aligned
+
 def resize_source(image, K, height=384, width=640):
     image=image.convert('RGB'); old_w,old_h=image.size; image=image.resize((width,height),Image.Resampling.LANCZOS)
     sx,sy=width/old_w,height/old_h
@@ -48,7 +64,7 @@ def main():
     if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
     elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
-    pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16,revision=a.model_revision).to('cuda')
+    pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16,revision=a.model_revision).to('cuda'); _install_odd_grid_scheduler_alignment(pipe)
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
     geometry_layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not geometry_layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')

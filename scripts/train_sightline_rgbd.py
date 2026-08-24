@@ -128,6 +128,25 @@ def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
 
+def _match_spatial_grid(value,target):
+    """Align Helios' odd-grid velocity field without changing temporal semantics."""
+    if value.shape==target.shape: return value
+    if value.ndim!=5 or target.ndim!=5 or value.shape[:3]!=target.shape[:3]:
+        raise RuntimeError(f'cannot align flow grid {value.shape} to latent grid {target.shape}')
+    batch,channels,frames,height,width=value.shape
+    return torch.nn.functional.interpolate(
+        value.permute(0,2,1,3,4).reshape(batch*frames,channels,height,width).float(),
+        size=target.shape[-2:],mode='bilinear',align_corners=False,
+    ).reshape(batch,frames,channels,*target.shape[-2:]).permute(0,2,1,3,4).to(dtype=value.dtype)
+
+def _install_odd_grid_scheduler_alignment(pipe):
+    """Keep pinned Helios sampling valid for the canonical 480×832 (15-row latent) input."""
+    scheduler=pipe.scheduler
+    original=scheduler.convert_flow_pred_to_x0
+    def aligned(flow_pred,xt,timestep,sigmas,timesteps):
+        return original(_match_spatial_grid(flow_pred,xt),xt,timestep,sigmas,timesteps)
+    scheduler.convert_flow_pred_to_x0=aligned
+
 def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk):
     """Native Helios autoregressive inference from noise; no target argument exists."""
     noise=torch.randn((source.shape[0],source.shape[1],9,source.shape[-2],source.shape[-1]),device=source.device,dtype=source.dtype)
@@ -259,7 +278,7 @@ def main():
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
     source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'; fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
-    pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
+    pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); _install_odd_grid_scheduler_alignment(pipe); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
     trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,camera_layers=cfg.camera_layers,heads=heads).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)

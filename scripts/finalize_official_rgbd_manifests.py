@@ -62,13 +62,19 @@ def select_tartan(rows: list[dict], train_count: int, val_count: int) -> tuple[l
     for row in rows:
         groups[row["sequence_id"].rsplit("/", 1)[0]].append(row)
     ordered = sorted(groups, key=lambda key: hashlib.sha256(key.encode()).hexdigest())
-    val_groups, val_capacity = set(), 0
+    # Exact subset-sum keeps every one of the 400 constructed records while
+    # assigning whole trajectories to one split only.
+    choices: dict[int, tuple[str, ...]] = {0: ()}
     for key in ordered:
-        if val_capacity >= val_count:
-            break
-        val_groups.add(key); val_capacity += len(groups[key])
-    val = ranked([row for key in val_groups for row in groups[key]])[:val_count]
-    train = ranked([row for key in ordered if key not in val_groups for row in groups[key]])[:train_count]
+        count=len(groups[key])
+        for total, selected in sorted(tuple(choices.items()),reverse=True):
+            if total+count<=val_count and total+count not in choices:
+                choices[total+count]=selected+(key,)
+    if val_count not in choices:
+        raise ValueError('TartanGround trajectory groups cannot realize the exact val count')
+    val_groups=set(choices[val_count])
+    val = ranked([row for key in val_groups for row in groups[key]])
+    train = ranked([row for key in ordered if key not in val_groups for row in groups[key]])
     if len(train) != train_count or len(val) != val_count:
         raise ValueError(f'TartanGround capacity is insufficient: train={len(train)}, val={len(val)}')
     for row in train: row["split"] = "train"

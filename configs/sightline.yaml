@@ -46,5 +46,5 @@ sightline_checkpoint_schema_version: sightline-checkpoint-v9
 p1_steps: 400
 p2_steps: 600
 p3_steps: 1500
-ddp_world_size: 2
+ddp_world_size: 4
 checkpoint_every: 100

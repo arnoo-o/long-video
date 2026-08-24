@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Build DDAD and ARKitScenes records using their official geometry semantics."""
 from __future__ import annotations
-import argparse, json, os
+import argparse, json, os, sys
 from datetime import datetime
 from pathlib import Path
 import cv2, numpy as np
 from scipy.spatial.transform import Rotation
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from long_video.data.rgbd_memory import build_causal_correspondence_cache, localize_c2w, transform_rgb_depth
 
 H, W = 480, 832

@@ -2,6 +2,7 @@
 """Build DDAD and ARKitScenes records using their official geometry semantics."""
 from __future__ import annotations
 import argparse, json, os
+from datetime import datetime
 from pathlib import Path
 import cv2, numpy as np
 from scipy.spatial.transform import Rotation
@@ -63,7 +64,38 @@ def arkit(root,out):
         for n,start in enumerate(range(0,len(obs)-192,193)):
             write_record(out,'arkitscenes',video.name,f'{video.name}/{n:04d}',obs[start:start+193],6,split,{'official_asset':'raw lowres_wide/depth/traj/intrinsics'})
 
+def ddad_depth(scene, datum, camera_pose, K):
+    pc=np.load(scene/datum['datum']['point_cloud']['filename'])['data'][:,:3]
+    world=(pose_matrix(datum['datum']['point_cloud']['pose'])[:3]@np.c_[pc,np.ones(len(pc))].T).T
+    cam=(np.linalg.inv(camera_pose)[:3]@np.c_[world,np.ones(len(world))].T).T
+    uv=(K@cam.T).T; uv=(uv[:,:2]/np.maximum(uv[:,2:3],1e-12)).astype(int); z=cam[:,2]
+    depth=np.zeros((1216,1936),np.float32); valid=(z>0)&(uv[:,0]>=0)&(uv[:,0]<1936)&(uv[:,1]>=0)&(uv[:,1]<1216)
+    depth[uv[valid,1],uv[valid,0]]=z[valid]
+    return depth
+
+def ddad(root,out):
+    candidates=[]
+    for scene in sorted(x for x in root.iterdir() if x.is_dir()):
+        payload=json.loads(next(scene.glob('scene_*.json')).read_text()); data={x['key']:x for x in payload['data']}
+        calibration=json.loads(next((scene/'calibration').glob('*.json')).read_text()); ci={n:i for i,n in enumerate(calibration['names'])}
+        for camera_name in ('CAMERA_01','CAMERA_05'):
+            rows=[]; kidx=ci[camera_name]; intr=calibration['intrinsics'][kidx]; K=np.array([[intr['fx'],0,intr['cx']],[0,intr['fy'],intr['cy']],[0,0,1.]])
+            for sample in payload['samples']:
+                datums=[data[k] for k in sample['datum_keys']]; cam=next((d for d in datums if d['id']['name']==camera_name),None); lidar=next((d for d in datums if d['id']['name']=='LIDAR'),None)
+                if cam is None or lidar is None: continue
+                image=cam['datum']['image']; c2w=pose_matrix(image['pose']); rgb=scene/image['filename']; pc_path=scene/lidar['datum']['point_cloud']['filename']
+                if not rgb.is_file() or not pc_path.is_file(): continue
+                timestamp=datetime.fromisoformat(cam['id']['timestamp'].replace('Z','+00:00')).timestamp()
+                rows.append({'rgb':rgb,'depth':lambda s=scene,d=lidar,p=c2w,k=K:ddad_depth(s,d,p,k),'K':K,'c2w':c2w,'timestamp':timestamp})
+            if len(rows)>=97: candidates.append((scene.name,camera_name,rows[:97]))
+    # One record per CAMERA_01 scene, then CAMERA_05 from distinct valid source streams.
+    selected=[x for x in candidates if x[1]=='CAMERA_01']
+    selected.extend(x for x in candidates if x[1]=='CAMERA_05')
+    for scene,camera,rows in selected[:200]:
+        write_record(out,'ddad',scene,f'{scene}/{camera}',rows,3,'train',{'official_loader_semantics':'DGP pose_WC + generate_depth_from_datum=LIDAR','camera':camera})
+
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--dataset',choices=('arkit',),required=True); p.add_argument('--source',type=Path,required=True); p.add_argument('--output',type=Path,required=True); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--dataset',choices=('arkit','ddad'),required=True); p.add_argument('--source',type=Path,required=True); p.add_argument('--output',type=Path,required=True); a=p.parse_args()
     if a.dataset=='arkit': arkit(a.source,a.output)
+    else: ddad(a.source,a.output)
 if __name__=='__main__': main()

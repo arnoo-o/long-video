@@ -18,15 +18,18 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def unit_row(record, output_root: Path, offset: int) -> dict:
+def unit_row(record, output_root: Path, offset: int, *, rebuild: bool = False) -> dict:
     row = dict(record.raw)
     row.update(record_id=f"{record.record_id}__frames_{offset:03d}_{offset + 96:03d}", parent_record_id=record.record_id,
                source_frame_start=offset, frame_count=97, chunk_count=3)
     cache_dir = output_root / "unit_correspondence"
     cache = cache_dir / f"{row['record_id'].replace(':', '_')}.npz"
-    if not cache.is_file():
+    if rebuild or not cache.is_file():
         arrays=record.load_correspondences(); stop=offset+97; chunk_offset=offset//32
-        keep=(arrays['query_frame']>=offset)&(arrays['query_frame']<stop)&(arrays['key_frame']>=offset)&(arrays['key_frame']<stop)
+        keep=((arrays['query_frame']>=offset)&(arrays['query_frame']<stop)&
+              (arrays['key_frame']>=offset)&(arrays['key_frame']<stop)&
+              (arrays['query_chunk']>=chunk_offset)&(arrays['query_chunk']<chunk_offset+3)&
+              (arrays['key_chunk']>=chunk_offset)&(arrays['key_chunk']<chunk_offset+3))
         sliced={key:value[keep].copy() for key,value in arrays.items()}
         sliced['query_frame']-=offset; sliced['key_frame']-=offset
         sliced['query_chunk']-=chunk_offset; sliced['key_chunk']-=chunk_offset
@@ -39,6 +42,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True, help="mixed full-record train manifest")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--rebuild", action="store_true")
     args = parser.parse_args()
     records = load_rgbd_memory_manifest(args.manifest)
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -47,7 +51,7 @@ def main() -> None:
         if record.chunk_count == 3:
             rows.append(dict(record.raw))
         elif record.chunk_count == 6:
-            rows.extend((unit_row(record, args.out.parent, 0), unit_row(record, args.out.parent, 96)))
+            rows.extend((unit_row(record, args.out.parent, 0, rebuild=args.rebuild), unit_row(record, args.out.parent, 96, rebuild=args.rebuild)))
         else:
             raise ValueError(f"unsupported training record geometry: {record.record_id}")
     if len({row['record_id'] for row in rows}) != len(rows):

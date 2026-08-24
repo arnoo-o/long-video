@@ -78,7 +78,7 @@ def ddad(root,out):
     for scene in sorted(x for x in root.iterdir() if x.is_dir()):
         payload=json.loads(next(scene.glob('scene_*.json')).read_text()); data={x['key']:x for x in payload['data']}
         calibration=json.loads(next((scene/'calibration').glob('*.json')).read_text()); ci={n:i for i,n in enumerate(calibration['names'])}
-        for camera_name in ('CAMERA_01','CAMERA_05'):
+        for camera_name in ('CAMERA_01',):
             rows=[]; kidx=ci[camera_name]; intr=calibration['intrinsics'][kidx]; K=np.array([[intr['fx'],0,intr['cx']],[0,intr['fy'],intr['cy']],[0,0,1.]])
             for sample in payload['samples']:
                 datums=[data[k] for k in sample['datum_keys']]; cam=next((d for d in datums if d['id']['name']==camera_name),None); lidar=next((d for d in datums if d['id']['name']=='LIDAR'),None)
@@ -88,10 +88,13 @@ def ddad(root,out):
                 timestamp=datetime.fromisoformat(cam['id']['timestamp'].replace('Z','+00:00')).timestamp()
                 rows.append({'rgb':rgb,'depth':lambda s=scene,d=lidar,p=c2w,k=K:ddad_depth(s,d,p,k),'K':K,'c2w':c2w,'timestamp':timestamp})
             if len(rows)>=97: candidates.append((scene.name,camera_name,rows[:97]))
-    # One record per CAMERA_01 scene, then CAMERA_05 from distinct valid source streams.
+    # The selected official subset contains exactly 132 scenes with a complete
+    # 97-frame CAMERA_01 stream.  Do not synthesize extra records from another
+    # camera on the same drive.
     selected=[x for x in candidates if x[1]=='CAMERA_01']
-    selected.extend(x for x in candidates if x[1]=='CAMERA_05')
-    for scene,camera,rows in selected[:200]:
+    if len(selected) != 132:
+        raise ValueError(f'expected 132 complete DDAD CAMERA_01 scenes, found {len(selected)}')
+    for scene,camera,rows in selected:
         write_record(out,'ddad',scene,f'{scene}/{camera}',rows,3,'train',{'official_loader_semantics':'DGP pose_WC + generate_depth_from_datum=LIDAR','camera':camera})
 
 def main():

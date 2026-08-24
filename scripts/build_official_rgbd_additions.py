@@ -27,7 +27,7 @@ def pointcloud_from_depth(depth, K, c2w, stride=4):
     cam=(np.linalg.inv(K)@np.stack((x*z,y*z,z))).T
     return (c2w[:3]@np.c_[cam,np.ones(len(cam))].T).T.astype(np.float32)
 
-def write_record(out, dataset, scene, sequence, observations, chunk_count, split, source):
+def write_record(out, dataset, scene, sequence, observations, chunk_count, split, source, correspondence_stride=8):
     count=1+32*chunk_count
     if len(observations)!=count: raise ValueError('window length mismatch')
     rid=f'{dataset}__{sequence.replace("/","_")}' ; root=out/'records'/dataset/rid
@@ -50,7 +50,7 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     poses=np.stack(poses); Ks=np.stack(Ks); times=np.asarray(times,np.float64)
     np.save(root/'c2w_abs.npy',poses); np.save(root/'c2w_local.npy',localize_c2w(poses)); np.save(root/'intrinsics.npy',Ks); np.save(root/'timestamps.npy',times)
     np.savez_compressed(root/'pointcloud.npz',xyz_world=np.concatenate(points),offsets=np.asarray(offsets,np.int64))
-    corr=build_causal_correspondence_cache(sorted(depdir.glob('*.png')),poses,Ks,root/'correspondence_cache.npz',chunk_count=chunk_count,pixel_stride=8)
+    corr=build_causal_correspondence_cache(sorted(depdir.glob('*.png')),poses,Ks,root/'correspondence_cache.npz',chunk_count=chunk_count,pixel_stride=correspondence_stride)
     meta={'schema_version':'rgbd-memory-record-v2','record_id':rid,'dataset':dataset,'scene_id':scene,'sequence_id':sequence,'split':split,'frame_count':count,'chunk_count':chunk_count,'height':H,'width':W,'stride':1,'source':source,'pose_convention':'OpenCV camera-to-world','correspondence':corr}
     atomic_json(root/'metadata.json',meta)
     return True
@@ -124,7 +124,7 @@ def ddad(root,out):
     if len(selected) != 132:
         raise ValueError(f'expected 132 complete DDAD CAMERA_01 scenes, found {len(selected)}')
     for scene,camera,rows in selected:
-        write_record(out,'ddad',scene,f'{scene}/{camera}',rows,3,'train',{'official_loader_semantics':'DGP pose_WC + generate_depth_from_datum=LIDAR','camera':camera})
+        write_record(out,'ddad',scene,f'{scene}/{camera}',rows,3,'train',{'official_loader_semantics':'DGP pose_WC + generate_depth_from_datum=LIDAR','camera':camera},correspondence_stride=1)
 
 def tartan_depth(path):
     """Decode the official TartanAir/TartanGround float32 RGBA PNG."""

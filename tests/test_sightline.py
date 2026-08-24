@@ -65,7 +65,7 @@ def test_camera_first_curriculum_uses_random_two_chunk_window():
     assert curriculum_phase(400)['lora'] and curriculum_phase(400)['max_chunks']==2
     assert curriculum_phase(999)['max_chunks']==2
     assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==1
-    assert curriculum_phase(2499)['max_chunks']==3
+    assert curriculum_phase(2499)['max_chunks']==6
     generator=torch.Generator().manual_seed(7)
     assert 0 <= select_chunk_window(2,generator=generator) <= 4
 
@@ -380,7 +380,7 @@ def test_training_preflight_and_fixed_2500_warmup_schedule():
     with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
     cfg.memory_layers=(); cfg.correspondence_layers=()
-    with pytest.raises(ValueError,match='Memory layers'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
+    with pytest.raises(ValueError,match='Memory/correspondence'): _preflight(cfg,SimpleNamespace(train=True,max_steps=1001),())
     assert _lr_multiplier(0)==pytest.approx(.01) and _lr_multiplier(99)==pytest.approx(1.) and _lr_multiplier(100)==pytest.approx(1.) and _lr_multiplier(2499)<1e-5
 
 def test_p3_chunk_curriculum_has_fixed_global_step_boundaries():

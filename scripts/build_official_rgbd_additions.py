@@ -31,7 +31,7 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     count=1+32*chunk_count
     if len(observations)!=count: raise ValueError('window length mismatch')
     rid=f'{dataset}__{sequence.replace("/","_")}' ; root=out/'records'/dataset/rid
-    if (root/'metadata.json').is_file(): return
+    if (root/'metadata.json').is_file(): return False
     rgbdir=root/'rgb'; depdir=root/'depth'; rgbdir.mkdir(parents=True,exist_ok=True); depdir.mkdir()
     poses=[]; Ks=[]; times=[]; points=[]; offsets=[0]
     for i,row in enumerate(observations):
@@ -49,11 +49,16 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     corr=build_causal_correspondence_cache(sorted(depdir.glob('*.png')),poses,Ks,root/'correspondence_cache.npz',chunk_count=chunk_count,pixel_stride=8)
     meta={'schema_version':'rgbd-memory-record-v2','record_id':rid,'dataset':dataset,'scene_id':scene,'sequence_id':sequence,'split':split,'frame_count':count,'chunk_count':chunk_count,'height':H,'width':W,'stride':1,'source':source,'pose_convention':'OpenCV camera-to-world','correspondence':corr}
     atomic_json(root/'metadata.json',meta)
+    return True
 
 def arkit(root,out):
     for split_dir,split in ((root/'Training','train'),(root/'Validation','val')):
       if not split_dir.is_dir(): continue
+      target={'train':350,'val':50}[split]
+      built=sum(1 for path in (out/'records'/'arkitscenes').glob('*/metadata.json')
+                if json.loads(path.read_text()).get('split')==split)
       for video in sorted(x for x in split_dir.iterdir() if x.is_dir()):
+        if built >= target: break
         traj={}
         for line in (video/'lowres_wide.traj').read_text().splitlines():
             a=line.split(); R=Rotation.from_rotvec(np.asarray(a[1:4],float)).as_matrix(); ext=np.eye(4); ext[:3,:3]=R; ext[:3,3]=np.asarray(a[4:7],float); traj[f'{float(a[0]):.3f}']=np.linalg.inv(ext)
@@ -65,7 +70,8 @@ def arkit(root,out):
             w,h,fx,fy,cx,cy=np.loadtxt(intr[ikey]); K=np.array([[fx,0,cx],[0,fy,cy],[0,0,1.]])
             obs.append({'rgb':rgb[fid],'depth':dep[fid],'K':K,'c2w':traj[key],'timestamp':float(fid)})
         for n,start in enumerate(range(0,len(obs)-192,193)):
-            write_record(out,'arkitscenes',video.name,f'{video.name}/{n:04d}',obs[start:start+193],6,split,{'official_asset':'raw lowres_wide/depth/traj/intrinsics'})
+            if built >= target: break
+            built += int(write_record(out,'arkitscenes',video.name,f'{video.name}/{n:04d}',obs[start:start+193],6,split,{'official_asset':'raw lowres_wide/depth/traj/intrinsics'}))
 
 def ddad_depth(scene, datum, camera_pose, K):
     pc=np.load(scene/datum['datum']['point_cloud']['filename'])['data'][:,:3]
@@ -108,7 +114,9 @@ def tartan_depth(path):
     return np.ascontiguousarray(rgba).view('<f4').reshape(rgba.shape[:2])
 
 def tartanground(root,out):
+    built=sum(1 for _ in (out/'records'/'tartanground').glob('*/metadata.json'))
     for trajectory in sorted(root.glob('*/Data_*/P*')):
+        if built >= 400: break
         rgbdir=trajectory/'image_lcam_front'; depdir=trajectory/'depth_lcam_front'
         posefile=trajectory/'pose_lcam_front.txt'; metafile=trajectory/f'{trajectory.name}_metadata.json'
         if not (rgbdir.is_dir() and depdir.is_dir() and posefile.is_file() and metafile.is_file()):
@@ -139,9 +147,10 @@ def tartanground(root,out):
         clip=0
         for run in runs:
             for start in range(0,len(run)-192,193):
-                write_record(out,'tartanground',env,f'{sequence}/{clip:04d}',run[start:start+193],6,'candidate',
-                             {'official_asset':'TartanGround pinhole image/depth/pose/metadata',
-                              'official_camera':'lcam_front','time_step':dt})
+                if built >= 400: return
+                built += int(write_record(out,'tartanground',env,f'{sequence}/{clip:04d}',run[start:start+193],6,'candidate',
+                                          {'official_asset':'TartanGround pinhole image/depth/pose/metadata',
+                                           'official_camera':'lcam_front','time_step':dt}))
                 clip+=1
 
 def main():

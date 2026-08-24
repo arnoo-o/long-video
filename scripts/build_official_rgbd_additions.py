@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build DDAD and ARKitScenes records using their official geometry semantics."""
 from __future__ import annotations
-import argparse, json, os, sys
+import argparse, json, os, shutil, sys
 from datetime import datetime
 from pathlib import Path
 import cv2, numpy as np
@@ -32,6 +32,10 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     if len(observations)!=count: raise ValueError('window length mismatch')
     rid=f'{dataset}__{sequence.replace("/","_")}' ; root=out/'records'/dataset/rid
     if (root/'metadata.json').is_file(): return False
+    if root.exists():
+        # A terminated builder may leave a metadata-less record.  Such a
+        # directory is never a committed record and is safe to reconstruct.
+        shutil.rmtree(root)
     rgbdir=root/'rgb'; depdir=root/'depth'; rgbdir.mkdir(parents=True,exist_ok=True); depdir.mkdir()
     poses=[]; Ks=[]; times=[]; points=[]; offsets=[0]
     for i,row in enumerate(observations):
@@ -65,8 +69,9 @@ def arkit(root,out):
         rgb={p.stem.split('_')[-1]:p for p in (video/'lowres_wide').glob('*.png')}; dep={p.stem.split('_')[-1]:p for p in (video/'lowres_depth').glob('*.png')}; intr={p.stem.split('_')[-1]:p for p in (video/'lowres_wide_intrinsics').glob('*.pincam')}
         ids=sorted(set(rgb)&set(dep),key=float); obs=[]
         for fid in ids:
-            key=f'{float(fid):.3f}'; ikey=min(intr,key=lambda x:abs(float(x)-float(fid))) if intr else None
-            if key not in traj or ikey is None or abs(float(ikey)-float(fid))>.0011: continue
+            value=float(fid); key=f'{value:.3f}'
+            ikey=next((candidate for candidate in (key,f'{value-.001:.3f}',f'{value+.001:.3f}') if candidate in intr),None)
+            if key not in traj or ikey is None: continue
             w,h,fx,fy,cx,cy=np.loadtxt(intr[ikey]); K=np.array([[fx,0,cx],[0,fy,cy],[0,0,1.]])
             obs.append({'rgb':rgb[fid],'depth':dep[fid],'K':K,'c2w':traj[key],'timestamp':float(fid)})
         for n,start in enumerate(range(0,len(obs)-192,193)):

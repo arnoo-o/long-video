@@ -7,15 +7,40 @@ from collections import Counter, defaultdict
 import json
 from pathlib import Path
 import random
+import sys
 
 import cv2
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 
 
 def _size(path: Path) -> int:
     return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
+
+
+def _sequence_identity(record) -> tuple[str, str]:
+    sequence = record.raw["sequence_id"]
+    if record.raw["dataset"] in {"arkitscenes", "tartanground"}:
+        sequence = sequence.rsplit("/", 1)[0]
+    return record.raw["dataset"], sequence
+
+
+def _record_size(record) -> int:
+    metadata = record.path("metadata") if "metadata" in record.raw else record.path("rgb_dir").parent / "metadata.json"
+    return _size(metadata.parent)
+
+
+def _validate_pointcloud(record) -> None:
+    if "pointcloud" not in record.raw:
+        return
+    with np.load(record.path("pointcloud"), allow_pickle=False) as value:
+        xyz=np.asarray(value["xyz_world"]); offsets=np.asarray(value["offsets"])
+    if xyz.ndim != 2 or xyz.shape[1] != 3 or not len(xyz) or not np.isfinite(xyz).all():
+        raise ValueError(f"{record.record_id}: invalid point cloud")
+    if offsets.shape != (record.frame_count+1,) or offsets[0] != 0 or offsets[-1] != len(xyz) or np.any(np.diff(offsets)<=0):
+        raise ValueError(f"{record.record_id}: point-cloud frame offsets are invalid")
 
 
 def _render(record, row, output: Path):
@@ -43,20 +68,22 @@ def main():
     train = load_rgbd_memory_manifest(args.dataset_root / "manifest_train.json")
     val = load_rgbd_memory_manifest(args.dataset_root / "manifest_val.json")
     all_records = load_rgbd_memory_manifest(args.dataset_root / "manifest_all.json")
-    train_sequences = {(row.raw["dataset"], row.raw["sequence_id"]) for row in train}
-    val_sequences = {(row.raw["dataset"], row.raw["sequence_id"]) for row in val}
+    train_sequences = {_sequence_identity(row) for row in train}
+    val_sequences = {_sequence_identity(row) for row in val}
     if train_sequences & val_sequences:
         raise RuntimeError("sequence leakage between train and val")
     summary = defaultdict(lambda: Counter(sequences=set()))
     for record in all_records:
+        _validate_pointcloud(record)
         bucket = summary[record.raw["dataset"]]
-        bucket["clips"] += 1; bucket["frames"] += 97
+        bucket["clips"] += 1; bucket["frames"] += record.frame_count
         bucket[record.raw["split"]] += 1
         cache = record.load_correspondences()
         bucket["correspondences"] += len(cache.get("query_frame", ()))
         bucket["camera_only"] += int(not record.memory_eligible)
         bucket["memory_eligible"] += int(record.memory_eligible)
-        bucket["sequences"].add(record.raw["sequence_id"])
+        bucket["processed_bytes"] += _record_size(record)
+        bucket["sequences"].add(_sequence_identity(record)[1])
     candidates = []
     for record in all_records:
         cache = record.load_correspondences()
@@ -85,13 +112,13 @@ def main():
             "sequences": len(counts["sequences"]),
             "original_sequences": int(build_report.get("sequence_count", len(counts["sequences"]))),
             "raw_bytes": _size(args.raw_root / dataset) if args.raw_root and (args.raw_root / dataset).is_dir() else None,
-            "processed_bytes": _size(args.dataset_root / "records" / dataset),
+            "processed_bytes": int(counts["processed_bytes"]),
             "filters": dict(filtered),
         }
     payload = {
         "schema_version": "rgbd-memory-validation-v1", "record_count": len(all_records),
         "train_count": len(train), "val_count": len(val), "sequence_leakage": False,
-        "processed_bytes": _size(args.dataset_root / "records"), "qa": qa,
+        "processed_bytes": sum(_record_size(record) for record in all_records), "qa": qa,
         "datasets": datasets,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)

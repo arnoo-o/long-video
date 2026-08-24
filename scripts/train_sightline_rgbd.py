@@ -165,7 +165,7 @@ def _load_correspondence(record):
     rows=list(record.correspondence_rows())
     for row in rows:
         qf,kf=int(row['query_frame']),int(row['key_frame'])
-        if kf>=qf or not (0<=int(row['key_chunk'])<int(row['query_chunk'])<3): raise RuntimeError('invalid causal RGB-D correspondence identity')
+        if kf>=qf or not (0<=int(row['key_chunk'])<int(row['query_chunk'])<record.chunk_count): raise RuntimeError('invalid causal RGB-D correspondence identity')
         if not np.isfinite(float(row['weight'])) or float(row['weight'])<0: raise RuntimeError('invalid RGB-D correspondence weight')
     return rows
 
@@ -260,7 +260,7 @@ def _all_rank_rng_states(world_size):
     return [local]
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True)
+    p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
     p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
@@ -272,7 +272,7 @@ def main():
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
     if args.train and world_size!=cfg.ddp_world_size: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
     probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
-    if args.train and len(records)!=400: raise ValueError(f'formal training requires exactly 400 train records, got {len(records)}')
+    p3_records=load_rgbd_memory_manifest(args.p3_manifest) if args.p3_manifest else records
     if cfg.chunk_count!=3 or cfg.chunk_length!=33 or cfg.chunk_stride!=32 or (cfg.source_height,cfg.source_width)!=(480,832): raise ValueError('formal RGB-D training requires 3 chunks, 97 frames, and 480x832 geometry')
     sys.path.insert(0,args.helios_root)
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
@@ -309,12 +309,13 @@ def main():
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
-        phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps); phase={**phase,'max_chunks':min(int(cfg.chunk_count),int(phase['max_chunks']))}; checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
+        phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps); checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
-        eligible_records=[record for record in records if record.memory_eligible] if (phase['memory'] or phase['correspondence'] or bool(args.probe_capture)) else records
+        phase_records=p3_records if phase['name']=='P3' else records
+        eligible_records=[record for record in phase_records if record.chunk_count >= phase['max_chunks'] and (record.memory_eligible or not (phase['memory'] or phase['correspondence'] or bool(args.probe_capture)))]
         if not eligible_records: raise RuntimeError(f"{phase['name']} requires at least one memory-eligible RGB-D record")
         if args.record_index is not None:
-            record=records[args.record_index]
+            record=phase_records[args.record_index]
             if record not in eligible_records: raise ValueError(f"record {record.record_id} is camera-only and cannot be used in {phase['name']}")
         else:
             index=_ddp_record_index(step,rank,world_size,len(eligible_records)); record=eligible_records[index]
@@ -322,8 +323,9 @@ def main():
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
-        if all_latents.shape[2]<25: raise ValueError('three 33-frame chunks require at least 25 latent frames')
-        window_start=0 if phase['name']=='P3' else select_chunk_window(phase['max_chunks'],total_chunks=cfg.chunk_count)
+        required_latents=1+8*record.chunk_count
+        if all_latents.shape[2] < required_latents: raise ValueError(f'{record.record_id}: latent cache is shorter than record geometry')
+        window_start=0 if phase['name']=='P3' else select_chunk_window(phase['max_chunks'],total_chunks=record.chunk_count)
         latent_start=window_start*8; frame_start=window_start*32
         latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to(device,dtype=torch.bfloat16)
         rgb_paths=record.rgb_paths()
@@ -410,7 +412,7 @@ def main():
                 processor.last_attention_bias=None
             return generated
         if phase['name']=='P3':
-            _,policies=run_causal_prefix_chunks(3,train_chunk,forward_chunk)
+            _,policies=run_causal_prefix_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         elif args.probe_only and args.alpha_zero_baseline:
             with torch.no_grad(): _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         else:

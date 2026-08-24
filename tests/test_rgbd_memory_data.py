@@ -72,6 +72,27 @@ def test_camera_only_record_does_not_require_correspondence(tmp_path):
     assert list(record.correspondence_rows()) == []
 
 
+def test_six_chunk_record_has_its_own_geometry(tmp_path):
+    row = _record(tmp_path)
+    root = tmp_path / "record"
+    for index in range(97, 193):
+        Image.new("RGB", (832, 480)).save(root / "rgb" / f"{index:06d}.png")
+        Image.fromarray(np.ones((480, 832), np.uint16)).save(root / "depth" / f"{index:06d}.png")
+    poses = np.repeat(np.eye(4)[None], 193, axis=0); poses[:, 0, 3] = np.arange(193)
+    np.save(root / "c2w_abs.npy", poses); np.save(root / "c2w_local.npy", poses)
+    np.save(root / "intrinsics.npy", np.repeat(np.eye(3)[None], 193, axis=0))
+    np.save(root / "timestamps.npy", np.arange(193, dtype=np.float64))
+    np.savez_compressed(root / "correspondence_cache.npz", **{
+        "query_frame": np.array([160]), "key_frame": np.array([32]), "query_chunk": np.array([5]), "key_chunk": np.array([1]),
+        "query_t": np.array([0]), "key_t": np.array([0]), "query_y": np.array([1]), "query_x": np.array([2]), "key_y": np.array([1]), "key_x": np.array([2]), "weight": np.array([1.0]),
+    })
+    row.update(frame_count=193, chunk_count=6)
+    manifest = tmp_path / "manifest.json"; manifest.write_text(json.dumps({"records": [row]}))
+    record = load_rgbd_memory_manifest(manifest)[0]
+    assert record.load_cameras()[0].shape == (193, 4, 4)
+    assert record.chunk_count == 6
+
+
 def test_sequence_split_hits_exact_train_count_without_leakage():
     script = Path(__file__).parents[1] / "scripts" / "split_rgbd_train_val.py"
     spec = importlib.util.spec_from_file_location("rgbd_split", script)

@@ -30,7 +30,7 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
     return min(maximum, 1 + step // warmup_steps)
 
 def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_steps: int = 1500):
-    """Formal 400/600/1500 curriculum; P3 always exposes all three chunks."""
+    """Formal 400/600/1500 curriculum with a 1→6 chunk P3 rollout."""
     if step < 0 or min(p1_steps, p2_steps, p3_steps) < 1:
         raise ValueError("invalid curriculum schedule")
     if step < p1_steps - 100:
@@ -39,8 +39,16 @@ def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_
         return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False}
     if step < p1_steps + p2_steps:
         return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False}
-    if step < p1_steps + p2_steps + p3_steps:
-        return {"name":"P3","max_chunks":3,"lora":True,"correspondence":True,"memory":True}
+    p3_step = step - p1_steps - p2_steps
+    if p3_step < p3_steps:
+        # Fixed global-step boundaries keep checkpoint resumes deterministic.
+        if p3_step < 400: chunks = 1
+        elif p3_step < 700: chunks = 2
+        elif p3_step < 900: chunks = 3
+        elif p3_step < 1100: chunks = 4
+        elif p3_step < 1300: chunks = 5
+        else: chunks = 6
+        return {"name":"P3","max_chunks":chunks,"lora":True,"correspondence":True,"memory":True}
     raise ValueError("step is outside the configured training schedule")
 
 def select_chunk_window(window_chunks: int, total_chunks: int = 6,

@@ -1,4 +1,8 @@
-"""Strict loader for the canonical 97-frame RGB-D memory dataset."""
+"""Strict loader for variable-length canonical RGB-D memory records.
+
+Records own their 3- or 6-chunk geometry.  This deliberately permits mixed
+97/193-frame manifests without padding or reordering observations.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,8 +13,7 @@ from typing import Iterator
 import numpy as np
 
 
-FRAME_COUNT = 97
-CHUNK_COUNT = 3
+CHUNK_STRIDE = 32
 HEIGHT = 480
 WIDTH = 832
 REQUIRED_KEYS = (
@@ -18,6 +21,12 @@ REQUIRED_KEYS = (
     "c2w_abs", "c2w_local", "intrinsics", "timestamps",
     "frame_count", "chunk_count", "height", "width",
 )
+
+
+def expected_frame_count(chunk_count: int) -> int:
+    if not 1 <= int(chunk_count) <= 6:
+        raise ValueError("chunk_count must be in 1..6")
+    return 1 + CHUNK_STRIDE * int(chunk_count)
 
 
 @dataclass(frozen=True)
@@ -35,6 +44,19 @@ class RGBDMemoryRecord:
         return self.record_id
 
     @property
+    def frame_count(self) -> int:
+        return int(self.raw["frame_count"])
+
+    @property
+    def chunk_count(self) -> int:
+        return int(self.raw["chunk_count"])
+
+    @property
+    def source_frame_start(self) -> int:
+        """Offset for a legal 3-chunk view of a 6-chunk parent record."""
+        return int(self.raw.get("source_frame_start", 0))
+
+    @property
     def training_scope(self) -> str:
         return str(self.raw.get("training_scope", "rgbd_memory"))
 
@@ -48,34 +70,38 @@ class RGBDMemoryRecord:
 
     @staticmethod
     def _frames(directory: Path) -> tuple[Path, ...]:
-        return tuple(sorted(p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}))
+        return tuple(sorted((p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}), key=lambda p: p.name))
+
+    def _slice(self, values, name: str):
+        start, stop = self.source_frame_start, self.source_frame_start + self.frame_count
+        if len(values) < stop:
+            raise ValueError(f"{self.record_id}: {name} has {len(values)} frames, requires [{start}:{stop})")
+        return values[start:stop]
 
     def rgb_paths(self) -> tuple[Path, ...]:
-        paths = self._frames(self.path("rgb_dir"))
-        if len(paths) != FRAME_COUNT:
-            raise ValueError(f"{self.record_id}: expected {FRAME_COUNT} RGB frames, found {len(paths)}")
+        paths = self._slice(self._frames(self.path("rgb_dir")), "RGB")
+        if len(paths) != self.frame_count:
+            raise ValueError(f"{self.record_id}: RGB count mismatch")
         return paths
 
     def depth_paths(self) -> tuple[Path, ...]:
-        paths = self._frames(self.path("depth_dir"))
-        if len(paths) != FRAME_COUNT:
-            raise ValueError(f"{self.record_id}: expected {FRAME_COUNT} depth frames, found {len(paths)}")
+        paths = self._slice(self._frames(self.path("depth_dir")), "depth")
+        if len(paths) != self.frame_count:
+            raise ValueError(f"{self.record_id}: depth count mismatch")
         return paths
 
     def load_cameras(self, *, local: bool = True) -> tuple[np.ndarray, np.ndarray]:
-        key = "c2w_local" if local else "c2w_abs"
-        c2w = np.load(self.path(key), mmap_mode="r")
-        intrinsics = np.load(self.path("intrinsics"), mmap_mode="r")
-        if c2w.shape != (FRAME_COUNT, 4, 4):
-            raise ValueError(f"{self.record_id}: {key} must be [{FRAME_COUNT},4,4]")
-        if intrinsics.shape != (FRAME_COUNT, 3, 3):
-            raise ValueError(f"{self.record_id}: intrinsics must be [{FRAME_COUNT},3,3]")
+        absolute = self._slice(np.load(self.path("c2w_abs"), mmap_mode="r"), "c2w_abs")
+        intrinsics = self._slice(np.load(self.path("intrinsics"), mmap_mode="r"), "intrinsics")
+        if absolute.shape != (self.frame_count, 4, 4) or intrinsics.shape != (self.frame_count, 3, 3):
+            raise ValueError(f"{self.record_id}: camera shape does not match frame_count")
+        c2w = np.linalg.inv(np.asarray(absolute[0])) @ np.asarray(absolute) if local else absolute
         return c2w, intrinsics
 
     def load_timestamps(self) -> np.ndarray:
-        timestamps = np.load(self.path("timestamps"), mmap_mode="r")
-        if timestamps.shape != (FRAME_COUNT,) or not np.isfinite(timestamps).all():
-            raise ValueError(f"{self.record_id}: timestamps must be finite [{FRAME_COUNT}]")
+        timestamps = self._slice(np.load(self.path("timestamps"), mmap_mode="r"), "timestamps")
+        if timestamps.shape != (self.frame_count,) or not np.isfinite(timestamps).all():
+            raise ValueError(f"{self.record_id}: timestamps must match frame_count")
         if np.any(np.diff(timestamps) <= 0):
             raise ValueError(f"{self.record_id}: timestamps must be strictly increasing")
         return timestamps
@@ -94,8 +120,8 @@ class RGBDMemoryRecord:
         count = len(arrays["query_frame"])
         if any(len(value) != count for value in arrays.values() if value.ndim == 1):
             raise ValueError(f"{self.record_id}: correspondence columns have different lengths")
-        if count and (np.any(arrays["key_frame"] >= arrays["query_frame"]) or np.any(arrays["key_chunk"] >= arrays["query_chunk"])):
-            raise ValueError(f"{self.record_id}: correspondence cache is not strictly causal")
+        if count and (np.any(arrays["key_frame"] >= arrays["query_frame"]) or np.any(arrays["key_chunk"] >= arrays["query_chunk"]) or np.any(arrays["query_frame"] >= self.frame_count) or np.any(arrays["key_frame"] < 0) or np.any(arrays["query_chunk"] >= self.chunk_count) or np.any(arrays["key_chunk"] < 0)):
+            raise ValueError(f"{self.record_id}: correspondence cache is not strictly causal or out of bounds")
         return arrays
 
     def correspondence_rows(self) -> Iterator[dict]:
@@ -126,10 +152,10 @@ class RGBDMemoryRecord:
         missing = [key for key in REQUIRED_KEYS if key not in self.raw]
         if missing:
             raise ValueError(f"record missing keys: {missing}")
-        expected = {"frame_count": FRAME_COUNT, "chunk_count": CHUNK_COUNT, "height": HEIGHT, "width": WIDTH}
-        wrong = {key: (self.raw.get(key), value) for key, value in expected.items() if int(self.raw.get(key, -1)) != value}
-        if wrong:
-            raise ValueError(f"{self.record_id}: fixed geometry mismatch {wrong}")
+        if self.frame_count != expected_frame_count(self.chunk_count):
+            raise ValueError(f"{self.record_id}: frame_count must equal 1 + 32 * chunk_count")
+        if (int(self.raw.get("height", -1)), int(self.raw.get("width", -1))) != (HEIGHT, WIDTH):
+            raise ValueError(f"{self.record_id}: unsupported image geometry")
         rgb, depth = self.rgb_paths(), self.depth_paths()
         if [p.stem for p in rgb] != [p.stem for p in depth]:
             raise ValueError(f"{self.record_id}: RGB/depth frame names are not aligned")

@@ -12,7 +12,9 @@ import cv2
 import numpy as np
 
 HEIGHT, WIDTH = 480, 832
-FRAME_COUNT, CHUNK_COUNT, CHUNK_STRIDE = 97, 3, 32
+CHUNK_STRIDE = 32
+# Compatibility defaults only.  New code must take geometry from each record.
+FRAME_COUNT, CHUNK_COUNT = 97, 3
 LATENT_LOCAL_FRAMES = np.asarray((0, 4, 8, 12, 16, 20, 24, 28, 32), dtype=np.int16)
 
 
@@ -140,21 +142,26 @@ def _project_world(world: np.ndarray, c2w: np.ndarray, K: np.ndarray):
     return z, uv
 
 
-def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 30, token_width: int = 52) -> dict:
-    """Build sparse chunk1->0 and chunk2->0/1 GT correspondences."""
-    if len(depth_paths) != FRAME_COUNT or c2w.shape != (FRAME_COUNT, 4, 4) or K.shape != (FRAME_COUNT, 3, 3):
-        raise ValueError("correspondence inputs must contain exactly 97 frames")
-    depth_cache = {index: _depth(depth_paths[index]) for index in sorted(set(int(chunk * 32 + f) for chunk in range(3) for f in LATENT_LOCAL_FRAMES))}
+def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 30, token_width: int = 52) -> dict:
+    """Build sparse causal correspondences for every query_chunk/key_chunk pair."""
+    if chunk_count is None:
+        if (len(depth_paths) - 1) % CHUNK_STRIDE:
+            raise ValueError("frame count is not a shared-boundary chunk sequence")
+        chunk_count = (len(depth_paths) - 1) // CHUNK_STRIDE
+    expected = 1 + CHUNK_STRIDE * int(chunk_count)
+    if not 1 <= int(chunk_count) <= 6 or len(depth_paths) != expected or c2w.shape != (expected, 4, 4) or K.shape != (expected, 3, 3):
+        raise ValueError("correspondence inputs must be a 1..6 chunk shared-boundary sequence")
+    depth_cache = {index: _depth(depth_paths[index]) for index in sorted(set(int(chunk * CHUNK_STRIDE + f) for chunk in range(chunk_count) for f in LATENT_LOCAL_FRAMES))}
     yy, xx = np.mgrid[0:HEIGHT:pixel_stride, 0:WIDTH:pixel_stride]
     pixels = np.stack((xx.ravel(), yy.ravel()), axis=1)
     batches: dict[str, list[np.ndarray]] = {key: [] for key in ("query_frame", "key_frame", "query_chunk", "key_chunk", "query_t", "key_t", "query_y", "query_x", "key_y", "key_x", "matched_count", "valid_count", "coverage", "vote", "weight")}
     pair_stats, raw_matches = {}, 0
-    for query_chunk in (1, 2):
+    for query_chunk in range(1, chunk_count):
         for key_chunk in range(query_chunk):
             for query_t, local_query in enumerate(LATENT_LOCAL_FRAMES):
-                query_frame = int(query_chunk * 32 + local_query)
+                query_frame = int(query_chunk * CHUNK_STRIDE + local_query)
                 for key_t, local_key in enumerate(LATENT_LOCAL_FRAMES):
-                    key_frame = int(key_chunk * 32 + local_key)
+                    key_frame = int(key_chunk * CHUNK_STRIDE + local_key)
                     if key_frame >= query_frame:
                         continue
                     query_depth = depth_cache[query_frame]

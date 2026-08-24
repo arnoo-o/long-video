@@ -9,6 +9,8 @@ from scipy.spatial.transform import Rotation
 from long_video.data.rgbd_memory import build_causal_correspondence_cache, localize_c2w, transform_rgb_depth
 
 H, W = 480, 832
+TARTAN_NED_R_OPENCV = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]], dtype=np.float64)
+TARTAN_K = np.array([[320, 0, 319.5], [0, 320, 319.5], [0, 0, 1]], dtype=np.float64)
 
 def atomic_json(path, value):
     tmp=path.with_suffix(path.suffix+'.tmp'); tmp.write_text(json.dumps(value,indent=2)); os.replace(tmp,path)
@@ -97,8 +99,53 @@ def ddad(root,out):
     for scene,camera,rows in selected:
         write_record(out,'ddad',scene,f'{scene}/{camera}',rows,3,'train',{'official_loader_semantics':'DGP pose_WC + generate_depth_from_datum=LIDAR','camera':camera})
 
+def tartan_depth(path):
+    """Decode the official TartanAir/TartanGround float32 RGBA PNG."""
+    rgba=cv2.imread(str(path),cv2.IMREAD_UNCHANGED)
+    if rgba is None or rgba.dtype != np.uint8 or rgba.ndim != 3 or rgba.shape[2] != 4:
+        raise ValueError(f'invalid TartanGround depth image: {path}')
+    return np.ascontiguousarray(rgba).view('<f4').reshape(rgba.shape[:2])
+
+def tartanground(root,out):
+    for trajectory in sorted(root.glob('*/Data_*/P*')):
+        rgbdir=trajectory/'image_lcam_front'; depdir=trajectory/'depth_lcam_front'
+        posefile=trajectory/'pose_lcam_front.txt'; metafile=trajectory/f'{trajectory.name}_metadata.json'
+        if not (rgbdir.is_dir() and depdir.is_dir() and posefile.is_file() and metafile.is_file()):
+            continue
+        metadata=json.loads(metafile.read_text()); dt=float(metadata['time_step'])
+        poses=np.loadtxt(posefile,dtype=np.float64)
+        if poses.ndim != 2 or poses.shape[1] != 7:
+            raise ValueError(f'invalid TartanGround poses: {posefile}')
+        rgb={int(p.name.split('_',1)[0]):p for p in rgbdir.glob('*.png')}
+        depth={int(p.name.split('_',1)[0]):p for p in depdir.glob('*.png')}
+        ids=sorted(set(rgb)&set(depth)&set(range(len(poses))))
+        obs=[]
+        for fid in ids:
+            p=poses[fid]; c2w=np.eye(4,dtype=np.float64)
+            # Exact convention used by the official TartanAir customizer:
+            # camera pose is camera-to-world in NED, converted to OpenCV axes.
+            c2w[:3,:3]=Rotation.from_quat(p[3:]).as_matrix()@TARTAN_NED_R_OPENCV
+            c2w[:3,3]=p[:3]
+            obs.append({'rgb':rgb[fid], 'depth':lambda p=depth[fid]:tartan_depth(p),
+                        'K':TARTAN_K, 'c2w':c2w, 'timestamp':fid*dt, 'frame_id':fid})
+        # Identity must be explicit: no gaps and no filename-order association.
+        runs=[]; start=0
+        for i in range(1,len(obs)+1):
+            if i == len(obs) or obs[i]['frame_id'] != obs[i-1]['frame_id']+1:
+                runs.append(obs[start:i]); start=i
+        env=trajectory.parents[1].name; difficulty=trajectory.parent.name
+        sequence=f'{env}/{difficulty}/{trajectory.name}'
+        clip=0
+        for run in runs:
+            for start in range(0,len(run)-192,193):
+                write_record(out,'tartanground',env,f'{sequence}/{clip:04d}',run[start:start+193],6,'candidate',
+                             {'official_asset':'TartanGround pinhole image/depth/pose/metadata',
+                              'official_camera':'lcam_front','time_step':dt})
+                clip+=1
+
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--dataset',choices=('arkit','ddad'),required=True); p.add_argument('--source',type=Path,required=True); p.add_argument('--output',type=Path,required=True); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--dataset',choices=('arkit','ddad','tartanground'),required=True); p.add_argument('--source',type=Path,required=True); p.add_argument('--output',type=Path,required=True); a=p.parse_args()
     if a.dataset=='arkit': arkit(a.source,a.output)
-    else: ddad(a.source,a.output)
+    elif a.dataset=='ddad': ddad(a.source,a.output)
+    else: tartanground(a.source,a.output)
 if __name__=='__main__': main()

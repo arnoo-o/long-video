@@ -55,15 +55,22 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     atomic_json(root/'metadata.json',meta)
     return True
 
-def shard_target(total,index,count):
-    return total//count+int(index<total%count)
+def shard_targets(total,capacities):
+    targets=[0]*len(capacities); cursor=0
+    while sum(targets)<total:
+        eligible=[i for i,capacity in enumerate(capacities) if targets[i]<capacity]
+        if not eligible: raise ValueError(f'shard capacity {sum(capacities)} is below target {total}')
+        index=eligible[cursor%len(eligible)]; targets[index]+=1; cursor+=1
+    return targets
 
 def arkit(root,out,shard_index=0,shard_count=1):
     for split_dir,split in ((root/'Training','train'),(root/'Validation','val')):
       if not split_dir.is_dir(): continue
-      videos=sorted(x for x in split_dir.iterdir() if x.is_dir())[shard_index::shard_count]
+      all_videos=sorted(x for x in split_dir.iterdir() if x.is_dir())
+      videos=all_videos[shard_index::shard_count]
       video_ids={video.name for video in videos}
-      target=shard_target({'train':350,'val':50}[split],shard_index,shard_count)
+      capacities=[sum(len((video/'lowres_wide.traj').read_text().splitlines())//193 for video in all_videos[i::shard_count]) for i in range(shard_count)]
+      target=shard_targets({'train':350,'val':50}[split],capacities)[shard_index]
       built=sum(1 for path in (out/'records'/'arkitscenes').glob('*/metadata.json')
                 if (lambda meta:meta.get('split')==split and meta.get('scene_id') in video_ids)(json.loads(path.read_text())))
       for video in videos:
@@ -124,9 +131,16 @@ def tartan_depth(path):
     return np.ascontiguousarray(rgba).view('<f4').reshape(rgba.shape[:2])
 
 def tartanground(root,out,shard_index=0,shard_count=1):
-    trajectories=sorted(root.glob('*/Data_*/P*'))[shard_index::shard_count]
+    all_trajectories=sorted(root.glob('*/Data_*/P*'))
+    trajectories=all_trajectories[shard_index::shard_count]
     prefixes={f'{trajectory.parents[1].name}/{trajectory.parent.name}/{trajectory.name}' for trajectory in trajectories}
-    target=shard_target(400,shard_index,shard_count)
+    capacities=[]
+    for i in range(shard_count):
+        capacity=0
+        for trajectory in all_trajectories[i::shard_count]:
+            capacity+=min(len(list((trajectory/'image_lcam_front').glob('*.png'))),len(list((trajectory/'depth_lcam_front').glob('*.png'))))//193
+        capacities.append(capacity)
+    target=shard_targets(400,capacities)[shard_index]
     built=sum(1 for path in (out/'records'/'tartanground').glob('*/metadata.json')
               if json.loads(path.read_text()).get('sequence_id','').rsplit('/',1)[0] in prefixes)
     for trajectory in trajectories:

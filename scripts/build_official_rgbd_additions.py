@@ -55,13 +55,18 @@ def write_record(out, dataset, scene, sequence, observations, chunk_count, split
     atomic_json(root/'metadata.json',meta)
     return True
 
-def arkit(root,out):
+def shard_target(total,index,count):
+    return total//count+int(index<total%count)
+
+def arkit(root,out,shard_index=0,shard_count=1):
     for split_dir,split in ((root/'Training','train'),(root/'Validation','val')):
       if not split_dir.is_dir(): continue
-      target={'train':350,'val':50}[split]
+      videos=sorted(x for x in split_dir.iterdir() if x.is_dir())[shard_index::shard_count]
+      video_ids={video.name for video in videos}
+      target=shard_target({'train':350,'val':50}[split],shard_index,shard_count)
       built=sum(1 for path in (out/'records'/'arkitscenes').glob('*/metadata.json')
-                if json.loads(path.read_text()).get('split')==split)
-      for video in sorted(x for x in split_dir.iterdir() if x.is_dir()):
+                if (lambda meta:meta.get('split')==split and meta.get('scene_id') in video_ids)(json.loads(path.read_text())))
+      for video in videos:
         if built >= target: break
         traj={}
         for line in (video/'lowres_wide.traj').read_text().splitlines():
@@ -118,10 +123,14 @@ def tartan_depth(path):
         raise ValueError(f'invalid TartanGround depth image: {path}')
     return np.ascontiguousarray(rgba).view('<f4').reshape(rgba.shape[:2])
 
-def tartanground(root,out):
-    built=sum(1 for _ in (out/'records'/'tartanground').glob('*/metadata.json'))
-    for trajectory in sorted(root.glob('*/Data_*/P*')):
-        if built >= 400: break
+def tartanground(root,out,shard_index=0,shard_count=1):
+    trajectories=sorted(root.glob('*/Data_*/P*'))[shard_index::shard_count]
+    prefixes={f'{trajectory.parents[1].name}/{trajectory.parent.name}/{trajectory.name}' for trajectory in trajectories}
+    target=shard_target(400,shard_index,shard_count)
+    built=sum(1 for path in (out/'records'/'tartanground').glob('*/metadata.json')
+              if json.loads(path.read_text()).get('sequence_id','').rsplit('/',1)[0] in prefixes)
+    for trajectory in trajectories:
+        if built >= target: break
         rgbdir=trajectory/'image_lcam_front'; depdir=trajectory/'depth_lcam_front'
         posefile=trajectory/'pose_lcam_front.txt'; metafile=trajectory/f'{trajectory.name}_metadata.json'
         if not (rgbdir.is_dir() and depdir.is_dir() and posefile.is_file() and metafile.is_file()):
@@ -152,15 +161,16 @@ def tartanground(root,out):
         clip=0
         for run in runs:
             for start in range(0,len(run)-192,193):
-                if built >= 400: return
+                if built >= target: return
                 built += int(write_record(out,'tartanground',env,f'{sequence}/{clip:04d}',run[start:start+193],6,'candidate',
                                           {'official_asset':'TartanGround pinhole image/depth/pose/metadata',
                                            'official_camera':'lcam_front','time_step':dt}))
                 clip+=1
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--dataset',choices=('arkit','ddad','tartanground'),required=True); p.add_argument('--source',type=Path,required=True); p.add_argument('--output',type=Path,required=True); a=p.parse_args()
-    if a.dataset=='arkit': arkit(a.source,a.output)
+    p=argparse.ArgumentParser(); p.add_argument('--dataset',choices=('arkit','ddad','tartanground'),required=True); p.add_argument('--source',type=Path,required=True); p.add_argument('--output',type=Path,required=True); p.add_argument('--shard-index',type=int,default=0); p.add_argument('--shard-count',type=int,default=1); a=p.parse_args()
+    if a.shard_count<1 or not 0<=a.shard_index<a.shard_count: raise ValueError('invalid shard index/count')
+    if a.dataset=='arkit': arkit(a.source,a.output,a.shard_index,a.shard_count)
     elif a.dataset=='ddad': ddad(a.source,a.output)
-    else: tartanground(a.source,a.output)
+    else: tartanground(a.source,a.output,a.shard_index,a.shard_count)
 if __name__=='__main__': main()

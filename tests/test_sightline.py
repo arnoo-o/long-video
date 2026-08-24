@@ -64,7 +64,7 @@ def test_camera_first_curriculum_uses_random_two_chunk_window():
     assert not curriculum_phase(300)['lora'] and curriculum_phase(300)['max_chunks']==2
     assert curriculum_phase(400)['lora'] and curriculum_phase(400)['max_chunks']==2
     assert curriculum_phase(999)['max_chunks']==2
-    assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==3
+    assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==1
     assert curriculum_phase(2499)['max_chunks']==3
     generator=torch.Generator().manual_seed(7)
     assert 0 <= select_chunk_window(2,generator=generator) <= 4
@@ -376,7 +376,7 @@ def test_steps_override_is_effective_and_symmetric():
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
     from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier
-    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),camera_layers=(1,2,3,4,5,6),correspondence_layers=(16,20,24),memory_layers=tuple(range(17,25)),lora_layers=(),warmup_ratio=.04)
+    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),camera_layers=(1,2,3,4,5,6),correspondence_layers=(16,20,24),memory_layers=(16,20,24),lora_layers=(),warmup_ratio=.04)
     with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
     cfg.memory_layers=(); cfg.correspondence_layers=()

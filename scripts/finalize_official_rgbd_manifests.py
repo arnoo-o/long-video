@@ -98,6 +98,7 @@ def main() -> None:
     parser.add_argument("--additions-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--latent-cache-root", type=Path, required=True)
+    parser.add_argument("--allow-missing-latents", action="store_true", help="Emit a geometry-only preflight manifest")
     parser.add_argument("--ddad", type=int, default=132)
     parser.add_argument("--arkit-train", type=int, default=350)
     parser.add_argument("--arkit-val", type=int, default=50)
@@ -125,7 +126,7 @@ def main() -> None:
     for row in train + val:
         temporal=1+(int(row["frame_count"])-1)//4
         cache=args.latent_cache_root/row["record_id"]/f"continuous_{temporal}.pt"
-        if not cache.is_file():
+        if not cache.is_file() and not args.allow_missing_latents:
             raise FileNotFoundError(f'missing latent cache: {cache}')
         row["latent_cache"]=str(cache)
     assert_disjoint(train, val)

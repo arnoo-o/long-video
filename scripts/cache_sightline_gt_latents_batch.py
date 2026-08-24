@@ -12,6 +12,7 @@ def main():
     p.add_argument('--selection-manifest',help='Optional JSON containing trajectory_ids to encode')
     p.add_argument('--out-root',required=True); p.add_argument('--height',type=int,default=480); p.add_argument('--width',type=int,default=832)
     p.add_argument('--limit',type=int,default=0)
+    p.add_argument('--shard-index',type=int,default=0); p.add_argument('--shard-count',type=int,default=1)
     a=p.parse_args(); import sys; sys.path.insert(0,a.helios_root)
     from diffusers import AutoencoderKLWan
     from diffusers.video_processor import VideoProcessor
@@ -21,6 +22,9 @@ def main():
     if a.selection_manifest:
         selected=set(json.loads(Path(a.selection_manifest).read_text()).get('trajectory_ids',()))
         records=[record for record in records if record.get('trajectory_id') in selected]
+    if a.shard_count < 1 or not 0 <= a.shard_index < a.shard_count:
+        raise ValueError('invalid shard index/count')
+    records=records[a.shard_index::a.shard_count]
     model_files=[]
     for pattern in ('config.json','model_index.json','transformer/config.json','transformer/*.index.json','vae/config.json','vae/*.index.json'):
         model_files.extend(glob.glob(str(Path(a.model)/pattern)))

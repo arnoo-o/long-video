@@ -25,18 +25,19 @@ class SightlineConditioner(nn.Module):
     def project(self, rays, *, kind: str, training=None, scale_delta=None):
         if rays.shape[-1] != 7: raise ValueError("rays must contain d, m_hat, log_norm")
         if training is None: training=self.training
-        s=rays[...,6:7]; s_in=s if scale_delta is None else s+scale_delta
+        output_dtype=rays.dtype; parameter_dtype=self.gate.weight.dtype
+        s=rays[...,6:7].to(parameter_dtype); s_in=s if scale_delta is None else s+torch.as_tensor(scale_delta,device=s.device,dtype=parameter_dtype)
         # Scale augmentation exclusively affects this gate. E_q/E_k always see
         # true Plücker scale s, never the perturbed value.
         g=torch.sigmoid(self.gate(s_in))
         if kind not in ('q','k'): raise ValueError("kind must be q or k")
-        q_in=torch.cat((rays[...,:3],rays[...,3:6],s),-1)
-        k_in=torch.cat((rays[...,3:6],rays[...,:3],s),-1)
+        q_in=torch.cat((rays[...,:3].to(parameter_dtype),rays[...,3:6].to(parameter_dtype),s),-1)
+        k_in=torch.cat((rays[...,3:6].to(parameter_dtype),rays[...,:3].to(parameter_dtype),s),-1)
         dim=self.q_proj.out_features
         value=self.q_proj(q_in) if kind=='q' else self.k_proj(k_in)
         value=(self.rms_norm_q if kind=='q' else self.rms_norm_k)(value)
         alpha=self.alpha_q if kind=='q' else self.alpha_k
-        return alpha*g*value
+        return (alpha.to(value.dtype)*g*value).to(output_dtype)
     def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None):
         rays_k = rays_q if rays_k is None else rays_k
         if training is None: training=self.training

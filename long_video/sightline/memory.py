@@ -32,7 +32,10 @@ class LongTermKVMemory:
         pooled_h,pooled_w=H//self.pool,W//self.pool
         for i in range(hh.shape[1]):
             t=i//(pooled_h*pooled_w); rem=i%(pooled_h*pooled_w); y,x=divmod(rem,pooled_w)
-            if chunk_index>0 and t==0: continue
+            # temporal0 is always a shared/source boundary.  It is already
+            # represented by the preceding clean latent (or source image), so
+            # storing it would duplicate identity with an incorrect hidden.
+            if t==0: continue
             self.tokens.append(MemoryToken(hh[:,i:i+1].detach(),rr[:,i:i+1].detach(),chunk_index,i,t,y,x))
         if len(self.tokens)>self.budget: self.tokens=self.tokens[-self.budget:]
     def active_tokens(self,current_global_start=None):

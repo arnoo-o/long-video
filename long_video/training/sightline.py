@@ -4,7 +4,10 @@ Helios itself is frozen and supplied by the H100 adapter; this module owns only
 the trainable ray projections, alpha, timestamp and LoRA.
 """
 from __future__ import annotations
-import math, torch
+import hashlib, math, random
+import numpy as np
+import torch
+import torch.distributed as dist
 from torch import nn
 from ..sightline.conditioning import LayeredSightlineConditioner
 from ..sightline.correspondence import correspondence_loss
@@ -51,10 +54,43 @@ def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_
         return {"name":"P3","max_chunks":chunks,"lora":True,"correspondence":True,"memory":True}
     raise ValueError("step is outside the configured training schedule")
 
-def select_chunk_window(window_chunks: int, total_chunks: int = 6,
-                        generator: torch.Generator | None = None) -> int:
-    if not 1 <= window_chunks <= total_chunks: raise ValueError('invalid chunk window')
-    return int(torch.randint(total_chunks-window_chunks+1,(1,),generator=generator).item())
+INIT_SEED = 20260826
+
+def set_initialization_seed(seed: int = INIT_SEED) -> None:
+    random.seed(seed); np.random.seed(seed % (2**32-1)); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+def set_rank_runtime_seed(rank: int, step: int = 0) -> int:
+    seed=INIT_SEED+1000003*int(rank)+9176*int(step)
+    random.seed(seed); np.random.seed(seed%(2**32-1)); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+    return seed
+
+def synchronized_trainable_parameters(trainable, memory, transformer):
+    values=list(trainable.named_parameters())+[(f'memory.{n}',p) for n,p in memory.named_parameters()]
+    values += [(f'transformer.{n}',p) for n,p in transformer.named_parameters() if 'lora_' in n]
+    return sorted(values,key=lambda item:item[0])
+
+def parameter_digest(named_parameters) -> str:
+    digest=hashlib.sha256()
+    for name,parameter in named_parameters:
+        digest.update(name.encode()); digest.update(parameter.detach().float().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+def broadcast_and_assert_trainables(trainable, memory, transformer, world_size: int) -> str:
+    named=synchronized_trainable_parameters(trainable,memory,transformer)
+    if world_size>1:
+        if not dist.is_initialized(): raise RuntimeError('distributed parameter synchronization requires an initialized process group')
+        for _,parameter in named: dist.broadcast(parameter.data,src=0)
+    if any(not torch.isfinite(parameter).all() for _,parameter in named): raise RuntimeError('non-finite trainable parameter before step0')
+    digest=parameter_digest(named); signature=(sum(parameter.numel() for _,parameter in named),sum(float(parameter.detach().double().sum()) for _,parameter in named),sum(float(parameter.detach().double().square().sum()) for _,parameter in named)); gathered=[None]*world_size; signatures=[None]*world_size
+    if world_size>1:
+        dist.all_gather_object(gathered,digest); dist.all_gather_object(signatures,signature)
+    else:
+        gathered[0]=digest; signatures[0]=signature
+    if len(set(gathered))!=1: raise RuntimeError(f'trainable parameters differ before step0: {gathered}')
+    if len(set(signatures))!=1: raise RuntimeError(f'trainable numeric signatures differ before step0: {signatures}')
+    return digest
 
 def assert_single_backward_chunk(policies, train_chunk: int) -> None:
     if sum(policy == "backward" for policy in policies) != 1 or policies[train_chunk] != "backward":
@@ -100,8 +136,8 @@ def selected_qk_logits(query, key, query_indices):
     return torch.einsum('bqhd,bkhd->bhqk',selected,key)*(selected.shape[-1]**-.5)
 
 class SightlineTrainable(nn.Module):
-    def __init__(self, inner_dim, layers=(0,), camera_layers=(), timestamp_buckets=64, heads=16):
-        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,camera_layers=camera_layers)
+    def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16):
+        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers)
     def correspondence(self, logits, positives=None, weights=None, multi_positive=None, additive_bias=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
         if additive_bias is not None:
@@ -134,10 +170,20 @@ class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):
         super().__init__(); self.base=base; self.rank=rank; self.scale=float(scale if scale is not None else 1.0/rank)
         factory={'device':base.weight.device,'dtype':base.weight.dtype}
-        self.lora_down=nn.Linear(base.in_features,rank,bias=False,**factory); self.lora_up=nn.Linear(rank,base.out_features,bias=False,**factory)
+        self.lora_down=nn.Linear(base.in_features,rank,bias=False,**factory); self.lora_up=nn.Linear(rank,base.out_features,bias=False,**factory); self.enabled=True
         nn.init.kaiming_uniform_(self.lora_down.weight,a=math.sqrt(5)); nn.init.zeros_(self.lora_up.weight)
         for parameter in self.base.parameters(): parameter.requires_grad_(False)
-    def forward(self,x): return self.base(x)+self.lora_up(self.lora_down(x))*self.scale
+    def forward(self,x): return self.base(x) if not self.enabled else self.base(x)+self.lora_up(self.lora_down(x))*self.scale
+
+def set_lora_enabled(transformer: nn.Module, enabled: bool) -> None:
+    for module in transformer.modules():
+        if isinstance(module,LoRALinear): module.enabled=bool(enabled)
+
+def configure_alpha_zero_baseline(trainable, memory, transformer) -> None:
+    """Disable every Sightline modification while retaining native Helios V."""
+    for alpha in trainable.conditioner.alpha_parameters(): alpha.data.zero_()
+    memory.set_enabled(False)
+    set_lora_enabled(transformer,False)
 
 def install_lora(transformer: nn.Module, layers, rank=8):
     """Wrap only Q/K/V/O of explicitly selected self-attention blocks."""

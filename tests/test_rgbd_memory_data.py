@@ -93,6 +93,31 @@ def test_six_chunk_record_has_its_own_geometry(tmp_path):
     assert record.chunk_count == 6
 
 
+def test_second_half_training_unit_owns_reencoded_continuous25_identity(tmp_path):
+    torch=pytest.importorskip('torch')
+    from scripts.build_rgbd_training_units import unit_row
+    from long_video.training.sightline_data import rgbd_unit_identity,validate_rgbd_unit_latent,load_latent_tensor
+    row=_record(tmp_path); root=tmp_path/'record'
+    for index in range(97,193):
+        Image.new('RGB',(832,480),color=(index%255,0,0)).save(root/'rgb'/f'{index:06d}.png')
+        Image.fromarray(np.ones((480,832),np.uint16)).save(root/'depth'/f'{index:06d}.png')
+    poses=np.repeat(np.eye(4)[None],193,axis=0); poses[:,0,3]=np.arange(193)
+    np.save(root/'c2w_abs.npy',poses); np.save(root/'c2w_local.npy',poses)
+    np.save(root/'intrinsics.npy',np.repeat(np.eye(3)[None],193,axis=0)); np.save(root/'timestamps.npy',np.arange(193,dtype=np.float64))
+    row.update(frame_count=193,chunk_count=6)
+    manifest=tmp_path/'parent.json'; manifest.write_text(json.dumps({'records':[row]})); parent=load_rgbd_memory_manifest(manifest)[0]
+    unit_raw=unit_row(parent,tmp_path,tmp_path/'unit_latents',96,rebuild=True)
+    unit=type(parent)(unit_raw,tmp_path)
+    assert unit.rgb_paths()[0].name=='000096.png' and unit.frame_count==97
+    unit_cache=unit.path('gt_latent_cache'); unit_cache.parent.mkdir(parents=True)
+    torch.save({'latents':torch.ones(1,16,25,64,104),'schema':'continuous_25','unit_identity':rgbd_unit_identity(unit)},unit_cache)
+    assert validate_rgbd_unit_latent(unit,unit_cache)['source_frame_start']==96
+    assert torch.equal(load_latent_tensor(unit_cache),torch.ones(1,16,25,64,104))
+    parent_cache=tmp_path/'continuous_49.pt'
+    torch.save({'latents':torch.zeros(1,16,49,64,104),'schema':'continuous_49','unit_identity':{'record_id':parent.record_id}},parent_cache)
+    with pytest.raises(ValueError): validate_rgbd_unit_latent(unit,parent_cache)
+
+
 def test_sequence_split_hits_exact_train_count_without_leakage():
     script = Path(__file__).parents[1] / "scripts" / "split_rgbd_train_val.py"
     spec = importlib.util.spec_from_file_location("rgbd_split", script)

@@ -13,13 +13,15 @@ import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, select_chunk_window, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits
+from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
-from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache
+from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_unit_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, capture_rng_state
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
 from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
+from long_video.sightline.geometry import assert_latent_geometry, padded_size
+from long_video.sightline.boundary import constrain_flow_item, stage2_sample_with_boundary
 
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
@@ -57,8 +59,6 @@ def _preflight(cfg,args,probe_layers):
     sightline=set(cfg.sightline_layers)
     if not cfg.sightline_layers:
         raise ValueError('formal training requires non-empty sightline_layers')
-    if tuple(cfg.camera_layers)!=(1,2,3,4,5,6) or not set(cfg.camera_layers).issubset(set(cfg.sightline_layers)):
-        raise ValueError('camera_layers must be exactly 1..6 and belong to sightline_layers')
     if tuple(cfg.memory_layers)!=(16,20,24) or tuple(cfg.correspondence_layers)!=(16,20,24):
         raise ValueError('Memory/correspondence layers must be 16/20/24')
     if args.train and (cfg.memory_layers or cfg.correspondence_layers):
@@ -113,48 +113,17 @@ def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
         latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
         latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
     prediction=output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
-    # Helios' coarsest pyramid decoder rounds an odd 15-row grid down to 14
-    # rows for 480px inputs.  Keep the canonical 480x832 RGB-D geometry and
-    # align its velocity field back to the target latent grid before the
-    # flow-matching loss; temporal/channel/batch dimensions must remain exact.
-    if prediction.shape!=noisy.shape:
-        if prediction.shape[:3]!=noisy.shape[:3]:
-            raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
-        batch,channels,frames,height,width=prediction.shape
-        prediction=torch.nn.functional.interpolate(
-            prediction.permute(0,2,1,3,4).reshape(batch*frames,channels,height,width).float(),
-            size=noisy.shape[-2:],mode='bilinear',align_corners=False,
-        ).reshape(batch,frames,channels,*noisy.shape[-2:]).permute(0,2,1,3,4).to(dtype=noisy.dtype)
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
 
-def _match_spatial_grid(value,target):
-    """Align Helios' odd-grid velocity field without changing temporal semantics."""
-    if value.shape==target.shape: return value
-    if value.ndim!=5 or target.ndim!=5 or value.shape[:3]!=target.shape[:3]:
-        raise RuntimeError(f'cannot align flow grid {value.shape} to latent grid {target.shape}')
-    batch,channels,frames,height,width=value.shape
-    return torch.nn.functional.interpolate(
-        value.permute(0,2,1,3,4).reshape(batch*frames,channels,height,width).float(),
-        size=target.shape[-2:],mode='bilinear',align_corners=False,
-    ).reshape(batch,frames,channels,*target.shape[-2:]).permute(0,2,1,3,4).to(dtype=value.dtype)
-
-def _install_odd_grid_scheduler_alignment(pipe):
-    """Keep pinned Helios sampling valid for the canonical 480×832 (15-row latent) input."""
-    scheduler=pipe.scheduler
-    original=scheduler.convert_flow_pred_to_x0
-    def aligned(flow_pred,xt,timestep,sigmas,timesteps):
-        return original(_match_spatial_grid(flow_pred,xt),xt,timestep,sigmas,timesteps)
-    scheduler.convert_flow_pred_to_x0=aligned
-
-def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk):
+def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary=None):
     """Native Helios autoregressive inference from noise; no target argument exists."""
     noise=torch.randn((source.shape[0],source.shape[1],9,source.shape[-2],source.shape[-1]),device=source.device,dtype=source.dtype)
     indices=native_helios_indices(source.device,source.shape[0])['current']
     class Progress:
         def update(self): pass
     pipe._guidance_scale=1.0; pipe._attention_kwargs={'current_chunk':chunk}; pipe._current_timestep=None; pipe._interrupt=False
-    return pipe.stage2_sample(latents=noise,pyramid_num_stages=3,pyramid_num_inference_steps_list=list(cfg.pyramid_steps),
+    return stage2_sample_with_boundary(pipe,clean_boundary=clean_boundary,latents=noise,pyramid_num_stages=3,pyramid_num_inference_steps_list=list(cfg.pyramid_steps),
         prompt_embeds=prompt_embeds,negative_prompt_embeds=None,guidance_scale=1.0,indices_hidden_states=indices,
         latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
         latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
@@ -278,15 +247,18 @@ def main():
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
     source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'; fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
-    pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); _install_odd_grid_scheduler_alignment(pipe); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
+    pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
-    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,camera_layers=cfg.camera_layers,heads=heads).to(device,dtype=torch.float32)
+    set_initialization_seed()
+    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
-    provider=SightlineRayProvider(source_height=cfg.source_height,source_width=cfg.source_width); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
+    padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
+    provider=SightlineRayProvider(source_height=padded_h,source_width=padded_w); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
     runner.memory.to(device=device,dtype=torch.bfloat16)
     installed_layers=tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers).union(probe_layers))) if args.probe_only else tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers)))
-    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers,camera_layers=cfg.camera_layers)
+    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
+    initialization_hash=broadcast_and_assert_trainables(trainable,runner.memory,pipe.transformer,world_size)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     memory_params=list(runner.memory.parameters())
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.learning_rate}],weight_decay=.01)
@@ -300,12 +272,12 @@ def main():
     elif args.probe_checkpoint:
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
-    elif args.alpha_zero_baseline:
-        for alpha in trainable.conditioner.alpha_parameters(): alpha.data.zero_()
-        runner.memory.timestamp.weight.data.zero_()
-    if world_size>1 and not args.resume:
-        rank_seed=20260823+1000003*rank+9176*start_step
-        random.seed(rank_seed); np.random.seed(rank_seed%(2**32-1)); torch.manual_seed(rank_seed); torch.cuda.manual_seed_all(rank_seed)
+    if args.alpha_zero_baseline:
+        configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
+    if args.resume:
+        initialization_hash=broadcast_and_assert_trainables(trainable,runner.memory,pipe.transformer,world_size)
+    else:
+        set_rank_runtime_seed(rank,start_step)
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
@@ -321,11 +293,15 @@ def main():
             index=_ddp_record_index(step,rank,world_size,len(eligible_records)); record=eligible_records[index]
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
+        if phase['name'] in ('P1','P2'):
+            validate_rgbd_unit_latent(record,latent_path)
+            if record.frame_count!=97 or record.chunk_count!=3 or latent_schema!='continuous_25': raise ValueError(f'{record.record_id}: P1/P2 requires a unit-owned 97-frame continuous_25 cache')
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
+        assert_latent_geometry(all_latents,height=cfg.source_height,width=cfg.source_width,patch_size=pipe.transformer.config.patch_size)
         required_latents=1+8*record.chunk_count
         if all_latents.shape[2] < required_latents: raise ValueError(f'{record.record_id}: latent cache is shorter than record geometry')
-        window_start=0 if phase['name']=='P3' else select_chunk_window(phase['max_chunks'],total_chunks=record.chunk_count)
+        window_start=0
         latent_start=window_start*8; frame_start=window_start*32
         latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to(device,dtype=torch.bfloat16)
         rgb_paths=record.rgb_paths()
@@ -336,7 +312,8 @@ def main():
         K=torch.from_numpy(K_np).to(device,dtype=torch.float32).unsqueeze(0)
         _reset_sequence(runner); runner._trajectory_c2w=c2w; runner._trajectory_K=K; runner._source_camera=c2w[:,0]; runner._source_intrinsics=K[:,0]; runner.memory.set_enabled(phase['memory'])
         for name,parameter in pipe.transformer.named_parameters():
-            if 'lora_' in name: parameter.requires_grad_(phase['lora'])
+            if 'lora_' in name: parameter.requires_grad_(phase['lora'] and not args.alpha_zero_baseline)
+        set_lora_enabled(pipe.transformer,phase['lora'] and not args.alpha_zero_baseline)
         active_corr_layers=probe_layers or tuple(cfg.correspondence_layers); diagnostic_correspondence=bool(args.probe_capture)
         if phase['correspondence'] or diagnostic_correspondence:
             if not record.memory_eligible: raise RuntimeError(f"{record.record_id} has no calibrated RGB-D correspondence supervision")
@@ -347,17 +324,22 @@ def main():
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'])
         if not 0<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum')
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
-        history_state=NativeHistoryState(source,fake); losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
+        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
         if args.probe_capture: torch.cuda.reset_peak_memory_stats()
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
             history=history_state.groups(); coverage=history_state.coverage()
             if not keep_graph:
                 template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
-                generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk).detach()
+                clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:]
+                generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
             else:
-                target=latents[:,:,chunk*8:chunk*8+9]  # The sole non-source GT read in this step.
-                items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range); runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
+                target=latents[:,:,chunk*8:chunk*8+9].clone()  # The sole non-source GT read in this step.
+                clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:].detach()
+                if clean_boundary is not None: target[:,:,:1]=clean_boundary.to(target)
+                items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range)
+                if clean_boundary is not None: items=[constrain_flow_item(item,clean_boundary) for item in items]
+                runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 stage_losses=[]; final_prediction=None
                 for stage_index,item in enumerate(items):
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
@@ -405,6 +387,8 @@ def main():
                     first=layer_captures[0]
                     probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha_q=alpha_q,alpha_k=alpha_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             if chunk==0: generated[:,:,0:1]=source
+            else: generated[:,:,0:1]=clean_boundary.to(generated)
+            generated_prefix.append(generated.detach())
             history_state.append_chunk(generated,chunk)
             runner._finalize_chunk(chunk)
             for processor in pipe.transformer._sightline_processors.values():
@@ -431,12 +415,10 @@ def main():
                     geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
-                    camera_grads=[p.grad for p in trainable.conditioner.camera_parameters() if p.grad is not None]
-                    if not camera_grads or not all(torch.isfinite(g).all() for g in camera_grads): raise RuntimeError('P3 camera residual gradient missing or non-finite')
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
         if rank==0 and ((step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

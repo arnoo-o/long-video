@@ -4,7 +4,7 @@ import hashlib,json,random
 import numpy as np
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v7'; SCHEMA='sightline-checkpoint-v9'
+SEMANTICS='sightline-v8'; SCHEMA='sightline-checkpoint-v10'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)
@@ -48,7 +48,7 @@ def save_checkpoint(path, model, optimizer, scheduler, step, *, config, helios_f
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
 def validate_checkpoint(payload, *, config, helios_fingerprint, layers, memory_config, allow_memory_layer_migration=False):
     if payload.get('sightline_training_semantics_version')!=SEMANTICS or payload.get('sightline_checkpoint_schema_version')!=SCHEMA:
-        raise RuntimeError(f'incompatible Sightline checkpoint: expected {SEMANTICS}/{SCHEMA} for all-layer geometry, camera residual, and rank-16 LoRA; got {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")}')
+        raise RuntimeError(f'incompatible Sightline checkpoint: expected {SEMANTICS}/{SCHEMA} for padded Q/K-only Sightline and rank-16 LoRA; got {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")}')
     if payload.get('helios_fingerprint')!=helios_fingerprint: raise RuntimeError('Sightline checkpoint provenance mismatch')
     saved_config=payload.get('config',{})
     config_match=payload.get('config_fingerprint')==config_fingerprint(config)

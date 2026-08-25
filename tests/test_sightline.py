@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 import os, sys
+from pathlib import Path
 torch=pytest.importorskip('torch')
 from long_video.sightline.rays import plucker_rays, temporal_group_cameras
 from long_video.sightline.conditioning import SightlineConditioner
@@ -57,8 +58,8 @@ def test_train_chunk_policy_is_single_and_causal():
     seen=[]; outputs,policies=run_causal_prefix_chunks(3,2,lambda chunk,grad: seen.append((chunk,grad)) or weight*(chunk+1))
     assert seen==[(0,False),(1,False),(2,True)] and len(outputs)==3 and policies==('forward_detached','forward_detached','backward')
 
-def test_camera_first_curriculum_uses_random_two_chunk_window():
-    from long_video.training.sightline import curriculum_phase, select_chunk_window
+def test_camera_first_curriculum_uses_fixed_unit_origin():
+    from long_video.training.sightline import curriculum_phase
     assert curriculum_phase(0)=={'name':'P1','max_chunks':1,'lora':False,'correspondence':False,'memory':False}
     assert curriculum_phase(299)['max_chunks']==1
     assert not curriculum_phase(300)['lora'] and curriculum_phase(300)['max_chunks']==2
@@ -66,11 +67,11 @@ def test_camera_first_curriculum_uses_random_two_chunk_window():
     assert curriculum_phase(999)['max_chunks']==2
     assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==1
     assert curriculum_phase(2499)['max_chunks']==6
-    generator=torch.Generator().manual_seed(7)
-    assert 0 <= select_chunk_window(2,generator=generator) <= 4
+    source=Path(__file__).parents[1].joinpath('scripts/train_sightline_rgbd.py').read_text()
+    assert 'window_start=0' in source and 'select_chunk_window' not in source
 
 def test_memory_is_kv_only_and_eviction():
-    m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(1,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
+    m=LongTermKVMemory(budget=2,pool=1); x=torch.randn(1,8,4); r=torch.randn(1,8,7); m.capture(x,r,0,grid_shape=(2,2,2)); assert len(m)==2; k,v=m.get(); assert k.shape[-1]==4 and v.shape[-1]==7
 
 def test_selected_layers_have_independent_qk_geometry_and_alphas():
     from long_video.training.sightline import SightlineTrainable
@@ -101,11 +102,11 @@ def test_memory_rope_uses_saved_metadata_and_second_chunk_reads():
     class Rope:
         def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
     m=LongTermKVMemory(budget=8,pool=1); m.rope=Rope()
-    x=torch.randn(1,2,4); r=torch.randn(1,2,7); m.capture(x,r,0,grid_shape=(1,1,2))
+    x=torch.randn(1,4,4); r=torch.randn(1,4,7); m.capture(x,r,0,grid_shape=(2,1,2))
     rope=m.memory_rotary_emb(x.device,current_global_start=8)
-    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([11.,11.]))
+    assert rope.shape[1]==2 and torch.equal(rope[0,:,0],torch.tensor([12.,12.]))
     older=m.memory_rotary_emb(x.device,current_global_start=16)
-    assert torch.equal(older[0,:,0],torch.tensor([3.,3.]))
+    assert torch.equal(older[0,:,0],torch.tensor([4.,4.]))
     class Attn:
         heads=2; to_k=torch.nn.Linear(4,4); to_v=torch.nn.Linear(4,4); norm_k=torch.nn.Identity()
     key=torch.randn(1,3,2,2); value=torch.randn(1,3,2,2)
@@ -116,14 +117,14 @@ def test_memory_rope_recent_past_latent_is_position_18():
     memory=LongTermKVMemory(budget=8,pool=1)
     class Rope:
         def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
-    memory.rope=Rope(); memory.capture(torch.randn(1,8,4),torch.randn(1,8,7),0,grid_shape=(8,1,1))
+    memory.rope=Rope(); memory.capture(torch.randn(1,9,4),torch.randn(1,9,7),0,grid_shape=(9,1,1))
     rope=memory.memory_rotary_emb(torch.device('cpu'),8)
-    assert torch.equal(rope[0,:,0],torch.tensor([11.,12.,13.,14.,15.,16.,17.,18.]))
+    assert torch.equal(rope[0,:,0],torch.tensor([12.,13.,14.,15.,16.,17.,18.]))
 
 def test_memory_append_extends_attention_mask_to_final_key_length():
     class Rope:
         def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
-    memory=LongTermKVMemory(budget=4,pool=1); memory.rope=Rope(); memory.capture(torch.randn(1,1,8),torch.randn(1,1,7),0,grid_shape=(1,1,1))
+    memory=LongTermKVMemory(budget=4,pool=1); memory.rope=Rope(); memory.capture(torch.randn(1,2,8),torch.randn(1,2,7),0,grid_shape=(2,1,1))
     class A:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
     attn=A(); conditioner=SightlineConditioner(8)
@@ -161,6 +162,11 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     assert step==12 and all(torch.allclose(alpha,torch.tensor(.7)) for alpha in target.conditioner.alpha_parameters()) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
     assert torch.allclose(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),torch.full_like(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),.2))
     assert torch.equal(torch.rand(1),expected_random) and np.random.rand()==expected_numpy and target_scheduler.last_epoch==scheduler.last_epoch
+    inference_target=SightlineTrainable(4,heads=1); inference_memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); inference_transformer=Transformer(); install_lora(inference_transformer,[0])
+    restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=False)
+    assert torch.equal(inference_memory.timestamp.weight,memory.timestamp.weight)
+    inference_source=Path(__file__).parents[1].joinpath('scripts/infer_sightline.py').read_text()
+    assert 'timestamp.weight.data.zero_' not in inference_source
 
 def test_temporal_group_camera_shapes():
     c=torch.eye(4).repeat(2,33,1,1); k=torch.eye(3).repeat(2,33,1,1); cg,kg=temporal_group_cameras(c,k); assert cg.shape==(2,9,4,4) and kg.shape==(2,9,3,3)
@@ -356,8 +362,8 @@ def test_memory_shared_boundaries_are_unique_and_future_filtered():
     memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,9,4); rays=torch.randn(1,9,7)
     memory.capture(hidden,rays,0,grid_shape=(9,1,1)); memory.capture(hidden,rays,1,grid_shape=(9,1,1))
     global_ids=[token.chunk_index*8+token.temporal for token in memory.tokens]
-    assert len(global_ids)==17 and len(set(global_ids))==17 and global_ids.count(8)==1
-    active=memory.active_tokens(16); assert [token.chunk_index*8+token.temporal for token in active]==list(range(16))
+    assert len(global_ids)==16 and len(set(global_ids))==16 and 0 not in global_ids and global_ids.count(8)==1
+    active=memory.active_tokens(16); assert [token.chunk_index*8+token.temporal for token in active]==list(range(1,16))
 
 def test_scale_augmentation_delta_is_reused_for_q_k_and_memory():
     torch.manual_seed(2); conditioner=SightlineConditioner(8,scale_aug_prob=1.0); rays=torch.randn(1,3,7); delta=conditioner.sample_scale_delta(rays,True)
@@ -376,7 +382,7 @@ def test_steps_override_is_effective_and_symmetric():
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
     from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier
-    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),camera_layers=(1,2,3,4,5,6),correspondence_layers=(16,20,24),memory_layers=(16,20,24),lora_layers=(),warmup_ratio=.04)
+    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),correspondence_layers=(16,20,24),memory_layers=(16,20,24),lora_layers=(),warmup_ratio=.04)
     with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
     cfg.memory_layers=(); cfg.correspondence_layers=()
@@ -403,14 +409,53 @@ def test_teacher_token_vote_keeps_multi_positive_and_no_membership_double_count(
     out=token_vote_rows(rows,token_height=1,token_width=2,near_top_ratio=.5,total_frames=193)
     assert len(out)==4 and {row['key_x'] for row in out}=={0,1} and all(row['matched_count']==2 for row in out)
 
-def test_odd_grid_alignment_covers_detached_rollout_scheduler():
+def test_padded_geometry_has_exact_three_stage_grids_and_output_crop():
+    from long_video.sightline.geometry import assert_latent_geometry,crop_video,padded_size
+    assert padded_size(480,832)==(512,832)
+    latents=torch.randn(1,16,9,64,104)
+    assert_latent_geometry(latents,height=480,width=832,patch_size=(1,2,2))
+    with pytest.raises(ValueError): assert_latent_geometry(torch.randn(1,16,9,60,104),height=480,width=832,patch_size=(1,2,2))
+    video=np.zeros((1,33,512,832,3),np.float32)
+    assert crop_video(video,480,832).shape==(1,33,480,832,3)
+
+def test_shared_clean_boundary_is_clamped_before_and_after_every_sampling_step():
     from types import SimpleNamespace
-    from scripts.train_sightline_rgbd import _install_odd_grid_scheduler_alignment
-    class Scheduler:
-        def convert_flow_pred_to_x0(self,flow_pred,xt,timestep,sigmas,timesteps):
-            return xt-flow_pred
-    pipe=SimpleNamespace(scheduler=Scheduler())
-    _install_odd_grid_scheduler_alignment(pipe)
-    flow=torch.randn(1,2,9,14,26); latents=torch.randn(1,2,9,15,26)
-    output=pipe.scheduler.convert_flow_pred_to_x0(flow,latents,None,None,None)
-    assert output.shape==latents.shape
+    from long_video.sightline.boundary import stage2_sample_with_boundary,boundary_at_sigma,constrain_flow_item
+    class Transformer(torch.nn.Module):
+        def __init__(self): super().__init__(); self.seen=[]
+        def forward(self,hidden_states,timestep): self.seen.append((timestep.clone(),hidden_states.clone())); return hidden_states
+    class Pipe:
+        def __init__(self):
+            self.transformer=Transformer(); self.scheduler=SimpleNamespace(timesteps=torch.tensor([3.,2.,1.]),sigmas=torch.tensor([1.,.6,.2,0.]))
+        def stage2_sample(self,latents,callback_on_step_end,**kwargs):
+            for index,timestep in enumerate(self.scheduler.timesteps):
+                self.transformer(hidden_states=latents,timestep=timestep)
+                latents=latents+.25
+                latents=callback_on_step_end(self,index,timestep,{'latents':latents})['latents']
+            return latents
+    pipe=Pipe(); noise=torch.full((1,2,9,8,8),2.); clean=torch.full((1,2,1,8,8),-3.)
+    output=stage2_sample_with_boundary(pipe,clean_boundary=clean,latents=noise.clone())
+    for (timestep,seen),sigma in zip(pipe.transformer.seen,(1.,.6,.2)):
+        assert torch.allclose(seen[:,:,:1],boundary_at_sigma(clean,noise[:,:,:1],sigma,(8,8)))
+    assert torch.equal(output[:,:,:1],clean)
+    item={'noisy_latents':noise.clone(),'target':torch.zeros_like(noise),'noise':noise.clone(),'sigmas':torch.full((1,1,1,1,1),.5)}
+    constrained=constrain_flow_item(item,clean)
+    assert torch.allclose(constrained['noisy_latents'][:,:,:1],-.5*torch.ones_like(clean))
+
+def test_stride32_assembly_keeps_one_shared_boundary_per_chunk():
+    from long_video.sightline.pipeline import SightlinePipeline
+    accumulated=None
+    for chunk in range(6):
+        value=torch.full((1,1,9,1,1),float(chunk))
+        if accumulated is not None: value[:,:,:1]=accumulated[:,:,-1:]
+        accumulated=SightlinePipeline.append_stride32_latents(accumulated,value)
+    assert accumulated.shape[2]==1+8*6
+
+def test_alpha_zero_baseline_disables_qk_memory_and_lora():
+    from long_video.training.sightline import SightlineTrainable,LoRALinear,configure_alpha_zero_baseline
+    from long_video.sightline.memory import LayerKVMemoryBank
+    trainable=SightlineTrainable(4,layers=(0,)); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4)
+    transformer=torch.nn.Sequential(LoRALinear(torch.nn.Linear(4,4)))
+    configure_alpha_zero_baseline(trainable,memory,transformer)
+    assert all(float(alpha.detach())==0 for alpha in trainable.conditioner.alpha_parameters())
+    assert not memory.banks[0].enabled and not transformer[0].enabled

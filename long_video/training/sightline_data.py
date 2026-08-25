@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import json
+import hashlib
 from pathlib import Path
 import numpy as np
 
@@ -31,6 +32,40 @@ def _payload_tensor(file):
         value=value[keys[0]]
     if not isinstance(value,torch.Tensor) or value.ndim not in (4,5): raise ValueError(f"unsupported latent payload in {file}")
     return value
+
+def latent_cache_metadata(path: str|Path) -> dict:
+    """Return immutable unit identity metadata without accepting tensor-only caches."""
+    import torch
+    path=Path(path)
+    if path.suffix not in ('.pt','.pth'):
+        raise ValueError('formal unit latent caches must be metadata-bearing torch payloads')
+    value=torch.load(path,map_location='cpu',weights_only=False)
+    if not isinstance(value,dict) or not isinstance(value.get('unit_identity'),dict):
+        raise ValueError(f'latent cache has no unit_identity: {path}')
+    return value['unit_identity']
+
+def rgbd_unit_identity(record) -> dict:
+    """Bind a cache to exactly one RGB/c2w/K unit, including parent offset."""
+    rgb=record.rgb_paths(); c2w,K=record.load_cameras(local=False)
+    digest=lambda value: hashlib.sha256(np.ascontiguousarray(value).view(np.uint8)).hexdigest()
+    names='\n'.join(path.name for path in rgb)
+    return {
+        'record_id':record.record_id,
+        'parent_record_id':str(record.raw.get('parent_record_id',record.record_id)),
+        'source_frame_start':record.source_frame_start,
+        'frame_count':record.frame_count,
+        'rgb_names_sha256':hashlib.sha256(names.encode()).hexdigest(),
+        'c2w_abs_sha256':digest(c2w),
+        'intrinsics_sha256':digest(K),
+    }
+
+def validate_rgbd_unit_latent(record, path: str|Path) -> dict:
+    detected,_=validate_latent_cache(path,schema='continuous_25')
+    actual=latent_cache_metadata(path); expected=rgbd_unit_identity(record)
+    if actual != expected:
+        differences={key:(actual.get(key),value) for key,value in expected.items() if actual.get(key)!=value}
+        raise ValueError(f'{record.record_id}: latent/RGB/camera unit identity mismatch: {differences}')
+    return actual
 
 def _canonical_tensor(value, temporal_size):
     if value.ndim==4:

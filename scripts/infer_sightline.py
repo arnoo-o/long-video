@@ -7,22 +7,6 @@ import numpy as np
 from PIL import Image
 import torch
 
-def _match_spatial_grid(value,target):
-    if value.shape==target.shape: return value
-    if value.ndim!=5 or target.ndim!=5 or value.shape[:3]!=target.shape[:3]:
-        raise RuntimeError(f'cannot align flow grid {value.shape} to latent grid {target.shape}')
-    batch,channels,frames,height,width=value.shape
-    return torch.nn.functional.interpolate(
-        value.permute(0,2,1,3,4).reshape(batch*frames,channels,height,width).float(),
-        size=target.shape[-2:],mode='bilinear',align_corners=False,
-    ).reshape(batch,frames,channels,*target.shape[-2:]).permute(0,2,1,3,4).to(dtype=value.dtype)
-
-def _install_odd_grid_scheduler_alignment(pipe):
-    original=pipe.scheduler.convert_flow_pred_to_x0
-    def aligned(flow_pred,xt,timestep,sigmas,timesteps):
-        return original(_match_spatial_grid(flow_pred,xt),xt,timestep,sigmas,timesteps)
-    pipe.scheduler.convert_flow_pred_to_x0=aligned
-
 def resize_source(image, K, height=384, width=640):
     image=image.convert('RGB'); old_w,old_h=image.size; image=image.resize((width,height),Image.Resampling.LANCZOS)
     sx,sy=width/old_w,height/old_h
@@ -39,10 +23,11 @@ def main():
     if bool(a.checkpoint)==bool(a.alpha_zero_baseline): raise ValueError('provide --checkpoint, or explicitly select --alpha-zero-baseline')
     sys.path.insert(0,a.helios_root)
     from long_video.config import load_sightline_config
-    from long_video.training.sightline import SightlineTrainable, install_lora
+    from long_video.training.sightline import SightlineTrainable, install_lora, configure_alpha_zero_baseline, set_initialization_seed
     from long_video.training.sightline_checkpoint import restore_runtime_checkpoint, runtime_provenance
     from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
     from long_video.sightline.pipeline import SightlinePipeline
+    from long_video.sightline.geometry import padded_size
     from long_video.sightline.rays import canonicalize_c2w, temporal_group_cameras
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
@@ -64,28 +49,26 @@ def main():
     if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
     elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
-    pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16,revision=a.model_revision).to('cuda'); _install_odd_grid_scheduler_alignment(pipe)
+    pipe=HeliosPipeline.from_pretrained(a.model,torch_dtype=torch.bfloat16,revision=a.model_revision).to('cuda')
     inner=int(getattr(pipe.transformer.config,'attention_head_dim',64)*getattr(pipe.transformer.config,'num_attention_heads',8))
     geometry_layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not geometry_layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
     if tuple(geometry_layers) != tuple(cfg.sightline_layers):
         raise RuntimeError('formal inference requires the configured all-layer geometry set; refusing partial Sightline layer installation')
     layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers)))
-    trainable=SightlineTrainable(inner,layers=geometry_layers,camera_layers=cfg.camera_layers,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner; provider=SightlineRayProvider(c2w,K,source_height=cfg.source_height,source_width=cfg.source_width)
+    set_initialization_seed()
+    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads)).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
+    padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width); provider=SightlineRayProvider(c2w,K,source_height=padded_h,source_width=padded_w)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
-    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers,camera_layers=cfg.camera_layers)
+    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
         provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision)
         restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget},provenance=provenance)
-        # Keep this evaluation aligned with the zero-initialized timestamp semantics.
-        if runner.memory.timestamp is not None:
-            runner.memory.timestamp.weight.data.zero_()
     else:
-        runner.memory.set_enabled(False)
-        if any(float(alpha.detach()) != 0.0 for alpha in conditioner.alpha_parameters()): raise RuntimeError('alpha-zero baseline must have all Q/K alphas at zero')
+        configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
     trainable.eval(); conditioner.eval()
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K)

@@ -6,11 +6,15 @@ import torch
 from .history import CameraHistoryState,NativeHistoryState,native_helios_indices
 from .memory import LayerKVMemoryBank
 from .rays import chunk_cameras, temporal_group_cameras
+from .boundary import stage2_sample_with_boundary
+from .geometry import assert_latent_geometry, crop_video, pad_image_bottom_right, padded_size
 
 def prepare_source_condition(helios, image, *, height, width, device=None):
     """Use the pinned Helios image-conditioning path for training and inference."""
     device=device or helios._execution_device
-    image_tensor=helios.video_processor.preprocess(image,height=height,width=width)
+    padded_h,padded_w=padded_size(height,width)
+    image=pad_image_bottom_right(image,height,width)
+    image_tensor=helios.video_processor.preprocess(image,height=padded_h,width=padded_w)
     vae=helios.vae
     mean=torch.tensor(vae.config.latents_mean,device=device,dtype=vae.dtype).view(1,vae.config.z_dim,1,1,1)
     std=(1.0/torch.tensor(vae.config.latents_std,device=device,dtype=vae.dtype)).view(1,vae.config.z_dim,1,1,1)
@@ -51,9 +55,12 @@ class SightlinePipeline:
     def _stage_shapes(self, latents):
         patch=tuple(int(x) for x in self.helios.transformer.config.patch_size)
         stages=len(self.config.pyramid_steps); h,w=int(latents.shape[-2]),int(latents.shape[-1]); t=int(latents.shape[2]); shapes=[]
-        h//=2**(stages-1); w//=2**(stages-1)
+        assert_latent_geometry(latents,height=self.config.source_height,width=self.config.source_width,pyramid_stages=stages,patch_size=patch)
+        factor=2**(stages-1)
+        if h%factor or w%factor: raise RuntimeError('Helios pyramid would truncate the latent grid')
+        h//=factor; w//=factor
         for _ in range(stages):
-            if any(x<=0 for x in (t//patch[0],h//patch[1],w//patch[2])): raise RuntimeError('invalid Helios latent/patch shape')
+            if t%patch[0] or h%patch[1] or w%patch[2]: raise RuntimeError('Helios patching would truncate a stage grid')
             shapes.append((t//patch[0],h//patch[1],w//patch[2])); h*=2; w*=2
         return tuple(shapes)
 
@@ -77,7 +84,8 @@ class SightlinePipeline:
         shapes=self._stage_shapes(latents)
         if history_token_shapes is None:
             lh,lw=history_latent_hw or (int(latents.shape[-2]),int(latents.shape[-1]))
-            history_token_shapes={'long':(4,(lh+7)//8,(lw+7)//8),'mid':(1,(lh+3)//4,(lw+3)//4),'short':(2,(lh+1)//2,(lw+1)//2)}
+            if lh%8 or lw%8: raise RuntimeError('native history grids require exact /8,/4,/2 spatial divisibility')
+            history_token_shapes={'long':(4,lh//8,lw//8),'mid':(1,lh//4,lw//4),'short':(2,lh//2,lw//2)}
         if history_validity is None:
             history_validity={'long':tuple(bool(c) for c in history_global_coverages.get('long',())), 'mid':tuple(bool(c) for c in history_global_coverages.get('mid',())), 'short':tuple(True for _ in history_global_coverages.get('short',()))}
         self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_global_coverages=history_global_coverages,history_validity=history_validity,stage_shapes=shapes,token_shape=shapes[0])
@@ -111,6 +119,7 @@ class SightlinePipeline:
         if c2w.ndim!=4 or intrinsics.ndim!=4 or c2w.shape[:2]!=intrinsics.shape[:2]: raise ValueError('c2w/K must remain [B,F,...]')
         self._trajectory_c2w=c2w; self._trajectory_K=intrinsics; self._source_camera=c2w[:,0]; self._source_intrinsics=intrinsics[:,0]
         chunks=(num_frames-1)//32; device=self.helios._execution_device; transformer_dtype=self.helios.transformer.dtype; runtime_kwargs=dict(attention_kwargs or {})
+        padded_h,padded_w=padded_size(height,width)
         for module in (self.helios.transformer,self.helios.text_encoder,self.helios.vae): module.eval()
         if self.conditioner is not None: self.conditioner.eval()
         self.helios._guidance_scale=1.0; self.helios._attention_kwargs=runtime_kwargs; self.helios._current_timestep=None; self.helios._interrupt=False
@@ -122,18 +131,20 @@ class SightlinePipeline:
             def update(self): pass
         for chunk in range(chunks):
             history=self.history_state.groups(); coverage=self.history_state.coverage(); validity=self.history_state.validity()
-            latent=self.helios.prepare_latents(source.shape[0],self.helios.transformer.config.in_channels,height,width,33,dtype=torch.float32,device=device)
+            latent=self.helios.prepare_latents(source.shape[0],self.helios.transformer.config.in_channels,padded_h,padded_w,33,dtype=torch.float32,device=device)
             current_ids=native_helios_indices(device,source.shape[0])['current']
             self._prepare_chunk(chunk,latent,runtime_kwargs,history_global_coverages=coverage,history_validity=validity,history_latent_hw=source.shape[-2:])
-            latent=self.helios.stage2_sample(latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
+            boundary=None if chunk==0 else accumulated[:,:,-1:]
+            latent=stage2_sample_with_boundary(self.helios,clean_boundary=boundary,latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
             if chunk==0: latent[:,:,0:1]=source.to(latent)
+            else: latent[:,:,0:1]=boundary.to(latent)
             accumulated=self.append_stride32_latents(accumulated,latent)
             self.history_state.append_chunk(latent,chunk)
             self._finalize_chunk(chunk); self._active_chunk=chunk+1
         if accumulated is None or accumulated.shape[2]!=1+8*chunks: raise RuntimeError('stride-32 latent assembly failed')
         decoded=vae.decode(accumulated.to(vae.dtype)/std+mean,return_dict=False)[0]
         expected_frames=1+32*chunks; decoded=decoded[:,:,:expected_frames]
-        frames=self.helios.video_processor.postprocess_video(decoded,output_type='np')
+        frames=crop_video(self.helios.video_processor.postprocess_video(decoded,output_type='np'),height,width)
         self.helios._current_timestep=None
         return SimpleNamespace(frames=frames,latents=accumulated)
 

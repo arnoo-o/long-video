@@ -12,6 +12,7 @@ import cv2
 import numpy as np
 
 HEIGHT, WIDTH = 480, 832
+PADDED_HEIGHT, PADDED_WIDTH = 512, 832
 CHUNK_STRIDE = 32
 # Compatibility defaults only.  New code must take geometry from each record.
 FRAME_COUNT, CHUNK_COUNT = 97, 3
@@ -142,7 +143,7 @@ def _project_world(world: np.ndarray, c2w: np.ndarray, K: np.ndarray):
     return z, uv
 
 
-def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 30, token_width: int = 52) -> dict:
+def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 32, token_width: int = 52) -> dict:
     """Build sparse causal correspondences for every query_chunk/key_chunk pair."""
     if chunk_count is None:
         if (len(depth_paths) - 1) % CHUNK_STRIDE:
@@ -199,10 +200,12 @@ def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, 
                     pair_stats[f"{query_frame}->{key_frame}"] = int(len(selected))
                     raw_matches += len(selected)
                     qp = p[selected]; kp = rounded[selected]
-                    qtx = np.minimum(token_width - 1, qp[:, 0] * token_width // WIDTH)
-                    qty = np.minimum(token_height - 1, qp[:, 1] * token_height // HEIGHT)
-                    ktx = np.minimum(token_width - 1, kp[:, 0] * token_width // WIDTH)
-                    kty = np.minimum(token_height - 1, kp[:, 1] * token_height // HEIGHT)
+                    # Token coordinates live in the padded 512x832 system.
+                    # Original observations occupy only the top 480 rows.
+                    qtx = np.minimum(token_width - 1, qp[:, 0] * token_width // PADDED_WIDTH)
+                    qty = np.minimum(token_height - 1, qp[:, 1] * token_height // PADDED_HEIGHT)
+                    ktx = np.minimum(token_width - 1, kp[:, 0] * token_width // PADDED_WIDTH)
+                    kty = np.minimum(token_height - 1, kp[:, 1] * token_height // PADDED_HEIGHT)
                     token_count = token_height * token_width
                     pair_id = (qty * token_width + qtx) * token_count + (kty * token_width + ktx)
                     unique, inverse, counts = np.unique(pair_id, return_inverse=True, return_counts=True)

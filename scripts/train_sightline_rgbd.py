@@ -26,6 +26,10 @@ from long_video.sightline.boundary import constrain_flow_items, stage2_sample_wi
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
 
+def checkpoint_interval(global_step: int) -> int:
+    """Formal cadence: 100-step checkpoints through step 1000, then 60-step."""
+    return 100 if int(global_step) < 1000 else 60
+
 def _distributed_context():
     world_size=int(__import__('os').environ.get('WORLD_SIZE','1'))
     if world_size==1: return 0,1,torch.device('cuda')
@@ -226,7 +230,7 @@ def main():
     cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
     args.max_steps=args.max_steps or total_steps
     save_every=args.save_every or cfg.checkpoint_every
-    if args.train and save_every!=cfg.checkpoint_every: raise ValueError(f'formal training checkpoint interval is fixed at {cfg.checkpoint_every}')
+    if args.train and args.save_every is not None and args.save_every not in (60,100): raise ValueError('formal checkpoint cadence only permits 100 before step 1000 or 60 afterward')
     rank,world_size,device=_distributed_context()
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
     if args.train and world_size!=cfg.ddp_world_size: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
@@ -379,9 +383,12 @@ def main():
                     probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha_q=alpha_q,alpha_k=alpha_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             if chunk==0: generated[:,:,0:1]=source
             else: generated[:,:,0:1]=clean_boundary.to(generated)
+            capture_history=history
+            def clean_capture(clean_input,timestep, _history=capture_history, _chunk=chunk):
+                return _model_prediction(pipe,clean_input,{'timesteps':timestep},prompt_embeds,_history,_chunk*8)
             generated_prefix.append(generated.detach())
             history_state.append_chunk(generated,chunk)
-            runner._finalize_chunk(chunk)
+            runner._finalize_chunk(chunk,clean_latent=generated.detach(),capture_fn=clean_capture)
             for processor in pipe.transformer._sightline_processors.values():
                 processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
                 processor.last_attention_bias=None
@@ -414,7 +421,8 @@ def main():
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
-        checkpoint_due=(step+1)%save_every==0 or step+1==args.max_steps or (args.checkpoint_smoke_step is not None and step+1==args.checkpoint_smoke_step)
+        cadence=save_every if args.save_every is not None else checkpoint_interval(step)
+        checkpoint_due=(step+1)%cadence==0 or step+1==args.max_steps or (args.checkpoint_smoke_step is not None and step+1==args.checkpoint_smoke_step)
         if args.train and checkpoint_due:
             rng_states=gather_rank_rng_states(world_size,device)
             if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states,world_size=world_size)

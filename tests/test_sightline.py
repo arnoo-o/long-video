@@ -385,6 +385,47 @@ def test_memory_selector_is_anchor_plus_three_geometry_chunks_and_excludes_nativ
     assert [chunk.chunk_id for chunk in selected]==[0,5,4,3]
     assert len({chunk.chunk_id for chunk in selected})==4 and all(chunk.chunk_id<8 for chunk in selected)
 
+def test_memory_active_bank_prepared_once_and_cleared_without_archive_loss():
+    from long_video.sightline.memory import LongTermKVMemory
+    memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
+    for chunk in range(3): memory.capture(hidden,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
+    calls=[]; original=memory.select_chunks
+    memory.select_chunks=lambda *args,**kwargs:(calls.append(1) or original(*args,**kwargs))
+    memory.prepare_active_memory(query_chunk=2,query_camera_poses=_camera_trajectory(2.),device='cpu',dtype=torch.float32)
+    memory.prepare_active_memory(query_chunk=2,query_camera_poses=_camera_trajectory(2.),device='cpu',dtype=torch.float32)
+    assert len(calls)==1 and memory.last_selected_chunk_ids==(0,1)
+    assert memory.get(16,query_camera_poses=_camera_trajectory(2.),device='cpu')[0].shape[1]==2
+    memory.clear_active_memory()
+    assert not memory.last_active_tokens and memory.archive.keys()=={0,1,2}
+
+def test_memory_active_empty_bank_does_not_reselect():
+    from long_video.sightline.memory import LongTermKVMemory
+    memory=LongTermKVMemory(); calls=[]; original=memory.select_chunks
+    memory.select_chunks=lambda *args,**kwargs:(calls.append(1) or original(*args,**kwargs))
+    memory.prepare_active_memory(query_chunk=0,query_camera_poses=_camera_trajectory(),device='cpu',dtype=torch.float32)
+    assert memory.get(0,query_camera_poses=_camera_trajectory(),device='cpu')==(None,None)
+    assert len(calls)==1
+
+def test_clean_memory_capture_uses_scheduler_endpoint_and_ignores_stale_hidden():
+    from types import SimpleNamespace
+    from long_video.sightline.pipeline import SightlinePipeline
+    from long_video.sightline.memory import LongTermKVMemory
+    class Provider:
+        context={'stage_shapes':((2,1,1),)}
+        def current_rays(self,shape): return torch.ones(1,2,7)
+    memory=LongTermKVMemory(budget=8,pool=1)
+    processor=SimpleNamespace(memory=memory,last_hidden_states=torch.full((1,2,4),99.),last_current_length=2)
+    transformer=SimpleNamespace(_sightline_processors={0:processor})
+    helios=SimpleNamespace(transformer=transformer,scheduler=SimpleNamespace(sigmas=torch.tensor([1.,.5,0.]),timesteps=torch.tensor([10,5,0])))
+    config=SimpleNamespace(memory_layers=(0,),memory_budget=8,memory_pool=1,memory_write_sigma=0.0,pyramid_steps=(2,2,2))
+    runner=SightlinePipeline(helios,config=config,ray_provider=Provider())
+    cameras=_camera_trajectory(); runner._pending_camera_chunk=(list(cameras.unbind(1)),[],[])
+    seen=[]
+    def capture(clean,timestep):
+        seen.append((clean.clone(),timestep.clone())); processor.last_hidden_states=torch.ones(1,2,4)
+    runner._capture_clean_memory(0,torch.zeros(1,1,2,1,1),capture)
+    assert int(seen[0][1])==0 and torch.equal(memory.archive[0].tokens[0].hidden,torch.ones(1,1,4))
+
 def test_key_identity_map_contains_native_current_and_memory():
     from long_video.sightline.memory import LongTermKVMemory,MemoryToken
     provider=SightlineRayProvider(source_height=8,source_width=8)
@@ -443,6 +484,11 @@ def test_p3_chunk_curriculum_has_fixed_global_step_boundaries():
     assert [curriculum_phase(step)['max_chunks'] for step in (1000,1499,1500,1799,1800,2099,2100,2299,2300,2499)] == [2,2,3,3,4,4,5,5,6,6]
     generator=torch.Generator().manual_seed(9); selected=[select_train_chunk(6,generator,minimum=1) for _ in range(200)]
     assert 0 not in selected and set(selected)==set(range(1,6))
+
+def test_checkpoint_cadence_switches_after_p2():
+    from scripts.train_sightline_rgbd import checkpoint_interval
+    assert checkpoint_interval(0)==100 and checkpoint_interval(999)==100
+    assert checkpoint_interval(1000)==60 and checkpoint_interval(2499)==60
 
 def test_teacher_overlap_screening_is_deterministic_and_causal():
     from scripts.build_sightline_correspondences import screen_overlap

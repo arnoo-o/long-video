@@ -87,30 +87,62 @@ class SightlinePipeline:
         if history_validity is None:
             history_validity={'long':tuple(bool(c) for c in history_global_coverages.get('long',())), 'mid':tuple(bool(c) for c in history_global_coverages.get('mid',())), 'short':tuple(True for _ in history_global_coverages.get('short',()))}
         self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_global_coverages=history_global_coverages,history_validity=history_validity,stage_shapes=shapes,token_shape=shapes[0])
+        if self.memory is not None and any(bank.enabled for bank in self.memory.banks.values()):
+            native_chunks={int(identity)//8 for groups in history_global_coverages.values() for covered in groups for identity in covered if int(identity)//8 < int(chunk_index)}
+            self.memory.prepare_active_memory(query_chunk=chunk_index,query_camera_poses=cameras,
+                native_history_chunk_ids=native_chunks,device=latents.device,dtype=latents.dtype)
         self._pending_camera_chunk=(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))
         attention_kwargs['current_chunk']=chunk_index
         attention_kwargs['sightline_stage_shapes']=shapes
 
-    def _finalize_chunk(self, chunk_index):
+    def _resolve_memory_timestep(self, sigma:float, device):
+        """Map the configured memory-write sigma through Helios' scheduler API."""
+        scheduler=getattr(self.helios,'scheduler',None); sigma=float(sigma)
+        if scheduler is not None and hasattr(scheduler,'sigmas') and hasattr(scheduler,'timesteps'):
+            sigmas=torch.as_tensor(scheduler.sigmas,device=device,dtype=torch.float32)
+            index=int(torch.argmin((sigmas-sigma).abs()).item())
+            return torch.as_tensor(scheduler.timesteps[index],device=device)
+        return torch.as_tensor(sigma,device=device,dtype=torch.float32)
+
+    @torch.no_grad()
+    def _capture_clean_memory(self, chunk_index, clean_latent, capture_fn):
+        """Capture features from a final clean latent using a legal scheduler input."""
+        if self.ray_provider is None or capture_fn is None:
+            raise RuntimeError('clean Memory capture requires an explicit feature capture callback')
+        sigma=float(getattr(self.config,'memory_write_sigma',0.0)); capture_input=clean_latent
+        if sigma:
+            capture_input=clean_latent + sigma*torch.randn_like(clean_latent)
+        timestep=self._resolve_memory_timestep(sigma,capture_input.device)
+        for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
+            if processor.memory is not None: processor.last_hidden_states=None
+        capture_fn(capture_input,timestep)
+        pending=getattr(self,'_pending_camera_chunk',None)
+        if pending is None: raise RuntimeError('Memory capture has no camera trajectory metadata')
+        camera_poses=torch.stack(pending[0],1)
+        captured=0
+        for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
+            if processor.memory is None or processor.last_hidden_states is None: continue
+            hidden=processor.last_hidden_states[:, -processor.last_current_length:]
+            shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==processor.last_current_length),None)
+            if shape is None: raise RuntimeError('clean Memory capture hidden shape is not a current Helios grid')
+            rays=self.ray_provider.current_rays(shape)
+            processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays,camera_poses=camera_poses,timestamp=chunk_index)
+            processor.last_hidden_states=None; captured+=1
+        if captured != len([p for p in getattr(self.helios.transformer,'_sightline_processors',{}).values() if p.memory is not None]):
+            raise RuntimeError('clean Memory capture did not visit every enabled memory layer')
+
+    def _finalize_chunk(self, chunk_index, clean_latent=None, capture_fn=None):
         if self.ray_provider is None:
             pending=getattr(self,'_pending_camera_chunk',None)
             if pending is not None: self.camera_history.append_chunk(*pending); self._pending_camera_chunk=None
             return
-        for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
-            if processor.last_hidden_states is None or processor.memory is None: continue
-            hidden=processor.last_hidden_states[:, -processor.last_current_length:]
-            shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==processor.last_current_length),None)
-            if shape is None: continue
-            rays=self.ray_provider.current_rays(shape)
-            pending=getattr(self,'_pending_camera_chunk',None)
-            if pending is None: raise RuntimeError('Memory capture has no camera trajectory metadata')
-            camera_poses=torch.stack(pending[0],1)
-            processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays,camera_poses=camera_poses,timestamp=chunk_index)
-            processor.last_hidden_states=None
+        if clean_latent is None: raise RuntimeError('chunk finalization requires its final clean latent')
+        self._capture_clean_memory(chunk_index,clean_latent,capture_fn)
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is not None:
             self.camera_history.append_chunk(*pending)
             self._pending_camera_chunk=None
+        self.memory.clear_active_memory()
 
     @torch.inference_mode()
     def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps=None, c2w, intrinsics, attention_kwargs=None):
@@ -139,9 +171,18 @@ class SightlinePipeline:
             latent=stage2_sample_with_boundary(self.helios,clean_boundary=boundary,latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
             if chunk==0: latent[:,:,0:1]=source.to(latent)
             else: latent[:,:,0:1]=boundary.to(latent)
+            capture_history=history
             accumulated=self.append_stride32_latents(accumulated,latent)
             self.history_state.append_chunk(latent,chunk)
-            self._finalize_chunk(chunk); self._active_chunk=chunk+1
+            def clean_capture(clean_input,timestep, _history=capture_history, _chunk=chunk):
+                output=self.helios.transformer(hidden_states=clean_input.to(transformer_dtype),timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,indices_hidden_states=current_ids,
+                    latents_history_long=_history['long'][0],indices_latents_history_long=_history['long'][1],
+                    latents_history_mid=_history['mid'][0],indices_latents_history_mid=_history['mid'][1],
+                    latents_history_short=_history['short'][0],indices_latents_history_short=_history['short'][1],
+                    attention_kwargs={'current_chunk':_chunk})
+                return output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
+            self._finalize_chunk(chunk,clean_latent=latent,capture_fn=clean_capture); self._active_chunk=chunk+1
         if accumulated is None or accumulated.shape[2]!=1+8*chunks: raise RuntimeError('stride-32 latent assembly failed')
         decoded=vae.decode(accumulated.to(vae.dtype)/std+mean,return_dict=False)[0]
         expected_frames=1+32*chunks; decoded=decoded[:,:,:expected_frames]

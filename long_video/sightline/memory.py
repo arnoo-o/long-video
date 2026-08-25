@@ -52,6 +52,7 @@ class LongTermKVMemory:
     def __init__(self,budget=13312,pool=2,*,tau_pos=1.0,tau_angle=0.78539816339):
         self.budget=int(budget); self.pool=int(pool); self.tau_pos=float(tau_pos); self.tau_angle=float(tau_angle)
         self.archive:dict[int,MemoryChunk]={}; self.timestamp=None; self.rope=None; self.enabled=True; self.last_active_tokens=[]; self.last_selected_chunk_ids=()
+        self._active_query_chunk=None; self._active_hidden=None; self._active_rays=None; self._active_tokens=()
 
     @property
     def tokens(self): return [token for chunk in self.archive.values() for token in chunk.tokens]
@@ -93,7 +94,35 @@ class LongTermKVMemory:
         self.last_active_tokens=tokens; self.last_selected_chunk_ids=tuple(chunk.chunk_id for chunk in chunks)
         return tokens
 
+    def prepare_active_memory(self, *, query_chunk:int, query_camera_poses:torch.Tensor,
+                              native_history_chunk_ids=(), device=None, dtype=None):
+        """Select and materialize the complete active chunks once per query chunk."""
+        query_chunk=int(query_chunk)
+        if (self._active_query_chunk == query_chunk and self._active_hidden is not None
+                and tuple(native_history_chunk_ids) == getattr(self, '_active_native_history', ())):
+            return self._active_tokens
+        chunks=self.select_chunks(query_chunk,query_camera_poses,native_history_chunk_ids)
+        tokens=tuple(token for chunk in chunks for token in chunk.tokens)
+        if len(tokens)>self.budget:
+            raise RuntimeError(f'complete active Memory chunks exceed token budget: {len(tokens)}>{self.budget}')
+        self.last_active_tokens=list(tokens); self.last_selected_chunk_ids=tuple(chunk.chunk_id for chunk in chunks)
+        self._active_query_chunk=query_chunk; self._active_native_history=tuple(int(x) for x in native_history_chunk_ids); self._active_tokens=tokens
+        if tokens:
+            self._active_hidden=torch.cat([token.hidden for token in tokens],1).to(device=device,dtype=dtype)
+            self._active_rays=torch.cat([token.ray for token in tokens],1).to(device=device,dtype=dtype)
+        else:
+            self._active_hidden=self._active_rays=None
+        return tokens
+
+    def clear_active_memory(self):
+        self._active_query_chunk=None; self._active_native_history=(); self._active_hidden=None; self._active_rays=None; self._active_tokens=()
+        self.last_active_tokens=[]; self.last_selected_chunk_ids=()
+
     def get(self,current_global_start=None,*,query_camera_poses=None,native_history_chunk_ids=(),device=None,dtype=None):
+        current_chunk=int(current_global_start//8) if current_global_start is not None else None
+        if current_chunk is not None and self._active_query_chunk == current_chunk:
+            if self._active_hidden is None: return None,None
+            return self._active_hidden.to(device=device,dtype=dtype), self._active_rays.to(device=device,dtype=dtype)
         tokens=self.active_tokens(current_global_start,query_camera_poses=query_camera_poses,native_history_chunk_ids=native_history_chunk_ids)
         if not tokens: return None,None
         hidden=torch.cat([token.hidden for token in tokens],1); rays=torch.cat([token.ray for token in tokens],1)
@@ -154,5 +183,11 @@ class LayerKVMemoryBank(nn.Module):
     def set_enabled(self,enabled):
         for bank in self.banks.values():bank.enabled=bool(enabled)
     def reset(self):
-        for bank in self.banks.values():bank.archive.clear();bank.last_active_tokens=[];bank.last_selected_chunk_ids=()
+        for bank in self.banks.values():bank.archive.clear();bank.clear_active_memory()
+    def prepare_active_memory(self, *, query_chunk:int, query_camera_poses:torch.Tensor, native_history_chunk_ids=(), device=None, dtype=None):
+        """Prepare all layer banks once; attention calls only consume this cache."""
+        return {layer: bank.prepare_active_memory(query_chunk=query_chunk, query_camera_poses=query_camera_poses,
+            native_history_chunk_ids=native_history_chunk_ids, device=device, dtype=dtype) for layer,bank in self.banks.items()}
+    def clear_active_memory(self):
+        for bank in self.banks.values(): bank.clear_active_memory()
     def append_to_attention(self,*args,**kwargs):raise RuntimeError('select a layer bank with for_layer()')

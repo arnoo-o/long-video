@@ -12,6 +12,8 @@ def main():
     p.add_argument('--selection-manifest',help='Optional JSON containing trajectory_ids to encode')
     p.add_argument('--out-root',required=True); p.add_argument('--height',type=int,default=480); p.add_argument('--width',type=int,default=832)
     p.add_argument('--limit',type=int,default=0)
+    p.add_argument('--frame-count',type=int,choices=(97,193),help='Only encode records with this exact source length')
+    p.add_argument('--ignore-declared-cache',action='store_true',help='Write canonical caches below --out-root instead of a legacy manifest path')
     p.add_argument('--shard-index',type=int,default=0); p.add_argument('--shard-count',type=int,default=1)
     a=p.parse_args(); import sys; sys.path.insert(0,str(Path(__file__).resolve().parents[1])); sys.path.insert(0,a.helios_root)
     from long_video.sightline.geometry import pad_image_bottom_right, padded_size
@@ -24,7 +26,9 @@ def main():
     raw=json.loads(Path(a.manifest).read_text()); records=raw if isinstance(raw,list) else raw.get('records',raw.get('items',[]))
     if a.selection_manifest:
         selected=set(json.loads(Path(a.selection_manifest).read_text()).get('trajectory_ids',()))
-        records=[record for record in records if record.get('trajectory_id') in selected]
+        records=[record for record in records if (record.get('record_id') or record.get('trajectory_id')) in selected]
+    if a.frame_count is not None:
+        records=[record for record in records if int(record.get('frame_count',97))==a.frame_count]
     if a.shard_count < 1 or not 0 <= a.shard_index < a.shard_count:
         raise ValueError('invalid shard index/count')
     records=records[a.shard_index::a.shard_count]
@@ -53,7 +57,7 @@ def main():
         if not tid or not rgb: continue
         all_paths=sorted(p for p in Path(rgb).glob('*') if p.suffix.lower() in ('.png','.jpg','.jpeg'))
         source_start=int(rec.get('source_frame_start',0)); paths=all_paths[source_start:source_start+frame_count]
-        declared=rec.get('gt_latent_cache') or rec.get('latent_cache')
+        declared=None if a.ignore_declared_cache else (rec.get('gt_latent_cache') or rec.get('latent_cache'))
         if declared:
             out=Path(declared); out=out if out.is_absolute() else Path(a.manifest).resolve().parent/out
         else:

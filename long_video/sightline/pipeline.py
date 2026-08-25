@@ -30,7 +30,7 @@ class SightlinePipeline:
     def __init__(self, helios_pipeline, *, config, conditioner=None, ray_provider=None):
         self.helios=helios_pipeline; self.config=config; self.conditioner=conditioner; self.ray_provider=ray_provider
         inner_dim=int(getattr(conditioner,'inner_dim',conditioner.q_proj.out_features if conditioner is not None and hasattr(conditioner,'q_proj') else 0)) if conditioner is not None else None
-        self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim)
+        self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim,tau_pos=getattr(config,'memory_tau_pos',1.0),tau_angle=getattr(config,'memory_tau_angle',0.78539816339))
         self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None
 
     @staticmethod
@@ -70,12 +70,10 @@ class SightlinePipeline:
         frame_ids=(torch.arange(9,device=cameras.device)*4 + chunk_index*32).tolist()
         source_camera=self._source_camera
         source_K=self._source_intrinsics
-        def representative(covered):
-            identity=covered[-1] if covered else None
-            return self.camera_history.camera_for(identity,source_camera,source_K)
-        long_slots=[representative(covered) for covered in history_global_coverages['long']]
-        mid_slots=[representative(covered) for covered in history_global_coverages['mid']]
-        short_slots=[representative(covered) for covered in history_global_coverages['short']]
+        # Keep every real temporal camera footprint.  Q/K ray embeddings are
+        # projected per camera and only then pooled 4x/2x like Helios history.
+        slots=self.camera_history.slots(source_camera,source_K)
+        long_slots=slots[:16]; mid_slots=slots[16:18]; short_slots=[(source_camera,source_K),slots[18]]
         history_groups={
             'long':(torch.stack([c for c,_ in long_slots],1),torch.stack([k for _,k in long_slots],1)),
             'mid':(torch.stack([c for c,_ in mid_slots],1),torch.stack([k for _,k in mid_slots],1)),
@@ -104,7 +102,10 @@ class SightlinePipeline:
             shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==processor.last_current_length),None)
             if shape is None: continue
             rays=self.ray_provider.current_rays(shape)
-            processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays)
+            pending=getattr(self,'_pending_camera_chunk',None)
+            if pending is None: raise RuntimeError('Memory capture has no camera trajectory metadata')
+            camera_poses=torch.stack(pending[0],1)
+            processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays,camera_poses=camera_poses,timestamp=chunk_index)
             processor.last_hidden_states=None
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is not None:

@@ -59,13 +59,22 @@ def rgbd_unit_identity(record) -> dict:
         'intrinsics_sha256':digest(K),
     }
 
-def validate_rgbd_unit_latent(record, path: str|Path) -> dict:
-    detected,_=validate_latent_cache(path,schema='continuous_25')
+def validate_rgbd_record_latent(record, path: str|Path) -> dict:
+    """Bind every continuous cache, including P3 continuous_49, to its RGB-D record."""
+    temporal=1+(int(record.frame_count)-1)//4
+    expected_schema=f'continuous_{temporal}'
+    detected,_=validate_latent_cache(path,schema=expected_schema)
     actual=latent_cache_metadata(path); expected=rgbd_unit_identity(record)
     if actual != expected:
         differences={key:(actual.get(key),value) for key,value in expected.items() if actual.get(key)!=value}
         raise ValueError(f'{record.record_id}: latent/RGB/camera unit identity mismatch: {differences}')
+    if detected!=expected_schema: raise RuntimeError('latent schema validation returned an inconsistent result')
     return actual
+
+def validate_rgbd_unit_latent(record, path: str|Path) -> dict:
+    if int(record.frame_count)!=97 or int(record.chunk_count)!=3:
+        raise ValueError(f'{record.record_id}: a formal P1/P2 unit must be 97 frames / 3 chunks')
+    return validate_rgbd_record_latent(record,path)
 
 def _canonical_tensor(value, temporal_size):
     if value.ndim==4:

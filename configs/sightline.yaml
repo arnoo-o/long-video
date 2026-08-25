@@ -12,7 +12,9 @@ correspondence_layers: [16, 20, 24]
 lora_layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 lora_rank: 16
 memory_pool: 2
-memory_budget: 12960
+memory_budget: 13312
+memory_tau_pos: 1.0
+memory_tau_angle: 0.78539816339
 lambda_corr: 0.02
 lambda_corr_final: 0.005
 lambda_corr_decay_start: 0.4
@@ -39,9 +41,9 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v8
+sightline_training_semantics_version: sightline-v9
 sightline_correspondence_schema_version: sightline-correspondence-v5
-sightline_checkpoint_schema_version: sightline-checkpoint-v10
+sightline_checkpoint_schema_version: sightline-checkpoint-v11
 p1_steps: 400
 p2_steps: 600
 p3_steps: 1500

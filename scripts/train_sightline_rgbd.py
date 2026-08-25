@@ -15,13 +15,13 @@ from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
 from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
-from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_unit_latent
-from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, capture_rng_state
+from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
+from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
 from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
 from long_video.sightline.geometry import assert_latent_geometry, padded_size
-from long_video.sightline.boundary import constrain_flow_item, stage2_sample_with_boundary
+from long_video.sightline.boundary import constrain_flow_items, stage2_sample_with_boundary
 
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
@@ -218,16 +218,6 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
 def _reset_sequence(runner):
     runner.reset_sequence()
 
-def _local_rng_state():
-    return capture_rng_state()
-
-def _all_rank_rng_states(world_size):
-    local=_local_rng_state()
-    # PyTorch 2.11 cannot deserialize Tensor-backed objects through
-    # all_gather_object.  The checkpoint stores rank 0's complete RNG state;
-    # nonzero ranks deterministically fall back to it on resume.
-    return [local]
-
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
     p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
@@ -264,11 +254,11 @@ def main():
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
-    prompt_embeds,_=_prompt(pipe,args.prompt,device); config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
+    prompt_embeds,_=_prompt(pipe,args.prompt,device); config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     if args.resume:
-        payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=None if args.allow_memory_layer_migration else optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,allow_memory_layer_migration=args.allow_memory_layer_migration); start_step=completed_step+1
+        payload=torch.load(args.resume,map_location='cpu'); completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=None if args.allow_memory_layer_migration else optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration); start_step=completed_step+1
     elif args.probe_checkpoint:
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
@@ -293,8 +283,8 @@ def main():
             index=_ddp_record_index(step,rank,world_size,len(eligible_records)); record=eligible_records[index]
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
+        validate_rgbd_record_latent(record,latent_path)
         if phase['name'] in ('P1','P2'):
-            validate_rgbd_unit_latent(record,latent_path)
             if record.frame_count!=97 or record.chunk_count!=3 or latent_schema!='continuous_25': raise ValueError(f'{record.record_id}: P1/P2 requires a unit-owned 97-frame continuous_25 cache')
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
@@ -321,8 +311,9 @@ def main():
             for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=True
             corr_rows=_load_correspondence(record)
         else: corr_rows=None
-        train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'])
-        if not 0<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum')
+        minimum_train_chunk=1 if phase['name']=='P3' else 0
+        train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'],minimum=minimum_train_chunk)
+        if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
         history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
         if args.probe_capture: torch.cuda.reset_peak_memory_stats()
@@ -338,7 +329,7 @@ def main():
                 clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:].detach()
                 if clean_boundary is not None: target[:,:,:1]=clean_boundary.to(target)
                 items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range)
-                if clean_boundary is not None: items=[constrain_flow_item(item,clean_boundary) for item in items]
+                if clean_boundary is not None: items=constrain_flow_items(items,clean_boundary)
                 runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 stage_losses=[]; final_prediction=None
                 for stage_index,item in enumerate(items):
@@ -425,8 +416,8 @@ def main():
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
         checkpoint_due=(step+1)%save_every==0 or step+1==args.max_steps or (args.checkpoint_smoke_step is not None and step+1==args.checkpoint_smoke_step)
         if args.train and checkpoint_due:
-            rng_states=_all_rank_rng_states(world_size)
-            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states)
+            rng_states=gather_rank_rng_states(world_size,device)
+            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states,world_size=world_size)
             if world_size>1: dist.barrier()
     if world_size>1: dist.destroy_process_group()
 

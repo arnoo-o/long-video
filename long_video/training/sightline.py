@@ -12,9 +12,10 @@ from torch import nn
 from ..sightline.conditioning import LayeredSightlineConditioner
 from ..sightline.correspondence import correspondence_loss
 
-def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None) -> int:
+def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:
     if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
-    return int(torch.randint(max_chunks,(1,),generator=generator).item())
+    if not 0<=minimum<max_chunks: raise ValueError('minimum train chunk must be inside the rollout')
+    return int(torch.randint(minimum,max_chunks,(1,),generator=generator).item())
 
 def assert_trainable_whitelist(module: nn.Module) -> None:
     allowed=("conditioner.","memory.timestamp.","lora_")
@@ -45,9 +46,8 @@ def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_
     p3_step = step - p1_steps - p2_steps
     if p3_step < p3_steps:
         # Fixed global-step boundaries keep checkpoint resumes deterministic.
-        if p3_step < 400: chunks = 1
-        elif p3_step < 700: chunks = 2
-        elif p3_step < 900: chunks = 3
+        if p3_step < 500: chunks = 2
+        elif p3_step < 800: chunks = 3
         elif p3_step < 1100: chunks = 4
         elif p3_step < 1300: chunks = 5
         else: chunks = 6

@@ -46,8 +46,8 @@ def main() -> None:
     }
     if checks['completed_step']!=599 or checks['next_step']!=600 or checks['semantics']!=SEMANTICS or checks['schema']!=SCHEMA or not all(checks[key] for key in ('config_fingerprint_match','helios_fingerprint_match','optimizer','scheduler','rng')):
         raise RuntimeError(f'checkpoint-599 resume preflight failed: {checks}')
-    phases={step:curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps) for step in (599,600,999,1000,1399,1400,1699,1700,1899,1900,2099,2100,2299,2300,2499)}
-    if phases[599]['name']!='P2' or phases[600]['name']!='P2' or phases[999]['name']!='P2' or phases[1000]!={'name':'P3','max_chunks':1,'lora':True,'correspondence':True,'memory':True} or phases[2499]['max_chunks']!=6:
+    phases={step:curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps) for step in (599,600,999,1000,1499,1500,1799,1800,2099,2100,2299,2300,2499)}
+    if phases[599]['name']!='P2' or phases[600]['name']!='P2' or phases[999]['name']!='P2' or phases[1000]!={'name':'P3','max_chunks':2,'lora':True,'correspondence':True,'memory':True} or phases[2499]['max_chunks']!=6:
         raise RuntimeError(f'curriculum boundary mismatch: {phases}')
     units=records(args.unit_manifest);p3=records(args.p3_manifest)
     if any(int(row['chunk_count'])!=3 or int(row['frame_count'])!=97 for row in units):

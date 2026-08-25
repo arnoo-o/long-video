@@ -66,7 +66,7 @@ def main():
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
         provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision)
-        restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget},provenance=provenance)
+        restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle},provenance=provenance)
     else:
         configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
     trainable.eval(); conditioner.eval()

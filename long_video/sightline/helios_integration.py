@@ -40,6 +40,13 @@ class SightlineHeliosAttnProcessor:
             scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
             dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
             dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
+            history_len=max(0,key.shape[1]-current_len)
+            if history_len:
+                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta)
+                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta)
+                if pooled_q.shape[1]!=history_len or pooled_k.shape[1]!=history_len: raise RuntimeError('pooled history ray embedding count differs from Helios history tokens')
+                dq=torch.cat((pooled_q.to(dq),dq[:,-current_len:]),1)
+                dk=torch.cat((pooled_k.to(dk),dk[:,-current_len:]),1)
         dq=dq.to(query.dtype).unflatten(-1,(attn.heads,-1)); dk=dk.to(key.dtype).unflatten(-1,(attn.heads,-1))
         if key.shape[1] > current_len:
             validity=self.ray_provider.context.get('history_validity') if self.ray_provider.context is not None else None
@@ -74,16 +81,20 @@ class SightlineHeliosAttnProcessor:
             attention_mask=additive if attention_mask is None else attention_mask.to(additive)+additive
         if getattr(attn,'restrict_self_attn',False) and history_len:
             key=key[:,:history_len]; value=value[:,:history_len]
-        if self.memory is not None:
+        if self.memory is not None and self.memory.enabled:
             memory_kwargs=dict(kwargs); memory_kwargs.pop('timestamp_embedding',None); memory_kwargs.pop('memory_rotary_emb',None); memory_kwargs.pop('current_chunk',None)
             if self.ray_provider.context is None: raise RuntimeError('memory attention requires active Sightline context')
             active_chunk=int(self.ray_provider.context['chunk_index']); current_global_start=active_chunk*8
+            coverages=self.ray_provider.context.get('history_global_coverages') or {}
+            native_chunks={int(identity)//8 for groups in coverages.values() for covered in groups for identity in covered if int(identity)//8<active_chunk}
             key,value,self.last_attention_meta=self.memory.append_native_attention(
                 attn,key,value,rotary_emb,self.rotary_apply,
                 current_chunk=active_chunk,current_global_start=current_global_start,
                 timestamp_embedding=getattr(self.memory,'timestamp',None),
                 sightline_projector=self.conditioner,
                 scale_delta=scale_delta,
+                query_camera_poses=self.ray_provider.context['c2w'],
+                native_history_chunk_ids=native_chunks,
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:
@@ -124,7 +135,7 @@ class SightlineRayProvider:
         base=int(context['chunk_index'])*8
         identities.extend(('current',(base+t,),y,x,'current') for t in range(T) for y in range(H) for x in range(W))
         if memory is not None and memory.enabled:
-            identities.extend(('memory',(token.chunk_index*8+token.temporal,),token.pooled_y,token.pooled_x,'memory') for token in memory.active_tokens(base))
+            identities.extend(('memory',(token.chunk_index*8+token.temporal,),token.pooled_y,token.pooled_x,'memory') for token in memory.last_active_tokens)
         return tuple(identities)
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape
@@ -145,10 +156,8 @@ class SightlineRayProvider:
             shapes=context.get('history_token_shapes')
             if not shapes: raise RuntimeError('actual native history token shapes are required')
             for name in ('long','mid','short'):
-                hc,hk=groups[name]
                 ht,hh,hw=shapes[name]
-                if hc.shape[1]!=ht: raise RuntimeError(f'{name} camera count {hc.shape[1]} != native temporal tokens {ht}')
-                rays_by_group.append(plucker_rays(hc,hk,hh,hw,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7))
+                rays_by_group.append(torch.zeros(B,ht*hh*hw,7,device=rays.device,dtype=rays.dtype))
             history=torch.cat(rays_by_group,1)
         if history is None and context.get('history_cameras') is not None:
             hc=context['history_cameras']; hk=context.get('history_intrinsics')
@@ -163,6 +172,21 @@ class SightlineRayProvider:
             raise RuntimeError(f"history ray count does not exactly match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
+
+    def project_history(self,conditioner,*,kind,scale_delta):
+        """Project each real camera ray first, then pool temporal embeddings."""
+        context=self.context; groups=context.get('history_groups'); shapes=context.get('history_token_shapes')
+        if groups is None or not shapes: raise RuntimeError('history camera footprints are unavailable')
+        factors={'long':4,'mid':2,'short':1}; values=[]
+        for name in ('long','mid','short'):
+            cameras,K=groups[name]; out_t,height,width=shapes[name]; factor=factors[name]
+            if cameras.shape[1]!=out_t*factor: raise RuntimeError(f'{name} camera footprint does not match Helios temporal pooling')
+            rays=plucker_rays(cameras,K,height,width,source_height=self.source_height,source_width=self.source_width)
+            projected=conditioner.project(rays.to(next(conditioner.parameters()).dtype),kind=kind,training=conditioner.training,scale_delta=scale_delta)
+            # Never average poses or raw Plücker rays: only projected embeddings.
+            projected=projected.reshape(projected.shape[0],out_t,factor,height,width,-1).mean(2)
+            values.append(projected.reshape(projected.shape[0],-1,projected.shape[-1]))
+        return torch.cat(values,1)
 
     def current_rays(self, token_shape):
         T,H,W=token_shape; return token_rays_for_shape(self.context['c2w'],self.context['intrinsics'],(self.context['c2w'].shape[0],T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(self.context['c2w'].shape[0],-1,7)

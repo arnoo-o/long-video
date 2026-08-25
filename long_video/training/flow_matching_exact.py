@@ -67,5 +67,5 @@ def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), devi
         noisy=sigma*start_point+(1-sigma)*end_point
         for name,tensor in {'noisy':noisy,'target':start_point-end_point,'start':start_point,'end':end_point}.items():
             if tensor.shape!=current.shape: raise RuntimeError(f'stage {stage} {name} shape mismatch: {tensor.shape} vs {current.shape}')
-        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'use_dynamic_shifting':False})
+        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'stage_start_sigma':start,'stage_end_sigma':end,'use_dynamic_shifting':False})
     return items

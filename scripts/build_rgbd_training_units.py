@@ -20,6 +20,9 @@ def atomic_json(path: Path, value: dict) -> None:
 
 def unit_row(record, output_root: Path, latent_root: Path, offset: int, *, rebuild: bool = False) -> dict:
     row = dict(record.raw)
+    # A unit must never retain the parent's continuous_49 cache as a fallback.
+    row.pop("latent_cache", None)
+    row.pop("gt_latent_cache", None)
     row.update(record_id=f"{record.record_id}__frames_{offset:03d}_{offset + 96:03d}", parent_record_id=record.record_id,
                source_frame_start=offset, frame_count=97, chunk_count=3)
     cache_dir = output_root / "unit_correspondence"
@@ -55,6 +58,7 @@ def main() -> None:
     for record in records:
         if record.chunk_count == 3:
             row=dict(record.raw)
+            row.pop("latent_cache",None); row.pop("gt_latent_cache",None)
             latent=latent_root/record.record_id.replace(":","_")/"continuous_25.pt"
             row.update(gt_latent_cache=str(latent.relative_to(args.out.parent) if latent.is_relative_to(args.out.parent) else latent),latent_schema="continuous_25")
             rows.append(row)

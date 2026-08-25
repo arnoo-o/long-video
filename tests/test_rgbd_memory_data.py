@@ -96,7 +96,7 @@ def test_six_chunk_record_has_its_own_geometry(tmp_path):
 def test_second_half_training_unit_owns_reencoded_continuous25_identity(tmp_path):
     torch=pytest.importorskip('torch')
     from scripts.build_rgbd_training_units import unit_row
-    from long_video.training.sightline_data import rgbd_unit_identity,validate_rgbd_unit_latent,load_latent_tensor
+    from long_video.training.sightline_data import rgbd_unit_identity,validate_rgbd_unit_latent,validate_rgbd_record_latent,load_latent_tensor
     row=_record(tmp_path); root=tmp_path/'record'
     for index in range(97,193):
         Image.new('RGB',(832,480),color=(index%255,0,0)).save(root/'rgb'/f'{index:06d}.png')
@@ -104,9 +104,10 @@ def test_second_half_training_unit_owns_reencoded_continuous25_identity(tmp_path
     poses=np.repeat(np.eye(4)[None],193,axis=0); poses[:,0,3]=np.arange(193)
     np.save(root/'c2w_abs.npy',poses); np.save(root/'c2w_local.npy',poses)
     np.save(root/'intrinsics.npy',np.repeat(np.eye(3)[None],193,axis=0)); np.save(root/'timestamps.npy',np.arange(193,dtype=np.float64))
-    row.update(frame_count=193,chunk_count=6)
+    row.update(frame_count=193,chunk_count=6,latent_cache=str(tmp_path/'parent_continuous_49.pt'))
     manifest=tmp_path/'parent.json'; manifest.write_text(json.dumps({'records':[row]})); parent=load_rgbd_memory_manifest(manifest)[0]
     unit_raw=unit_row(parent,tmp_path,tmp_path/'unit_latents',96,rebuild=True)
+    assert 'latent_cache' not in unit_raw and unit_raw['latent_schema']=='continuous_25'
     unit=type(parent)(unit_raw,tmp_path)
     assert unit.rgb_paths()[0].name=='000096.png' and unit.frame_count==97
     unit_cache=unit.path('gt_latent_cache'); unit_cache.parent.mkdir(parents=True)
@@ -116,6 +117,8 @@ def test_second_half_training_unit_owns_reencoded_continuous25_identity(tmp_path
     parent_cache=tmp_path/'continuous_49.pt'
     torch.save({'latents':torch.zeros(1,16,49,64,104),'schema':'continuous_49','unit_identity':{'record_id':parent.record_id}},parent_cache)
     with pytest.raises(ValueError): validate_rgbd_unit_latent(unit,parent_cache)
+    torch.save({'latents':torch.zeros(1,16,49,64,104),'schema':'continuous_49','unit_identity':rgbd_unit_identity(parent)},parent_cache)
+    assert validate_rgbd_record_latent(parent,parent_cache)['frame_count']==193
 
 
 def test_sequence_split_hits_exact_train_count_without_leakage():

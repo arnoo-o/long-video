@@ -15,6 +15,7 @@ class SightlineHeliosAttnProcessor:
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
+        self.residual_scale=1.0
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
@@ -59,7 +60,8 @@ class SightlineHeliosAttnProcessor:
                 dk=torch.cat((dk[:,:len(flags)].masked_fill(~valid_mask,0),dk[:,len(flags):]),dim=1)
                 dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
-        query=query+dq; key=key+dk
+        residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
+        query=query+residual_scale*dq; key=key+residual_scale.to(key.dtype)*dk
         history_len=max(0,key.shape[1]-current_len)
         if getattr(attn,'is_amplify_history',False) and history_len:
             scale=1.0+__import__('torch').sigmoid(attn.history_key_scale)*(attn.max_scale-1.0)

@@ -448,6 +448,29 @@ def test_inference_can_disable_only_memory():
     calls=[]; runner=SimpleNamespace(memory=SimpleNamespace(set_enabled=lambda value:calls.append(value)))
     assert configure_inference_memory(runner,True) is False and calls==[False]
 
+def test_inference_global_sightline_residual_scale():
+    from types import SimpleNamespace
+    from scripts.infer_sightline import configure_sightline_residual_scale
+    processors={index:SimpleNamespace() for index in range(40)}
+    transformer=SimpleNamespace(_sightline_processors=processors)
+    assert configure_sightline_residual_scale(transformer,.2)==.2
+    assert all(processor.residual_scale==.2 for processor in processors.values())
+    with pytest.raises(ValueError): configure_sightline_residual_scale(transformer,float('nan'))
+
+def test_processor_residual_scale_matches_q_plus_s_delta():
+    class A:
+        heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
+    a=A(); c=SightlineConditioner(8).eval()
+    torch.nn.init.constant_(c.q_proj.weight,.1); torch.nn.init.constant_(c.k_proj.weight,.2)
+    rays=torch.ones(1,4,7); provider=lambda h,**kw:(rays,rays); h=torch.randn(1,4,8); seen=[]
+    def qkv(attn,states,_): return attn.to_q(states),attn.to_k(states),attn.to_v(states)
+    def dispatch(q,k,v,**kw): seen.append((q.clone(),k.clone())); return v
+    proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=lambda x,r:x,attention_dispatch=dispatch); proc.residual_scale=.2
+    proc(a,h)
+    native_q=a.to_q(h).unflatten(2,(a.heads,-1)); native_k=a.to_k(h).unflatten(2,(a.heads,-1))
+    dq=c.project(rays,kind='q',training=False).unflatten(-1,(a.heads,-1)); dk=c.project(rays,kind='k',training=False).unflatten(-1,(a.heads,-1))
+    assert torch.allclose(seen[0][0],native_q+.2*dq) and torch.allclose(seen[0][1],native_k+.2*dk)
+
 def test_key_identity_map_contains_native_current_and_memory():
     from long_video.sightline.memory import LongTermKVMemory,MemoryToken
     provider=SightlineRayProvider(source_height=8,source_width=8)

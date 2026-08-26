@@ -12,6 +12,25 @@ def _resize(value: torch.Tensor, spatial: tuple[int, int]) -> torch.Tensor:
     flat=F.interpolate(flat.float(),size=spatial,mode='bilinear',align_corners=False).to(value.dtype)
     return flat.reshape(batch,frames,channels,*spatial).permute(0,2,1,3,4)
 
+def _resize_nearest(value: torch.Tensor, spatial: tuple[int, int]) -> torch.Tensor:
+    if tuple(value.shape[-2:]) == tuple(spatial): return value
+    batch,channels,frames=value.shape[:3]
+    flat=value.permute(0,2,1,3,4).reshape(batch*frames,channels,*value.shape[-2:])
+    flat=F.interpolate(flat,size=spatial,mode='nearest')
+    return flat.reshape(batch,frames,channels,*spatial).permute(0,2,1,3,4)
+
+def _stage_transition_coefficients(scheduler,index:int) -> tuple[float,float]:
+    """The exact alpha/beta used by pinned Helios stage2_sample."""
+    try:
+        raw=float(scheduler.ori_start_sigmas[index]); gamma=float(scheduler.config.gamma)
+    except (AttributeError,KeyError,TypeError) as exc:
+        raise RuntimeError('Helios scheduler has no native stage transition coefficients') from exc
+    if not 0 < gamma or not 0 <= raw <= 1: raise RuntimeError('invalid Helios stage transition coefficients')
+    ori_sigma=1.0-raw
+    alpha=1.0/((1.0+1.0/gamma)**.5*(1.0-ori_sigma)+ori_sigma)
+    beta=alpha*(1.0-ori_sigma)/(gamma**.5)
+    return alpha,beta
+
 
 @dataclass(frozen=True)
 class BoundaryStage:
@@ -87,13 +106,13 @@ class SamplingBoundaryFlow:
         for divisor in (2**index for index in range(1,stage_count)):
             current=_resize(current,(full_spatial[0]//divisor,full_spatial[1]//divisor)); descending.append(current)
         self.clean_pyramid=tuple(reversed(descending))
-        self.stages={}; self.native_noise={}
+        self.stages={}; self.block_noise={}; self.effective_noise={}
 
     def record_block_noise(self,noise:torch.Tensor):
         """Record the exact noise Helios sampled for stage1, then stage2."""
-        index=len(self.native_noise)+1
+        index=len(self.block_noise)+1
         if not 1<=index<self.stage_count: raise RuntimeError('unexpected extra Helios block-noise sample')
-        self.native_noise[index]=noise[:,:,:1].detach().clone()
+        self.block_noise[index]=noise[:,:,:1].detach().clone()
 
     def stage_for(self,hidden:torch.Tensor) -> BoundaryStage:
         spatial=tuple(hidden.shape[-2:])
@@ -102,10 +121,30 @@ class SamplingBoundaryFlow:
         if index in self.stages: return self.stages[index]
         if index and index-1 not in self.stages: raise RuntimeError('Helios boundary stages were entered out of order')
         start=hidden[:,:,:1].detach().clone(); clean=self.clean_pyramid[index]
-        # start is the exact native stage start, including the pinned nearest
-        # upsample and alpha/beta block-noise transition for stage1/2.
-        noise=start if index==0 else self.native_noise.get(index)
-        if noise is None: raise RuntimeError(f'Helios stage{index} block noise was not captured before Transformer entry')
+        if index==0:
+            noise=start
+        else:
+            block=self.block_noise.get(index)
+            if block is None: raise RuntimeError(f'Helios stage{index} block noise was not captured before Transformer entry')
+            # Helios converts the sampled block noise to transformer_dtype
+            # before applying alpha/beta.  Keep that rounding point here: the
+            # captured value is the raw sampler result, not the native stage
+            # noise yet.
+            block=block.to(device=start.device,dtype=start.dtype)
+            previous=self.stages[index-1]; previous_noise=self.effective_noise[index-1]
+            previous_clean=_resize_nearest(self.clean_pyramid[index-1],spatial)
+            previous_noise=_resize_nearest(previous_noise,spatial)
+            previous_end=float(self.scheduler.end_sigmas[index-1])*previous_noise+(1.0-float(self.scheduler.end_sigmas[index-1]))*previous_clean
+            alpha,beta=_stage_transition_coefficients(self.scheduler,index)
+            native_start=(alpha*previous_end+beta*block).to(start)
+            start_sigma=float(self.scheduler.start_sigmas[index])
+            if start_sigma<=0: raise RuntimeError(f'Helios stage{index} start sigma must be positive')
+            # This is the full effective pyramid noise: it expands the same
+            # native nearest+alpha/beta transition in the training flow basis.
+            noise=((native_start-(1.0-start_sigma)*previous_clean)/start_sigma).to(start)
+            if not torch.allclose(native_start,start,rtol=2e-3,atol=2e-3):
+                raise RuntimeError(f'Helios stage{index} native transition disagrees with captured start')
+        self.effective_noise[index]=noise
         end=clean if index==self.stage_count-1 else (
             float(self.scheduler.end_sigmas[index])*noise+(1.0-float(self.scheduler.end_sigmas[index]))*clean)
         stage=BoundaryStage(index,start,end); self.stages[index]=stage; return stage

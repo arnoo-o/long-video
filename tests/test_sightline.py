@@ -442,6 +442,12 @@ def test_disabled_memory_skips_clean_feature_capture():
     runner._finalize_chunk(0,clean_latent=torch.zeros(1),capture_fn=lambda *_:called.append(1))
     assert called==[]
 
+def test_inference_can_disable_only_memory():
+    from types import SimpleNamespace
+    from scripts.infer_sightline import configure_inference_memory
+    calls=[]; runner=SimpleNamespace(memory=SimpleNamespace(set_enabled=lambda value:calls.append(value)))
+    assert configure_inference_memory(runner,True) is False and calls==[False]
+
 def test_key_identity_map_contains_native_current_and_memory():
     from long_video.sightline.memory import LongTermKVMemory,MemoryToken
     provider=SightlineRayProvider(source_height=8,source_width=8)

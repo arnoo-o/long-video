@@ -467,6 +467,13 @@ def test_inference_global_sightline_residual_scale():
     assert all(processor.residual_scale==.2 for processor in processors.values())
     with pytest.raises(ValueError): configure_sightline_residual_scale(transformer,float('nan'))
 
+def test_inference_dynamic_sigma_scale_uses_active_scheduler_grid():
+    from scripts.infer_sightline import scheduler_sigma_for_timestep,sightline_sigma_scale
+    scheduler=type('Scheduler',(),{'timesteps':torch.tensor([900.,650.,300.]),'sigmas':torch.tensor([.9,.65,.3,0.])})()
+    assert scheduler_sigma_for_timestep(scheduler,torch.tensor([649]))==pytest.approx(.65)
+    assert sightline_sigma_scale(.8)==1.0
+    assert sightline_sigma_scale(.35)==pytest.approx(.5)
+
 def test_processor_residual_scale_matches_q_plus_s_delta():
     class A:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])

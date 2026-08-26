@@ -617,6 +617,9 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
         def __init__(self):
             self.transformer=Transformer(); self.scheduler=SimpleNamespace(start_sigmas={0:1.,1:.75,2:.5},end_sigmas={0:.6,1:.25,2:0.},timesteps=None,sigmas=None)
             self.stage_noises=[torch.full((1,2,9,2,2),2.),torch.full((1,2,9,4,4),4.),torch.full((1,2,9,8,8),6.)]
+            self.block_noise_calls=[]
+        def sample_block_noise(self,*_args,**_kwargs):
+            value=self.stage_noises[len(self.block_noise_calls)+1].clone(); self.block_noise_calls.append(value); return value
         def stage2_sample(self,latents,callback_on_step_end,**kwargs):
             latents=self.stage_noises[0].clone()
             for stage in range(3):
@@ -624,7 +627,7 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
                     # Match the pinned inference transition: nearest upsample,
                     # followed by alpha*latent + beta*block_noise.
                     previous=torch.nn.functional.interpolate(latents.flatten(0,2).unsqueeze(1),size=self.stage_noises[stage].shape[-2:],mode='nearest').squeeze(1).reshape_as(self.stage_noises[stage])
-                    latents=.8*previous+.2*self.stage_noises[stage]
+                    latents=.8*previous+.2*self.sample_block_noise()
                 self.scheduler.timesteps=torch.tensor([2.,1.]);self.scheduler.sigmas=torch.tensor([1.,0.,0.])
                 for index,timestep in enumerate(self.scheduler.timesteps):
                     self.transformer(hidden_states=latents,timestep=timestep)
@@ -661,13 +664,16 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
         # to the untouched native temporal1 flow in every stage.
         assert torch.allclose(constrained[stage]['noisy_latents'][:,:,:1],items[stage]['noisy_latents'][:,:,1:2])
         assert torch.allclose(constrained[stage]['target'][:,:,:1],items[stage]['target'][:,:,1:2])
-    # Inference stage starts are the actual native transition outputs.  With
-    # stage0 ending at clean=-3, the fake native alpha/beta transitions yield
-    # .8*-3+.2*4=-1.6 and .8*-3+.2*6=-1.2.
-    native_starts=(2.,-1.6,-1.2)
-    for stage,expected in enumerate(native_starts):
+    # Inference starts are produced by native nearest+alpha/beta transitions;
+    # ends use the exact block-noise returned by native sample_block_noise.
+    # Stage1 starts from the native transition of stage0's constrained endpoint
+    # (0.8*0 + 0.2*4 = .8); stage2 likewise starts from stage1's endpoint.
+    native_starts=(2.,.8,.2); native_ends=(0.,-1.25,-3.)
+    for stage,(expected_start,expected_end) in enumerate(zip(native_starts,native_ends)):
+        expected=expected_start
         assert torch.allclose(pipe.transformer.seen[stage*2][:,:,:1],torch.full_like(pipe.transformer.seen[stage*2][:,:,:1],expected))
-        assert torch.allclose(pipe.transformer.seen[stage*2+1][:,:,:1],torch.full_like(pipe.transformer.seen[stage*2+1][:,:,:1],-3.))
+        assert torch.allclose(pipe.transformer.seen[stage*2+1][:,:,:1],torch.full_like(pipe.transformer.seen[stage*2+1][:,:,:1],expected_end))
+    assert len(pipe.block_noise_calls)==2
 
 def test_boundary_scheduler_resolves_helios_integer_transformer_timestep():
     from types import SimpleNamespace

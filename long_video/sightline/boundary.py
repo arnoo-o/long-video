@@ -79,7 +79,7 @@ def _scheduler_coefficient(scheduler,timestep,*,after_step:bool) -> torch.Tensor
 
 
 class SamplingBoundaryFlow:
-    """Follow each stage start produced by Helios' native transition."""
+    """Consume Helios' observed starts and its actual block-noise samples."""
     def __init__(self,scheduler,clean_boundary:torch.Tensor,full_spatial:tuple[int,int],stage_count:int):
         self.scheduler=scheduler; self.clean=clean_boundary; self.stage_count=stage_count
         self.spatial_to_stage={(full_spatial[0]//(2**(stage_count-1-index)),full_spatial[1]//(2**(stage_count-1-index))):index for index in range(stage_count)}
@@ -87,7 +87,13 @@ class SamplingBoundaryFlow:
         for divisor in (2**index for index in range(1,stage_count)):
             current=_resize(current,(full_spatial[0]//divisor,full_spatial[1]//divisor)); descending.append(current)
         self.clean_pyramid=tuple(reversed(descending))
-        self.stages={}
+        self.stages={}; self.native_noise={}
+
+    def record_block_noise(self,noise:torch.Tensor):
+        """Record the exact noise Helios sampled for stage1, then stage2."""
+        index=len(self.native_noise)+1
+        if not 1<=index<self.stage_count: raise RuntimeError('unexpected extra Helios block-noise sample')
+        self.native_noise[index]=noise[:,:,:1].detach().clone()
 
     def stage_for(self,hidden:torch.Tensor) -> BoundaryStage:
         spatial=tuple(hidden.shape[-2:])
@@ -96,10 +102,12 @@ class SamplingBoundaryFlow:
         if index in self.stages: return self.stages[index]
         if index and index-1 not in self.stages: raise RuntimeError('Helios boundary stages were entered out of order')
         start=hidden[:,:,:1].detach().clone(); clean=self.clean_pyramid[index]
-        # The observed start already includes Helios' real nearest upsample and
-        # alpha*latent + beta*block_noise stage conversion.  Never reverse a
-        # noise value or invent a second transition for the boundary token.
-        end=clean
+        # start is the exact native stage start, including the pinned nearest
+        # upsample and alpha/beta block-noise transition for stage1/2.
+        noise=start if index==0 else self.native_noise.get(index)
+        if noise is None: raise RuntimeError(f'Helios stage{index} block noise was not captured before Transformer entry')
+        end=clean if index==self.stage_count-1 else (
+            float(self.scheduler.end_sigmas[index])*noise+(1.0-float(self.scheduler.end_sigmas[index]))*clean)
         stage=BoundaryStage(index,start,end); self.stages[index]=stage; return stage
 
 
@@ -109,6 +117,13 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
     initial=kwargs['latents']; stage_count=int(kwargs.get('pyramid_num_stages',3))
     flow=SamplingBoundaryFlow(pipe.scheduler,clean_boundary,tuple(initial.shape[-2:]),stage_count)
     user_callback=kwargs.pop('callback_on_step_end',None)
+    original_block_noise=getattr(pipe,'sample_block_noise',None)
+    if not callable(original_block_noise): raise RuntimeError('pinned Helios stage2_sample must expose sample_block_noise')
+
+    def capture_block_noise(*args,**block_kwargs):
+        noise=original_block_noise(*args,**block_kwargs)
+        flow.record_block_noise(noise)
+        return noise
 
     def pre_hook(_module,args,call_kwargs):
         hidden=call_kwargs.get('hidden_states')
@@ -126,9 +141,11 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
         return {**callback_kwargs,'latents':latents}
 
     handle=pipe.transformer.register_forward_pre_hook(pre_hook,with_kwargs=True)
+    pipe.sample_block_noise=capture_block_noise
     try:
         result=pipe.stage2_sample(callback_on_step_end=callback,**kwargs)
     finally:
+        pipe.sample_block_noise=original_block_noise
         handle.remove()
     if len(flow.stages)!=stage_count: raise RuntimeError('Helios did not execute every configured boundary stage')
     result=result.clone(); result[:,:,:1]=_resize(clean_boundary,tuple(result.shape[-2:]))

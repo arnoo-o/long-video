@@ -98,9 +98,16 @@ class SightlinePipeline:
     def _resolve_memory_timestep(self, sigma:float, device):
         """Map the configured memory-write sigma through Helios' scheduler API."""
         scheduler=getattr(self.helios,'scheduler',None); sigma=float(sigma)
+        sigma_to_t=getattr(scheduler,'_sigma_to_t',None) if scheduler is not None else None
+        if callable(sigma_to_t):
+            timestep=torch.as_tensor(sigma_to_t(sigma),device=device,dtype=torch.float32)
+            if not torch.isfinite(timestep).all(): raise RuntimeError('memory capture scheduler returned a non-finite timestep')
+            return timestep
         if scheduler is not None and hasattr(scheduler,'sigmas') and hasattr(scheduler,'timesteps'):
             sigmas=torch.as_tensor(scheduler.sigmas,device=device,dtype=torch.float32)
             index=int(torch.argmin((sigmas-sigma).abs()).item())
+            if index>=len(scheduler.timesteps):
+                raise RuntimeError('scheduler clean sigma endpoint has no timestep mapping API')
             return torch.as_tensor(scheduler.timesteps[index],device=device)
         return torch.as_tensor(sigma,device=device,dtype=torch.float32)
 

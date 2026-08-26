@@ -180,6 +180,12 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     assert torch.equal(inference_memory.timestamp.weight,memory.timestamp.weight)
     with pytest.raises(RuntimeError,match='world size'):
         restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=True,rank=0,world_size=2)
+    migrated_config={'version':1,'ddp_world_size':4}; payload['config']={'version':1,'ddp_world_size':3}
+    from long_video.training.sightline_checkpoint import config_fingerprint
+    payload['config_fingerprint']=config_fingerprint(payload['config'])
+    with pytest.raises(RuntimeError,match='config mismatch'):
+        restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=migrated_config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=False)
+    assert restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=migrated_config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=True,rank=1,world_size=4,allow_world_size_migration=True)==12
     inference_source=Path(__file__).parents[1].joinpath('scripts/infer_sightline.py').read_text()
     assert 'timestamp.weight.data.zero_' not in inference_source
 

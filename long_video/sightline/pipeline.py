@@ -9,6 +9,10 @@ from .rays import chunk_cameras, temporal_group_cameras
 from .boundary import stage2_sample_with_boundary
 from .geometry import assert_latent_geometry, crop_video, pad_image_bottom_right, padded_size
 
+def boundary_enabled_for_chunk(chunk_index:int, off_from_chunk:int|None) -> bool:
+    if off_from_chunk is not None and int(off_from_chunk)<1: raise ValueError('boundary can only be disabled from chunk1 or later')
+    return int(chunk_index)==0 or off_from_chunk is None or int(chunk_index)<int(off_from_chunk)
+
 def prepare_source_condition(helios, image, *, height, width, device=None):
     """Use the pinned Helios image-conditioning path for training and inference."""
     device=device or helios._execution_device
@@ -158,7 +162,7 @@ class SightlinePipeline:
         self.memory.clear_active_memory()
 
     @torch.inference_mode()
-    def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps=None, c2w, intrinsics, attention_kwargs=None):
+    def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps=None, c2w, intrinsics, attention_kwargs=None, boundary_off_from_chunk=None):
         self.reset_sequence()
         if not self._source_initialized: self._source_initialized=True
         if num_frames<33 or (num_frames-1)%32: raise ValueError('Sightline inference requires 1+32*N frames')
@@ -181,9 +185,11 @@ class SightlinePipeline:
             current_ids=native_helios_indices(device,source.shape[0])['current']
             self._prepare_chunk(chunk,latent,runtime_kwargs,history_global_coverages=coverage,history_validity=validity,history_latent_hw=source.shape[-2:])
             boundary=None if chunk==0 else accumulated[:,:,-1:]
-            latent=stage2_sample_with_boundary(self.helios,clean_boundary=boundary,latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
+            constrain_boundary=boundary_enabled_for_chunk(chunk,boundary_off_from_chunk)
+            sampling_boundary=boundary if constrain_boundary else None
+            latent=stage2_sample_with_boundary(self.helios,clean_boundary=sampling_boundary,latents=latent,pyramid_num_stages=3,pyramid_num_inference_steps_list=stage_steps,prompt_embeds=prompt_embeds,negative_prompt_embeds=negative_embeds,guidance_scale=1.0,indices_hidden_states=current_ids,indices_latents_history_short=history['short'][1],indices_latents_history_mid=history['mid'][1],indices_latents_history_long=history['long'][1],latents_history_short=history['short'][0],latents_history_mid=history['mid'][0],latents_history_long=history['long'][0],attention_kwargs=runtime_kwargs,device=device,transformer_dtype=transformer_dtype,progress_bar=Progress())
             if chunk==0: latent[:,:,0:1]=source.to(latent)
-            else: latent[:,:,0:1]=boundary.to(latent)
+            elif constrain_boundary: latent[:,:,0:1]=boundary.to(latent)
             capture_history=history
             accumulated=self.append_stride32_latents(accumulated,latent)
             self.history_state.append_chunk(latent,chunk)

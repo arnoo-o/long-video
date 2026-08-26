@@ -634,6 +634,14 @@ def test_stride32_assembly_keeps_one_shared_boundary_per_chunk():
         accumulated=SightlinePipeline.append_stride32_latents(accumulated,value)
     assert accumulated.shape[2]==1+8*6
 
+def test_inference_boundary_off_is_diagnostic_and_never_affects_chunk0():
+    from long_video.sightline.pipeline import boundary_enabled_for_chunk
+    assert boundary_enabled_for_chunk(0,1)
+    assert not boundary_enabled_for_chunk(1,1)
+    assert not boundary_enabled_for_chunk(2,1)
+    assert boundary_enabled_for_chunk(1,None)
+    with pytest.raises(ValueError): boundary_enabled_for_chunk(1,0)
+
 def test_alpha_zero_baseline_disables_qk_memory_and_lora():
     from long_video.training.sightline import SightlineTrainable,LoRALinear,configure_alpha_zero_baseline
     from long_video.sightline.memory import LayerKVMemoryBank

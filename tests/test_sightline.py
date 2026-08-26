@@ -24,6 +24,16 @@ def test_scale_augmentation_gate_only_and_zero_alpha():
     torch.manual_seed(1); m=SightlineConditioner(16); r=torch.randn(2,3,7); q,k=m(r,training=False); assert q.shape==k.shape==(2,3,16)
     m.alpha_q.data.zero_(); m.alpha_k.data.zero_(); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
 
+def test_conditioner_numeric_capture_is_opt_in_and_value_preserving():
+    torch.manual_seed(7); module=SightlineConditioner(16).eval(); rays=torch.randn(2,3,7)
+    module.q_proj.weight.data.normal_(std=.01)
+    expected=module.project(rays,kind='q',training=False)
+    assert module.last_pre_norm_rms['q'] is None
+    module.capture_numeric_diagnostics=True
+    actual=module.project(rays,kind='q',training=False)
+    assert torch.equal(expected,actual)
+    assert module.last_pre_norm_rms['q'] > 0
+
 def test_history_six_chunks_causal_and_shared_boundary():
     h=HistoryManager(); src=torch.zeros(1); h.set_source(src)
     chunks=[[torch.tensor(float(c*32+i)) for i in range(33)] for c in range(6)]

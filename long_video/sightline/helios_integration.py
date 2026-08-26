@@ -17,6 +17,7 @@ class SightlineHeliosAttnProcessor:
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.residual_scale=1.0
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
+        self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
         self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
@@ -60,6 +61,18 @@ class SightlineHeliosAttnProcessor:
                 dk=torch.cat((dk[:,:len(flags)].masked_fill(~valid_mask,0),dk[:,len(flags):]),dim=1)
                 dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
+        if self.capture_numeric_diagnostics:
+            def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
+            def ratio(delta,native):
+                denominator=native.detach().float().norm().clamp_min(1e-30)
+                return float((delta.detach().float().norm()/denominator).cpu())
+            self.last_numeric_diagnostics={
+                'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],
+                'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
+                'delta_q_rms':rms(dq),'delta_k_rms':rms(dk),
+                'delta_q_over_q_native':ratio(dq,query),
+                'delta_k_over_k_native':ratio(dk,key),
+            }
         residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
         query=query+residual_scale*dq; key=key+residual_scale.to(key.dtype)*dk
         history_len=max(0,key.shape[1]-current_len)

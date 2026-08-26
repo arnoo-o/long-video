@@ -11,6 +11,11 @@ class SightlineConditioner(nn.Module):
         self.gate=nn.Linear(1,inner_dim)
         self.rms_norm_q=nn.RMSNorm(inner_dim,eps=eps)
         self.rms_norm_k=nn.RMSNorm(inner_dim,eps=eps)
+        # Opt-in, detached scalars for the standalone numerical diagnostic.
+        # Formal training never enables this flag and follows the exact same
+        # projection/RMSNorm path as before.
+        self.capture_numeric_diagnostics=False
+        self.last_pre_norm_rms={'q':None,'k':None}
         # Separate per-layer Q/K gains.  The terminal projections start at
         # zero, so alpha=1 still yields an exact native-Helios forward pass.
         self.alpha_q=nn.Parameter(torch.ones(())); self.alpha_k=nn.Parameter(torch.ones(()))
@@ -35,6 +40,8 @@ class SightlineConditioner(nn.Module):
         k_in=torch.cat((rays[...,3:6].to(parameter_dtype),rays[...,:3].to(parameter_dtype),s),-1)
         dim=self.q_proj.out_features
         value=self.q_proj(q_in) if kind=='q' else self.k_proj(k_in)
+        if self.capture_numeric_diagnostics:
+            self.last_pre_norm_rms[kind]=float(value.detach().float().square().mean().sqrt().cpu())
         value=(self.rms_norm_q if kind=='q' else self.rms_norm_k)(value)
         alpha=self.alpha_q if kind=='q' else self.alpha_k
         return (alpha.to(value.dtype)*g*value).to(output_dtype)

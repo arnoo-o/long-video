@@ -1,4 +1,4 @@
-"""Run with torchrun --standalone --nproc-per-node=4 to verify step0 identity."""
+"""Run with torchrun to verify step0 identity for the requested world size."""
 from __future__ import annotations
 import json, os, sys
 from pathlib import Path
@@ -20,7 +20,8 @@ class Transformer(torch.nn.Module):
 
 def main():
     dist.init_process_group('gloo',init_method='env://'); rank=dist.get_rank(); world=dist.get_world_size()
-    if world!=4: raise RuntimeError(f'expected exactly 4 ranks, got {world}')
+    expected=int(os.environ.get('EXPECTED_WORLD_SIZE','4'))
+    if world!=expected: raise RuntimeError(f'expected exactly {expected} ranks, got {world}')
     set_initialization_seed(); trainable=SightlineTrainable(8,layers=(0,),heads=2); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=8); transformer=Transformer(); install_lora(transformer,(0,),rank=8)
     if rank: next(trainable.parameters()).data.add_(rank)  # prove rank0 broadcast is authoritative
     digest=broadcast_and_assert_trainables(trainable,memory,transformer,world)

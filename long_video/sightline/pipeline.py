@@ -113,6 +113,10 @@ class SightlinePipeline:
         if sigma:
             capture_input=clean_latent + sigma*torch.randn_like(clean_latent)
         timestep=self._resolve_memory_timestep(sigma,capture_input.device)
+        if timestep.ndim==0: timestep=timestep.expand(capture_input.shape[0])
+        elif timestep.ndim!=1 or timestep.numel() not in (1,capture_input.shape[0]):
+            raise RuntimeError('memory capture scheduler timestep must be scalar or batch-shaped')
+        elif timestep.numel()==1 and capture_input.shape[0]!=1: timestep=timestep.expand(capture_input.shape[0])
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             if processor.memory is not None: processor.last_hidden_states=None
         capture_fn(capture_input,timestep)
@@ -136,8 +140,10 @@ class SightlinePipeline:
             pending=getattr(self,'_pending_camera_chunk',None)
             if pending is not None: self.camera_history.append_chunk(*pending); self._pending_camera_chunk=None
             return
-        if clean_latent is None: raise RuntimeError('chunk finalization requires its final clean latent')
-        self._capture_clean_memory(chunk_index,clean_latent,capture_fn)
+        memory_enabled=self.memory is not None and any(bank.enabled for bank in self.memory.banks.values())
+        if memory_enabled:
+            if clean_latent is None: raise RuntimeError('chunk finalization requires its final clean latent')
+            self._capture_clean_memory(chunk_index,clean_latent,capture_fn)
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is not None:
             self.camera_history.append_chunk(*pending)

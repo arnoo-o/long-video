@@ -424,7 +424,17 @@ def test_clean_memory_capture_uses_scheduler_endpoint_and_ignores_stale_hidden()
     def capture(clean,timestep):
         seen.append((clean.clone(),timestep.clone())); processor.last_hidden_states=torch.ones(1,2,4)
     runner._capture_clean_memory(0,torch.zeros(1,1,2,1,1),capture)
-    assert int(seen[0][1])==0 and torch.equal(memory.archive[0].tokens[0].hidden,torch.ones(1,1,4))
+    assert seen[0][1].shape==(1,) and int(seen[0][1])==0 and torch.equal(memory.archive[0].tokens[0].hidden,torch.ones(1,1,4))
+
+def test_disabled_memory_skips_clean_feature_capture():
+    from types import SimpleNamespace
+    from long_video.sightline.pipeline import SightlinePipeline
+    transformer=SimpleNamespace(_sightline_processors={})
+    config=SimpleNamespace(memory_layers=(0,),memory_budget=8,memory_pool=1,pyramid_steps=(2,2,2))
+    runner=SightlinePipeline(SimpleNamespace(transformer=transformer),config=config)
+    runner.memory.set_enabled(False); called=[]
+    runner._finalize_chunk(0,clean_latent=torch.zeros(1),capture_fn=lambda *_:called.append(1))
+    assert called==[]
 
 def test_key_identity_map_contains_native_current_and_memory():
     from long_video.sightline.memory import LongTermKVMemory,MemoryToken
@@ -468,6 +478,14 @@ def test_steps_override_is_effective_and_symmetric():
     from long_video.sightline.pipeline import SightlinePipeline
     assert SightlinePipeline.resolve_pyramid_steps((2,2,2),None)==(2,2,2)
     assert SightlinePipeline.resolve_pyramid_steps((2,2,2),4)==(4,4,4)
+
+def test_formal_config_accepts_explicit_reduced_ddp_world_size(tmp_path):
+    from long_video.config import load_sightline_config
+    source=Path(__file__).parents[1].joinpath('configs/sightline.yaml').read_text()
+    runtime=tmp_path/'sightline-3gpu.yaml'; runtime.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 3'))
+    assert load_sightline_config(runtime).ddp_world_size==3
+    invalid=tmp_path/'sightline-5gpu.yaml'; invalid.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 5'))
+    with pytest.raises(ValueError,match='DDP=1..4'): load_sightline_config(invalid)
 
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace

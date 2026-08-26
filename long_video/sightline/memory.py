@@ -37,10 +37,14 @@ def select_memory_chunks(archive:dict[int,MemoryChunk],*,query_chunk:int,query_c
                          retrieval_count:int=3)->tuple[MemoryChunk,...]:
     """Select only past chunks using known camera trajectories; never duplicates."""
     if tau_pos<=0 or tau_angle<=0 or retrieval_count<0: raise ValueError('invalid Memory retrieval configuration')
-    past={chunk_id:chunk for chunk_id,chunk in archive.items() if chunk_id<query_chunk}
+    native={int(value) for value in native_history_chunk_ids}
+    # Native history has priority: no active Memory chunk may duplicate it.
+    past={chunk_id:chunk for chunk_id,chunk in archive.items() if chunk_id<query_chunk and chunk_id not in native}
     selected=[]
+    # chunk0 is the permanent anchor, but becomes active only after it leaves
+    # Helios' native history window.
     if 0 in past: selected.append(past[0])
-    excluded={int(value) for value in native_history_chunk_ids}|{0,query_chunk}
+    excluded=native|{0,query_chunk}
     candidates=[chunk for chunk_id,chunk in past.items() if chunk_id not in excluded]
     candidates.sort(key=lambda chunk:(-_trajectory_score(query_camera_poses,chunk.camera_poses,tau_pos,tau_angle),chunk.chunk_id))
     selected.extend(candidates[:retrieval_count])
@@ -53,6 +57,7 @@ class LongTermKVMemory:
         self.budget=int(budget); self.pool=int(pool); self.tau_pos=float(tau_pos); self.tau_angle=float(tau_angle)
         self.archive:dict[int,MemoryChunk]={}; self.timestamp=None; self.rope=None; self.enabled=True; self.last_active_tokens=[]; self.last_selected_chunk_ids=()
         self._active_query_chunk=None; self._active_hidden=None; self._active_rays=None; self._active_tokens=()
+        self.protected_archive_chunk_ids=frozenset((0,))
 
     @property
     def tokens(self): return [token for chunk in self.archive.values() for token in chunk.tokens]
@@ -77,7 +82,17 @@ class LongTermKVMemory:
                     index=t*pooled_h*pooled_w+y*pooled_w+x
                     tokens.append(MemoryToken(hh[:,t,y,x].reshape(hh.shape[0],1,-1).detach().cpu(),rr[:,t,y,x].reshape(rr.shape[0],1,-1).detach().cpu(),int(chunk_index),index,t,y,x))
         chunk=MemoryChunk(int(chunk_index),tuple(tokens),camera_poses.detach().cpu(),tuple(int(chunk_index)*8+t for t in range(1,T)),int(chunk_index if timestamp is None else timestamp))
-        self.archive[int(chunk_index)]=chunk
+        chunk_id=int(chunk_index)
+        # A repeated capture must never silently replace the permanent anchor.
+        if chunk_id in self.protected_archive_chunk_ids and chunk_id in self.archive:
+            raise RuntimeError('permanent Memory anchor chunk0 cannot be overwritten')
+        self.archive[chunk_id]=chunk
+
+    def evict_archive_chunk(self,chunk_id:int) -> bool:
+        """Ordinary archive eviction; the permanent chunk0 anchor is protected."""
+        chunk_id=int(chunk_id)
+        if chunk_id in self.protected_archive_chunk_ids:return False
+        return self.archive.pop(chunk_id,None) is not None
 
     def select_chunks(self,current_chunk,query_camera_poses,native_history_chunk_ids=()):
         return select_memory_chunks(self.archive,query_chunk=int(current_chunk),query_camera_poses=query_camera_poses,native_history_chunk_ids=native_history_chunk_ids,tau_pos=self.tau_pos,tau_angle=self.tau_angle)

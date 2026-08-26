@@ -29,19 +29,28 @@ class BoundaryStage:
 
 
 def training_boundary_stages(items: list[dict], clean_boundary: torch.Tensor) -> tuple[BoundaryStage,...]:
-    """Construct the exact recursive Helios start/end path for temporal0."""
-    stages=[]; previous_end=None
+    """Apply Helios' native per-stage flow to a replaced temporal0 clean target."""
+    stages=[]; shapes=[tuple(item['noisy_latents'].shape[-2:]) for item in items]
+    # Match _pyramid_latents exactly: full -> half -> quarter, sequentially,
+    # and then consume the list coarse -> mid -> full.
+    current=_resize(clean_boundary,shapes[-1]); descending=[current]
+    for spatial in reversed(shapes[:-1]):
+        current=_resize(current,spatial); descending.append(current)
+    clean_pyramid=list(reversed(descending))
     for index,item in enumerate(items):
-        spatial=tuple(item['noisy_latents'].shape[-2:]); clean=_resize(clean_boundary,spatial)
+        spatial=tuple(item['noisy_latents'].shape[-2:]); clean=clean_pyramid[index]
         noise=item['noise'][:,:,:1]
         start_sigma=float(item['stage_start_sigma']); end_sigma=float(item['stage_end_sigma'])
         if index==0:
             start=noise
         else:
-            previous=_resize(previous_end,spatial)
-            start=start_sigma*noise+(1.0-start_sigma)*previous
+            # This is the same definition used for temporal1..8 by
+            # exact_flow_matching_items: upsample the previous clean pyramid,
+            # never the previous stage's noisy end point.
+            previous_clean=_resize(clean_pyramid[index-1],spatial)
+            start=start_sigma*noise+(1.0-start_sigma)*previous_clean
         end=clean if index==len(items)-1 else end_sigma*noise+(1.0-end_sigma)*clean
-        stage=BoundaryStage(index,start,end); stages.append(stage); previous_end=end
+        stages.append(BoundaryStage(index,start,end))
     return tuple(stages)
 
 
@@ -70,10 +79,14 @@ def _scheduler_coefficient(scheduler,timestep,*,after_step:bool) -> torch.Tensor
 
 
 class SamplingBoundaryFlow:
-    """Discover Helios' actual re-noised stage start and constrain its path."""
+    """Follow each stage start produced by Helios' native transition."""
     def __init__(self,scheduler,clean_boundary:torch.Tensor,full_spatial:tuple[int,int],stage_count:int):
         self.scheduler=scheduler; self.clean=clean_boundary; self.stage_count=stage_count
         self.spatial_to_stage={(full_spatial[0]//(2**(stage_count-1-index)),full_spatial[1]//(2**(stage_count-1-index))):index for index in range(stage_count)}
+        full=_resize(clean_boundary,full_spatial); descending=[full]; current=full
+        for divisor in (2**index for index in range(1,stage_count)):
+            current=_resize(current,(full_spatial[0]//divisor,full_spatial[1]//divisor)); descending.append(current)
+        self.clean_pyramid=tuple(reversed(descending))
         self.stages={}
 
     def stage_for(self,hidden:torch.Tensor) -> BoundaryStage:
@@ -82,19 +95,16 @@ class SamplingBoundaryFlow:
         index=self.spatial_to_stage[spatial]
         if index in self.stages: return self.stages[index]
         if index and index-1 not in self.stages: raise RuntimeError('Helios boundary stages were entered out of order')
-        start=hidden[:,:,:1].detach().clone(); clean=_resize(self.clean,spatial)
-        start_sigma=float(self.scheduler.start_sigmas[index]); end_sigma=float(self.scheduler.end_sigmas[index])
-        if index==0:
-            noise=start
-        else:
-            previous=_resize(self.stages[index-1].end,spatial)
-            noise=(start-(1.0-start_sigma)*previous)/max(start_sigma,1e-8)
-        end=clean if index==self.stage_count-1 else end_sigma*noise+(1.0-end_sigma)*clean
+        start=hidden[:,:,:1].detach().clone(); clean=self.clean_pyramid[index]
+        # The observed start already includes Helios' real nearest upsample and
+        # alpha*latent + beta*block_noise stage conversion.  Never reverse a
+        # noise value or invent a second transition for the boundary token.
+        end=clean
         stage=BoundaryStage(index,start,end); self.stages[index]=stage; return stage
 
 
 def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs):
-    """Constrain temporal0 before every Transformer call and after every step."""
+    """Constrain temporal0 along native Helios stages without replacing transitions."""
     if clean_boundary is None: return pipe.stage2_sample(**kwargs)
     initial=kwargs['latents']; stage_count=int(kwargs.get('pyramid_num_stages',3))
     flow=SamplingBoundaryFlow(pipe.scheduler,clean_boundary,tuple(initial.shape[-2:]),stage_count)

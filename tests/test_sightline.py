@@ -400,6 +400,28 @@ def test_memory_selector_is_anchor_plus_three_geometry_chunks_and_excludes_nativ
     selected=select_memory_chunks(memory.archive,query_chunk=8,query_camera_poses=_camera_trajectory(8.),native_history_chunk_ids={6,7},tau_pos=1.,tau_angle=1.)
     assert [chunk.chunk_id for chunk in selected]==[0,5,4,3]
     assert len({chunk.chunk_id for chunk in selected})==4 and all(chunk.chunk_id<8 for chunk in selected)
+    # Anchor is archived permanently but cannot duplicate native history.
+    selected=select_memory_chunks(memory.archive,query_chunk=8,query_camera_poses=_camera_trajectory(8.),native_history_chunk_ids={0,6,7},tau_pos=1.,tau_angle=1.)
+    assert [chunk.chunk_id for chunk in selected]==[5,4,3]
+    assert not ({chunk.chunk_id for chunk in selected}&{0,6,7})
+
+def test_memory_anchor_archive_is_permanent_and_only_activates_after_native_exit():
+    from long_video.sightline.memory import select_memory_chunks
+    memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
+    for chunk in range(5): memory.capture(hidden,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
+    assert not memory.evict_archive_chunk(0) and 0 in memory.archive
+    assert memory.evict_archive_chunk(4) and 4 not in memory.archive
+    with pytest.raises(RuntimeError,match='permanent Memory anchor'):
+        memory.capture(hidden,rays,0,grid_shape=(2,1,1),camera_poses=_camera_trajectory())
+    while_native=select_memory_chunks(memory.archive,query_chunk=3,query_camera_poses=_camera_trajectory(3.),native_history_chunk_ids={0,1,2})
+    assert while_native==()
+    after_exit=select_memory_chunks(memory.archive,query_chunk=4,query_camera_poses=_camera_trajectory(4.),native_history_chunk_ids={1,2,3})
+    assert [chunk.chunk_id for chunk in after_exit]==[0]
+
+def test_native_history_chunk_ownership_does_not_treat_source_as_anchor():
+    from long_video.sightline.history import covered_history_chunk_ids
+    assert covered_history_chunk_ids({'short':((0,),()),'mid':(), 'long':()},4)==set()
+    assert covered_history_chunk_ids({'short':((0,),(1,8)),'mid':((9,16),),'long':()},4)=={0,1}
 
 def test_memory_active_bank_prepared_once_and_cleared_without_archive_loss():
     from long_video.sightline.memory import LongTermKVMemory
@@ -599,8 +621,10 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
             latents=self.stage_noises[0].clone()
             for stage in range(3):
                 if stage:
-                    previous=torch.nn.functional.interpolate(latents.flatten(0,2).unsqueeze(1),size=self.stage_noises[stage].shape[-2:],mode='bilinear',align_corners=False).squeeze(1).reshape_as(self.stage_noises[stage])
-                    sigma=self.scheduler.start_sigmas[stage]; latents=sigma*self.stage_noises[stage]+(1-sigma)*previous
+                    # Match the pinned inference transition: nearest upsample,
+                    # followed by alpha*latent + beta*block_noise.
+                    previous=torch.nn.functional.interpolate(latents.flatten(0,2).unsqueeze(1),size=self.stage_noises[stage].shape[-2:],mode='nearest').squeeze(1).reshape_as(self.stage_noises[stage])
+                    latents=.8*previous+.2*self.stage_noises[stage]
                 self.scheduler.timesteps=torch.tensor([2.,1.]);self.scheduler.sigmas=torch.tensor([1.,0.,0.])
                 for index,timestep in enumerate(self.scheduler.timesteps):
                     self.transformer(hidden_states=latents,timestep=timestep)
@@ -609,14 +633,41 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
             return latents
     pipe=Pipe(); clean=torch.full((1,2,1,8,8),-3.); output=stage2_sample_with_boundary(pipe,clean_boundary=clean,latents=torch.zeros(1,2,9,8,8),pyramid_num_stages=3)
     assert torch.equal(output[:,:,:1],clean)
+    clean_pyramid=[clean]
+    for noise in reversed(pipe.stage_noises[:-1]):
+        value=clean_pyramid[-1]; resized=torch.nn.functional.interpolate(value.flatten(0,2).unsqueeze(1),size=noise.shape[-2:],mode='bilinear',align_corners=False).squeeze(1)
+        clean_pyramid.append(resized.reshape(1,2,1,*noise.shape[-2:]))
+    clean_pyramid=list(reversed(clean_pyramid))
     items=[]
     for stage,noise in enumerate(pipe.stage_noises):
-        items.append({'noisy_latents':noise.clone(),'target':torch.zeros_like(noise),'noise':noise.clone(),'sigmas':torch.full((1,1,1,1,1),.35),'stage_start_sigma':pipe.scheduler.start_sigmas[stage],'stage_end_sigma':pipe.scheduler.end_sigmas[stage]})
+        clean_stage=clean_pyramid[stage].expand(-1,-1,9,-1,-1)
+        if stage==0: native_start=noise
+        else:
+            previous=clean_pyramid[stage-1].expand(-1,-1,9,-1,-1); flat=previous.flatten(0,2).unsqueeze(1)
+            previous=torch.nn.functional.interpolate(flat,size=noise.shape[-2:],mode='bilinear',align_corners=False).squeeze(1).reshape_as(noise)
+            native_start=pipe.scheduler.start_sigmas[stage]*noise+(1-pipe.scheduler.start_sigmas[stage])*previous
+        native_end=clean_stage if stage==2 else pipe.scheduler.end_sigmas[stage]*noise+(1-pipe.scheduler.end_sigmas[stage])*clean_stage
+        sigma=torch.full((1,1,1,1,1),.35); noisy=sigma*native_start+(1-sigma)*native_end
+        items.append({'noisy_latents':noisy,'target':native_start-native_end,'noise':noise.clone(),'sigmas':sigma,'stage_start_sigma':pipe.scheduler.start_sigmas[stage],'stage_end_sigma':pipe.scheduler.end_sigmas[stage]})
     stages=training_boundary_stages(items,clean); constrained=constrain_flow_items(items,clean)
     for stage in range(3):
-        assert torch.allclose(pipe.transformer.seen[stage*2][:,:,:1],stages[stage].start)
-        assert torch.allclose(pipe.transformer.seen[stage*2+1][:,:,:1],stages[stage].end)
-        assert torch.allclose(constrained[stage]['target'][:,:,:1],stages[stage].start-stages[stage].end)
+        noise=pipe.stage_noises[stage][:,:,:1]; clean_stage=clean_pyramid[stage]
+        expected_start=noise if stage==0 else pipe.scheduler.start_sigmas[stage]*noise+(1-pipe.scheduler.start_sigmas[stage])*torch.nn.functional.interpolate(clean_pyramid[stage-1].flatten(0,2).unsqueeze(1),size=noise.shape[-2:],mode='bilinear',align_corners=False).squeeze(1).reshape_as(clean_stage)
+        expected_end=clean_stage if stage==2 else pipe.scheduler.end_sigmas[stage]*noise+(1-pipe.scheduler.end_sigmas[stage])*clean_stage
+        assert torch.allclose(stages[stage].start,expected_start)
+        assert torch.allclose(stages[stage].end,expected_end)
+        assert torch.allclose(constrained[stage]['target'][:,:,:1],expected_start-expected_end)
+        # With identical clean/noise inputs, temporal0 is numerically identical
+        # to the untouched native temporal1 flow in every stage.
+        assert torch.allclose(constrained[stage]['noisy_latents'][:,:,:1],items[stage]['noisy_latents'][:,:,1:2])
+        assert torch.allclose(constrained[stage]['target'][:,:,:1],items[stage]['target'][:,:,1:2])
+    # Inference stage starts are the actual native transition outputs.  With
+    # stage0 ending at clean=-3, the fake native alpha/beta transitions yield
+    # .8*-3+.2*4=-1.6 and .8*-3+.2*6=-1.2.
+    native_starts=(2.,-1.6,-1.2)
+    for stage,expected in enumerate(native_starts):
+        assert torch.allclose(pipe.transformer.seen[stage*2][:,:,:1],torch.full_like(pipe.transformer.seen[stage*2][:,:,:1],expected))
+        assert torch.allclose(pipe.transformer.seen[stage*2+1][:,:,:1],torch.full_like(pipe.transformer.seen[stage*2+1][:,:,:1],-3.))
 
 def test_boundary_scheduler_resolves_helios_integer_transformer_timestep():
     from types import SimpleNamespace

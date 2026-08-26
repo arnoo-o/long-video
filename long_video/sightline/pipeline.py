@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
 import torch
-from .history import CameraHistoryState,NativeHistoryState,native_helios_indices
+from .history import CameraHistoryState,NativeHistoryState,native_helios_indices,covered_history_chunk_ids
 from .memory import LayerKVMemoryBank
 from .rays import chunk_cameras, temporal_group_cameras
 from .boundary import stage2_sample_with_boundary
@@ -92,7 +92,7 @@ class SightlinePipeline:
             history_validity={'long':tuple(bool(c) for c in history_global_coverages.get('long',())), 'mid':tuple(bool(c) for c in history_global_coverages.get('mid',())), 'short':tuple(True for _ in history_global_coverages.get('short',()))}
         self.ray_provider.set_context(chunk_index=chunk_index,c2w=cameras,intrinsics=K,latent_cameras=reps,history_groups=history_groups,history_token_shapes=history_token_shapes,history_global_coverages=history_global_coverages,history_validity=history_validity,stage_shapes=shapes,token_shape=shapes[0])
         if self.memory is not None and any(bank.enabled for bank in self.memory.banks.values()):
-            native_chunks={int(identity)//8 for groups in history_global_coverages.values() for covered in groups for identity in covered if int(identity)//8 < int(chunk_index)}
+            native_chunks=covered_history_chunk_ids(history_global_coverages,chunk_index)
             self.memory.prepare_active_memory(query_chunk=chunk_index,query_camera_poses=cameras,
                 native_history_chunk_ids=native_chunks,device=latents.device,dtype=latents.dtype)
         self._pending_camera_chunk=(list(reps.unbind(1)),frame_ids,list(repK.unbind(1)))

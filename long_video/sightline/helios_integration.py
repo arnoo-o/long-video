@@ -4,6 +4,7 @@ import hashlib
 import torch
 from .conditioning import SightlineConditioner
 from .rays import token_rays_for_shape, plucker_rays
+from .history import covered_history_chunk_ids
 
 def helio_source_fingerprint(source_text: str) -> str:
     return hashlib.sha256(source_text.encode()).hexdigest()
@@ -101,7 +102,7 @@ class SightlineHeliosAttnProcessor:
             if self.ray_provider.context is None: raise RuntimeError('memory attention requires active Sightline context')
             active_chunk=int(self.ray_provider.context['chunk_index']); current_global_start=active_chunk*8
             coverages=self.ray_provider.context.get('history_global_coverages') or {}
-            native_chunks={int(identity)//8 for groups in coverages.values() for covered in groups for identity in covered if int(identity)//8<active_chunk}
+            native_chunks=covered_history_chunk_ids(coverages,active_chunk)
             key,value,self.last_attention_meta=self.memory.append_native_attention(
                 attn,key,value,rotary_emb,self.rotary_apply,
                 current_chunk=active_chunk,current_global_start=current_global_start,

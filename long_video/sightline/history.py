@@ -10,6 +10,18 @@ def native_helios_indices(device=None, batch_size=1):
     def row(values): return torch.tensor(values,device=device,dtype=torch.long).view(1,-1).expand(batch_size,-1)
     return {'long':row(range(1,17)),'mid':row((17,18)),'short':row((0,19)),'current':row(range(20,29))}
 
+def covered_history_chunk_ids(coverages,current_chunk:int) -> set[int]:
+    """Map global latent IDs to completed owner chunks; source ID 0 is not chunk0."""
+    result=set()
+    for groups in coverages.values():
+        for covered in groups:
+            for identity in covered:
+                identity=int(identity)
+                if identity<=0: continue
+                owner=(identity-1)//8
+                if owner<int(current_chunk): result.add(owner)
+    return result
+
 class NativeHistoryState:
     """One causal FIFO shared by training, rollout and inference."""
     def __init__(self, source_latent, fake_image_latent=None):

@@ -99,10 +99,13 @@ def _scheduler_coefficient(scheduler,timestep,*,after_step:bool) -> torch.Tensor
 
 class SamplingBoundaryFlow:
     """Consume Helios' observed starts and its actual block-noise samples."""
-    def __init__(self,scheduler,clean_boundary:torch.Tensor,full_spatial:tuple[int,int],stage_count:int):
+    def __init__(self,scheduler,clean_boundary:torch.Tensor,full_spatial:tuple[int,int],stage_count:int,transformer_dtype:torch.dtype):
         self.scheduler=scheduler; self.clean=clean_boundary; self.stage_count=stage_count
+        self.transformer_dtype=transformer_dtype
         self.spatial_to_stage={(full_spatial[0]//(2**(stage_count-1-index)),full_spatial[1]//(2**(stage_count-1-index))):index for index in range(stage_count)}
-        full=_resize(clean_boundary,full_spatial); descending=[full]; current=full
+        # Boundary algebra stays FP32.  Casting occurs only where Helios would
+        # write temporal0 back into its native latent tensor.
+        full=_resize(clean_boundary.float(),full_spatial); descending=[full]; current=full
         for divisor in (2**index for index in range(1,stage_count)):
             current=_resize(current,(full_spatial[0]//divisor,full_spatial[1]//divisor)); descending.append(current)
         self.clean_pyramid=tuple(reversed(descending))
@@ -112,7 +115,9 @@ class SamplingBoundaryFlow:
         """Record the exact noise Helios sampled for stage1, then stage2."""
         index=len(self.block_noise)+1
         if not 1<=index<self.stage_count: raise RuntimeError('unexpected extra Helios block-noise sample')
-        self.block_noise[index]=noise[:,:,:1].detach().clone()
+        # Match Helios' one native sampler conversion before alpha/beta.  The
+        # stored value is subsequently promoted to FP32 for boundary algebra.
+        self.block_noise[index]=noise.to(dtype=self.transformer_dtype)[:,:,:1].detach().clone()
 
     def stage_for(self,hidden:torch.Tensor) -> BoundaryStage:
         spatial=tuple(hidden.shape[-2:])
@@ -120,30 +125,44 @@ class SamplingBoundaryFlow:
         index=self.spatial_to_stage[spatial]
         if index in self.stages: return self.stages[index]
         if index and index-1 not in self.stages: raise RuntimeError('Helios boundary stages were entered out of order')
-        start=hidden[:,:,:1].detach().clone(); clean=self.clean_pyramid[index]
+        observed_start=hidden[:,:,:1].detach().float().clone(); clean=self.clean_pyramid[index]
         if index==0:
-            noise=start
+            # Stage0 has no preceding native transition.  Its observable
+            # scheduler start is the flow-basis noise.
+            start=observed_start; noise=start
         else:
             block=self.block_noise.get(index)
             if block is None: raise RuntimeError(f'Helios stage{index} block noise was not captured before Transformer entry')
-            # Helios converts the sampled block noise to transformer_dtype
-            # before applying alpha/beta.  Keep that rounding point here: the
-            # captured value is the raw sampler result, not the native stage
-            # noise yet.
-            block=block.to(device=start.device,dtype=start.dtype)
-            previous=self.stages[index-1]; previous_noise=self.effective_noise[index-1]
-            previous_clean=_resize_nearest(self.clean_pyramid[index-1],spatial)
-            previous_noise=_resize_nearest(previous_noise,spatial)
-            previous_end=float(self.scheduler.end_sigmas[index-1])*previous_noise+(1.0-float(self.scheduler.end_sigmas[index-1]))*previous_clean
+            block=block.to(device=observed_start.device,dtype=torch.float32)
+            previous=self.stages[index-1]
+            # Helios transitions its scheduler latent, which remains FP32
+            # between stages; only Transformer inputs are cast separately.
+            # Nearest therefore operates on the FP32 prior endpoint.
+            previous_end=_resize_nearest(previous.end,spatial)
             alpha,beta=_stage_transition_coefficients(self.scheduler,index)
-            native_start=(alpha*previous_end+beta*block).to(start)
+            native_start=alpha*previous_end+beta*block
             start_sigma=float(self.scheduler.start_sigmas[index])
             if start_sigma<=0: raise RuntimeError(f'Helios stage{index} start sigma must be positive')
-            # This is the full effective pyramid noise: it expands the same
-            # native nearest+alpha/beta transition in the training flow basis.
-            noise=((native_start-(1.0-start_sigma)*previous_clean)/start_sigma).to(start)
-            if not torch.allclose(native_start,start,rtol=2e-3,atol=2e-3):
-                raise RuntimeError(f'Helios stage{index} native transition disagrees with captured start')
+            # `_upsample()` in training defines the clean term in the flow
+            # basis.  It is intentionally bilinear, unlike the native stage
+            # transition above.
+            previous_clean=_resize(self.clean_pyramid[index-1],spatial)
+            noise=(native_start-(1.0-start_sigma)*previous_clean)/start_sigma
+            # Transformer sees the native scheduler latent after its sole
+            # input conversion to transformer_dtype.  Keep the full FP32
+            # start for boundary algebra and compare in that observable form.
+            projected=native_start.to(hidden).float()
+            # stage0's full scheduler start is observed through the
+            # Transformer BF16 input, so its recursive contribution can carry
+            # one BF16 quantization unit into later stages.
+            if not torch.allclose(projected,observed_start,rtol=1e-2,atol=2e-2):
+                error=(projected-observed_start).abs()
+                raise RuntimeError(
+                    f'Helios stage{index} native transition disagrees with captured start '
+                    f'(max={float(error.max()):.6g}, mean={float(error.mean()):.6g}, '
+                    f'native_rms={float(native_start.square().mean().sqrt()):.6g}, '
+                    f'observed_rms={float(observed_start.square().mean().sqrt()):.6g})')
+            start=native_start
         self.effective_noise[index]=noise
         end=clean if index==self.stage_count-1 else (
             float(self.scheduler.end_sigmas[index])*noise+(1.0-float(self.scheduler.end_sigmas[index]))*clean)
@@ -154,7 +173,7 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
     """Constrain temporal0 along native Helios stages without replacing transitions."""
     if clean_boundary is None: return pipe.stage2_sample(**kwargs)
     initial=kwargs['latents']; stage_count=int(kwargs.get('pyramid_num_stages',3))
-    flow=SamplingBoundaryFlow(pipe.scheduler,clean_boundary,tuple(initial.shape[-2:]),stage_count)
+    flow=SamplingBoundaryFlow(pipe.scheduler,clean_boundary,tuple(initial.shape[-2:]),stage_count,kwargs.get('transformer_dtype',initial.dtype))
     user_callback=kwargs.pop('callback_on_step_end',None)
     original_block_noise=getattr(pipe,'sample_block_noise',None)
     if not callable(original_block_noise): raise RuntimeError('pinned Helios stage2_sample must expose sample_block_noise')
@@ -168,7 +187,7 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
         hidden=call_kwargs.get('hidden_states')
         if hidden is None: return args,call_kwargs
         stage=flow.stage_for(hidden); coefficient=_scheduler_coefficient(pipe.scheduler,call_kwargs['timestep'],after_step=False)
-        hidden=hidden.clone(); hidden[:,:,:1]=stage.at(coefficient)
+        hidden=hidden.clone(); hidden[:,:,:1]=stage.at(coefficient).to(hidden)
         call_kwargs=dict(call_kwargs); call_kwargs['hidden_states']=hidden
         return args,call_kwargs
 
@@ -176,7 +195,7 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
         if user_callback is not None: callback_kwargs=user_callback(owner,step,timestep,callback_kwargs)
         latents=callback_kwargs['latents'].clone(); stage=flow.stage_for(latents)
         coefficient=_scheduler_coefficient(pipe.scheduler,timestep,after_step=True)
-        latents[:,:,:1]=stage.at(coefficient)
+        latents[:,:,:1]=stage.at(coefficient).to(latents)
         return {**callback_kwargs,'latents':latents}
 
     handle=pipe.transformer.register_forward_pre_hook(pre_hook,with_kwargs=True)

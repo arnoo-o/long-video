@@ -635,7 +635,7 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
                     latents=latents+.25
                     latents=callback_on_step_end(self,index,timestep,{'latents':latents})['latents']
             return latents
-    pipe=Pipe(); clean=torch.full((1,2,1,8,8),-3.); output=stage2_sample_with_boundary(pipe,clean_boundary=clean,latents=torch.zeros(1,2,9,8,8),pyramid_num_stages=3)
+    pipe=Pipe(); clean=torch.arange(128.,dtype=torch.float32).reshape(1,2,1,8,8); output=stage2_sample_with_boundary(pipe,clean_boundary=clean,latents=torch.zeros(1,2,9,8,8),pyramid_num_stages=3)
     assert torch.equal(output[:,:,:1],clean)
     clean_pyramid=[clean]
     for noise in reversed(pipe.stage_noises[:-1]):
@@ -674,7 +674,10 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
         if stage:
             previous_end=expected_ends[-1]; alpha,beta=_stage_transition_coefficients(pipe.scheduler,stage)
             native_start=alpha*torch.nn.functional.interpolate(previous_end.flatten(0,2).unsqueeze(1),size=pipe.stage_noises[stage].shape[-2:],mode='nearest').squeeze(1).reshape_as(clean_stage)+beta*pipe.stage_noises[stage][:,:,:1]
-            prior_clean=torch.nn.functional.interpolate(clean_pyramid[stage-1].flatten(0,2).unsqueeze(1),size=pipe.stage_noises[stage].shape[-2:],mode='nearest').squeeze(1).reshape_as(clean_stage)
+            # Training's flow basis uses bilinear previous-clean upsample;
+            # the native endpoint transition above intentionally remains
+            # nearest.
+            prior_clean=torch.nn.functional.interpolate(clean_pyramid[stage-1].flatten(0,2).unsqueeze(1),size=pipe.stage_noises[stage].shape[-2:],mode='bilinear',align_corners=False).squeeze(1).reshape_as(clean_stage)
             effective.append((native_start-(1-pipe.scheduler.start_sigmas[stage])*prior_clean)/pipe.scheduler.start_sigmas[stage]); expected_starts.append(native_start)
         endpoint=clean_stage if stage==2 else pipe.scheduler.end_sigmas[stage]*effective[stage]+(1-pipe.scheduler.end_sigmas[stage])*clean_stage
         expected_ends.append(endpoint)

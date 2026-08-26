@@ -572,6 +572,13 @@ def test_shared_clean_boundary_training_and_sampling_use_same_three_stage_flow()
         assert torch.allclose(pipe.transformer.seen[stage*2+1][:,:,:1],stages[stage].end)
         assert torch.allclose(constrained[stage]['target'][:,:,:1],stages[stage].start-stages[stage].end)
 
+def test_boundary_scheduler_resolves_helios_integer_transformer_timestep():
+    from types import SimpleNamespace
+    from long_video.sightline.boundary import _scheduler_coefficient
+    scheduler=SimpleNamespace(timesteps=torch.tensor([998.999,412.75]),sigmas=torch.tensor([.9,.4,0.]))
+    assert torch.equal(_scheduler_coefficient(scheduler,torch.tensor([998],dtype=torch.int64),after_step=False),scheduler.sigmas[0])
+    assert torch.equal(_scheduler_coefficient(scheduler,scheduler.timesteps[0],after_step=True),scheduler.sigmas[1])
+
 def test_stride32_assembly_keeps_one_shared_boundary_per_chunk():
     from long_video.sightline.pipeline import SightlinePipeline
     accumulated=None

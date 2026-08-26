@@ -55,9 +55,16 @@ def constrain_flow_items(items: list[dict], clean_boundary: torch.Tensor) -> lis
 
 
 def _scheduler_coefficient(scheduler,timestep,*,after_step:bool) -> torch.Tensor:
-    times=scheduler.timesteps; needle=torch.as_tensor(timestep,device=times.device).reshape(-1)[0]
+    times=scheduler.timesteps; raw=torch.as_tensor(timestep,device=times.device); needle=raw.reshape(-1)[0]
     matches=torch.nonzero(torch.isclose(times.float(),needle.float()),as_tuple=False).flatten()
+    # Helios deliberately casts the timestep passed to the Transformer to
+    # int64, while scheduler.step receives the original floating-point value.
+    # Resolve the pre-hook coordinate through that same legal cast instead of
+    # requiring equality with the scheduler's unrounded local timestep.
+    if not len(matches) and not torch.is_floating_point(raw):
+        matches=torch.nonzero(times.to(dtype=raw.dtype)==needle,as_tuple=False).flatten()
     if not len(matches): raise RuntimeError(f'scheduler timestep {float(needle)} has no local coefficient')
+    if len(matches)!=1: raise RuntimeError(f'scheduler timestep {float(needle)} is ambiguous in the local schedule')
     index=int(matches[0])+int(after_step)
     return scheduler.sigmas[min(index,len(scheduler.sigmas)-1)]
 

@@ -75,6 +75,7 @@ class LongTermKVMemory:
         self.archive:dict[int,MemoryChunk]={}; self.timestamp=None; self.rope=None; self.enabled=True; self.last_active_tokens=[]; self.last_selected_chunk_ids=()
         self._active_query_chunk=None; self._active_hidden=None; self._active_rays=None; self._active_tokens=()
         self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
+        self._active_identity_metadata=()
         self.protected_archive_chunk_ids=frozenset((0,))
 
     @property
@@ -131,7 +132,7 @@ class LongTermKVMemory:
         return tokens
 
     def prepare_active_memory(self, *, query_chunk:int, query_camera_poses:torch.Tensor,
-                              native_history_chunk_ids=(), device=None, dtype=None, selected_chunk_ids=None):
+                              native_history_chunk_ids=(), device=None, dtype=None, selected_chunk_ids=None, identity_metadata=None):
         """Select and materialize the complete active chunks once per query chunk."""
         query_chunk=int(query_chunk)
         if self._active_query_chunk == query_chunk: return self.last_selected_chunk_ids
@@ -149,14 +150,24 @@ class LongTermKVMemory:
             self._active_x=torch.cat([chunk.pooled_x for chunk in chunks]).to(device=device)
             self._active_global_ids=torch.cat([chunk.global_latent_ids for chunk in chunks]).to(device=device)
             self._active_chunk_ids=torch.cat([torch.full((chunk.token_count,),chunk.chunk_id,dtype=torch.long) for chunk in chunks]).to(device=device)
+            # Build Python identity data once from CPU archive metadata.  The
+            # processor reuses this cache; no GPU tensor is converted to a list
+            # while denoising or attending.
+            self._active_identity_metadata=tuple(
+                (int(global_id),int(y),int(x))
+                for chunk in chunks
+                for global_id,y,x in zip(chunk.global_latent_ids.tolist(),chunk.pooled_y.tolist(),chunk.pooled_x.tolist())
+            ) if identity_metadata is None else tuple(identity_metadata)
         else:
             self._active_hidden=self._active_rays=None
             self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
+            self._active_identity_metadata=()
         return self.last_selected_chunk_ids
 
     def clear_active_memory(self):
         self._active_query_chunk=None; self._active_hidden=None; self._active_rays=None; self._active_tokens=()
         self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
+        self._active_identity_metadata=()
         self.last_active_tokens=[]; self.last_selected_chunk_ids=()
 
     def get(self,current_global_start=None,*,query_camera_poses=None,native_history_chunk_ids=(),device=None,dtype=None):
@@ -210,12 +221,11 @@ class LongTermKVMemory:
         if memory_type_embedding is not None:
             if memory_type_embedding.numel()!=mem_k.shape[2]*mem_k.shape[3]: raise RuntimeError('memory type embedding does not match Memory K head dimension')
             mem_k=mem_k+memory_type_embedding.to(mem_k).view(1,1,mem_k.shape[2],mem_k.shape[3])
-        meta={'memory_tokens':mem_k.shape[1],'memory_chunk_count':len(self.last_selected_chunk_ids),'memory_chunk_ids':list(self.last_selected_chunk_ids),'memory_global_ids':self._active_global_ids.tolist()}
+        meta={'memory_tokens':mem_k.shape[1],'memory_chunk_count':len(self.last_selected_chunk_ids),'memory_chunk_ids':list(self.last_selected_chunk_ids),'memory_global_ids':tuple(global_id for global_id,_,_ in self._active_identity_metadata)}
         return torch.cat((key,mem_k),1),torch.cat((value,mem_v),1),meta
 
     def active_identity_metadata(self):
-        if self._active_global_ids is None:return ()
-        return tuple(zip(self._active_global_ids.tolist(),self._active_y.tolist(),self._active_x.tolist()))
+        return self._active_identity_metadata
 
     def _memory_rays(self):
         return torch.cat([chunk.rays for chunk in self.archive.values()],1) if self.archive else None
@@ -248,8 +258,17 @@ class LayerKVMemoryBank(nn.Module):
             self._selected_query_chunk=int(query_chunk); self._selected_chunk_ids=selected_ids
         for bank in self.banks.values():
             if any(chunk_id not in bank.archive for chunk_id in selected_ids): raise RuntimeError('Memory layer archives differ in complete chunk membership')
-        return {layer: bank.prepare_active_memory(query_chunk=query_chunk,query_camera_poses=query_camera_poses,
-            device=device,dtype=dtype,selected_chunk_ids=selected_ids) for layer,bank in self.banks.items()}
+        # Capture identity metadata once from the reference archive and share it
+        # across the three equal-layout Memory layers.
+        reference.prepare_active_memory(query_chunk=query_chunk,query_camera_poses=query_camera_poses,
+            device=device,dtype=dtype,selected_chunk_ids=selected_ids)
+        identity_metadata=reference.active_identity_metadata()
+        result={layer:reference.last_selected_chunk_ids for layer,bank in self.banks.items() if bank is reference}
+        for layer,bank in self.banks.items():
+            if bank is reference: continue
+            result[layer]=bank.prepare_active_memory(query_chunk=query_chunk,query_camera_poses=query_camera_poses,
+                device=device,dtype=dtype,selected_chunk_ids=selected_ids,identity_metadata=identity_metadata)
+        return result
     def clear_active_memory(self):
         for bank in self.banks.values(): bank.clear_active_memory()
         self._selected_query_chunk=None; self._selected_chunk_ids=()

@@ -13,7 +13,7 @@ import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled, prefix_chunk_can_enter_active_memory, correspondence_capture_for_stage
+from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
@@ -196,8 +196,19 @@ def _mapped_correspondences(processor,rows,chunk,identity_index=None):
                     source='memory' if ki in memory else ('native' if ki in native else ('source' if ki in source_keys else 'current'))
                     bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(columns['weight'][row_index])),source)
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
-    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]; sources=['memory' if any(value[1]=='memory' for value in grouped[query].values()) and not any(value[1] in ('source','native','current') for value in grouped[query].values()) else ('native' if any(value[1]=='native' for value in grouped[query].values()) else ('source' if any(value[1]=='source' for value in grouped[query].values()) else 'current')) for query in selected]
-    return selected,positives,weights,sources
+    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]
+    flags=[{'has_native_positive':any(value[1] in ('native','source','current') for value in grouped[query].values()),'has_memory_positive':any(value[1]=='memory' for value in grouped[query].values())} for query in selected]
+    return selected,positives,weights,flags
+
+def _sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed):
+    if len(selected)<=max_rows:return selected,positives,weights,flags
+    memory_indices=[i for i,flag in enumerate(flags) if flag['has_memory_positive']]
+    generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed) & ((1<<63)-1))
+    order=torch.randperm(len(selected),generator=generator).tolist()
+    memory_set=set(memory_indices); memory_order=[i for i in order if i in memory_set]
+    chosen_memory=memory_order[:max_rows]; chosen_memory_set=set(chosen_memory)
+    choice=(chosen_memory+[i for i in order if i not in chosen_memory_set])[:max_rows]
+    return ([selected[i] for i in choice],[positives[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
 
 def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
@@ -209,17 +220,11 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
         if processor.last_key_identities!=identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first.last_q.shape[1] or processor.last_k.shape[1]!=first.last_k.shape[1]:
             raise RuntimeError('correspondence layers must have identical key identity maps for shared mapping')
     mapping_started=time.perf_counter()
-    try: selected,positives,weights,sources=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
+    try: selected,positives,weights,flags=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
     except RuntimeError as exc:
         if 'do not map' not in str(exc): raise
-        selected=positives=weights=sources=[]
-    if len(selected)>max_rows:
-        memory_indices=[i for i,source in enumerate(sources) if source=='memory']
-        generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed) & ((1<<63)-1))
-        order=torch.randperm(len(selected),generator=generator).tolist()
-        choice=([memory_indices[0]] if memory_indices else []) + [i for i in order if i not in memory_indices[:1]]
-        choice=choice[:max_rows]
-        selected=[selected[i] for i in choice]; positives=[positives[i] for i in choice]; weights=[weights[i] for i in choice]
+        selected=positives=weights=flags=[]
+    selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
     if timings is not None: timings['correspondence_mapping_seconds']+=time.perf_counter()-mapping_started
     losses=[]; loss_started=time.perf_counter()
     for layer in layers:
@@ -435,7 +440,7 @@ def main():
                 return _model_prediction(pipe,clean_input,{'timesteps':timestep},prompt_embeds,_history,_chunk*8)
             generated_prefix.append(generated.detach())
             history_state.append_chunk(generated,chunk)
-            capture_memory=phase['name']!='P3' or prefix_chunk_can_enter_active_memory(chunk,train_chunk)
+            capture_memory=phase['name']!='P3' or prefix_chunk_should_capture_memory(chunk,train_chunk)
             timing_sync(); memory_timings=runner._finalize_chunk(chunk,clean_latent=generated.detach(),capture_fn=clean_capture,capture_memory=capture_memory); timing_sync()
             for name,value in memory_timings.items(): perf[name]+=value
             for processor in pipe.transformer._sightline_processors.values():

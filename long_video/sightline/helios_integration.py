@@ -152,7 +152,7 @@ class SightlineRayProvider:
         base=int(context['chunk_index'])*8
         identities.extend(('current',(base+t,),y,x,'current') for t in range(T) for y in range(H) for x in range(W))
         if memory is not None and memory.enabled:
-            identities.extend(('memory',(token.chunk_index*8+token.temporal,),token.pooled_y,token.pooled_x,'memory') for token in memory.last_active_tokens)
+            identities.extend(('memory',(global_id,),y,x,'memory') for global_id,y,x in memory.active_identity_metadata())
         return tuple(identities)
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape

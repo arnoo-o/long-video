@@ -113,14 +113,32 @@ def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, confi
     validate_checkpoint(payload,config=config,helios_fingerprint=helios_fingerprint,layers=layers,memory_config=memory_config,allow_memory_layer_migration=allow_memory_layer_migration,allow_world_size_migration=allow_world_size_migration)
     if provenance is not None and not _provenance_matches(payload.get('runtime_provenance'),provenance): raise RuntimeError('Sightline checkpoint runtime provenance mismatch')
     trainable.load_state_dict(payload['trainable'],strict=True)
-    if not allow_memory_layer_migration: memory.load_state_dict(payload['memory'],strict=True)
+    memory_missing_type=False
+    if not allow_memory_layer_migration:
+        missing,unexpected=memory.load_state_dict(payload['memory'],strict=False)
+        # Existing checkpoints predate the zero-initialized type marker.  It is
+        # the only allowed omission; all new checkpoints restore strictly.
+        if unexpected or set(missing) not in (set(),{'memory_type_embedding'}):
+            raise RuntimeError(f'checkpoint Memory parameter set mismatch: missing={missing}, unexpected={unexpected}')
+        memory_missing_type='memory_type_embedding' in missing
     missing,unexpected=transformer.load_state_dict(payload.get('lora',{}),strict=False)
     unexpected=[name for name in unexpected if 'lora_' in name]
     expected={name for name,_ in transformer.named_parameters() if 'lora_' in name}
     if unexpected or not expected.issubset(payload.get('lora',{})): raise RuntimeError('checkpoint LoRA parameter set mismatch')
     if optimizer is not None:
         if payload.get('optimizer') is None: raise RuntimeError('checkpoint has no optimizer state')
-        optimizer.load_state_dict(payload['optimizer'])
+        optimizer_state=payload['optimizer']
+        if memory_missing_type:
+            # The zero-initialized type marker was added after checkpoint 999.
+            # Preserve all old optimizer moments and give only this new scalar
+            # vector a fresh Adam state in the existing Memory parameter group.
+            optimizer_state={key:value for key,value in optimizer_state.items()}
+            optimizer_state['state']=dict(optimizer_state['state'])
+            optimizer_state['param_groups']=[dict(group) for group in optimizer_state['param_groups']]
+            current_groups=optimizer.state_dict()['param_groups']
+            if len(current_groups)!=len(optimizer_state['param_groups']): raise RuntimeError('checkpoint optimizer group layout mismatch')
+            for saved,current in zip(optimizer_state['param_groups'],current_groups): saved['params']=list(current['params'])
+        optimizer.load_state_dict(optimizer_state)
     if scheduler is not None:
         if payload.get('scheduler') is None: raise RuntimeError('checkpoint has no scheduler state')
         scheduler.load_state_dict(payload['scheduler'])

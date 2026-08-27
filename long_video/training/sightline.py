@@ -18,7 +18,7 @@ def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None
     return int(torch.randint(minimum,max_chunks,(1,),generator=generator).item())
 
 def assert_trainable_whitelist(module: nn.Module) -> None:
-    allowed=("conditioner.","memory.timestamp.","lora_")
+    allowed=("conditioner.","memory.timestamp.","memory.memory_type_embedding","lora_")
     bad=[name for name,p in module.named_parameters() if p.requires_grad and not name.startswith(allowed)]
     if bad: raise RuntimeError(f"Sightline trainable whitelist violation: {bad[:8]}")
 
@@ -128,12 +128,9 @@ def run_causal_prefix_chunks(max_chunks, train_chunk, forward_chunk):
     assert_single_backward_chunk(policies,train_chunk)
     return outputs,policies
 
-def prefix_chunk_can_enter_active_memory(chunk_index:int, final_query_chunk:int) -> bool:
-    """Whether a completed chunk can leave Helios' 19-latent history in this rollout."""
-    if not 0<=int(chunk_index)<int(final_query_chunk): return False
-    # A completed chunk contributes eight new temporal identities.  The native
-    # 19-latent FIFO still covers it for the next three query chunks.
-    return int(final_query_chunk)-int(chunk_index)>=4
+def prefix_chunk_should_capture_memory(chunk_index:int, train_chunk:int) -> bool:
+    """Every completed prefix may serve the next query; the backward chunk cannot."""
+    return 0<=int(chunk_index)<int(train_chunk)
 
 def correspondence_capture_for_stage(stage_index:int,stage_count:int,enabled:bool) -> bool:
     if not 0<=int(stage_index)<int(stage_count): raise ValueError('stage index outside flow')

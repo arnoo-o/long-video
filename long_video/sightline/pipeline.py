@@ -211,7 +211,7 @@ class SightlinePipeline:
                     latents_history_short=_history['short'][0],indices_latents_history_short=_history['short'][1],
                     attention_kwargs={'current_chunk':_chunk})
                 return output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
-            self._finalize_chunk(chunk,clean_latent=latent,capture_fn=clean_capture); self._active_chunk=chunk+1
+            self._finalize_chunk(chunk,clean_latent=latent,capture_fn=clean_capture,capture_memory=chunk+1<chunks); self._active_chunk=chunk+1
         if accumulated is None or accumulated.shape[2]!=1+8*chunks: raise RuntimeError('stride-32 latent assembly failed')
         decoded=vae.decode(accumulated.to(vae.dtype)/std+mean,return_dict=False)[0]
         expected_frames=1+32*chunks; decoded=decoded[:,:,:expected_frames]

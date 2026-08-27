@@ -61,7 +61,7 @@ def test_history_ray_count_must_be_exact():
         provider(torch.zeros(1,4,8),key_length=9,current_length=4)
 
 def test_train_chunk_policy_is_single_and_causal():
-    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan, run_single_graph_chunks, run_causal_prefix_chunks, prefix_chunk_can_enter_active_memory, correspondence_capture_for_stage
+    from long_video.training.sightline import chunk_grad_policy, assert_single_backward_chunk, causal_chunk_plan, run_single_graph_chunks, run_causal_prefix_chunks, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
     train_chunk=2; policies=[chunk_grad_policy(i,train_chunk) for i in range(6)]
     assert policies[:2]==["forward_detached"]*2 and policies[2]=="backward"
     assert policies[3:]==["rollout_detached"]*3
@@ -72,8 +72,8 @@ def test_train_chunk_policy_is_single_and_causal():
     assert [out.requires_grad for out in outputs]==[False,False,True,False]
     seen=[]; outputs,policies=run_causal_prefix_chunks(3,2,lambda chunk,grad: seen.append((chunk,grad)) or weight*(chunk+1))
     assert seen==[(0,False),(1,False),(2,True)] and len(outputs)==3 and policies==('forward_detached','forward_detached','backward')
-    assert not any(prefix_chunk_can_enter_active_memory(chunk,1) for chunk in (0,1))
-    assert [chunk for chunk in range(5) if prefix_chunk_can_enter_active_memory(chunk,4)]==[0]
+    assert [chunk for chunk in range(2) if prefix_chunk_should_capture_memory(chunk,1)]==[0]
+    assert [chunk for chunk in range(5) if prefix_chunk_should_capture_memory(chunk,4)]==[0,1,2,3]
     assert [correspondence_capture_for_stage(stage,3,True) for stage in range(3)]==[False,False,True]
 
 def test_camera_first_curriculum_uses_fixed_unit_origin():
@@ -158,6 +158,22 @@ def test_memory_rope_recent_past_latent_is_position_18():
     tokens=memory.active_tokens(8,query_camera_poses=_camera_trajectory(1.)); rope=memory.memory_rotary_emb(tokens,torch.device('cpu'),8)
     assert torch.equal(rope[0,:,0],torch.tensor([12.,13.,14.,15.,16.,17.,18.,18.]))
 
+def test_memory_type_embedding_changes_only_long_term_k():
+    from long_video.sightline.memory import LayerKVMemoryBank
+    class Rope:
+        def forward_with_positions(self,t,y,x,device): return torch.zeros(1,6,t.shape[1],device=device)
+    class Attn:
+        heads=2; to_k=torch.nn.Identity(); to_v=torch.nn.Identity(); norm_k=torch.nn.Identity()
+    bank=LayerKVMemoryBank((16,),budget=8,pool=1,hidden_dim=4); bank.bind_rope(Rope()); memory=bank.for_layer(16)
+    memory.capture(torch.arange(8,dtype=torch.float32).reshape(1,2,4),torch.randn(1,2,7),0,grid_shape=(2,1,1),camera_poses=_camera_trajectory())
+    memory.prepare_active_memory(query_chunk=1,query_camera_poses=_camera_trajectory(1.),device='cpu',dtype=torch.float32)
+    key=torch.zeros(1,1,2,2); value=torch.zeros_like(key)
+    zero_k,zero_v,_=memory.append_native_attention(Attn(),key,value,None,lambda tensor,rotary:tensor,current_chunk=1,current_global_start=8)
+    bank.memory_type_embedding.data.copy_(torch.tensor([1.,2.,3.,4.]))
+    typed_k,typed_v,_=memory.append_native_attention(Attn(),key,value,None,lambda tensor,rotary:tensor,current_chunk=1,current_global_start=8)
+    assert torch.equal(typed_v,zero_v) and torch.equal(typed_k[:,:1],zero_k[:,:1])
+    assert torch.allclose(typed_k[:,1:]-zero_k[:,1:],torch.tensor([[[[1.,2.],[3.,4.]]]]))
+
 def test_memory_append_extends_attention_mask_to_final_key_length():
     class Rope:
         def forward_with_positions(self,t,y,x,device): return torch.stack((t,y,x,t,y,x),1)
@@ -188,6 +204,7 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     trainable=SightlineTrainable(4,heads=1); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); transformer=Transformer(); install_lora(transformer,[0])
     for alpha in trainable.conditioner.alpha_parameters(): alpha.data.fill_(.7)
     memory.timestamp.weight.data.fill_(.3)
+    memory.memory_type_embedding.data.fill_(.4)
     next(p for n,p in transformer.named_parameters() if 'lora_up' in n).data.fill_(.2)
     optimizer=torch.optim.AdamW(list(trainable.parameters())+list(memory.parameters())); scheduler=torch.optim.lr_scheduler.StepLR(optimizer,1); optimizer.step(); scheduler.step()
     torch.manual_seed(123); np.random.seed(456); path=tmp_path/'checkpoint.pt'; save_runtime_checkpoint(path,trainable,memory,transformer,optimizer,scheduler,12,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config); expected_random=torch.rand(1); expected_numpy=np.random.rand()
@@ -197,12 +214,17 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     assert {'trainable','memory','lora','optimizer','scheduler','step','rng_torch','rng_python','rng_numpy','rng_cuda','rng_states','rng_world_size'}.issubset(payload)
     assert payload['rng_world_size']==1 and len(payload['rng_states'])==1 and payload['rng_states'][0].dtype==torch.uint8
     step=restore_runtime_checkpoint(payload,target,target_memory,target_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,optimizer=target_optimizer,scheduler=target_scheduler,restore_rng=True)
-    assert step==12 and all(torch.allclose(alpha,torch.tensor(.7)) for alpha in target.conditioner.alpha_parameters()) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3))
+    assert step==12 and all(torch.allclose(alpha,torch.tensor(.7)) for alpha in target.conditioner.alpha_parameters()) and torch.allclose(target_memory.timestamp.weight,torch.full_like(target_memory.timestamp.weight,.3)) and torch.allclose(target_memory.memory_type_embedding,torch.full_like(target_memory.memory_type_embedding,.4))
     assert torch.allclose(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),torch.full_like(next(p for n,p in target_transformer.named_parameters() if 'lora_up' in n),.2))
     assert torch.equal(torch.rand(1),expected_random) and np.random.rand()==expected_numpy and target_scheduler.last_epoch==scheduler.last_epoch
     inference_target=SightlineTrainable(4,heads=1); inference_memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); inference_transformer=Transformer(); install_lora(inference_transformer,[0])
     restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=False)
-    assert torch.equal(inference_memory.timestamp.weight,memory.timestamp.weight)
+    assert torch.equal(inference_memory.timestamp.weight,memory.timestamp.weight) and torch.equal(inference_memory.memory_type_embedding,memory.memory_type_embedding)
+    legacy_payload={key:value for key,value in payload.items()}; legacy_payload['memory']=dict(payload['memory']); legacy_payload['memory'].pop('memory_type_embedding')
+    legacy_memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4); legacy_target=SightlineTrainable(4,heads=1); legacy_transformer=Transformer(); install_lora(legacy_transformer,[0])
+    legacy_optimizer=torch.optim.AdamW(list(legacy_target.parameters())+list(legacy_memory.parameters()))
+    restore_runtime_checkpoint(legacy_payload,legacy_target,legacy_memory,legacy_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,optimizer=legacy_optimizer,restore_rng=False)
+    assert torch.count_nonzero(legacy_memory.memory_type_embedding)==0
     with pytest.raises(RuntimeError,match='world size'):
         restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=True,rank=0,world_size=2)
     migrated_config={'version':1,'ddp_world_size':4}; payload['config']={'version':1,'ddp_world_size':3}
@@ -407,20 +429,20 @@ def test_history_rays_project_each_camera_then_match_helios_temporal_pooling():
     long_last=projector.project(plucker_rays(groups['long'][0][:,3::4],groups['long'][1][:,3::4],1,1,source_height=32,source_width=32)).reshape(1,4,4)
     assert not torch.allclose(actual[:,:4],long_last)
 
-def test_memory_selector_is_anchor_plus_three_geometry_chunks_and_excludes_native_history():
+def test_memory_selector_is_anchor_plus_three_geometry_chunks_and_may_overlap_native_history():
     from long_video.sightline.memory import select_memory_chunks
     memory=LongTermKVMemory(budget=100,pool=1)
     hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
     for chunk in range(9): memory.capture(hidden,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
     selected=select_memory_chunks(memory.archive,query_chunk=8,query_camera_poses=_camera_trajectory(8.),native_history_chunk_ids={6,7},tau_pos=1.,tau_angle=1.)
-    assert [chunk.chunk_id for chunk in selected]==[0,5,4,3]
+    assert [chunk.chunk_id for chunk in selected]==[0,7,6,5]
     assert len({chunk.chunk_id for chunk in selected})==4 and all(chunk.chunk_id<8 for chunk in selected)
-    # Anchor is archived permanently but cannot duplicate native history.
+    # The scene Memory path is independent and may overlap native history.
     selected=select_memory_chunks(memory.archive,query_chunk=8,query_camera_poses=_camera_trajectory(8.),native_history_chunk_ids={0,6,7},tau_pos=1.,tau_angle=1.)
-    assert [chunk.chunk_id for chunk in selected]==[5,4,3]
-    assert not ({chunk.chunk_id for chunk in selected}&{0,6,7})
+    assert [chunk.chunk_id for chunk in selected]==[0,7,6,5]
+    assert {0,6,7}.issubset({chunk.chunk_id for chunk in selected})
 
-def test_memory_anchor_archive_is_permanent_and_only_activates_after_native_exit():
+def test_memory_anchor_archive_is_permanent_and_active_inside_native_history():
     from long_video.sightline.memory import select_memory_chunks
     memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
     for chunk in range(5): memory.capture(hidden,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
@@ -429,9 +451,9 @@ def test_memory_anchor_archive_is_permanent_and_only_activates_after_native_exit
     with pytest.raises(RuntimeError,match='permanent Memory anchor'):
         memory.capture(hidden,rays,0,grid_shape=(2,1,1),camera_poses=_camera_trajectory())
     while_native=select_memory_chunks(memory.archive,query_chunk=3,query_camera_poses=_camera_trajectory(3.),native_history_chunk_ids={0,1,2})
-    assert while_native==()
+    assert [chunk.chunk_id for chunk in while_native]==[0,2,1]
     after_exit=select_memory_chunks(memory.archive,query_chunk=4,query_camera_poses=_camera_trajectory(4.),native_history_chunk_ids={1,2,3})
-    assert [chunk.chunk_id for chunk in after_exit]==[0]
+    assert [chunk.chunk_id for chunk in after_exit]==[0,3,2,1]
 
 def test_native_history_chunk_ownership_does_not_treat_source_as_anchor():
     from long_video.sightline.history import covered_history_chunk_ids
@@ -450,6 +472,18 @@ def test_memory_active_bank_prepared_once_and_cleared_without_archive_loss():
     assert memory.get(16,query_camera_poses=_camera_trajectory(2.),device='cpu')[0].shape[1]==2
     memory.clear_active_memory()
     assert not memory.last_active_tokens and memory.archive.keys()=={0,1,2}
+
+def test_layer_memory_banks_select_once_and_share_chunk_ids():
+    from long_video.sightline.memory import LayerKVMemoryBank
+    memory=LayerKVMemoryBank((16,20,24),budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
+    for bank in memory.banks.values():
+        for chunk in range(3): bank.capture(hidden+chunk,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
+    calls=[]
+    for bank in memory.banks.values():
+        original=bank.select_chunks
+        bank.select_chunks=lambda *args,_original=original,**kwargs:(calls.append(1) or _original(*args,**kwargs))
+    memory.prepare_active_memory(query_chunk=2,query_camera_poses=_camera_trajectory(2.),native_history_chunk_ids={0,1},device='cpu',dtype=torch.float32)
+    assert calls==[1] and all(bank.last_selected_chunk_ids==(0,1) for bank in memory.banks.values())
 
 def test_memory_active_empty_bank_does_not_reselect():
     from long_video.sightline.memory import LongTermKVMemory
@@ -539,15 +573,17 @@ def test_processor_residual_scale_matches_q_plus_s_delta():
     assert torch.allclose(seen[0][0],native_q+.2*dq) and torch.allclose(seen[0][1],native_k+.2*dk)
 
 def test_key_identity_map_contains_native_current_and_memory():
-    from long_video.sightline.memory import LongTermKVMemory,MemoryToken
+    from long_video.sightline.memory import LongTermKVMemory
     provider=SightlineRayProvider(source_height=8,source_width=8)
     cameras=torch.eye(4).view(1,1,4,4).expand(1,9,-1,-1); K=torch.eye(3).view(1,1,3,3).expand(1,9,-1,-1)
     shapes={'long':(1,1,1),'mid':(1,1,1),'short':(1,1,1)}; coverage={'long':((1,2,3,4),),'mid':((5,6),),'short':((7,),)}
     provider.set_context(chunk_index=1,c2w=cameras,intrinsics=K,history_token_shapes=shapes,history_global_coverages=coverage,stage_shapes=((9,1,1),),token_shape=(9,1,1))
-    memory=LongTermKVMemory(); memory.last_active_tokens=[MemoryToken(0,0,4,2,3)]
+    memory=LongTermKVMemory(budget=200,pool=1)
+    memory.capture(torch.zeros(1,9*3*4,4),torch.zeros(1,9*3*4,7),0,grid_shape=(9,3,4),camera_poses=_camera_trajectory())
+    memory.prepare_active_memory(query_chunk=1,query_camera_poses=_camera_trajectory(1.),device='cpu',dtype=torch.float32)
     identities=provider.key_identities(9,memory)
     assert identities[:3]==(('native',(1,2,3,4),0,0,'long'),('native',(5,6),0,0,'mid'),('native',(7,),0,0,'short'))
-    assert ('current',(8,),0,0,'current') in identities and identities[-1]==('memory',(4,),2,3,'memory')
+    assert ('current',(8,),0,0,'current') in identities and identities[-1]==('memory',(8,),2,3,'memory')
 
 def test_p3_corr_loss_selected_queries_forward_backward():
     from types import SimpleNamespace
@@ -570,8 +606,8 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     for layer in (16,20,24):
         q=torch.randn(1,1,2,2,requires_grad=True); k=torch.randn(1,3,2,2,requires_grad=True)
         processors[layer]=SimpleNamespace(last_q=q,last_k=k,last_current_length=1,ray_provider=SimpleNamespace(context={'stage_shapes':((1,1,1),)}),last_key_identities=identities,last_attention_bias=None)
-    selected,positives,weights,sources=training._mapped_correspondences(processors[16],rows,1)
-    assert selected==[0] and positives==[[0]] and weights==[.7] and sources==['native']
+    selected,positives,weights,flags=training._mapped_correspondences(processors[16],rows,1)
+    assert selected==[0] and positives==[[0]] and weights==[.7] and flags==[{'has_native_positive':True,'has_memory_positive':False}]
     calls=[]; original=training._mapped_correspondences
     def counted(*args,**kwargs): calls.append(1); return original(*args,**kwargs)
     monkeypatch.setattr(training,'_mapped_correspondences',counted)
@@ -580,6 +616,18 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     processors[24].last_key_identities=identities[:-1]
     with pytest.raises(RuntimeError,match='identical key identity maps'):
         training._corr_loss(SightlineTrainable(4,layers=(16,20,24),heads=2),processors,rows,1,(16,20,24),8)
+
+def test_native_memory_overlap_is_multi_positive_and_memory_rows_survive_sampling():
+    from types import SimpleNamespace
+    import scripts.train_sightline_rgbd as training
+    identities=(('native',(1,),0,0,'short'),('current',(8,),0,0,'current'),('memory',(1,),0,0,'memory'))
+    processor=SimpleNamespace(last_q=torch.randn(1,1,2,2),last_k=torch.randn(1,3,2,2),last_current_length=1,ray_provider=SimpleNamespace(context={'stage_shapes':((1,1,1),)}),last_key_identities=identities)
+    rows=[{'query_chunk':1,'query_latent_temporal':0,'query_y':0,'query_x':0,'key_chunk':0,'key_latent_temporal':1,'key_y':0,'key_x':0,'weight':.9}]
+    selected,positives,weights,flags=training._mapped_correspondences(processor,rows,1)
+    assert selected==[0] and positives==[[0,2]] and weights==[.9]
+    assert flags==[{'has_native_positive':True,'has_memory_positive':True}]
+    sampled=training._sample_correspondence_mapping(list(range(5)),[[i] for i in range(5)],[1.]*5,[{'has_native_positive':True,'has_memory_positive':i in (3,4)} for i in range(5)],2,7)
+    assert len(sampled[0])==2 and all(flag['has_memory_positive'] for flag in sampled[3])
 
 def test_memory_shared_boundaries_are_unique_and_future_filtered():
     memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,9,4); rays=torch.randn(1,9,7)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from types import SimpleNamespace
+import time
 import torch
 from .history import CameraHistoryState,NativeHistoryState,native_helios_indices,covered_history_chunk_ids
 from .memory import LayerKVMemoryBank
@@ -128,38 +129,47 @@ class SightlinePipeline:
         elif timestep.ndim!=1 or timestep.numel() not in (1,capture_input.shape[0]):
             raise RuntimeError('memory capture scheduler timestep must be scalar or batch-shaped')
         elif timestep.numel()==1 and capture_input.shape[0]!=1: timestep=timestep.expand(capture_input.shape[0])
-        for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
-            if processor.memory is not None: processor.last_hidden_states=None
-        capture_fn(capture_input,timestep)
+        memory_processors=[processor for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values() if processor.memory is not None and processor.memory.enabled]
+        for processor in memory_processors:
+            processor.last_hidden_states=None; processor.capture_memory_hidden=True
+        clean_started=time.perf_counter()
+        try: capture_fn(capture_input,timestep)
+        finally:
+            clean_seconds=time.perf_counter()-clean_started
+            for processor in memory_processors: processor.capture_memory_hidden=False
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is None: raise RuntimeError('Memory capture has no camera trajectory metadata')
         camera_poses=torch.stack(pending[0],1)
-        captured=0
-        for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
-            if processor.memory is None or processor.last_hidden_states is None: continue
+        captured=0; archive_started=time.perf_counter()
+        for processor in memory_processors:
+            if processor.last_hidden_states is None: continue
             hidden=processor.last_hidden_states[:, -processor.last_current_length:]
             shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==processor.last_current_length),None)
             if shape is None: raise RuntimeError('clean Memory capture hidden shape is not a current Helios grid')
             rays=self.ray_provider.current_rays(shape)
             processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays,camera_poses=camera_poses,timestamp=chunk_index)
             processor.last_hidden_states=None; captured+=1
-        if captured != len([p for p in getattr(self.helios.transformer,'_sightline_processors',{}).values() if p.memory is not None]):
+        archive_seconds=time.perf_counter()-archive_started
+        if captured != len(memory_processors):
             raise RuntimeError('clean Memory capture did not visit every enabled memory layer')
+        return {'memory_clean_forward_seconds':clean_seconds,'memory_archive_write_seconds':archive_seconds}
 
-    def _finalize_chunk(self, chunk_index, clean_latent=None, capture_fn=None):
+    def _finalize_chunk(self, chunk_index, clean_latent=None, capture_fn=None, *, capture_memory=True):
         if self.ray_provider is None:
             pending=getattr(self,'_pending_camera_chunk',None)
             if pending is not None: self.camera_history.append_chunk(*pending); self._pending_camera_chunk=None
-            return
+            return {'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0}
         memory_enabled=self.memory is not None and any(bank.enabled for bank in self.memory.banks.values())
-        if memory_enabled:
+        timings={'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0}
+        if memory_enabled and capture_memory:
             if clean_latent is None: raise RuntimeError('chunk finalization requires its final clean latent')
-            self._capture_clean_memory(chunk_index,clean_latent,capture_fn)
+            timings=self._capture_clean_memory(chunk_index,clean_latent,capture_fn)
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is not None:
             self.camera_history.append_chunk(*pending)
             self._pending_camera_chunk=None
         self.memory.clear_active_memory()
+        return timings
 
     @torch.inference_mode()
     def generate(self, *, image, prompt, negative_prompt, height, width, num_frames, steps=None, c2w, intrinsics, attention_kwargs=None, boundary_off_from_chunk=None):

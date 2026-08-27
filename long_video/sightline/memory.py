@@ -7,17 +7,36 @@ from torch import nn
 
 @dataclass
 class MemoryToken:
-    hidden:torch.Tensor; ray:torch.Tensor; chunk_index:int; token_index:int
-    temporal:int; pooled_y:int; pooled_x:int
+    chunk_index:int; token_index:int; temporal:int; pooled_y:int; pooled_x:int
 
 
 @dataclass
 class MemoryChunk:
     chunk_id:int
-    tokens:tuple[MemoryToken,...]
+    hidden:torch.Tensor
+    rays:torch.Tensor
+    temporal:tuple[int,...]
+    pooled_y:tuple[int,...]
+    pooled_x:tuple[int,...]
     camera_poses:torch.Tensor
     global_latent_ids:tuple[int,...]
     timestamp:int
+
+    def __post_init__(self):
+        count=int(self.hidden.shape[1])
+        if self.hidden.ndim!=3 or self.rays.ndim!=3 or self.rays.shape[:2]!=self.hidden.shape[:2] or self.rays.shape[-1]!=7:
+            raise ValueError('MemoryChunk hidden/rays must be [B,N,D] and [B,N,7]')
+        if any(len(values)!=count for values in (self.temporal,self.pooled_y,self.pooled_x)):
+            raise ValueError('MemoryChunk metadata must match its token axis')
+        if not self.hidden.is_contiguous() or not self.rays.is_contiguous():
+            raise ValueError('MemoryChunk tensors must be contiguous')
+
+    @property
+    def token_count(self): return int(self.hidden.shape[1])
+
+    @property
+    def tokens(self):
+        return tuple(MemoryToken(self.chunk_id,index,self.temporal[index],self.pooled_y[index],self.pooled_x[index]) for index in range(self.token_count))
 
 
 def _trajectory_score(query:torch.Tensor,history:torch.Tensor,tau_pos:float,tau_angle:float)->float:
@@ -75,13 +94,16 @@ class LongTermKVMemory:
         if ray_recompute is not None: rr=ray_recompute((T,H//self.pool,W//self.pool)).reshape_as(rr)
         rr[...,:3]=rr[...,:3]/rr[...,:3].norm(dim=-1,keepdim=True).clamp_min(1e-6)
         rr[...,3:6]=rr[...,3:6]/rr[...,3:6].norm(dim=-1,keepdim=True).clamp_min(1e-6)
-        pooled_h,pooled_w=H//self.pool,W//self.pool; tokens=[]
-        for t in range(1,T):
-            for y in range(pooled_h):
-                for x in range(pooled_w):
-                    index=t*pooled_h*pooled_w+y*pooled_w+x
-                    tokens.append(MemoryToken(hh[:,t,y,x].reshape(hh.shape[0],1,-1).detach().cpu(),rr[:,t,y,x].reshape(rr.shape[0],1,-1).detach().cpu(),int(chunk_index),index,t,y,x))
-        chunk=MemoryChunk(int(chunk_index),tuple(tokens),camera_poses.detach().cpu(),tuple(int(chunk_index)*8+t for t in range(1,T)),int(chunk_index if timestamp is None else timestamp))
+        pooled_h,pooled_w=H//self.pool,W//self.pool
+        # Discard temporal0 before flattening.  Each payload crosses to CPU as
+        # one contiguous tensor; never create or transfer per-token tensors.
+        hidden_chunk=hh[:,1:].reshape(hh.shape[0],-1,hh.shape[-1]).contiguous().detach().cpu()
+        ray_chunk=rr[:,1:].reshape(rr.shape[0],-1,rr.shape[-1]).contiguous().detach().cpu()
+        temporal=tuple(t for t in range(1,T) for _ in range(pooled_h*pooled_w))
+        pooled_y=tuple(y for _ in range(1,T) for y in range(pooled_h) for _ in range(pooled_w))
+        pooled_x=tuple(x for _ in range(1,T) for _ in range(pooled_h) for x in range(pooled_w))
+        global_ids=tuple(int(chunk_index)*8+t for t in temporal)
+        chunk=MemoryChunk(int(chunk_index),hidden_chunk,ray_chunk,temporal,pooled_y,pooled_x,camera_poses.detach().cpu(),global_ids,int(chunk_index if timestamp is None else timestamp))
         chunk_id=int(chunk_index)
         # A repeated capture must never silently replace the permanent anchor.
         if chunk_id in self.protected_archive_chunk_ids and chunk_id in self.archive:
@@ -122,9 +144,9 @@ class LongTermKVMemory:
             raise RuntimeError(f'complete active Memory chunks exceed token budget: {len(tokens)}>{self.budget}')
         self.last_active_tokens=list(tokens); self.last_selected_chunk_ids=tuple(chunk.chunk_id for chunk in chunks)
         self._active_query_chunk=query_chunk; self._active_native_history=tuple(int(x) for x in native_history_chunk_ids); self._active_tokens=tokens
-        if tokens:
-            self._active_hidden=torch.cat([token.hidden for token in tokens],1).to(device=device,dtype=dtype)
-            self._active_rays=torch.cat([token.ray for token in tokens],1).to(device=device,dtype=dtype)
+        if chunks:
+            self._active_hidden=torch.cat([chunk.hidden for chunk in chunks],1).to(device=device,dtype=dtype)
+            self._active_rays=torch.cat([chunk.rays for chunk in chunks],1).to(device=device,dtype=dtype)
         else:
             self._active_hidden=self._active_rays=None
         return tokens
@@ -140,10 +162,11 @@ class LongTermKVMemory:
             return self._active_hidden.to(device=device,dtype=dtype), self._active_rays.to(device=device,dtype=dtype)
         tokens=self.active_tokens(current_global_start,query_camera_poses=query_camera_poses,native_history_chunk_ids=native_history_chunk_ids)
         if not tokens: return None,None
-        hidden=torch.cat([token.hidden for token in tokens],1); rays=torch.cat([token.ray for token in tokens],1)
+        chunks=self.select_chunks(current_chunk,query_camera_poses,native_history_chunk_ids)
+        hidden=torch.cat([chunk.hidden for chunk in chunks],1); rays=torch.cat([chunk.rays for chunk in chunks],1)
         return hidden.to(device=device,dtype=dtype),rays.to(device=device,dtype=dtype)
 
-    def __len__(self): return sum(len(chunk.tokens) for chunk in self.archive.values())
+    def __len__(self): return sum(chunk.token_count for chunk in self.archive.values())
 
     def position_metadata(self,tokens,device,current_global_start):
         if not tokens:return None
@@ -182,7 +205,7 @@ class LongTermKVMemory:
         return torch.cat((key,mem_k),1),torch.cat((value,mem_v),1),meta
 
     def _memory_rays(self):
-        return torch.cat([token.ray for token in self.tokens],1) if self.tokens else None
+        return torch.cat([chunk.rays for chunk in self.archive.values()],1) if self.archive else None
 
 
 class LayerKVMemoryBank(nn.Module):

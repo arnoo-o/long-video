@@ -5,7 +5,7 @@ Records own their 3- or 6-chunk geometry.  This deliberately permits mixed
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 from typing import Iterator
@@ -22,6 +22,14 @@ REQUIRED_KEYS = (
     "frame_count", "chunk_count", "height", "width",
 )
 
+@dataclass(frozen=True)
+class CorrespondenceSlice:
+    arrays:dict[str,np.ndarray]
+    indices:np.ndarray
+
+    def __len__(self): return int(self.indices.size)
+    def column(self,name): return self.arrays[name][self.indices]
+
 
 def expected_frame_count(chunk_count: int) -> int:
     if not 1 <= int(chunk_count) <= 6:
@@ -33,6 +41,8 @@ def expected_frame_count(chunk_count: int) -> int:
 class RGBDMemoryRecord:
     raw: dict
     root: Path
+    _correspondence_arrays:dict[str,np.ndarray]|None=field(default=None,init=False,repr=False,compare=False)
+    _correspondence_by_query:tuple[np.ndarray,...]|None=field(default=None,init=False,repr=False,compare=False)
 
     @property
     def record_id(self) -> str:
@@ -111,8 +121,9 @@ class RGBDMemoryRecord:
             return {}
         if "correspondence_cache" not in self.raw:
             raise ValueError(f"{self.record_id}: memory-eligible record has no correspondence cache")
+        if self._correspondence_arrays is not None: return self._correspondence_arrays
         with np.load(self.path("correspondence_cache"), allow_pickle=False) as cache:
-            arrays = {key: np.asarray(cache[key]) for key in cache.files}
+            arrays = {key: np.ascontiguousarray(cache[key]) for key in cache.files}
         required = {"query_frame", "key_frame", "query_chunk", "key_chunk", "query_t", "key_t", "query_y", "query_x", "key_y", "key_x", "weight"}
         missing = required.difference(arrays)
         if missing:
@@ -122,7 +133,14 @@ class RGBDMemoryRecord:
             raise ValueError(f"{self.record_id}: correspondence columns have different lengths")
         if count and (np.any(arrays["key_frame"] >= arrays["query_frame"]) or np.any(arrays["key_chunk"] >= arrays["query_chunk"]) or np.any(arrays["query_frame"] >= self.frame_count) or np.any(arrays["key_frame"] < 0) or np.any(arrays["query_chunk"] >= self.chunk_count) or np.any(arrays["key_chunk"] < 0)):
             raise ValueError(f"{self.record_id}: correspondence cache is not strictly causal or out of bounds")
+        object.__setattr__(self,"_correspondence_arrays",arrays)
+        object.__setattr__(self,"_correspondence_by_query",tuple(np.flatnonzero(arrays["query_chunk"]==chunk).astype(np.int64,copy=False) for chunk in range(self.chunk_count)))
         return arrays
+
+    def correspondences_for_chunk(self,query_chunk:int) -> CorrespondenceSlice:
+        if not 0<=int(query_chunk)<self.chunk_count: raise ValueError('query_chunk outside record')
+        arrays=self.load_correspondences()
+        return CorrespondenceSlice(arrays,self._correspondence_by_query[int(query_chunk)])
 
     def correspondence_rows(self) -> Iterator[dict]:
         cache = self.load_correspondences()
@@ -167,7 +185,8 @@ class RGBDMemoryRecord:
             raise ValueError(f"{self.record_id}: first local pose is not identity")
         self.load_timestamps()
         if self.memory_eligible:
-            self.load_correspondences()
+            if "correspondence_cache" not in self.raw or not self.path("correspondence_cache").is_file():
+                raise ValueError(f"{self.record_id}: memory-eligible record has no correspondence cache")
 
 
 def load_rgbd_memory_manifest(path: str | Path, *, expected_count: int | None = None) -> list[RGBDMemoryRecord]:

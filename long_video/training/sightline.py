@@ -128,6 +128,17 @@ def run_causal_prefix_chunks(max_chunks, train_chunk, forward_chunk):
     assert_single_backward_chunk(policies,train_chunk)
     return outputs,policies
 
+def prefix_chunk_can_enter_active_memory(chunk_index:int, final_query_chunk:int) -> bool:
+    """Whether a completed chunk can leave Helios' 19-latent history in this rollout."""
+    if not 0<=int(chunk_index)<int(final_query_chunk): return False
+    # A completed chunk contributes eight new temporal identities.  The native
+    # 19-latent FIFO still covers it for the next three query chunks.
+    return int(final_query_chunk)-int(chunk_index)>=4
+
+def correspondence_capture_for_stage(stage_index:int,stage_count:int,enabled:bool) -> bool:
+    if not 0<=int(stage_index)<int(stage_count): raise ValueError('stage index outside flow')
+    return bool(enabled and int(stage_index)+1==int(stage_count))
+
 def selected_qk_logits(query, key, query_indices):
     """Compute attention logits only for selected queries, never full Q x K."""
     if query.ndim!=4 or key.ndim!=4: raise ValueError('Q/K must be [B,N,H,D]')

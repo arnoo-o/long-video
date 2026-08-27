@@ -13,7 +13,7 @@ import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled
+from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled, prefix_chunk_can_enter_active_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
@@ -134,37 +134,57 @@ def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_b
         latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],
         attention_kwargs={'current_chunk':chunk},device=source.device,transformer_dtype=pipe.transformer.dtype,progress_bar=Progress())
 
-def _load_correspondence(record):
-    rows=list(record.correspondence_rows())
-    for row in rows:
-        qf,kf=int(row['query_frame']),int(row['key_frame'])
-        if kf>=qf or not (0<=int(row['key_chunk'])<int(row['query_chunk'])<record.chunk_count): raise RuntimeError('invalid causal RGB-D correspondence identity')
-        if not np.isfinite(float(row['weight'])) or float(row['weight'])<0: raise RuntimeError('invalid RGB-D correspondence weight')
+def _load_correspondence(record,query_chunk=None):
+    rows=record.correspondences_for_chunk(query_chunk) if query_chunk is not None else list(record.correspondence_rows())
+    if hasattr(rows,'column'):
+        qf,kf=rows.column('query_frame'),rows.column('key_frame'); qc,kc=rows.column('query_chunk'),rows.column('key_chunk'); weights=rows.column('weight')
+        if len(rows) and (np.any(kf>=qf) or np.any(kc>=qc) or np.any(qc!=int(query_chunk)) or np.any(kc<0) or not np.isfinite(weights).all() or np.any(weights<0)):
+            raise RuntimeError('invalid causal RGB-D correspondence identity or weight')
+    else:
+        for row in rows:
+            qf,kf=int(row['query_frame']),int(row['key_frame'])
+            if kf>=qf or not (0<=int(row['key_chunk'])<int(row['query_chunk'])<record.chunk_count): raise RuntimeError('invalid causal RGB-D correspondence identity')
+            if not np.isfinite(float(row['weight'])) or float(row['weight'])<0: raise RuntimeError('invalid RGB-D correspondence weight')
     return rows
 
-def _mapped_correspondences(processor,rows,chunk):
+def _correspondence_columns(rows):
+    names={'query_chunk':'query_chunk','query_latent_temporal':'query_t','query_y':'query_y','query_x':'query_x','key_chunk':'key_chunk','key_latent_temporal':'key_t','key_y':'key_y','key_x':'key_x','weight':'weight'}
+    if hasattr(rows,'column'): return {name:rows.column(column) for name,column in names.items()}
+    return {name:np.asarray([row[name] for row in rows]) for name in names}
+
+def _identity_lookup(identities):
+    lookup={}
+    for index,identity in enumerate(identities):
+        kind,global_ids,y,x,level=identity
+        for global_id in global_ids:
+            lookup.setdefault((kind,int(global_id),int(y),int(x),level),[]).append(index)
+    return lookup
+
+def _mapped_correspondences(processor,rows,chunk,identity_index=None):
     q,k=processor.last_q,processor.last_k
     if q is None or k is None: raise RuntimeError('correspondence processor did not capture Q/K')
     current=processor.last_current_length; identities=processor.last_key_identities
     if identities is None or len(identities)!=k.shape[1]: raise RuntimeError('explicit attention key identity map is missing or misaligned')
     current_shape=next(shape for shape in processor.ray_provider.context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current)
     _,height,width=current_shape; q_start=q.shape[1]-current
-    grouped={}
-    for row in rows:
-        if int(row['query_chunk'])!=chunk: continue
-        qt=int(row['query_latent_temporal']); qy=int(row['query_y']); qx=int(row['query_x'])
+    identity_index=_identity_lookup(identities) if identity_index is None else identity_index
+    columns=_correspondence_columns(rows); grouped={}
+    for row_index in range(len(columns['query_chunk'])):
+        if int(columns['query_chunk'][row_index])!=chunk: continue
+        qt=int(columns['query_latent_temporal'][row_index]); qy=int(columns['query_y'][row_index]); qx=int(columns['query_x'][row_index])
         if not (0<=qt<current_shape[0] and 0<=qy<height and 0<=qx<width): continue
         qi=q_start+qt*height*width+qy*width+qx
-        global_key=int(row['key_chunk'])*8+int(row['key_latent_temporal'])
+        global_key=int(columns['key_chunk'][row_index])*8+int(columns['key_latent_temporal'][row_index])
         query_global=chunk*8+qt
         if global_key>query_global: continue
-        ky,kx=int(row['key_y']),int(row['key_x'])
+        ky,kx=int(columns['key_y'][row_index]),int(columns['key_x'][row_index])
         factors={'long':4,'mid':2,'short':1}
-        native=[i for i,identity in enumerate(identities) if identity[0]=='native' and global_key in identity[1] and identity[2:4]==(ky//factors[identity[4]],kx//factors[identity[4]])]
+        native=[]
+        for level,factor in factors.items(): native.extend(identity_index.get(('native',global_key,ky//factor,kx//factor,level),()))
         native.sort(key=lambda index:{'short':0,'mid':1,'long':2}[identities[index][4]])
-        memory=[i for i,identity in enumerate(identities) if identity[0]=='memory' and identity[1]==(global_key,) and identity[2:4]==(ky//2,kx//2)]
-        current_keys=[i for i,identity in enumerate(identities) if identity[0]=='current' and identity[1]==(global_key,) and identity[2:4]==(ky,kx)]
-        source_keys=[i for i,identity in enumerate(identities) if identity[0]=='source' and global_key in identity[1] and identity[2:4]==(ky,kx)]
+        memory=list(identity_index.get(('memory',global_key,ky//2,kx//2,'memory'),()))
+        current_keys=list(identity_index.get(('current',global_key,ky,kx,'current'),()))
+        source_keys=list(identity_index.get(('source',global_key,ky,kx,'source'),()))
         # Preserve every legal representation of the teacher identity on the
         # actual key axis.  Source/native/current/memory are diagnostics only.
         candidates=sorted(set(native + current_keys + source_keys + memory))
@@ -174,30 +194,36 @@ def _mapped_correspondences(processor,rows,chunk):
             for ki in candidates:
                 if 0<=ki<k.shape[1]:
                     source='memory' if ki in memory else ('native' if ki in native else ('source' if ki in source_keys else 'current'))
-                    bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(row['weight'])),source)
+                    bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(columns['weight'][row_index])),source)
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
     selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]; sources=['memory' if any(value[1]=='memory' for value in grouped[query].values()) and not any(value[1] in ('source','native','current') for value in grouped[query].values()) else ('native' if any(value[1]=='native' for value in grouped[query].values()) else ('source' if any(value[1]=='source' for value in grouped[query].values()) else 'current')) for query in selected]
     return selected,positives,weights,sources
 
-def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0):
+def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
     missing=[layer for layer in layers if layer not in processors]
     if missing: raise RuntimeError(f'correspondence layers have no Sightline processor: {missing}')
-    losses=[]
+    first=processors[layers[0]]; identities=first.last_key_identities
+    for layer in layers[1:]:
+        processor=processors[layer]
+        if processor.last_key_identities!=identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first.last_q.shape[1] or processor.last_k.shape[1]!=first.last_k.shape[1]:
+            raise RuntimeError('correspondence layers must have identical key identity maps for shared mapping')
+    mapping_started=time.perf_counter()
+    try: selected,positives,weights,sources=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
+    except RuntimeError as exc:
+        if 'do not map' not in str(exc): raise
+        selected=positives=weights=sources=[]
+    if len(selected)>max_rows:
+        memory_indices=[i for i,source in enumerate(sources) if source=='memory']
+        generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed) & ((1<<63)-1))
+        order=torch.randperm(len(selected),generator=generator).tolist()
+        choice=([memory_indices[0]] if memory_indices else []) + [i for i in order if i not in memory_indices[:1]]
+        choice=choice[:max_rows]
+        selected=[selected[i] for i in choice]; positives=[positives[i] for i in choice]; weights=[weights[i] for i in choice]
+    if timings is not None: timings['correspondence_mapping_seconds']+=time.perf_counter()-mapping_started
+    losses=[]; loss_started=time.perf_counter()
     for layer in layers:
         processor=processors[layer]
-        try:
-            selected,positives,weights,sources=_mapped_correspondences(processor,rows,chunk)
-        except RuntimeError as exc:
-            if 'do not map' not in str(exc): raise
-            continue
-        if len(selected)>max_rows:
-            memory_indices=[i for i,source in enumerate(sources) if source=='memory']; other_indices=[i for i,source in enumerate(sources) if source!='memory']
-            generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed) & ((1<<63)-1))
-            order=torch.randperm(len(selected),generator=generator).tolist()
-            choice=([memory_indices[0]] if memory_indices else []) + [i for i in order if i not in memory_indices[:1]]
-            choice=choice[:max_rows]
-            selected=[selected[i] for i in choice]; positives=[positives[i] for i in choice]; weights=[weights[i] for i in choice]
         if not selected: continue
         numerator=processor.last_q.new_zeros(()); denominator=processor.last_q.new_zeros(())
         for start in range(0,len(selected),64):
@@ -216,7 +242,8 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
             block_loss=trainable.correspondence(sampled,None,weight,multi_positive=block_positive,additive_bias=additive_bias)
             numerator=numerator+block_loss*weight.sum(); denominator=denominator+weight.sum()
         losses.append(numerator/denominator.clamp_min(1e-8))
-    if not losses: return processor.last_q.new_zeros(())
+    if timings is not None: timings['correspondence_loss_seconds']+=time.perf_counter()-loss_started
+    if not losses: return first.last_q.new_zeros(())
     return torch.stack(losses).mean()
 
 def _reset_sequence(runner):
@@ -225,7 +252,7 @@ def _reset_sequence(runner):
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
     p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--allow-world-size-migration',action='store_true'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
-    p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--train',action='store_true'); args=p.parse_args()
+    p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--profile-timing',action='store_true'); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
     args.max_steps=args.max_steps or total_steps
@@ -317,17 +344,22 @@ def main():
         if phase['correspondence'] or diagnostic_correspondence:
             if not record.memory_eligible: raise RuntimeError(f"{record.record_id} has no calibrated RGB-D correspondence supervision")
             if not active_corr_layers or any(layer not in pipe.transformer._sightline_processors for layer in active_corr_layers): raise RuntimeError('active correspondence/probe layers are not installed Sightline layers')
-            for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=True
-            corr_rows=_load_correspondence(record)
-        else: corr_rows=None
+            for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=False
         minimum_train_chunk=1 if phase['name']=='P3' else 0
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'],minimum=minimum_train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
+        perf={'prefix_generation_seconds':0.0,'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0,'correspondence_load_seconds':0.0,'correspondence_mapping_seconds':0.0,'correspondence_loss_seconds':0.0,'backward_seconds':0.0}
+        def timing_sync():
+            if args.profile_timing: torch.cuda.synchronize(device)
+        if phase['correspondence'] or diagnostic_correspondence:
+            load_started=time.perf_counter(); corr_rows=_load_correspondence(record,train_chunk); perf['correspondence_load_seconds']=time.perf_counter()-load_started
+        else: corr_rows=None
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
         history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
         if args.probe_capture: torch.cuda.reset_peak_memory_stats()
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
+            chunk_started=time.perf_counter()
             history=history_state.groups(); coverage=history_state.coverage()
             if not keep_graph:
                 template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
@@ -342,15 +374,20 @@ def main():
                 runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 stage_losses=[]; final_prediction=None
                 for stage_index,item in enumerate(items):
+                    capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
+                    for layer in active_corr_layers:
+                        pipe.transformer._sightline_processors[layer].capture_diagnostics=capture_correspondence
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
                     stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
-                    if args.train and stage_index+1<len(items): (stage_loss/len(items)).backward()
+                    if args.train and stage_index+1<len(items):
+                        timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
-                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)) if (corr_rows and not args.alpha_zero_baseline) else fm.new_zeros(())
+                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16),timings=perf) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
                 total=stage_losses[-1]/len(items)+trainable.lambda_corr(step/total_steps)*corr if args.train else fm+trainable.lambda_corr(step/total_steps)*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
-                if args.train: total.backward()
+                if args.train:
+                    timing_sync(); backward_started=time.perf_counter(); total.backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -374,18 +411,23 @@ def main():
                         runner.memory.set_enabled(False); provider.context=base_context
                         zero=_model_prediction(pipe,final['noisy_latents'],final,prompt_embeds,history,chunk*8)
                         for bank_layer,enabled in memory_enabled_by_layer.items(): runner.memory.banks[bank_layer].enabled=enabled
-                        originals={layer:[token.hidden for token in bank.tokens] for layer,bank in runner.memory.banks.items()}
+                        originals={layer:{chunk_id:chunk.hidden for chunk_id,chunk in bank.archive.items()} for layer,bank in runner.memory.banks.items()}
                         for bank in runner.memory.banks.values():
-                            shuffled=list(reversed([token.hidden for token in bank.tokens]))
-                            for token,hidden in zip(bank.tokens,shuffled): token.hidden=hidden
+                            chunks=list(bank.archive.values())
+                            if chunks:
+                                shuffled=torch.cat([chunk.hidden for chunk in chunks],1).flip(1)
+                                offset=0
+                                for memory_chunk in chunks:
+                                    count=memory_chunk.token_count; memory_chunk.hidden=shuffled[:,offset:offset+count].contiguous(); offset+=count
                         shuffled_prediction=_model_prediction(pipe,final['noisy_latents'],final,prompt_embeds,history,chunk*8)
                         for bank_layer,hiddens in originals.items():
-                            for token,hidden in zip(runner.memory.banks[bank_layer].tokens,hiddens): token.hidden=hidden
+                            for chunk_id,hidden in hiddens.items(): runner.memory.banks[bank_layer].archive[chunk_id].hidden=hidden
                         provider.context=base_context
                     alpha_q,alpha_k=trainable.conditioner.alpha_values()
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
                     first=layer_captures[0]
                     probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha_q=alpha_q,alpha_k=alpha_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+            for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=False
             if chunk==0: generated[:,:,0:1]=source
             else: generated[:,:,0:1]=clean_boundary.to(generated)
             capture_history=history
@@ -393,10 +435,13 @@ def main():
                 return _model_prediction(pipe,clean_input,{'timesteps':timestep},prompt_embeds,_history,_chunk*8)
             generated_prefix.append(generated.detach())
             history_state.append_chunk(generated,chunk)
-            runner._finalize_chunk(chunk,clean_latent=generated.detach(),capture_fn=clean_capture)
+            capture_memory=phase['name']!='P3' or prefix_chunk_can_enter_active_memory(chunk,train_chunk)
+            timing_sync(); memory_timings=runner._finalize_chunk(chunk,clean_latent=generated.detach(),capture_fn=clean_capture,capture_memory=capture_memory); timing_sync()
+            for name,value in memory_timings.items(): perf[name]+=value
             for processor in pipe.transformer._sightline_processors.values():
                 processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
                 processor.last_attention_bias=None
+            if not keep_graph: perf['prefix_generation_seconds']+=time.perf_counter()-chunk_started
             return generated
         if phase['name']=='P3':
             _,policies=run_causal_prefix_chunks(phase['max_chunks'],train_chunk,forward_chunk)
@@ -421,7 +466,8 @@ def main():
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':time.perf_counter()-started,'uses_future_gt':False}
+        step_seconds=time.perf_counter()-started
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and ((step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

@@ -45,6 +45,8 @@ def test_strict_rgbd_manifest_loads_97_frame_record(tmp_path):
     record = load_rgbd_memory_manifest(manifest)[0]
     assert record.load_cameras()[0].shape == (97, 4, 4)
     assert len(list(record.correspondence_rows())) == 1
+    first=record.correspondences_for_chunk(1); second=record.correspondences_for_chunk(1)
+    assert len(first)==1 and first.arrays is second.arrays and record.correspondences_for_chunk(0).indices.size==0
 
 
 def test_rgbd_manifest_rejects_noncausal_cache(tmp_path):
@@ -56,8 +58,9 @@ def test_rgbd_manifest_rejects_noncausal_cache(tmp_path):
     np.savez_compressed(cache, **data)
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"records": [row]}))
+    record=load_rgbd_memory_manifest(manifest)[0]
     with pytest.raises(ValueError, match="not strictly causal"):
-        load_rgbd_memory_manifest(manifest)
+        record.correspondences_for_chunk(1)
 
 
 def test_camera_only_record_does_not_require_correspondence(tmp_path):

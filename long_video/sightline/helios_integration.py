@@ -19,7 +19,7 @@ class SightlineHeliosAttnProcessor:
         self.residual_scale=1.0
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
-        self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
+        self.capture_memory_hidden=False; self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
         if self.qkv_projection is None or self.rotary_apply is None or self.attention_dispatch is None:
@@ -31,8 +31,9 @@ class SightlineHeliosAttnProcessor:
         if rotary_emb is not None:
             query=self.rotary_apply(query,rotary_emb); key=self.rotary_apply(key,rotary_emb)
         current_len=original_context_length or query.shape[1]
-        if (self.memory is not None and self.memory.enabled) or self.capture_diagnostics:
+        if self.capture_memory_hidden:
             self.last_hidden_states=hidden_states
+        if self.capture_memory_hidden or self.capture_diagnostics:
             self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
         if self.conditioner is None:

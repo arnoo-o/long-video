@@ -207,7 +207,7 @@ def _write(output,payload,rows):
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--mode",choices=("init-jump","checkpoint"),required=True)
     p.add_argument("--config",default="configs/sightline.yaml"); p.add_argument("--model",required=True); p.add_argument("--helios-root",required=True)
-    p.add_argument("--manifest",required=True); p.add_argument("--latent-cache-root"); p.add_argument("--record-id",default="nrgbd__complete_kitchen__000005")
+    p.add_argument("--manifest",required=True); p.add_argument("--latent-cache-root"); p.add_argument("--record-id",default="bonn__rgbd_bonn_static_close_far__000010")
     p.add_argument("--checkpoint"); p.add_argument("--sigma",type=float,default=.8); p.add_argument("--noise-seed",type=int,default=260827)
     p.add_argument("--output",required=True); args=p.parse_args()
     cfg,pipe,trainable,runner,_=_setup(args); record,latent_path,target,prompt,history=_real_batch(args,cfg,pipe,runner,torch.device("cuda"))

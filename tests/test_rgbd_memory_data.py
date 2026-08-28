@@ -131,7 +131,7 @@ def test_sequence_split_hits_exact_train_count_without_leakage():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     records = []
-    for dataset, sizes in {"tum": (3, 7), "bonn": (3, 7), "nrgbd": (3, 7)}.items():
+    for dataset, sizes in {"tum": (3, 7), "bonn": (3, 7), "scannet": (3, 7)}.items():
         for sequence_index, size in enumerate(sizes):
             records.extend({"dataset": dataset, "sequence_id": f"seq-{sequence_index}", "record_id": f"{dataset}-{sequence_index}-{clip}"} for clip in range(size))
     all_rows, train, val = module.split_records(records, 21)

@@ -22,7 +22,9 @@ def _size(path: Path) -> int:
 
 def _sequence_identity(record) -> tuple[str, str]:
     sequence = record.raw["sequence_id"]
-    if record.raw["dataset"] in {"arkitscenes", "tartanground"}:
+    if record.raw["dataset"] == "scannet":
+        sequence = record.raw["scene_id"]
+    elif record.raw["dataset"] in {"arkitscenes", "tartanground"}:
         sequence = sequence.rsplit("/", 1)[0]
     return record.raw["dataset"], sequence
 

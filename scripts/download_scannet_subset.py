@@ -38,16 +38,24 @@ def main() -> None:
     args = parser.parse_args()
     root = args.output_root; shards = root / "shards"; shards.mkdir(parents=True, exist_ok=True)
     state_path = root / "download_state.json"
-    state = json.loads(state_path.read_text()) if state_path.exists() else {"repo": REPO, "completed": {}, "failed": {}}
-    available = shutil.disk_usage(root).free / 2**30
-    if available < args.min_free_gib:
-        raise RuntimeError(f"only {available:.1f} GiB free; need {args.min_free_gib:.1f} GiB")
-    api = HfApi(); files = sorted(x for x in api.list_repo_files(REPO, repo_type="dataset") if x.startswith("scannet_scans_part_") and x.endswith(".tar.gz"))
+    state = json.loads(state_path.read_text()) if state_path.exists() else {"repo": REPO, "completed": {}, "cleaned": {}, "failed": {}}
+    state.setdefault("cleaned", {})
+    api = HfApi()
+    tree = list(api.list_repo_tree(REPO, repo_type="dataset", recursive=False, expand=True))
+    entries = {item.path: item for item in tree if item.path.startswith("scannet_scans_part_") and item.path.endswith(".tar.gz")}
+    files = sorted(entries)
     selected = files[args.start_part:args.start_part + args.max_parts]
     if not selected:
         raise ValueError("no requested ScanNet shard exists")
     for name in selected:
         target = shards / Path(name).name
+        if name in state["cleaned"]:
+            print(json.dumps({"status": "already_processed_and_cleaned", "shard": name})); continue
+        remote_size = int(entries[name].size)
+        available = shutil.disk_usage(root).free
+        required = remote_size + int(args.min_free_gib * 2**30)
+        if available < required:
+            raise RuntimeError(f"{name}: only {available / 2**30:.1f} GiB free; need shard plus {args.min_free_gib:.1f} GiB reserve")
         if name in state["completed"] and target.is_file() and sha256(target) == state["completed"][name]["sha256"]:
             print(json.dumps({"status": "already_complete", "shard": name})); continue
         for attempt in range(1, args.retries + 1):
@@ -55,6 +63,8 @@ def main() -> None:
                 cached = Path(hf_hub_download(REPO, name, repo_type="dataset", local_dir=shards, resume_download=True))
                 if cached.resolve() != target.resolve():
                     cached.replace(target)
+                if target.stat().st_size != remote_size:
+                    raise IOError(f"{name}: expected {remote_size} bytes, got {target.stat().st_size}")
                 state["completed"][name] = {"sha256": sha256(target), "bytes": target.stat().st_size, "completed_at": time.time()}
                 state["failed"].pop(name, None); atomic_json(state_path, state)
                 print(json.dumps({"status": "complete", "shard": name, **state["completed"][name]})); break

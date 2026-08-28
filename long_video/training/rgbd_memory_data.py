@@ -21,6 +21,9 @@ REQUIRED_KEYS = (
     "c2w_abs", "c2w_local", "intrinsics", "timestamps",
     "frame_count", "chunk_count", "height", "width",
 )
+SCANNET_REQUIRED_KEYS = (
+    "source_timestamps", "source_frame_indices", "pointcloud", "metadata", "fps",
+)
 
 @dataclass(frozen=True)
 class CorrespondenceSlice:
@@ -116,6 +119,23 @@ class RGBDMemoryRecord:
             raise ValueError(f"{self.record_id}: timestamps must be strictly increasing")
         return timestamps
 
+    def load_source_identity(self) -> tuple[np.ndarray, np.ndarray]:
+        if "source_timestamps" not in self.raw or "source_frame_indices" not in self.raw:
+            raise ValueError(f"{self.record_id}: source timestamp/frame identity is missing")
+        timestamps = np.asarray(np.load(self.path("source_timestamps"), mmap_mode="r"))
+        indices = np.asarray(np.load(self.path("source_frame_indices"), mmap_mode="r"))
+        start, stop = self.source_frame_start, self.source_frame_start + self.frame_count
+        timestamps, indices = timestamps[start:stop], indices[start:stop]
+        if timestamps.shape != (self.frame_count,) or indices.shape != (self.frame_count,):
+            raise ValueError(f"{self.record_id}: source identity must match frame_count")
+        if timestamps.dtype.kind != "f" or indices.dtype.kind not in "iu":
+            raise ValueError(f"{self.record_id}: invalid source identity dtypes")
+        if not np.isfinite(timestamps).all() or np.any(np.diff(timestamps) <= 0):
+            raise ValueError(f"{self.record_id}: source timestamps are not strictly increasing")
+        if np.any(np.diff(indices) <= 0) or len(np.unique(indices)) != self.frame_count:
+            raise ValueError(f"{self.record_id}: source frame indices must be unique and increasing")
+        return timestamps.astype(np.float64, copy=False), indices.astype(np.int64, copy=False)
+
     def load_correspondences(self) -> dict[str, np.ndarray]:
         if not self.memory_eligible:
             return {}
@@ -187,6 +207,59 @@ class RGBDMemoryRecord:
         if self.memory_eligible:
             if "correspondence_cache" not in self.raw or not self.path("correspondence_cache").is_file():
                 raise ValueError(f"{self.record_id}: memory-eligible record has no correspondence cache")
+        if self.raw.get("dataset") == "scannet":
+            self._validate_scannet()
+
+    def _validate_scannet(self) -> None:
+        missing = [key for key in SCANNET_REQUIRED_KEYS if key not in self.raw]
+        if missing:
+            raise ValueError(f"{self.record_id}: ScanNet record missing {missing}")
+        if self.frame_count != 193 or self.chunk_count != 6 or float(self.raw["fps"]) != 24.0:
+            raise ValueError(f"{self.record_id}: ScanNet requires 193 frames / 6 chunks / 24 FPS")
+        target = self.load_timestamps()
+        expected = target[0] + np.arange(193, dtype=np.float64) / 24.0
+        if not np.allclose(target, expected, rtol=0.0, atol=1e-8) or not np.isclose(target[-1] - target[0], 8.0, atol=1e-8):
+            raise ValueError(f"{self.record_id}: ScanNet target timestamps are not an exact 8-second 24 FPS axis")
+        source_timestamps, source_indices = self.load_source_identity()
+        if np.max(np.abs(source_timestamps - target)) > (1.0 / 60.0 + 1e-6):
+            raise ValueError(f"{self.record_id}: source frames are not nearest 30 FPS observations")
+        if np.max(np.diff(source_timestamps)) > (2.0 / 30.0 + 1e-6):
+            raise ValueError(f"{self.record_id}: ScanNet source time discontinuity")
+        c2w, intrinsics = self.load_cameras(local=False)
+        rotations = c2w[:, :3, :3]
+        should_be_identity = rotations.transpose(0, 2, 1) @ rotations
+        if (not np.allclose(c2w[:, 3], np.asarray((0, 0, 0, 1)), atol=1e-5)
+                or not np.allclose(should_be_identity, np.eye(3), atol=1e-4)
+                or not np.allclose(np.linalg.det(rotations), 1.0, atol=1e-4)):
+            raise ValueError(f"{self.record_id}: ScanNet c2w is not a rigid OpenCV transform")
+        if (np.any(intrinsics[:, 0, 0] <= 0) or np.any(intrinsics[:, 1, 1] <= 0)
+                or np.any(intrinsics[:, 0, 2] < 0) or np.any(intrinsics[:, 0, 2] >= WIDTH)
+                or np.any(intrinsics[:, 1, 2] < 0) or np.any(intrinsics[:, 1, 2] >= HEIGHT)
+                or not np.allclose(intrinsics[:, 2], np.asarray((0, 0, 1)), atol=1e-6)):
+            raise ValueError(f"{self.record_id}: invalid ScanNet intrinsics")
+        metadata = json.loads(self.path("metadata").read_text(encoding="utf-8"))
+        continuity = metadata.get("continuity_validation", {})
+        orientation = metadata.get("orientation_validation", {})
+        if continuity.get("passed") is not True or orientation.get("passed") is not True:
+            raise ValueError(f"{self.record_id}: ScanNet continuity/orientation validation did not pass")
+        if int(orientation.get("rotation_cw_degrees", -1)) not in (0, 90, 180, 270):
+            raise ValueError(f"{self.record_id}: invalid ScanNet record orientation")
+        with np.load(self.path("pointcloud"), allow_pickle=False) as cloud:
+            required = {"xyz_world", "offsets", "source_frame_indices", "timestamps"}
+            if not required.issubset(cloud.files):
+                raise ValueError(f"{self.record_id}: ScanNet pointcloud metadata is incomplete")
+            xyz, offsets = cloud["xyz_world"], cloud["offsets"]
+            if (xyz.dtype != np.float32 or xyz.ndim != 2 or xyz.shape[1] != 3 or not np.isfinite(xyz).all()
+                    or offsets.dtype != np.int64 or offsets.shape != (194,) or offsets[0] != 0
+                    or offsets[-1] != len(xyz) or np.any(np.diff(offsets) <= 0)):
+                raise ValueError(f"{self.record_id}: invalid ScanNet pointcloud frame layout")
+            if not np.array_equal(cloud["source_frame_indices"].astype(np.int64), source_indices):
+                raise ValueError(f"{self.record_id}: pointcloud/source frame identity mismatch")
+            if not np.array_equal(cloud["timestamps"].astype(np.float64), target):
+                raise ValueError(f"{self.record_id}: pointcloud timestamp identity mismatch")
+        cache = self.load_correspondences()
+        if not len(cache.get("query_frame", ())):
+            raise ValueError(f"{self.record_id}: ScanNet correspondence cache is empty")
 
 
 def load_rgbd_memory_manifest(path: str | Path, *, expected_count: int | None = None) -> list[RGBDMemoryRecord]:

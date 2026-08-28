@@ -143,7 +143,7 @@ def _project_world(world: np.ndarray, c2w: np.ndarray, K: np.ndarray):
     return z, uv
 
 
-def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 32, token_width: int = 52) -> dict:
+def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 32, token_width: int = 52, compressed: bool = True) -> dict:
     """Build sparse causal correspondences for every query_chunk/key_chunk pair."""
     if chunk_count is None:
         if (len(depth_paths) - 1) % CHUNK_STRIDE:
@@ -222,7 +222,7 @@ def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, 
     for key in integer_keys | {"coverage", "vote", "weight"}:
         arrays.setdefault(key, np.asarray([], dtype=np.int32 if key in integer_keys else np.float32))
     destination = Path(output); destination.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(destination, **arrays)
+    (np.savez_compressed if compressed else np.savez)(destination, **arrays)
     return {"row_count": len(arrays["query_frame"]), "raw_match_count": int(raw_matches), "pair_counts": pair_stats, "pixel_stride": pixel_stride, "token_grid": [token_height, token_width]}
 
 

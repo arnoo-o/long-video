@@ -24,6 +24,7 @@ REQUIRED_KEYS = (
 SCANNET_REQUIRED_KEYS = (
     "source_timestamps", "source_frame_indices", "pointcloud", "metadata", "fps",
 )
+ARKIT_RRD_REQUIRED_KEYS = SCANNET_REQUIRED_KEYS
 
 @dataclass(frozen=True)
 class CorrespondenceSlice:
@@ -209,6 +210,56 @@ class RGBDMemoryRecord:
                 raise ValueError(f"{self.record_id}: memory-eligible record has no correspondence cache")
         if self.raw.get("dataset") == "scannet":
             self._validate_scannet()
+        if self.raw.get("dataset") == "arkitscenes":
+            self._validate_arkitscenes_rrd()
+
+    def _validate_arkitscenes_rrd(self) -> None:
+        missing = [key for key in ARKIT_RRD_REQUIRED_KEYS if key not in self.raw]
+        if missing:
+            raise ValueError(f"{self.record_id}: ARKitScenes RRD record missing {missing}")
+        if self.frame_count != 193 or self.chunk_count != 6 or float(self.raw["fps"]) != 24.0:
+            raise ValueError(f"{self.record_id}: ARKitScenes RRD requires 193 frames / 6 chunks / 24 FPS")
+        target = self.load_timestamps()
+        expected = np.arange(193, dtype=np.float64) / 24.0
+        if not np.allclose(target, expected, rtol=0.0, atol=1e-8):
+            raise ValueError(f"{self.record_id}: ARKitScenes target timestamps are not an exact 8-second 24 FPS axis")
+        source_timestamps, source_indices = self.load_source_identity()
+        if np.max(np.abs((source_timestamps-source_timestamps[0])-target)) > .0100001:
+            raise ValueError(f"{self.record_id}: ARKitScenes RGB observations exceed 10 ms target tolerance")
+        if np.max(np.diff(source_timestamps)) > .060:
+            raise ValueError(f"{self.record_id}: ARKitScenes source time discontinuity")
+        c2w, intrinsics = self.load_cameras(local=False); rotations = c2w[:, :3, :3]
+        if (not np.allclose(c2w[:, 3], np.asarray((0, 0, 0, 1)), atol=1e-5)
+                or not np.allclose(rotations.transpose(0, 2, 1) @ rotations, np.eye(3), atol=1e-4)
+                or not np.allclose(np.linalg.det(rotations), 1.0, atol=1e-4)):
+            raise ValueError(f"{self.record_id}: ARKitScenes c2w is not rigid")
+        if (np.any(intrinsics[:, 0, 0] <= 0) or np.any(intrinsics[:, 1, 1] <= 0)
+                or np.any(intrinsics[:, 0, 2] < 0) or np.any(intrinsics[:, 0, 2] >= WIDTH)
+                or np.any(intrinsics[:, 1, 2] < 0) or np.any(intrinsics[:, 1, 2] >= HEIGHT)
+                or not np.allclose(intrinsics[:, 2], np.asarray((0, 0, 1)), atol=1e-6)):
+            raise ValueError(f"{self.record_id}: invalid ARKitScenes intrinsics")
+        metadata = json.loads(self.path("metadata").read_text(encoding="utf-8"))
+        if metadata.get("pose_source") != "mebx_stream_4_vision_transform" or metadata.get("orientation_source") != "measured_gravity":
+            raise ValueError(f"{self.record_id}: invalid ARKitScenes RRD provenance")
+        timing = metadata.get("timing_validation", {})
+        timing_keys=("rgb_target_max_error_seconds", "depth_rgb_max_error_seconds", "pose_rgb_max_error_seconds", "intrinsics_rgb_max_error_seconds", "depth_intrinsics_rgb_max_error_seconds", "confidence_rgb_max_error_seconds")
+        if any(float(timing.get(key, 1.0)) > .0100001 for key in timing_keys):
+            raise ValueError(f"{self.record_id}: ARKitScenes cross-stream timing validation failed")
+        with np.load(self.path("pointcloud"), allow_pickle=False) as cloud:
+            required = {"xyz_world", "offsets", "source_frame_indices", "timestamps"}
+            if not required.issubset(cloud.files):
+                raise ValueError(f"{self.record_id}: ARKitScenes pointcloud metadata is incomplete")
+            xyz, offsets = cloud["xyz_world"], cloud["offsets"]
+            if (xyz.dtype != np.float32 or xyz.ndim != 2 or xyz.shape[1] != 3 or not np.isfinite(xyz).all()
+                    or offsets.dtype != np.int64 or offsets.shape != (194,) or offsets[0] != 0
+                    or offsets[-1] != len(xyz) or np.any(np.diff(offsets) <= 0)):
+                raise ValueError(f"{self.record_id}: invalid ARKitScenes pointcloud frame layout")
+            if not np.array_equal(cloud["source_frame_indices"].astype(np.int64), source_indices):
+                raise ValueError(f"{self.record_id}: ARKitScenes pointcloud/source identity mismatch")
+            if not np.array_equal(cloud["timestamps"].astype(np.float64), target):
+                raise ValueError(f"{self.record_id}: ARKitScenes pointcloud timestamp mismatch")
+        if not len(self.load_correspondences().get("query_frame", ())):
+            raise ValueError(f"{self.record_id}: ARKitScenes correspondence cache is empty")
 
     def _validate_scannet(self) -> None:
         missing = [key for key in SCANNET_REQUIRED_KEYS if key not in self.raw]

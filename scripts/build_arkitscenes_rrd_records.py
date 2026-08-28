@@ -65,6 +65,11 @@ def calibration(path):
     q=np.asarray([x[0] for x in t['Transform3D:quaternion']],np.float64); tr=np.asarray([x[0] for x in t['Transform3D:translation']],np.float64)
     c2w=np.repeat(np.eye(4)[None],len(q),0); c2w[:,:3,:3]=Rotation.from_quat(q).as_matrix(); c2w[:,:3,3]=tr
     K=np.asarray([np.asarray(x[0],np.float64).reshape(3,3) for x in p['Pinhole:image_from_camera']],np.float64)
+    # RRD stores the pinhole matrix in column-vector layout; normalize to OpenCV row layout.
+    if np.mean(np.abs(K[:,2,2]-1.0)) < 1e-3 and np.mean(np.abs(K[:,2,:2])) < 1e-3:
+        pass
+    elif np.mean(np.abs(K[:,:,2][:,:2])) < 1e-3:
+        K = np.transpose(K, (0,2,1))
     return times,c2w,K
 
 def select_indices(times, start):

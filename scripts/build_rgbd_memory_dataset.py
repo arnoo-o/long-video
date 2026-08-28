@@ -38,6 +38,21 @@ OPENGL_TO_OPENCV = np.diag((1.0, -1.0, -1.0, 1.0))
 SEVEN_SCENES_K = np.asarray(((585.0, 0.0, 320.0), (0.0, 585.0, 240.0), (0.0, 0.0, 1.0)))
 
 
+def _nearest_so3(matrix: np.ndarray) -> np.ndarray:
+    """Project a numerically scaled calibration rotation back onto SO(3)."""
+    u, _, vt = np.linalg.svd(np.asarray(matrix, dtype=np.float64))
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0:
+        u[:, -1] *= -1
+        rotation = u @ vt
+    return rotation
+
+
+# The published marker coefficients carry a uniform scale (~1.059).  Keeping
+# it in c2w violates the OpenCV rigid-camera contract and corrupts projection.
+BONN_T_MARKER[:3, :3] = _nearest_so3(BONN_T_MARKER[:3, :3])
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")

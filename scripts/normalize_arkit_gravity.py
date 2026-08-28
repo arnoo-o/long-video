@@ -165,7 +165,7 @@ def normalize_record_entry(value: tuple[dict, bool]) -> dict:
     return normalize_record(value[0], value[1])
 
 
-def _unit_cache_from_parent(unit: dict, parent: dict) -> None:
+def _unit_cache_from_parent(unit: dict, parent: dict, unified_root: Path) -> None:
     offset, count = int(unit.get("source_frame_start", 0)), int(unit["frame_count"])
     chunk_offset = offset // 32
     with np.load(parent["correspondence_cache"], allow_pickle=False) as value:
@@ -174,7 +174,9 @@ def _unit_cache_from_parent(unit: dict, parent: dict) -> None:
     arrays = {key: value[keep].copy() for key, value in arrays.items()}
     arrays["query_frame"] -= offset; arrays["key_frame"] -= offset
     arrays["query_chunk"] -= chunk_offset; arrays["key_chunk"] -= chunk_offset
-    output = Path(unit["correspondence_cache"]); temporary = output.with_name(output.stem + ".gravity.tmp.npz")
+    output = Path(unit["correspondence_cache"])
+    if not output.is_absolute(): output = unified_root / output
+    temporary = output.with_name(output.stem + ".gravity.tmp.npz")
     np.savez_compressed(temporary, **arrays); os.replace(temporary, output)
 
 
@@ -192,14 +194,14 @@ def main() -> None:
     if args.workers == 1: result = [normalize_record_entry(job) for job in jobs]
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as pool: result = list(pool.map(normalize_record_entry, jobs))
-    changed = {item["record_id"] for item in result if item["status"] in {"normalized", "would_normalize"}}
+    changed = {item["record_id"] for item in result if int(item.get("rotation", 0)) != 0}
     if args.apply:
         units = json.loads((unified / "manifest_train_units_3chunk.json").read_text(encoding="utf-8"))["records"]
         parents = {row["record_id"]: row for row in rows}
         for unit in units:
             parent_id = unit.get("parent_record_id", unit["record_id"])
             if unit.get("dataset") == "arkitscenes" and parent_id in changed:
-                _unit_cache_from_parent(unit, parents[parent_id])
+                _unit_cache_from_parent(unit, parents[parent_id], unified)
         atomic_json(unified / "arkit_gravity_normalization_report.json", {"records": result, "normalized": len(changed), "kept": len(rows) - len(changed)})
     print(json.dumps({"mode": "apply" if args.apply else "dry_run", "records": len(rows), "normalized": len(changed), "kept": len(rows) - len(changed), "rotations": {str(k): sum(x.get("rotation") == k for x in result) for k in (0,90,180,270)}}, indent=2))
 

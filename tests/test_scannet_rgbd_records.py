@@ -67,6 +67,16 @@ def test_strict_scannet_record_validator(tmp_path):
     assert source.shape == indices.shape == (193,)
 
 
+def test_scannet_validator_accepts_parent_derived_second_unit(tmp_path):
+    row, _ = _scannet_record(tmp_path)
+    row.update(record_id="scannet__scene0000_00__000000__frames_096_192",
+               parent_record_id="scannet__scene0000_00__000000",
+               source_frame_start=96, frame_count=97, chunk_count=3)
+    manifest = tmp_path / "unit_manifest.json"; manifest.write_text(json.dumps({"records": [row]}))
+    record = load_rgbd_memory_manifest(manifest, expected_count=1)[0]
+    assert record.source_frame_start == 96 and record.load_timestamps()[0] == 4.0
+
+
 def test_scannet_validator_rejects_nonunique_source_frames(tmp_path):
     row, root = _scannet_record(tmp_path)
     indices = np.load(root / "source_frame_indices.npy"); indices[10] = indices[9]

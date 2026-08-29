@@ -217,14 +217,20 @@ class RGBDMemoryRecord:
         missing = [key for key in ARKIT_RRD_REQUIRED_KEYS if key not in self.raw]
         if missing:
             raise ValueError(f"{self.record_id}: ARKitScenes RRD record missing {missing}")
-        if self.frame_count != 193 or self.chunk_count != 6 or float(self.raw["fps"]) != 24.0:
-            raise ValueError(f"{self.record_id}: ARKitScenes RRD requires 193 frames / 6 chunks / 24 FPS")
+        derived = bool(self.raw.get("parent_record_id"))
+        legal_geometry = ((self.frame_count, self.chunk_count, self.source_frame_start) == (193, 6, 0) if not derived
+                          else (self.frame_count, self.chunk_count, self.source_frame_start) in ((97, 3, 0), (97, 3, 96)))
+        if not legal_geometry or float(self.raw["fps"]) != 24.0:
+            raise ValueError(f"{self.record_id}: ARKitScenes RRD requires a full 193/6 record or a legal parent-derived 97/3 unit")
         target = self.load_timestamps()
-        expected = np.arange(193, dtype=np.float64) / 24.0
+        expected = target[0] + np.arange(self.frame_count, dtype=np.float64) / 24.0
         if not np.allclose(target, expected, rtol=0.0, atol=1e-8):
-            raise ValueError(f"{self.record_id}: ARKitScenes target timestamps are not an exact 8-second 24 FPS axis")
+            raise ValueError(f"{self.record_id}: ARKitScenes target timestamps are not an exact 24 FPS axis")
         source_timestamps, source_indices = self.load_source_identity()
-        if np.max(np.abs((source_timestamps-source_timestamps[0])-target)) > .0100001:
+        all_source=np.load(self.path("source_timestamps"),mmap_mode="r")
+        all_target=np.load(self.path("timestamps"),mmap_mode="r")
+        parent_clock_offset=float(all_source[0]-all_target[0])
+        if np.max(np.abs((source_timestamps-target)-parent_clock_offset)) > .0100001:
             raise ValueError(f"{self.record_id}: ARKitScenes RGB observations exceed 10 ms target tolerance")
         if np.max(np.diff(source_timestamps)) > .060:
             raise ValueError(f"{self.record_id}: ARKitScenes source time discontinuity")
@@ -254,9 +260,10 @@ class RGBDMemoryRecord:
                     or offsets.dtype != np.int64 or offsets.shape != (194,) or offsets[0] != 0
                     or offsets[-1] != len(xyz) or np.any(np.diff(offsets) <= 0)):
                 raise ValueError(f"{self.record_id}: invalid ARKitScenes pointcloud frame layout")
-            if not np.array_equal(cloud["source_frame_indices"].astype(np.int64), source_indices):
+            start,stop=self.source_frame_start,self.source_frame_start+self.frame_count
+            if not np.array_equal(cloud["source_frame_indices"][start:stop].astype(np.int64), source_indices):
                 raise ValueError(f"{self.record_id}: ARKitScenes pointcloud/source identity mismatch")
-            if not np.array_equal(cloud["timestamps"].astype(np.float64), target):
+            if not np.array_equal(cloud["timestamps"][start:stop].astype(np.float64), target):
                 raise ValueError(f"{self.record_id}: ARKitScenes pointcloud timestamp mismatch")
         if not len(self.load_correspondences().get("query_frame", ())):
             raise ValueError(f"{self.record_id}: ARKitScenes correspondence cache is empty")
@@ -265,12 +272,15 @@ class RGBDMemoryRecord:
         missing = [key for key in SCANNET_REQUIRED_KEYS if key not in self.raw]
         if missing:
             raise ValueError(f"{self.record_id}: ScanNet record missing {missing}")
-        if self.frame_count != 193 or self.chunk_count != 6 or float(self.raw["fps"]) != 24.0:
-            raise ValueError(f"{self.record_id}: ScanNet requires 193 frames / 6 chunks / 24 FPS")
+        derived = bool(self.raw.get("parent_record_id"))
+        legal_geometry = ((self.frame_count, self.chunk_count, self.source_frame_start) == (193, 6, 0) if not derived
+                          else (self.frame_count, self.chunk_count, self.source_frame_start) in ((97, 3, 0), (97, 3, 96)))
+        if not legal_geometry or float(self.raw["fps"]) != 24.0:
+            raise ValueError(f"{self.record_id}: ScanNet requires a full 193/6 record or a legal parent-derived 97/3 unit")
         target = self.load_timestamps()
-        expected = target[0] + np.arange(193, dtype=np.float64) / 24.0
-        if not np.allclose(target, expected, rtol=0.0, atol=1e-8) or not np.isclose(target[-1] - target[0], 8.0, atol=1e-8):
-            raise ValueError(f"{self.record_id}: ScanNet target timestamps are not an exact 8-second 24 FPS axis")
+        expected = target[0] + np.arange(self.frame_count, dtype=np.float64) / 24.0
+        if not np.allclose(target, expected, rtol=0.0, atol=1e-8):
+            raise ValueError(f"{self.record_id}: ScanNet target timestamps are not an exact 24 FPS axis")
         source_timestamps, source_indices = self.load_source_identity()
         if np.max(np.abs(source_timestamps - target)) > (1.0 / 60.0 + 1e-6):
             raise ValueError(f"{self.record_id}: source frames are not nearest 30 FPS observations")
@@ -304,9 +314,10 @@ class RGBDMemoryRecord:
                     or offsets.dtype != np.int64 or offsets.shape != (194,) or offsets[0] != 0
                     or offsets[-1] != len(xyz) or np.any(np.diff(offsets) <= 0)):
                 raise ValueError(f"{self.record_id}: invalid ScanNet pointcloud frame layout")
-            if not np.array_equal(cloud["source_frame_indices"].astype(np.int64), source_indices):
+            start,stop=self.source_frame_start,self.source_frame_start+self.frame_count
+            if not np.array_equal(cloud["source_frame_indices"][start:stop].astype(np.int64), source_indices):
                 raise ValueError(f"{self.record_id}: pointcloud/source frame identity mismatch")
-            if not np.array_equal(cloud["timestamps"].astype(np.float64), target):
+            if not np.array_equal(cloud["timestamps"][start:stop].astype(np.float64), target):
                 raise ValueError(f"{self.record_id}: pointcloud timestamp identity mismatch")
         cache = self.load_correspondences()
         if not len(cache.get("query_frame", ())):

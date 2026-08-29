@@ -34,6 +34,15 @@ def test_strict_arkitscenes_rrd_validator(tmp_path):
     row,_=_record(tmp_path); manifest=tmp_path/'manifest.json'; manifest.write_text(json.dumps({'records':[row]}))
     assert load_rgbd_memory_manifest(manifest,expected_count=1)[0].chunk_count==6
 
+def test_strict_arkitscenes_rrd_validator_accepts_parent_derived_second_unit(tmp_path):
+    row,root=_record(tmp_path)
+    source=np.load(root/'source_timestamps.npy')+123.0; target=np.load(root/'timestamps.npy')
+    source[96]=123.0+target[96]-.008; source[97]=123.0+target[97]+.008; np.save(root/'source_timestamps.npy',source)
+    row.update(record_id='arkitscenes__1__000000__frames_096_192',parent_record_id='arkitscenes__1__000000',source_frame_start=96,frame_count=97,chunk_count=3)
+    manifest=tmp_path/'unit_manifest.json'; manifest.write_text(json.dumps({'records':[row]}))
+    record=load_rgbd_memory_manifest(manifest,expected_count=1)[0]
+    assert record.source_frame_start==96 and record.load_timestamps()[0]==4.0
+
 def test_arkitscenes_rrd_validator_rejects_bad_provenance(tmp_path):
     row,root=_record(tmp_path); metadata=json.loads((root/'metadata.json').read_text()); metadata['pose_source']='lowres_traj_slerp'; (root/'metadata.json').write_text(json.dumps(metadata))
     manifest=tmp_path/'manifest.json'; manifest.write_text(json.dumps({'records':[row]}))

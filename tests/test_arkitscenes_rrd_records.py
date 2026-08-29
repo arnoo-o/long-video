@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
-from scripts.build_arkitscenes_rrd_records import match_times, select_indices
+from scripts.build_arkitscenes_rrd_records import align_lowres_to_output, match_times, select_indices
 
 def _record(tmp_path: Path):
     root=tmp_path/'record'; (root/'rgb').mkdir(parents=True); (root/'depth').mkdir()
@@ -22,6 +22,13 @@ def test_real_60hz_mapping_is_unique_and_within_10ms():
     source=np.arange(600,dtype=np.float64)/60; ids=select_indices(source,1)
     assert ids is not None and len(np.unique(ids))==193 and np.all(np.diff(ids)>0)
     assert match_times(source,source[ids]) is not None
+
+def test_lowres_depth_alignment_respects_principal_point_offset():
+    depth=np.zeros((192,256),np.uint16); depth[80,100]=1234
+    low=np.array([[200,0,96],[0,200,128],[0,0,1]],np.float64)
+    out=np.array([[400,0,426],[0,400,240],[0,0,1]],np.float64)
+    aligned=align_lowres_to_output(depth,low,out)
+    assert aligned[144,434] == 1234
 
 def test_strict_arkitscenes_rrd_validator(tmp_path):
     row,_=_record(tmp_path); manifest=tmp_path/'manifest.json'; manifest.write_text(json.dumps({'records':[row]}))

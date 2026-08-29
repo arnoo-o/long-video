@@ -121,11 +121,22 @@ def render_qa(paths,out):
         cv2.putText(panel,f'frame {index}',(10,25),cv2.FONT_HERSHEY_SIMPLEX,.7,(255,255,255),2,cv2.LINE_AA); panels.append(panel)
     cv2.imwrite(str(out),np.concatenate(panels,axis=1))
 
+def align_lowres_to_output(image,lowres_K,output_K):
+    """Map an RRD low-res plane into the cropped RGB output pinhole."""
+    transform=np.asarray(output_K,np.float64)@np.linalg.inv(np.asarray(lowres_K,np.float64))
+    if not np.isfinite(transform).all(): raise ValueError('invalid_rgb_depth_homography')
+    return cv2.warpPerspective(image,transform,(WIDTH,HEIGHT),flags=cv2.INTER_NEAREST,borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+
 def build_one(video_id, root, out, ordinal, split):
     base=root/'base'/f'{video_id}.rrd'; props0=props(base)
     if props0.get('pose_source')!='mebx_stream_4_vision_transform' or props0.get('orientation_source')!='measured_gravity': return False,'provenance'
     if not all((root/layer/f'{video_id}.rrd').is_file() for layer in ('calibration','video_wide','depth')):
         return False,'missing_layers'
+    # Resumes must not decode the AV1/depth streams or rebuild geometry for a
+    # video which already produced a complete record.
+    existing = list((out/'records'/'arkitscenes').glob(f'arkitscenes__{video_id}__*/metadata.json'))
+    if existing:
+        return True, existing[0].parent.name
     pose_times,c2w,k_times,K,low_k_times,lowK,cam2rig=calibration(root/'calibration'/f'{video_id}.rrd'); frames,rgb_times=decode_video(root/'video_wide'/f'{video_id}.rrd'); depth_blobs,dtimes,conf,ctimes=decode_depth(root/'depth'/f'{video_id}.rrd')
     if not frames or not depth_blobs or len(frames) < N or len(pose_times) < N: return False,'missing_stream'
     limit=len(rgb_times)-N+1
@@ -142,9 +153,6 @@ def build_one(video_id, root, out, ordinal, split):
         if pm['max_translation_m']>.50 or pm['max_rotation_degrees']>45: continue
         # Stable across sharding/restarts; one non-overlapping 8-second window per video.
         rid=f'arkitscenes__{video_id}__{int(ids[0]):06d}'; dest=out/'records'/'arkitscenes'/rid
-        existing = list((out/'records'/'arkitscenes').glob(f'arkitscenes__{video_id}__*/metadata.json'))
-        if existing:
-            return True, existing[0].parent.name
         if (dest/'metadata.json').is_file(): return True,rid
         tmp=dest.with_name(dest.name+'.tmp'); shutil.rmtree(tmp,ignore_errors=True); (tmp/'rgb').mkdir(parents=True); (tmp/'depth').mkdir()
         Ks=[]; ds=[]; means=[]; stds=[]; changes=[]; previous=None; depth_valid=[]; confidence_valid=[]
@@ -153,14 +161,11 @@ def build_one(video_id, root, out, ordinal, split):
                 rgb=frames[src]; dep=cv2.imdecode(np.frombuffer(depth_blobs[depth_ids[j]],np.uint8),cv2.IMREAD_UNCHANGED)
                 if dep is None or dep.ndim!=2: raise ValueError('depth_decode_failure')
                 confidence=np.frombuffer(conf[conf_ids[j]],np.uint8).reshape(dep.shape)
-                rgb_h,rgb_w=rgb.shape[:2]; dep_h,dep_w=dep.shape
-                scaled_low=lowK[low_k_ids[j]].copy(); scaled_low[0]*=rgb_w/dep_w; scaled_low[1]*=rgb_h/dep_h
-                if not np.allclose(K[k_ids[j]],scaled_low,atol=.05): raise ValueError('rgb_depth_intrinsics_mismatch')
+                rgb_h,rgb_w=rgb.shape[:2]
                 crop,K0=center_crop_resize_geometry(rgb_h,rgb_w,K[k_ids[j]]); l,t,r,b=crop
-                dl=int(round(l*dep_w/rgb_w)); dr=int(round(r*dep_w/rgb_w)); dt=int(round(t*dep_h/rgb_h)); db=int(round(b*dep_h/rgb_h))
                 rgb=cv2.resize(rgb[t:b,l:r],(WIDTH,HEIGHT),interpolation=cv2.INTER_AREA)
-                dep=cv2.resize(dep[dt:db,dl:dr],(WIDTH,HEIGHT),interpolation=cv2.INTER_NEAREST)
-                confidence_roi=confidence[dt:db,dl:dr]
+                dep=align_lowres_to_output(dep,lowK[low_k_ids[j]],K0)
+                confidence_roi=align_lowres_to_output(confidence,lowK[low_k_ids[j]],K0)
                 gray=cv2.resize(cv2.cvtColor(rgb,cv2.COLOR_BGR2GRAY),(160,120),interpolation=cv2.INTER_AREA); means.append(float(gray.mean())); stds.append(float(gray.std())); depth_valid.append(float(np.mean(dep>0))); confidence_valid.append(float(np.mean(confidence_roi>=1)))
                 if previous is not None: changes.append(float(np.mean(np.abs(gray.astype(np.float32)-previous.astype(np.float32)))))
                 previous=gray
@@ -175,15 +180,22 @@ def build_one(video_id, root, out, ordinal, split):
             render_qa(sorted((tmp/'rgb').glob('*.png')),tmp/'qa_7frames.jpg')
             visit=str(props0.get('visit_id') or video_id); visit=video_id if visit.upper() in {'NA','NONE','UNKNOWN'} else visit
             timing={'rgb_target_max_error_seconds':float(np.max(np.abs(selected_times-(selected_times[0]+target)))),'depth_rgb_max_error_seconds':float(np.max(np.abs(dtimes[depth_ids]-selected_times))),'pose_rgb_max_error_seconds':float(np.max(np.abs(pose_times[pose_ids]-selected_times))),'intrinsics_rgb_max_error_seconds':float(np.max(np.abs(k_times[k_ids]-selected_times))),'depth_intrinsics_rgb_max_error_seconds':float(np.max(np.abs(low_k_times[low_k_ids]-selected_times))),'confidence_rgb_max_error_seconds':float(np.max(np.abs(ctimes[conf_ids]-selected_times)))}
-            meta={'schema_version':'rgbd-memory-record-v3','record_id':rid,'dataset':'arkitscenes','scene_id':visit,'sequence_id':video_id,'visit_id':visit,'split':split,'frame_count':N,'chunk_count':CHUNKS,'chunk_stride':32,'fps':FPS,'duration_seconds':8.0,'pose_source':props0.get('pose_source'),'orientation_source':props0.get('orientation_source'),'pose_convention':'OpenCV camera-to-world = RRD rig-to-world @ cam_00-to-rig','cam_00_to_rig':cam2rig.tolist(),'source_frame_indices':ids.tolist(),'source_timing':'RRD video_time 60Hz nearest mapping','timing_validation':timing,'pose_validation':pm,'depth_valid_fraction_min':min(depth_valid),'depth_valid_fraction_median':float(np.median(depth_valid)),'confidence_valid_fraction_median':float(np.median(confidence_valid)),'pointcloud_points':points,'correspondence':corr,'depth_confidence':'RRD ARKit confidence >= 1'}; atomic(tmp/'metadata.json',meta); dest.parent.mkdir(parents=True,exist_ok=True); os.replace(tmp,dest); return True,rid
+            meta={'schema_version':'rgbd-memory-record-v3','record_id':rid,'dataset':'arkitscenes','scene_id':visit,'sequence_id':video_id,'visit_id':visit,'split':split,'frame_count':N,'chunk_count':CHUNKS,'chunk_stride':32,'fps':FPS,'duration_seconds':8.0,'pose_source':props0.get('pose_source'),'orientation_source':props0.get('orientation_source'),'pose_convention':'OpenCV camera-to-world = RRD rig-to-world @ cam_00-to-rig','cam_00_to_rig':cam2rig.tolist(),'rgb_depth_alignment':'pinhole homography output_K @ inv(lowres_K)','source_frame_indices':ids.tolist(),'source_timing':'RRD video_time 60Hz nearest mapping','timing_validation':timing,'pose_validation':pm,'depth_valid_fraction_min':min(depth_valid),'depth_valid_fraction_median':float(np.median(depth_valid)),'confidence_valid_fraction_median':float(np.median(confidence_valid)),'pointcloud_points':points,'correspondence':corr,'depth_confidence':'RRD ARKit confidence >= 1'}; atomic(tmp/'metadata.json',meta); dest.parent.mkdir(parents=True,exist_ok=True); os.replace(tmp,dest); return True,rid
         except Exception as e: shutil.rmtree(tmp,ignore_errors=True); return False,str(e)
     return False,'no_valid_window'
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--rrd-root',type=Path,required=True); p.add_argument('--output-root',type=Path,required=True); p.add_argument('--max-records',type=int,default=600); p.add_argument('--start',type=int,default=0)
-    p.add_argument('--shard-index',type=int,default=0); p.add_argument('--shard-count',type=int,default=1); a=p.parse_args()
+    p.add_argument('--shard-index',type=int,default=0); p.add_argument('--shard-count',type=int,default=1)
+    p.add_argument('--skip-ids-file',type=Path,help='newline-delimited video IDs already fully attempted with this builder version')
+    a=p.parse_args()
     if not 0 <= a.shard_index < a.shard_count: raise ValueError('shard-index must be in [0, shard-count)')
     ids=sorted((x.stem for x in (a.rrd_root/'base').glob('*.rrd')),key=lambda v:sum((a.rrd_root/l/f'{v}.rrd').stat().st_size if (a.rrd_root/l/f'{v}.rrd').is_file() else 1<<60 for l in ('video_wide','depth')))[a.start:]
+    if a.skip_ids_file:
+        skipped={line.strip() for line in a.skip_ids_file.read_text(encoding='utf-8').splitlines() if line.strip()}
+        ids=[video_id for video_id in ids if video_id not in skipped]
+    completed={path.parent.name.split('__')[1] for path in (a.output_root/'records'/'arkitscenes').glob('arkitscenes__*__*/metadata.json')}
+    ids=[video_id for video_id in ids if video_id not in completed]
     ids=ids[a.shard_index::a.shard_count]; stats=Counter(); rows=[]
     for vid in ids:
         ok,r=build_one(vid,a.rrd_root,a.output_root,len(rows),'candidate'); stats['built' if ok else r]+=1

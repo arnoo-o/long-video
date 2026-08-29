@@ -6,6 +6,7 @@ cache, so it can be consumed independently without future identities.
 """
 from __future__ import annotations
 import argparse, json, sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -18,7 +19,7 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
-def unit_row(record, output_root: Path, latent_root: Path, offset: int, *, rebuild: bool = False) -> dict:
+def unit_row(record, output_root: Path, latent_root: Path, offset: int, *, rebuild: bool = False, arrays=None) -> dict:
     row = dict(record.raw)
     # A unit must never retain the parent's continuous_49 cache as a fallback.
     row.pop("latent_cache", None)
@@ -28,7 +29,8 @@ def unit_row(record, output_root: Path, latent_root: Path, offset: int, *, rebui
     cache_dir = output_root / "unit_correspondence"
     cache = cache_dir / f"{row['record_id'].replace(':', '_')}.npz"
     if rebuild or not cache.is_file():
-        arrays=record.load_correspondences(); stop=offset+97; chunk_offset=offset//32
+        arrays=record.load_correspondences() if arrays is None else arrays
+        stop=offset+97; chunk_offset=offset//32
         keep=((arrays['query_frame']>=offset)&(arrays['query_frame']<stop)&
               (arrays['key_frame']>=offset)&(arrays['key_frame']<stop)&
               (arrays['query_chunk']>=chunk_offset)&(arrays['query_chunk']<chunk_offset+3)&
@@ -50,22 +52,27 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--latent-root", type=Path, help="unit-owned cache root; defaults beside the output manifest")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
     records = load_rgbd_memory_manifest(args.manifest)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     latent_root = (args.latent_root or (args.out.parent / "unit_latents")).resolve()
-    rows = []
-    for record in records:
+    def convert(record):
         if record.chunk_count == 3:
             row=dict(record.raw)
             row.pop("latent_cache",None); row.pop("gt_latent_cache",None)
             latent=latent_root/record.record_id.replace(":","_")/"continuous_25.pt"
             row.update(gt_latent_cache=str(latent.relative_to(args.out.parent) if latent.is_relative_to(args.out.parent) else latent),latent_schema="continuous_25")
-            rows.append(row)
+            return [row]
         elif record.chunk_count == 6:
-            rows.extend((unit_row(record,args.out.parent,latent_root,0,rebuild=args.rebuild),unit_row(record,args.out.parent,latent_root,96,rebuild=args.rebuild)))
+            arrays=record.load_correspondences()
+            return [unit_row(record,args.out.parent,latent_root,0,rebuild=args.rebuild,arrays=arrays),
+                    unit_row(record,args.out.parent,latent_root,96,rebuild=args.rebuild,arrays=arrays)]
         else:
             raise ValueError(f"unsupported training record geometry: {record.record_id}")
+    if args.workers < 1: raise ValueError("workers must be positive")
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        rows=[row for converted in executor.map(convert,records) for row in converted]
     if len({row['record_id'] for row in rows}) != len(rows):
         raise ValueError("training-unit ids must be unique")
     atomic_json(args.out, {"schema_version": "rgbd-memory-training-units-v2", "split": "train", "height": 480, "width": 832, "records": rows})

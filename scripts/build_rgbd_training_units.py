@@ -65,7 +65,14 @@ def main() -> None:
             row.update(gt_latent_cache=str(latent.relative_to(args.out.parent) if latent.is_relative_to(args.out.parent) else latent),latent_schema="continuous_25")
             return [row]
         elif record.chunk_count == 6:
-            arrays=record.load_correspondences()
+            first_cache = args.out.parent / "unit_correspondence" / f"{record.record_id.replace(':', '_')}__frames_000_096.npz"
+            second_cache = args.out.parent / "unit_correspondence" / f"{record.record_id.replace(':', '_')}__frames_096_192.npz"
+            # Existing units already own their rebased causal caches.  Avoid
+            # reading/decompressing the much larger parent cache unless at
+            # least one unit actually has to be built.
+            arrays = None
+            if args.rebuild or not (first_cache.is_file() and second_cache.is_file()):
+                arrays = record.load_correspondences()
             return [unit_row(record,args.out.parent,latent_root,0,rebuild=args.rebuild,arrays=arrays),
                     unit_row(record,args.out.parent,latent_root,96,rebuild=args.rebuild,arrays=arrays)]
         else:

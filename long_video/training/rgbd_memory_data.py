@@ -25,6 +25,7 @@ SCANNET_REQUIRED_KEYS = (
     "source_timestamps", "source_frame_indices", "pointcloud", "metadata", "fps",
 )
 ARKIT_RRD_REQUIRED_KEYS = SCANNET_REQUIRED_KEYS
+RESAMPLED_RGBD_REQUIRED_KEYS = SCANNET_REQUIRED_KEYS
 
 @dataclass(frozen=True)
 class CorrespondenceSlice:
@@ -212,6 +213,53 @@ class RGBDMemoryRecord:
             self._validate_scannet()
         if self.raw.get("dataset") == "arkitscenes":
             self._validate_arkitscenes_rrd()
+        if self.raw.get("dataset") in {"bonn", "tum"} and "fps" in self.raw:
+            self._validate_resampled_bonn_tum()
+
+    def _validate_resampled_bonn_tum(self) -> None:
+        missing = [key for key in RESAMPLED_RGBD_REQUIRED_KEYS if key not in self.raw]
+        if missing:
+            raise ValueError(f"{self.record_id}: 24 FPS Bonn/TUM record missing {missing}")
+        if (self.frame_count, self.chunk_count, self.source_frame_start) != (97, 3, 0):
+            raise ValueError(f"{self.record_id}: Bonn/TUM requires a full 97-frame/3-chunk record")
+        if float(self.raw["fps"]) != 24.0:
+            raise ValueError(f"{self.record_id}: Bonn/TUM target FPS must be 24")
+        target = self.load_timestamps()
+        expected = np.arange(self.frame_count, dtype=np.float64) / 24.0
+        if not np.allclose(target, expected, rtol=0.0, atol=1e-8):
+            raise ValueError(f"{self.record_id}: Bonn/TUM target timestamps are not an exact 24 FPS axis")
+        source_timestamps, source_indices = self.load_source_identity()
+        if len(np.unique(source_indices)) != self.frame_count or np.any(np.diff(source_indices) <= 0):
+            raise ValueError(f"{self.record_id}: Bonn/TUM source frames are repeated or reordered")
+        metadata = json.loads(self.path("metadata").read_text(encoding="utf-8"))
+        origin = float(metadata.get("target_time_origin_seconds", float("nan")))
+        if not np.isfinite(origin) or np.max(np.abs(source_timestamps - (origin + target))) > .0200005:
+            raise ValueError(f"{self.record_id}: Bonn/TUM source observation exceeds 20 ms target tolerance")
+        if metadata.get("interpolation") != "none" or metadata.get("source_selection") != "nearest real frame; strictly increasing and unique":
+            raise ValueError(f"{self.record_id}: Bonn/TUM real-frame provenance is invalid")
+        c2w, intrinsics = self.load_cameras(local=False); rotations = c2w[:, :3, :3]
+        if (not np.allclose(c2w[:, 3], np.asarray((0, 0, 0, 1)), atol=1e-5)
+                or not np.allclose(rotations.transpose(0, 2, 1) @ rotations, np.eye(3), atol=2e-4)
+                or not np.allclose(np.linalg.det(rotations), 1.0, atol=2e-4)):
+            raise ValueError(f"{self.record_id}: Bonn/TUM c2w is not rigid")
+        if (np.any(intrinsics[:, 0, 0] <= 0) or np.any(intrinsics[:, 1, 1] <= 0)
+                or np.any(intrinsics[:, 0, 2] < 0) or np.any(intrinsics[:, 0, 2] >= WIDTH)
+                or np.any(intrinsics[:, 1, 2] < 0) or np.any(intrinsics[:, 1, 2] >= HEIGHT)):
+            raise ValueError(f"{self.record_id}: invalid Bonn/TUM intrinsics")
+        with np.load(self.path("pointcloud"), allow_pickle=False) as cloud:
+            required = {"xyz_world", "offsets", "source_frame_indices", "timestamps"}
+            if not required.issubset(cloud.files):
+                raise ValueError(f"{self.record_id}: Bonn/TUM pointcloud metadata is incomplete")
+            xyz, offsets = cloud["xyz_world"], cloud["offsets"]
+            if (xyz.dtype != np.float32 or xyz.ndim != 2 or xyz.shape[1] != 3 or not np.isfinite(xyz).all()
+                    or offsets.dtype != np.int64 or offsets.shape != (98,) or offsets[0] != 0
+                    or offsets[-1] != len(xyz) or np.any(np.diff(offsets) <= 0)
+                    or not np.array_equal(cloud["source_frame_indices"].astype(np.int64), source_indices)
+                    or not np.array_equal(cloud["timestamps"].astype(np.float64), target)):
+                raise ValueError(f"{self.record_id}: invalid Bonn/TUM pointcloud frame identity")
+        cache = self.load_correspondences()
+        if not len(cache.get("query_frame", ())):
+            raise ValueError(f"{self.record_id}: Bonn/TUM correspondence cache is empty")
 
     def _validate_arkitscenes_rrd(self) -> None:
         missing = [key for key in ARKIT_RRD_REQUIRED_KEYS if key not in self.raw]

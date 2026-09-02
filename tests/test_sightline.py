@@ -665,6 +665,18 @@ def test_formal_config_accepts_explicit_reduced_ddp_world_size(tmp_path):
     invalid=tmp_path/'sightline-5gpu.yaml'; invalid.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 5'))
     with pytest.raises(ValueError,match='DDP=1..4'): load_sightline_config(invalid)
 
+def test_bucketed_manual_ddp_preserves_gradient_average_and_reduces_collectives(monkeypatch):
+    import scripts.train_sightline_rgbd as training
+    first=torch.nn.Parameter(torch.ones(4)); second=torch.nn.Parameter(torch.ones(3)); unused=torch.nn.Parameter(torch.ones(2))
+    first.grad=torch.arange(4,dtype=torch.float32); second.grad=torch.arange(3,dtype=torch.float32)+4
+    expected=(first.grad.clone(),second.grad.clone())
+    calls=[]
+    def identical_second_rank(value): calls.append(value.numel()); value.mul_(2)
+    monkeypatch.setattr(training.dist,'all_reduce',identical_second_rank)
+    training._average_gradients([first,second,unused],2,bucket_bytes=1024)
+    assert torch.equal(first.grad,expected[0]) and torch.equal(second.grad,expected[1]) and unused.grad is None
+    assert calls==[3,7]
+
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
     from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier,FORMAL_MEMORY_LAYERS

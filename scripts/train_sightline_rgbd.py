@@ -39,19 +39,40 @@ def _distributed_context():
     dist.init_process_group(backend='nccl',init_method='env://')
     return dist.get_rank(),world_size,torch.device('cuda',local_rank)
 
-def _average_gradients(parameters,world_size):
+def _average_gradients(parameters,world_size,bucket_bytes=64<<20):
+    """Average dense gradients with one presence collective and large buckets.
+
+    Unused parameters still contribute explicit zeros, matching the previous
+    per-parameter implementation.  Bucketing only reduces NCCL launch and host
+    synchronization overhead; it does not change the averaged gradient.
+    """
     if world_size==1: return
-    for parameter in parameters:
-        present=torch.tensor(parameter.grad is not None,device=parameter.device,dtype=torch.int32)
-        dist.all_reduce(present)
-        count=int(present.item())
-        if count==0:
-            continue
-        # Unused parameters on a rank contribute an explicit zero.  This is
-        # required for sparse correspondence rows and keeps all ranks in the
-        # same collective sequence.
-        grad=parameter.grad if parameter.grad is not None else torch.zeros_like(parameter)
-        dist.all_reduce(grad); grad.div_(world_size); parameter.grad=grad
+    parameters=list(parameters)
+    if not parameters: return
+    presence=torch.tensor([parameter.grad is not None for parameter in parameters],device=parameters[0].device,dtype=torch.int32)
+    dist.all_reduce(presence)
+    globally_present=presence.cpu().tolist()
+    groups={}
+    for parameter,count in zip(parameters,globally_present):
+        if not count: continue
+        grad=parameter.grad
+        if grad is not None and grad.is_sparse: raise RuntimeError('bucketed DDP requires dense gradients')
+        groups.setdefault((parameter.device,parameter.dtype),[]).append((parameter,grad if grad is not None else torch.zeros_like(parameter)))
+    for entries in groups.values():
+        bucket=[]; size=0
+        for entry in entries:
+            nbytes=entry[1].numel()*entry[1].element_size()
+            if bucket and size+nbytes>bucket_bytes:
+                _all_reduce_gradient_bucket(bucket,world_size); bucket=[]; size=0
+            bucket.append(entry); size+=nbytes
+        if bucket: _all_reduce_gradient_bucket(bucket,world_size)
+
+def _all_reduce_gradient_bucket(entries,world_size):
+    flat=torch.cat([grad.reshape(-1) for _,grad in entries])
+    dist.all_reduce(flat); flat.div_(world_size)
+    offset=0
+    for parameter,grad in entries:
+        count=grad.numel(); parameter.grad=flat[offset:offset+count].view_as(parameter); offset+=count
 
 def _ddp_record_index(step,rank,world_size,count,seed=20260823):
     if world_size==1: return random.randrange(count)

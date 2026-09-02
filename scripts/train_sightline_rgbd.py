@@ -25,6 +25,7 @@ from long_video.sightline.boundary import constrain_flow_items, stage2_sample_wi
 
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
+FORMAL_MEMORY_LAYERS=(4,6,8,16,20,24,32,34,36)
 
 def checkpoint_interval(global_step: int) -> int:
     """Formal cadence: 100-step checkpoints through step 1000, then 60-step."""
@@ -63,8 +64,8 @@ def _preflight(cfg,args,probe_layers):
     sightline=set(cfg.sightline_layers)
     if not cfg.sightline_layers:
         raise ValueError('formal training requires non-empty sightline_layers')
-    if tuple(cfg.memory_layers)!=(16,20,24) or tuple(cfg.correspondence_layers)!=(16,20,24):
-        raise ValueError('Memory/correspondence layers must be 16/20/24')
+    if tuple(cfg.memory_layers)!=FORMAL_MEMORY_LAYERS or tuple(cfg.correspondence_layers)!=FORMAL_MEMORY_LAYERS:
+        raise ValueError(f'Memory/correspondence layers must be {FORMAL_MEMORY_LAYERS}')
     if args.train and (cfg.memory_layers or cfg.correspondence_layers):
         # These modules remain reserved but are intentionally disabled in the
         # camera-only retraining curriculum.
@@ -217,7 +218,8 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
     first=processors[layers[0]]; identities=first.last_key_identities
     for layer in layers[1:]:
         processor=processors[layer]
-        if processor.last_key_identities!=identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first.last_q.shape[1] or processor.last_k.shape[1]!=first.last_k.shape[1]:
+        same_identities=(processor.last_key_identities is identities or processor.last_key_identities==identities)
+        if not same_identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first.last_q.shape[1] or processor.last_k.shape[1]!=first.last_k.shape[1]:
             raise RuntimeError('correspondence layers must have identical key identity maps for shared mapping')
     mapping_started=time.perf_counter()
     try: selected,positives,weights,flags=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))

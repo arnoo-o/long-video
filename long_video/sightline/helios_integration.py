@@ -136,12 +136,17 @@ class SightlineRayProvider:
     """Runtime ray provider bound to one actual Helios token grid."""
     def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
-        self.c2w=c2w; self.intrinsics=intrinsics; self.context=None
+        self.c2w=c2w; self.intrinsics=intrinsics; self.context=None; self._key_identity_cache={}
     def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_global_coverages=None, history_validity=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
         if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
         self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_global_coverages':history_global_coverages,'history_validity':history_validity,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+        self._key_identity_cache={}
 
     def key_identities(self, current_length, memory=None):
+        memory_metadata=memory.active_identity_metadata() if memory is not None and memory.enabled else None
+        cache_key=(int(current_length),id(memory_metadata) if memory_metadata is not None else None)
+        cached=self._key_identity_cache.get(cache_key)
+        if cached is not None:return cached
         context=self.context; identities=[]; shapes=context.get('history_token_shapes') or {}; coverages=context.get('history_global_coverages') or {}
         for name in ('long','mid','short'):
             if name not in shapes: continue
@@ -151,9 +156,10 @@ class SightlineRayProvider:
         T,H,W=next(shape for shape in context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current_length)
         base=int(context['chunk_index'])*8
         identities.extend(('current',(base+t,),y,x,'current') for t in range(T) for y in range(H) for x in range(W))
-        if memory is not None and memory.enabled:
-            identities.extend(('memory',(global_id,),y,x,'memory') for global_id,y,x in memory.active_identity_metadata())
-        return tuple(identities)
+        if memory_metadata is not None:
+            identities.extend(('memory',(global_id,),y,x,'memory') for global_id,y,x in memory_metadata)
+        result=tuple(identities); self._key_identity_cache[cache_key]=result
+        return result
     def __call__(self, hidden_states, *, key_length, current_length, **kwargs):
         B,N,_=hidden_states.shape
         context=self.context

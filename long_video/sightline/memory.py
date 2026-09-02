@@ -259,7 +259,7 @@ class LayerKVMemoryBank(nn.Module):
         for bank in self.banks.values():
             if any(chunk_id not in bank.archive for chunk_id in selected_ids): raise RuntimeError('Memory layer archives differ in complete chunk membership')
         # Capture identity metadata once from the reference archive and share it
-        # across the three equal-layout Memory layers.
+        # across every equal-layout Memory layer.
         reference.prepare_active_memory(query_chunk=query_chunk,query_camera_poses=query_camera_poses,
             device=device,dtype=dtype,selected_chunk_ids=selected_ids)
         identity_metadata=reference.active_identity_metadata()

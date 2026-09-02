@@ -475,7 +475,8 @@ def test_memory_active_bank_prepared_once_and_cleared_without_archive_loss():
 
 def test_layer_memory_banks_select_once_and_share_chunk_ids():
     from long_video.sightline.memory import LayerKVMemoryBank
-    memory=LayerKVMemoryBank((16,20,24),budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
+    layers=(4,6,8,16,20,24,32,34,36)
+    memory=LayerKVMemoryBank(layers,budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
     for bank in memory.banks.values():
         for chunk in range(3): bank.capture(hidden+chunk,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
     calls=[]
@@ -484,6 +485,8 @@ def test_layer_memory_banks_select_once_and_share_chunk_ids():
         bank.select_chunks=lambda *args,_original=original,**kwargs:(calls.append(1) or _original(*args,**kwargs))
     memory.prepare_active_memory(query_chunk=2,query_camera_poses=_camera_trajectory(2.),native_history_chunk_ids={0,1},device='cpu',dtype=torch.float32)
     assert calls==[1] and all(bank.last_selected_chunk_ids==(0,1) for bank in memory.banks.values())
+    identity_objects=[bank.active_identity_metadata() for bank in memory.banks.values()]
+    assert all(value is identity_objects[0] for value in identity_objects)
 
 def test_memory_active_empty_bank_does_not_reselect():
     from long_video.sightline.memory import LongTermKVMemory
@@ -582,6 +585,7 @@ def test_key_identity_map_contains_native_current_and_memory():
     memory.capture(torch.zeros(1,9*3*4,4),torch.zeros(1,9*3*4,7),0,grid_shape=(9,3,4),camera_poses=_camera_trajectory())
     memory.prepare_active_memory(query_chunk=1,query_camera_poses=_camera_trajectory(1.),device='cpu',dtype=torch.float32)
     identities=provider.key_identities(9,memory)
+    assert provider.key_identities(9,memory) is identities
     assert identities[:3]==(('native',(1,2,3,4),0,0,'long'),('native',(5,6),0,0,'mid'),('native',(7,),0,0,'short'))
     assert ('current',(8,),0,0,'current') in identities and identities[-1]==('memory',(8,),2,3,'memory')
 
@@ -603,19 +607,20 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     identities=(('native',(0,),0,0,'short'),('current',(8,),0,0,'current'),('memory',(1,),0,0,'memory'))
     rows=[{'query_chunk':1,'query_latent_temporal':0,'query_y':0,'query_x':0,'key_chunk':0,'key_latent_temporal':0,'key_y':0,'key_x':0,'weight':.7}]
     processors={}
-    for layer in (16,20,24):
+    layers=(4,6,8,16,20,24,32,34,36)
+    for layer in layers:
         q=torch.randn(1,1,2,2,requires_grad=True); k=torch.randn(1,3,2,2,requires_grad=True)
         processors[layer]=SimpleNamespace(last_q=q,last_k=k,last_current_length=1,ray_provider=SimpleNamespace(context={'stage_shapes':((1,1,1),)}),last_key_identities=identities,last_attention_bias=None)
-    selected,positives,weights,flags=training._mapped_correspondences(processors[16],rows,1)
+    selected,positives,weights,flags=training._mapped_correspondences(processors[4],rows,1)
     assert selected==[0] and positives==[[0]] and weights==[.7] and flags==[{'has_native_positive':True,'has_memory_positive':False}]
     calls=[]; original=training._mapped_correspondences
     def counted(*args,**kwargs): calls.append(1); return original(*args,**kwargs)
     monkeypatch.setattr(training,'_mapped_correspondences',counted)
-    loss=training._corr_loss(SightlineTrainable(4,layers=(16,20,24),heads=2),processors,rows,1,(16,20,24),8)
+    loss=training._corr_loss(SightlineTrainable(4,layers=layers,heads=2),processors,rows,1,layers,8)
     assert len(calls)==1 and loss.requires_grad
-    processors[24].last_key_identities=identities[:-1]
+    processors[36].last_key_identities=identities[:-1]
     with pytest.raises(RuntimeError,match='identical key identity maps'):
-        training._corr_loss(SightlineTrainable(4,layers=(16,20,24),heads=2),processors,rows,1,(16,20,24),8)
+        training._corr_loss(SightlineTrainable(4,layers=layers,heads=2),processors,rows,1,layers,8)
 
 def test_native_memory_overlap_is_multi_positive_and_memory_rows_survive_sampling():
     from types import SimpleNamespace
@@ -653,6 +658,8 @@ def test_steps_override_is_effective_and_symmetric():
 def test_formal_config_accepts_explicit_reduced_ddp_world_size(tmp_path):
     from long_video.config import load_sightline_config
     source=Path(__file__).parents[1].joinpath('configs/sightline.yaml').read_text()
+    formal=load_sightline_config(Path(__file__).parents[1]/'configs/sightline.yaml')
+    assert formal.memory_layers==formal.correspondence_layers==(4,6,8,16,20,24,32,34,36)
     runtime=tmp_path/'sightline-3gpu.yaml'; runtime.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 3'))
     assert load_sightline_config(runtime).ddp_world_size==3
     invalid=tmp_path/'sightline-5gpu.yaml'; invalid.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 5'))
@@ -660,8 +667,8 @@ def test_formal_config_accepts_explicit_reduced_ddp_world_size(tmp_path):
 
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
-    from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier
-    cfg=SimpleNamespace(sightline_layers=tuple(range(25)),correspondence_layers=(16,20,24),memory_layers=(16,20,24),lora_layers=(),warmup_ratio=.04)
+    from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier,FORMAL_MEMORY_LAYERS
+    cfg=SimpleNamespace(sightline_layers=tuple(range(40)),correspondence_layers=FORMAL_MEMORY_LAYERS,memory_layers=FORMAL_MEMORY_LAYERS,lora_layers=(),warmup_ratio=.04)
     with pytest.raises(ValueError,match='P2'): _preflight(cfg,SimpleNamespace(train=True,max_steps=401),())
     cfg.lora_layers=(0,)
     cfg.memory_layers=(); cfg.correspondence_layers=()

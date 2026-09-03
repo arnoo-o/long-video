@@ -54,7 +54,9 @@ def validate_checkpoint(payload, *, config, helios_fingerprint, layers, memory_c
     config_match=payload.get('config_fingerprint')==config_fingerprint(config)
     if (allow_memory_layer_migration or allow_world_size_migration) and not config_match:
         old=dict(saved_config); new=dict(config)
-        if allow_memory_layer_migration: old.pop('memory_layers',None); new.pop('memory_layers',None)
+        if allow_memory_layer_migration:
+            old.pop('memory_layers',None); new.pop('memory_layers',None)
+            old.pop('correspondence_layers',None); new.pop('correspondence_layers',None)
         if allow_world_size_migration: old.pop('ddp_world_size',None); new.pop('ddp_world_size',None)
         config_match=old==new
     if not config_match: raise RuntimeError('Sightline checkpoint config mismatch')
@@ -114,13 +116,12 @@ def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, confi
     if provenance is not None and not _provenance_matches(payload.get('runtime_provenance'),provenance): raise RuntimeError('Sightline checkpoint runtime provenance mismatch')
     trainable.load_state_dict(payload['trainable'],strict=True)
     memory_missing_type=False
-    if not allow_memory_layer_migration:
-        missing,unexpected=memory.load_state_dict(payload['memory'],strict=False)
-        # Existing checkpoints predate the zero-initialized type marker.  It is
-        # the only allowed omission; all new checkpoints restore strictly.
-        if unexpected or set(missing) not in (set(),{'memory_type_embedding'}):
-            raise RuntimeError(f'checkpoint Memory parameter set mismatch: missing={missing}, unexpected={unexpected}')
-        memory_missing_type='memory_type_embedding' in missing
+    missing,unexpected=memory.load_state_dict(payload['memory'],strict=False)
+    # Layer selection changes archive routing only; timestamp/type parameters
+    # retain the same schema and must still restore exactly.
+    if unexpected or set(missing) not in (set(),{'memory_type_embedding'}):
+        raise RuntimeError(f'checkpoint Memory parameter set mismatch: missing={missing}, unexpected={unexpected}')
+    memory_missing_type='memory_type_embedding' in missing
     missing,unexpected=transformer.load_state_dict(payload.get('lora',{}),strict=False)
     unexpected=[name for name in unexpected if 'lora_' in name]
     expected={name for name,_ in transformer.named_parameters() if 'lora_' in name}

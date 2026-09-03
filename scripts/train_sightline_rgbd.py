@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse, hashlib, json, os, random, sys, time
 # Must be set before importing/initializing CUDA; callers may override it.
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 from dataclasses import asdict
 from pathlib import Path
 import numpy as np
@@ -27,7 +28,7 @@ from long_video.sightline.boundary import constrain_flow_items, stage2_sample_wi
 
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
-FORMAL_MEMORY_LAYERS=(4,6,8,16,20,24,32,34,36)
+FORMAL_MEMORY_LAYERS=(4,8,16,20,24,32,36)
 
 def checkpoint_interval(global_step: int) -> int:
     """Formal cadence: 100-step checkpoints through step 1000, then 60-step."""
@@ -253,16 +254,16 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
     return CorrespondencePlan(torch.as_tensor(selected,device=device,dtype=torch.long),positive_indices,positive_mask,
                               torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags))
 
-def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,plan=None):
+def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,plan=None,vram_callback=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
     missing=[layer for layer in layers if layer not in processors]
     if missing: raise RuntimeError(f'correspondence layers have no Sightline processor: {missing}')
     first=processors[layers[0]]; identities=first.last_key_identities
-    captured={layer:(processors[layer].last_q,processors[layer].last_k,getattr(processors[layer],'last_attention_bias',None)) for layer in layers}
+    first_q_shape=first.last_q.shape; first_k_shape=first.last_k.shape
     for layer in layers[1:]:
         processor=processors[layer]
         same_identities=(processor.last_key_identities is identities or processor.last_key_identities==identities)
-        if not same_identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first.last_q.shape[1] or processor.last_k.shape[1]!=first.last_k.shape[1]:
+        if not same_identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first_q_shape[1] or processor.last_k.shape[1]!=first_k_shape[1]:
             raise RuntimeError('correspondence layers must have identical key identity maps for shared mapping')
     mapping_started=time.perf_counter()
     if plan is None:
@@ -278,8 +279,10 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
     losses=[]; loss_started=time.perf_counter()
     for layer in layers:
         processor=processors[layer]
-        if not selected: continue
-        captured_q,captured_k,captured_bias=captured[layer]
+        if not selected:
+            processor.last_q=None; processor.last_k=None; processor.last_attention_bias=None
+            continue
+        captured_q=processor.last_q; captured_k=processor.last_k; captured_bias=getattr(processor,'last_attention_bias',None)
         if plan is None:
             numerator=captured_q.new_zeros(()); denominator=captured_q.new_zeros(())
             for start in range(0,len(selected),64):
@@ -298,13 +301,34 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
                 additive_bias=additive_bias[:,:,plan.query_indices,:] if additive_bias.ndim==4 else additive_bias[:,plan.query_indices,:].unsqueeze(1)
             layer_loss=trainable.correspondence_streaming(captured_q,captured_k,plan,additive_bias=additive_bias)
         if not layer_loss.requires_grad or not captured_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd')
+        if vram_callback is not None:
+            captured_q.register_hook(lambda grad,callback=vram_callback: (callback('correspondence_backward'),grad)[1])
         losses.append(layer_loss)
+        # The autograd node is now the sole owner of Q/K and compact plan state.
+        # Do not pin nine full K tensors through processor diagnostics/finalize.
+        processor.last_q=None; processor.last_k=None; processor.last_attention_bias=None
     if timings is not None: timings['correspondence_loss_seconds']+=time.perf_counter()-loss_started
-    if not losses: return captured[layers[0]][0].new_zeros(())
+    if not losses: return torch.zeros((),device=first.ray_provider.context['c2w'].device)
     return torch.stack(losses).mean()
 
 def _reset_sequence(runner):
     runner.reset_sequence()
+
+def _install_oom_profiler(output,device,rank,state):
+    """Flush useful CUDA state even when a step dies before normal metrics."""
+    original=sys.excepthook
+    def hook(exc_type,exc_value,traceback):
+        if isinstance(exc_value,torch.cuda.OutOfMemoryError):
+            payload=dict(state)
+            payload.update(rank=int(rank),timestamp=time.time(),error=str(exc_value),
+                memory_allocated=int(torch.cuda.memory_allocated(device)),
+                memory_reserved=int(torch.cuda.memory_reserved(device)),
+                max_memory_allocated=int(torch.cuda.max_memory_allocated(device)))
+            path=Path(output)/'oom_profile.jsonl'; path.parent.mkdir(parents=True,exist_ok=True)
+            with path.open('a',buffering=1) as handle:
+                handle.write(json.dumps(payload)+'\n'); handle.flush()
+        original(exc_type,exc_value,traceback)
+    sys.excepthook=hook
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
@@ -317,7 +341,8 @@ def main():
     if args.train and args.save_every is not None and args.save_every not in (60,100): raise ValueError('formal checkpoint cadence only permits 100 before step 1000 or 60 afterward')
     rank,world_size,device=_distributed_context()
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
-    if args.train and world_size!=cfg.ddp_world_size: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
+    smoke_world_size_migration=(args.profile_timing and args.allow_world_size_migration and os.environ.get('SIGHTLINE_SMOKE_ALLOW_WORLD_SIZE')=='1')
+    if args.train and world_size!=cfg.ddp_world_size and not smoke_world_size_migration: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
     probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
     p3_records=load_rgbd_memory_manifest(args.p3_manifest) if args.p3_manifest else records
     if cfg.chunk_count!=3 or cfg.chunk_length!=33 or cfg.chunk_stride!=32 or (cfg.source_height,cfg.source_width)!=(480,832): raise ValueError('formal RGB-D training requires 3 chunks, 97 frames, and 480x832 geometry')
@@ -354,7 +379,7 @@ def main():
     world_size_migrated=False
     if args.resume:
         payload=torch.load(args.resume,map_location='cpu'); world_size_migrated=int(payload.get('rng_world_size',-1))!=world_size
-        completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=None if args.allow_memory_layer_migration else optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration,allow_world_size_migration=args.allow_world_size_migration); start_step=completed_step+1
+        completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration,allow_world_size_migration=args.allow_world_size_migration); start_step=completed_step+1
         if world_size_migrated:
             seed=set_rank_runtime_seed(rank,start_step)
             if rank==0: print(f'checkpoint world size migration: deterministic per-rank reseed at step {start_step}, rank0 seed {seed}',flush=True)
@@ -368,8 +393,12 @@ def main():
     else:
         set_rank_runtime_seed(rank,start_step)
     output=Path(args.output_dir); output.mkdir(parents=True,exist_ok=True); metrics=output/'metrics.jsonl'
+    oom_state={'stage':'initialization','step':int(start_step),'train_chunk':None,'memory_token_count':0,'k_length':0,'selected_q_count':0}
+    _install_oom_profiler(output,device,rank,oom_state)
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
+        oom_state.update(stage='step_setup',step=int(step),train_chunk=None,memory_token_count=0,k_length=0,selected_q_count=0)
+        if args.profile_timing: torch.cuda.reset_peak_memory_stats(device)
         phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps); checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         phase_records=p3_records if phase['name']=='P3' else records
@@ -395,6 +424,7 @@ def main():
         latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to(device,dtype=torch.bfloat16)
         rgb_paths=record.rgb_paths()
         if len(rgb_paths)<=frame_start: raise RuntimeError('trajectory RGB frames do not cover sampled chunk window')
+        oom_state['stage']='source_condition_vae'
         source,fake,_,_=prepare_source_condition(pipe,Image.open(rgb_paths[frame_start]).convert('RGB'),height=cfg.source_height,width=cfg.source_width,device=device)
         c2w_np,K_np=record.load_cameras(); c2w_np=np.array(c2w_np[frame_start:frame_start+1+phase['max_chunks']*32],copy=True); K_np=np.array(K_np[frame_start:frame_start+1+phase['max_chunks']*32],copy=True)
         c2w=torch.from_numpy(c2w_np).to(device,dtype=torch.float32).unsqueeze(0); c2w=torch.linalg.inv(c2w[:,:1])@c2w
@@ -412,6 +442,7 @@ def main():
                 pipe.transformer._sightline_processors[layer].capture_query_indices=None
         minimum_train_chunk=1 if phase['name']=='P3' else 0
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'],minimum=minimum_train_chunk)
+        oom_state['train_chunk']=int(train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
         perf={'prefix_generation_seconds':0.0,'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0,'correspondence_load_seconds':0.0,'correspondence_mapping_seconds':0.0,'correspondence_loss_seconds':0.0,'backward_seconds':0.0}
         def timing_sync():
@@ -426,12 +457,12 @@ def main():
         else: corr_rows=None
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
         history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
-        if args.probe_capture: torch.cuda.reset_peak_memory_stats()
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
             chunk_started=time.perf_counter()
             history=history_state.groups(); coverage=history_state.coverage()
             if not keep_graph:
+                oom_state['stage']='prefix_rollout'
                 template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:]
                 generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
@@ -443,6 +474,10 @@ def main():
                 items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range)
                 if clean_boundary is not None: items=constrain_flow_items(items,clean_boundary)
                 runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
+                oom_state['stage']='active_memory'
+                if active_corr_layers:
+                    active=pipe.transformer._sightline_processors[active_corr_layers[0]].memory
+                    oom_state['memory_token_count']=len(active.active_identity_metadata()) if active is not None and active.enabled else 0
                 record_vram('active_memory')
                 correspondence_plan=None
                 correspondence_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)
@@ -450,6 +485,8 @@ def main():
                     final_shape=runner.ray_provider.context['stage_shapes'][-1]
                     current_length=int(final_shape[0]*final_shape[1]*final_shape[2])
                     correspondence_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],corr_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
+                    oom_state['k_length']=len(correspondence_plan.identities)
+                    oom_state['selected_q_count']=int(correspondence_plan.query_indices.numel())
                 stage_losses=[]; final_prediction=None
                 for stage_index,item in enumerate(items):
                     capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
@@ -457,6 +494,7 @@ def main():
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=capture_correspondence
                         processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and args.train else None
+                    oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
                     if capture_correspondence: record_vram('final_stage_forward')
                     stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
@@ -464,14 +502,17 @@ def main():
                         timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_weight=trainable.lambda_corr(step/total_steps)
-                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
+                oom_state['stage']='correspondence_forward'
+                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
                 record_vram('correspondence_loss')
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
                 total=stage_losses[-1]/len(items)+corr_weight*corr if args.train else fm+corr_weight*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
                 if args.train:
+                    oom_state['stage']='correspondence_and_fm_backward'
                     timing_sync(); backward_started=time.perf_counter(); total.backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                     record_vram('backward')
+                    record_vram('fm_backward')
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -522,6 +563,7 @@ def main():
             generated_prefix.append(generated.detach())
             history_state.append_chunk(generated,chunk)
             capture_memory=phase['name']!='P3' or prefix_chunk_should_capture_memory(chunk,train_chunk)
+            oom_state['stage']='clean_memory_capture'
             timing_sync(); memory_timings=runner._finalize_chunk(chunk,clean_latent=generated.detach(),capture_fn=clean_capture,capture_memory=capture_memory); timing_sync()
             if capture_memory: record_vram('clean_memory_capture')
             for name,value in memory_timings.items(): perf[name]+=value
@@ -550,6 +592,7 @@ def main():
                     geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
+            oom_state['stage']='ddp_gradient_average'; record_vram('pre_ddp')
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         alpha_q,alpha_k=trainable.conditioner.alpha_values()

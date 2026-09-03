@@ -49,11 +49,16 @@ class SightlineHeliosAttnProcessor:
             scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
         else:
             condition_dtype=next(self.conditioner.parameters()).dtype
-            conditioned_q=rays_q.to(condition_dtype); conditioned_k=rays_k.to(condition_dtype)
+            history_len=max(0,key.shape[1]-current_len)
+            # Native history has its own exact camera-footprint projection below.
+            # Projecting placeholder/all-token rays here only to overwrite the
+            # history prefix was both redundant and a large checkpoint-backward
+            # peak. The current suffix is pointwise-identical to the old path.
+            conditioned_q=rays_q[:,-current_len:].to(condition_dtype)
+            conditioned_k=rays_k[:,-current_len:].to(condition_dtype)
             scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
             dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
             dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
-            history_len=max(0,key.shape[1]-current_len)
             if history_len:
                 pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta)
                 pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta)

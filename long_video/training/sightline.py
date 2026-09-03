@@ -22,49 +22,89 @@ class CorrespondencePlan:
     identities: tuple
     flags: tuple
 
-def _streaming_correspondence_value(q, k, positive_indices, positive_mask, weights, bias, key_block):
-    """Exact dense-reference value using bounded CUDA K blocks."""
-    scale=q.shape[-1]**-0.5; b,nq,h=q.shape[:3]; nk=k.shape[1]
-    running_max=torch.full((b,h,nq),-torch.inf,device=q.device,dtype=torch.float32)
-    running_sum=torch.zeros_like(running_max)
-    has_bias=bias.numel()!=0
-    for start in range(0,nk,int(key_block)):
-        stop=min(nk,start+int(key_block))
-        logits=torch.einsum('bqhd,bkhd->bhqk',q,k[:,start:stop]).float()*scale
-        if has_bias:
-            logits=logits+(bias[:,None,None,start:stop] if bias.ndim==2 else bias[...,start:stop]).float()
-        block_max=logits.amax(-1); new_max=torch.maximum(running_max,block_max)
-        running_sum=running_sum*torch.exp(running_max-new_max)+torch.exp(logits-new_max[...,None]).sum(-1)
-        running_max=new_max
-    log_denom=running_max+running_sum.log()
-    safe=positive_indices.clamp_min(0)
+def _bias_tile(bias, q0, q1, k0, k1):
+    if bias.numel()==0: return None
+    if bias.ndim==2: return bias[:,None,None,k0:k1].float()
+    if bias.ndim==4: return bias[:,:,q0:q1,k0:k1].float()
+    raise ValueError('additive bias must be [B,K] or [B,H,Q,K]')
+
+def _logits_tile(q, k, bias, q0, q1, k0, k1, scale):
+    # Both axes are bounded.  In particular, never materialize [B,H,Q,Kblock].
+    logits=torch.einsum('bqhd,bkhd->bhqk',q[:,q0:q1],k[:,k0:k1]).float().mul_(scale)
+    tiled_bias=_bias_tile(bias,q0,q1,k0,k1)
+    if tiled_bias is not None: logits.add_(tiled_bias)
+    return logits
+
+def _positive_statistics(q,k,positive_indices,positive_mask,bias,log_denom,scale):
+    """Return per-head positive mass and its head sum without a dense QxK tensor."""
+    b,nq,h=q.shape[:3]; safe=positive_indices.clamp_min(0)
     gathered=k[:,safe.reshape(-1)].reshape(b,nq,safe.shape[1],h,k.shape[-1])
-    pos_logits=torch.einsum('bqhd,bqphd->bhqp',q,gathered).float()*scale
-    if has_bias:
-        if bias.ndim==2:
-            pos_bias=bias[:,safe]
-            pos_logits=pos_logits+pos_bias[:,None].float()
-        else:
+    logits=torch.einsum('bqhd,bqphd->bhqp',q,gathered).float().mul_(scale)
+    if bias.numel()!=0:
+        if bias.ndim==2: logits.add_(bias[:,safe][:,None].float())
+        elif bias.ndim==4:
             gather_index=safe[None,None].expand(b,h,-1,-1)
-            pos_logits=pos_logits+torch.gather(bias,3,gather_index).float()
-    log_prob=(pos_logits-log_denom[...,None]).masked_fill(~positive_mask[None,None],-torch.inf)
-    log_mass=torch.logsumexp(log_prob,dim=(1,3))-math.log(h)
-    row_loss=-log_mass.mean(0)
-    w=weights.float(); return (row_loss*w).sum()/w.sum().clamp_min(1e-8)
+            logits.add_(torch.gather(bias,3,gather_index).float())
+        else: raise ValueError('additive bias must be [B,K] or [B,H,Q,K]')
+    probs=torch.exp(logits-log_denom[...,None]).masked_fill_(~positive_mask[None,None],0.0)
+    per_head=probs.sum(-1)
+    return per_head,per_head.sum(1).clamp_min_(torch.finfo(torch.float32).tiny)
+
+def _streaming_correspondence_forward(q,k,positive_indices,positive_mask,weights,bias,key_block,query_block):
+    """Exact objective with online FP32 reduction over bounded Q/K tiles."""
+    scale=q.shape[-1]**-0.5; b,nq,h=q.shape[:3]; nk=k.shape[1]
+    log_denom=torch.empty((b,h,nq),device=q.device,dtype=torch.float32)
+    for q0 in range(0,nq,int(query_block)):
+        q1=min(nq,q0+int(query_block)); width=q1-q0
+        running_max=torch.full((b,h,width),-torch.inf,device=q.device,dtype=torch.float32)
+        running_sum=torch.zeros_like(running_max)
+        for k0 in range(0,nk,int(key_block)):
+            k1=min(nk,k0+int(key_block)); logits=_logits_tile(q,k,bias,q0,q1,k0,k1,scale)
+            block_max=logits.amax(-1); new_max=torch.maximum(running_max,block_max)
+            running_sum.mul_(torch.exp(running_max-new_max)).add_(torch.exp(logits-new_max[...,None]).sum(-1))
+            running_max=new_max
+        log_denom[:,:,q0:q1]=running_max+running_sum.log()
+    positive_head,positive_total=_positive_statistics(q,k,positive_indices,positive_mask,bias,log_denom,scale)
+    row_loss=-(positive_total.log()-math.log(h)).mean(0)
+    w=weights.float(); value=(row_loss*w).sum()/w.sum().clamp_min(1e-8)
+    return value,log_denom,positive_head,positive_total
 
 class _StreamingCorrespondence(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,q,k,positive_indices,positive_mask,weights,bias,key_block):
-        ctx.save_for_backward(q,k,positive_indices,positive_mask,weights,bias); ctx.key_block=int(key_block)
-        return _streaming_correspondence_value(q,k,positive_indices,positive_mask,weights,bias,ctx.key_block)
+    def forward(ctx,q,k,positive_indices,positive_mask,weights,bias,key_block,query_block):
+        value,log_denom,positive_head,positive_total=_streaming_correspondence_forward(
+            q,k,positive_indices,positive_mask,weights,bias,int(key_block),int(query_block))
+        ctx.save_for_backward(q,k,positive_indices,positive_mask,weights,bias,log_denom,positive_head,positive_total)
+        ctx.key_block=int(key_block); ctx.query_block=int(query_block)
+        return value
     @staticmethod
     def backward(ctx,grad_output):
-        q,k,positive_indices,positive_mask,weights,bias=ctx.saved_tensors
-        with torch.enable_grad():
-            qr=q.detach().requires_grad_(True); kr=k.detach().requires_grad_(True)
-            value=_streaming_correspondence_value(qr,kr,positive_indices,positive_mask,weights,bias,ctx.key_block)
-            dq,dk=torch.autograd.grad(value,(qr,kr),grad_output)
-        return dq,dk,None,None,None,None,None
+        q,k,positive_indices,positive_mask,weights,bias,log_denom,positive_head,positive_total=ctx.saved_tensors
+        scale=q.shape[-1]**-0.5; b,nq,h=q.shape[:3]; nk=k.shape[1]
+        # Gradients use the input dtype for bounded memory. Each tile contracts in
+        # FP32 and is cast only when accumulated into the returned Q/K gradient.
+        dq=torch.zeros_like(q); dk=torch.zeros_like(k)
+        normalizer=weights.float().sum().clamp_min(1e-8)
+        row_coeff=(weights.float()/normalizer/float(b))*grad_output.float()
+        for k0 in range(0,nk,ctx.key_block):
+            k1=min(nk,k0+ctx.key_block)
+            dk_tile=torch.zeros((b,k1-k0,h,k.shape[-1]),device=k.device,dtype=torch.float32)
+            key_ids=torch.arange(k0,k1,device=k.device)
+            for q0 in range(0,nq,ctx.query_block):
+                q1=min(nq,q0+ctx.query_block)
+                logits=_logits_tile(q,k,bias,q0,q1,k0,k1,scale)
+                probs=torch.exp(logits-log_denom[:,:,q0:q1,None])
+                pos=(positive_indices[q0:q1,:,None]==key_ids[None,None,:])
+                pos=(pos & positive_mask[q0:q1,:,None]).any(1).to(dtype=torch.float32)
+                a=positive_head[:,:,q0:q1]
+                total=positive_total[:,q0:q1]
+                dlogits=probs*((a[...,None]-pos[None,None])/total[:,None,:,None])
+                dlogits.mul_(row_coeff[q0:q1][None,None,:,None])
+                dq_part=torch.einsum('bhqk,bkhd->bqhd',dlogits,k[:,k0:k1].float()).mul_(scale)
+                dq[:,q0:q1].add_(dq_part.to(dq.dtype))
+                dk_tile.add_(torch.einsum('bhqk,bqhd->bkhd',dlogits,q[:,q0:q1].float()).mul_(scale))
+            dk[:,k0:k1].copy_(dk_tile.to(dk.dtype))
+        return dq,dk,None,None,None,None,None,None
 
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:
     if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
@@ -218,10 +258,10 @@ class SightlineTrainable(nn.Module):
         if positives is None: raise ValueError('positives are required without multi_positive')
         return correspondence_loss(z.reshape(-1,z.shape[-1]),positives.reshape(-1),weights)
 
-    def correspondence_streaming(self, selected_query, key, plan, additive_bias=None, key_block=256):
+    def correspondence_streaming(self, selected_query, key, plan, additive_bias=None, key_block=256, query_block=128):
         if selected_query.ndim!=4 or key.ndim!=4: raise ValueError('Q/K must be [B,N,H,D]')
         bias=selected_query.new_empty(0) if additive_bias is None else additive_bias
-        return _StreamingCorrespondence.apply(selected_query,key,plan.positive_indices,plan.positive_mask,plan.weights,bias,int(key_block))
+        return _StreamingCorrespondence.apply(selected_query,key,plan.positive_indices,plan.positive_mask,plan.weights,bias,int(key_block),int(query_block))
     @staticmethod
     def lambda_corr(progress, start=.4, initial=.02, final=.005):
         if progress <= start: return initial

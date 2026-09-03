@@ -140,7 +140,7 @@ def test_streaming_correspondence_matches_dense_loss_and_gradients():
     dense=-(torch.stack([torch.logsumexp(z[:,i,list(keys)],-1).mean() for i,keys in enumerate((p for _,p in positives))])*weights).sum()/weights.sum()
     positive_indices=torch.tensor([[1,4],[2,9],[0,22]]); mask=torch.ones_like(positive_indices,dtype=torch.bool)
     plan=CorrespondencePlan(torch.tensor(indices),positive_indices,mask,weights,(),())
-    streamed=model.correspondence_streaming(q[:,indices],k,plan,key_block=5)
+    streamed=model.correspondence_streaming(q[:,indices],k,plan,key_block=5,query_block=2)
     dq_dense,dk_dense=torch.autograd.grad(dense,(q,k),retain_graph=True)
     dq_stream,dk_stream=torch.autograd.grad(streamed,(q,k))
     assert torch.allclose(dense,streamed,atol=2e-5,rtol=2e-5)
@@ -159,7 +159,7 @@ def test_streaming_correspondence_bias_matches_dense(bias_kind):
     dense_rows=[-torch.logsumexp(z[:,i,positive[i,mask[i]]],-1).mean() for i in range(qcount)]
     dense=(torch.stack(dense_rows)*weights).sum()/weights.sum()
     plan=CorrespondencePlan(torch.arange(qcount),positive,mask,weights,(),())
-    streamed=SightlineTrainable(8,layers=(0,),heads=heads).correspondence_streaming(q,k,plan,additive_bias=bias,key_block=6)
+    streamed=SightlineTrainable(8,layers=(0,),heads=heads).correspondence_streaming(q,k,plan,additive_bias=bias,key_block=6,query_block=3)
     dense_grads=torch.autograd.grad(dense,(q,k),retain_graph=True); stream_grads=torch.autograd.grad(streamed,(q,k))
     assert torch.allclose(dense,streamed,atol=3e-5,rtol=3e-5)
     assert all(torch.allclose(a,b,atol=3e-5,rtol=3e-5) for a,b in zip(dense_grads,stream_grads))
@@ -251,7 +251,7 @@ def test_memory_append_extends_attention_mask_to_final_key_length():
 def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     from long_video.training.sightline import SightlineTrainable, install_lora
     from long_video.sightline.memory import LayerKVMemoryBank
-    from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint
+    from long_video.training.sightline_checkpoint import config_fingerprint, save_runtime_checkpoint, restore_runtime_checkpoint
     class Attn(torch.nn.Module):
         def __init__(self): super().__init__(); self.to_q=torch.nn.Linear(4,4); self.to_k=torch.nn.Linear(4,4); self.to_v=torch.nn.Linear(4,4); self.to_out=torch.nn.ModuleList([torch.nn.Linear(4,4),torch.nn.Identity()]); self.to_qkv=None; self.fused_projections=False
         def unfuse_projections(self): self.to_qkv=None; self.fused_projections=False
@@ -286,8 +286,12 @@ def test_checkpoint_restores_alpha_timestamp_and_lora(tmp_path):
     assert torch.count_nonzero(legacy_memory.memory_type_embedding)==0
     with pytest.raises(RuntimeError,match='world size'):
         restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=True,rank=0,world_size=2)
+    old_routing=[4,6,8,16,20,24,32,34,36]; new_routing=[4,8,16,20,24,32,36]
+    layer_payload=dict(payload); layer_payload['config']={'version':1,'memory_layers':old_routing,'correspondence_layers':old_routing}; layer_payload['config_fingerprint']=config_fingerprint(layer_payload['config']); layer_payload['memory_config']={'layers':old_routing,'pool':2,'budget':8}
+    migrated_layer_config={'version':1,'memory_layers':new_routing,'correspondence_layers':new_routing}; migrated_memory_config={'layers':new_routing,'pool':2,'budget':8}
+    assert restore_runtime_checkpoint(layer_payload,target,target_memory,target_transformer,config=migrated_layer_config,helios_fingerprint='h',layers=layers,memory_config=migrated_memory_config,optimizer=target_optimizer,scheduler=target_scheduler,restore_rng=False,allow_memory_layer_migration=True)==12
+    assert target_optimizer.state_dict()['state']==optimizer.state_dict()['state'] and target_scheduler.last_epoch==scheduler.last_epoch
     migrated_config={'version':1,'ddp_world_size':4}; payload['config']={'version':1,'ddp_world_size':3}
-    from long_video.training.sightline_checkpoint import config_fingerprint
     payload['config_fingerprint']=config_fingerprint(payload['config'])
     with pytest.raises(RuntimeError,match='config mismatch'):
         restore_runtime_checkpoint(payload,inference_target,inference_memory,inference_transformer,config=migrated_config,helios_fingerprint='h',layers=layers,memory_config=memory_config,restore_rng=False)
@@ -344,6 +348,22 @@ def test_processor_qk_only_cpu_shape_and_v_unchanged():
     def dispatch(q,k,v,**kw): observed.append(v.detach().clone()); return torch.nn.functional.scaled_dot_product_attention(q.transpose(1,2),k.transpose(1,2),v.transpose(1,2)).transpose(1,2)
     proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=rope,attention_dispatch=dispatch); out=proc(a,h,rotary_emb=torch.zeros(1,4,1,2)); assert out.shape==h.shape; assert torch.equal(observed[0],expected_v)
     assert not hasattr(proc,'last_value_native') and not hasattr(proc,'last_value')
+
+def test_processor_projects_only_current_rays_before_exact_history_replacement():
+    class A:
+        heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
+    class Conditioner(torch.nn.Module):
+        def __init__(self): super().__init__(); self.marker=torch.nn.Parameter(torch.zeros(())); self.training=False; self.lengths=[]
+        def sample_scale_delta(self,rays,training): return None
+        def project(self,rays,**kwargs): self.lengths.append(rays.shape[1]); return torch.zeros(*rays.shape[:-1],8)
+    class Provider:
+        context=None
+        def __call__(self,h,**kwargs): return torch.zeros(h.shape[0],h.shape[1],7),torch.zeros(h.shape[0],h.shape[1],7)
+        def project_history(self,conditioner,**kwargs): return torch.zeros(1,6,8)
+    attn=A(); conditioner=Conditioner(); hidden=torch.randn(1,10,8)
+    proc=SightlineHeliosAttnProcessor(conditioner,Provider(),qkv_projection=lambda a,h,e:(a.to_q(h),a.to_k(h),a.to_v(h)),rotary_apply=lambda x,r:x,attention_dispatch=lambda q,k,v,**kwargs:v)
+    proc(attn,hidden,original_context_length=4)
+    assert conditioner.lengths==[4,4]
 
 def test_exact_flow_matching_three_stage_shapes_and_noise_scale():
     from types import SimpleNamespace
@@ -534,7 +554,7 @@ def test_memory_active_bank_prepared_once_and_cleared_without_archive_loss():
 
 def test_layer_memory_banks_select_once_and_share_chunk_ids():
     from long_video.sightline.memory import LayerKVMemoryBank
-    layers=(4,6,8,16,20,24,32,34,36)
+    layers=(4,8,16,20,24,32,36)
     memory=LayerKVMemoryBank(layers,budget=100,pool=1); hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
     for bank in memory.banks.values():
         for chunk in range(3): bank.capture(hidden+chunk,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
@@ -666,7 +686,7 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     identities=(('native',(0,),0,0,'short'),('current',(8,),0,0,'current'),('memory',(1,),0,0,'memory'))
     rows=[{'query_chunk':1,'query_latent_temporal':0,'query_y':0,'query_x':0,'key_chunk':0,'key_latent_temporal':0,'key_y':0,'key_x':0,'weight':.7}]
     processors={}
-    layers=(4,6,8,16,20,24,32,34,36)
+    layers=(4,8,16,20,24,32,36)
     for layer in layers:
         q=torch.randn(1,1,2,2,requires_grad=True); k=torch.randn(1,3,2,2,requires_grad=True)
         processors[layer]=SimpleNamespace(last_q=q,last_k=k,last_current_length=1,ray_provider=SimpleNamespace(context={'stage_shapes':((1,1,1),)}),last_key_identities=identities,last_attention_bias=None)
@@ -677,9 +697,28 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     monkeypatch.setattr(training,'_mapped_correspondences',counted)
     loss=training._corr_loss(SightlineTrainable(4,layers=layers,heads=2),processors,rows,1,layers,8)
     assert len(calls)==1 and loss.requires_grad
+    assert all(processors[layer].last_q is None and processors[layer].last_k is None and processors[layer].last_attention_bias is None for layer in layers)
+    for layer in layers:
+        processors[layer].last_q=torch.randn(1,1,2,2,requires_grad=True)
+        processors[layer].last_k=torch.randn(1,3,2,2,requires_grad=True)
     processors[36].last_key_identities=identities[:-1]
     with pytest.raises(RuntimeError,match='identical key identity maps'):
         training._corr_loss(SightlineTrainable(4,layers=layers,heads=2),processors,rows,1,layers,8)
+
+def test_streaming_correspondence_never_materializes_full_query_key_axis(monkeypatch):
+    import long_video.training.sightline as sightline
+    torch.manual_seed(94); nq,nk=1024,2051
+    q=torch.randn(1,nq,2,4); k=torch.randn(1,nk,2,4)
+    positive=torch.stack((torch.arange(nq)%nk,(torch.arange(nq)*7+3)%nk),1)
+    mask=torch.ones_like(positive,dtype=torch.bool); weights=torch.ones(nq)
+    plan=sightline.CorrespondencePlan(torch.arange(nq),positive,mask,weights,(),())
+    seen=[]; original=sightline._logits_tile
+    def checked(qv,kv,bias,q0,q1,k0,k1,scale):
+        seen.append((q1-q0,k1-k0)); return original(qv,kv,bias,q0,q1,k0,k1,scale)
+    monkeypatch.setattr(sightline,'_logits_tile',checked)
+    value=sightline.SightlineTrainable(8,layers=(0,),heads=2).correspondence_streaming(q,k,plan,key_block=128,query_block=64)
+    assert torch.isfinite(value) and seen and max(x for x,_ in seen)<=64 and max(y for _,y in seen)<=128
+    assert (nq,nk) not in seen
 
 def test_correspondence_plan_exactly_matches_legacy_mapping():
     from types import SimpleNamespace
@@ -695,6 +734,20 @@ def test_correspondence_plan_exactly_matches_legacy_mapping():
     plan=training._build_correspondence_plan(processor,rows,1,1,1024,7)
     assert plan.query_indices.tolist()==expected[0] and [row[row>=0].tolist() for row in plan.positive_indices]==expected[1]
     assert plan.weights.tolist()==pytest.approx(expected[2]) and plan.flags==tuple(expected[3])
+
+def test_formal_correspondence_loss_releases_processor_qk_references():
+    from types import SimpleNamespace
+    import scripts.train_sightline_rgbd as training
+    from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
+    identities=(('native',(1,),0,0,'short'),('current',(8,),0,0,'current'))
+    plan=CorrespondencePlan(torch.tensor([0]),torch.tensor([[0]]),torch.tensor([[True]]),torch.tensor([1.]),identities,({},))
+    provider=SimpleNamespace(context={'stage_shapes':((1,1,1),),'c2w':torch.eye(4).view(1,1,4,4)})
+    layers=(4,6)
+    processors={layer:SimpleNamespace(last_q=torch.randn(1,1,2,2,requires_grad=True),last_k=torch.randn(1,2,2,2,requires_grad=True),last_attention_bias=None,last_current_length=1,last_key_identities=identities,ray_provider=provider) for layer in layers}
+    loss=training._corr_loss(SightlineTrainable(4,layers=layers,heads=2),processors,[],1,layers,1024,plan=plan)
+    assert loss.requires_grad
+    assert all(processors[layer].last_q is None and processors[layer].last_k is None and processors[layer].last_attention_bias is None for layer in layers)
+    loss.backward()
 
 def test_formal_processor_captures_only_selected_queries():
     class Attention:
@@ -746,7 +799,7 @@ def test_formal_config_accepts_explicit_reduced_ddp_world_size(tmp_path):
     from long_video.config import load_sightline_config
     source=Path(__file__).parents[1].joinpath('configs/sightline.yaml').read_text()
     formal=load_sightline_config(Path(__file__).parents[1]/'configs/sightline.yaml')
-    assert formal.memory_layers==formal.correspondence_layers==(4,6,8,16,20,24,32,34,36)
+    assert formal.memory_layers==formal.correspondence_layers==(4,8,16,20,24,32,36)
     runtime=tmp_path/'sightline-3gpu.yaml'; runtime.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 3'))
     assert load_sightline_config(runtime).ddp_world_size==3
     invalid=tmp_path/'sightline-5gpu.yaml'; invalid.write_text(source.replace('ddp_world_size: 4','ddp_world_size: 5'))

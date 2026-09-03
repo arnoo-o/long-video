@@ -54,6 +54,8 @@ class SightlinePipeline:
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
+            processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None
+            processor.capture_query_indices=None
             processor.last_attention_bias=None
             processor.last_attention_meta={}; processor.last_current_length=None
 
@@ -131,7 +133,7 @@ class SightlinePipeline:
         elif timestep.numel()==1 and capture_input.shape[0]!=1: timestep=timestep.expand(capture_input.shape[0])
         memory_processors=[processor for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values() if processor.memory is not None and processor.memory.enabled]
         for processor in memory_processors:
-            processor.last_hidden_states=None; processor.capture_memory_hidden=True
+            processor.last_hidden_states=None; processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None; processor.capture_memory_hidden=True
         clean_started=time.perf_counter()
         try: capture_fn(capture_input,timestep)
         finally:
@@ -142,13 +144,11 @@ class SightlinePipeline:
         camera_poses=torch.stack(pending[0],1)
         captured=0; archive_started=time.perf_counter()
         for processor in memory_processors:
-            if processor.last_hidden_states is None: continue
-            hidden=processor.last_hidden_states[:, -processor.last_current_length:]
-            shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==processor.last_current_length),None)
-            if shape is None: raise RuntimeError('clean Memory capture hidden shape is not a current Helios grid')
-            rays=self.ray_provider.current_rays(shape)
-            processor.memory.capture(hidden,rays,chunk_index,grid_shape=shape,ray_recompute=self.ray_provider.current_rays,camera_poses=camera_poses,timestamp=chunk_index)
-            processor.last_hidden_states=None; captured+=1
+            if processor.last_pooled_hidden is None: continue
+            shape=processor.last_pooled_grid_shape
+            rays=self.ray_provider.current_rays(shape); rays=rays.reshape(rays.shape[0],shape[0],shape[1],shape[2],7)[:,1:].reshape(rays.shape[0],-1,7)
+            processor.memory.capture_pooled(processor.last_pooled_hidden,rays,chunk_index,grid_shape=shape,camera_poses=camera_poses,timestamp=chunk_index)
+            processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None; captured+=1
         archive_seconds=time.perf_counter()-archive_started
         if captured != len(memory_processors):
             raise RuntimeError('clean Memory capture did not visit every enabled memory layer')

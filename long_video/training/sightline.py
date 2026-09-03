@@ -4,6 +4,7 @@ Helios itself is frozen and supplied by the H100 adapter; this module owns only
 the trainable ray projections, alpha, timestamp and LoRA.
 """
 from __future__ import annotations
+from dataclasses import dataclass
 import hashlib, math, random
 import numpy as np
 import torch
@@ -11,6 +12,59 @@ import torch.distributed as dist
 from torch import nn
 from ..sightline.conditioning import LayeredSightlineConditioner
 from ..sightline.correspondence import correspondence_loss
+
+@dataclass(frozen=True)
+class CorrespondencePlan:
+    query_indices: torch.Tensor
+    positive_indices: torch.Tensor
+    positive_mask: torch.Tensor
+    weights: torch.Tensor
+    identities: tuple
+    flags: tuple
+
+def _streaming_correspondence_value(q, k, positive_indices, positive_mask, weights, bias, key_block):
+    """Exact dense-reference value using bounded CUDA K blocks."""
+    scale=q.shape[-1]**-0.5; b,nq,h=q.shape[:3]; nk=k.shape[1]
+    running_max=torch.full((b,h,nq),-torch.inf,device=q.device,dtype=torch.float32)
+    running_sum=torch.zeros_like(running_max)
+    has_bias=bias.numel()!=0
+    for start in range(0,nk,int(key_block)):
+        stop=min(nk,start+int(key_block))
+        logits=torch.einsum('bqhd,bkhd->bhqk',q,k[:,start:stop]).float()*scale
+        if has_bias:
+            logits=logits+(bias[:,None,None,start:stop] if bias.ndim==2 else bias[...,start:stop]).float()
+        block_max=logits.amax(-1); new_max=torch.maximum(running_max,block_max)
+        running_sum=running_sum*torch.exp(running_max-new_max)+torch.exp(logits-new_max[...,None]).sum(-1)
+        running_max=new_max
+    log_denom=running_max+running_sum.log()
+    safe=positive_indices.clamp_min(0)
+    gathered=k[:,safe.reshape(-1)].reshape(b,nq,safe.shape[1],h,k.shape[-1])
+    pos_logits=torch.einsum('bqhd,bqphd->bhqp',q,gathered).float()*scale
+    if has_bias:
+        if bias.ndim==2:
+            pos_bias=bias[:,safe]
+            pos_logits=pos_logits+pos_bias[:,None].float()
+        else:
+            gather_index=safe[None,None].expand(b,h,-1,-1)
+            pos_logits=pos_logits+torch.gather(bias,3,gather_index).float()
+    log_prob=(pos_logits-log_denom[...,None]).masked_fill(~positive_mask[None,None],-torch.inf)
+    log_mass=torch.logsumexp(log_prob,dim=(1,3))-math.log(h)
+    row_loss=-log_mass.mean(0)
+    w=weights.float(); return (row_loss*w).sum()/w.sum().clamp_min(1e-8)
+
+class _StreamingCorrespondence(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,q,k,positive_indices,positive_mask,weights,bias,key_block):
+        ctx.save_for_backward(q,k,positive_indices,positive_mask,weights,bias); ctx.key_block=int(key_block)
+        return _streaming_correspondence_value(q,k,positive_indices,positive_mask,weights,bias,ctx.key_block)
+    @staticmethod
+    def backward(ctx,grad_output):
+        q,k,positive_indices,positive_mask,weights,bias=ctx.saved_tensors
+        with torch.enable_grad():
+            qr=q.detach().requires_grad_(True); kr=k.detach().requires_grad_(True)
+            value=_streaming_correspondence_value(qr,kr,positive_indices,positive_mask,weights,bias,ctx.key_block)
+            dq,dk=torch.autograd.grad(value,(qr,kr),grad_output)
+        return dq,dk,None,None,None,None,None
 
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:
     if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
@@ -164,57 +218,10 @@ class SightlineTrainable(nn.Module):
         if positives is None: raise ValueError('positives are required without multi_positive')
         return correspondence_loss(z.reshape(-1,z.shape[-1]),positives.reshape(-1),weights)
 
-    def correspondence_streaming(self, query, key, *, query_indices, multi_positive,
-                                 weights=None, additive_bias=None, key_block=256):
-        """Exact multi-positive correspondence loss without a dense QxK tensor.
-
-        Helios averages per-head softmax probabilities (rather than logits), so
-        the denominator is accumulated per head and positive logits are visited
-        in a second small pass.  Recomputing each K block preserves gradients.
-        """
-        if query.ndim != 4 or key.ndim != 4:
-            raise ValueError('Q/K must be [B,N,H,D]')
-        qi = torch.as_tensor(query_indices, device=query.device, dtype=torch.long)
-        q = query.index_select(1, qi)
-        scale = q.shape[-1] ** -0.5
-        b, h, nq, nk = q.shape[0], q.shape[2], q.shape[1], key.shape[1]
-        running_max = q.new_full((b, h, nq), -torch.inf)
-        running_sum = q.new_zeros((b, h, nq))
-        bias = additive_bias
-        if bias is not None:
-            if bias.ndim == 2: bias = bias[:, None, None, :]
-            elif bias.ndim == 4: pass
-            else: raise ValueError('additive bias must be [B,K] or [B,H,Q,K]')
-        for start in range(0, nk, int(key_block)):
-            stop = min(nk, start + int(key_block))
-            logits = torch.einsum('bqhd,bkhd->bhqk', q, key[:, start:stop]) * scale
-            if bias is not None:
-                logits = logits + bias[..., start:stop]
-            block_max = logits.amax(dim=-1)
-            new_max = torch.maximum(running_max, block_max)
-            running_sum = running_sum * torch.exp(running_max - new_max) + torch.exp(logits - new_max[..., None]).sum(-1)
-            running_max = new_max
-        log_denom = running_max + torch.log(running_sum.clamp_min(torch.finfo(running_sum.dtype).tiny))
-        values = []
-        for qpos, positives in multi_positive:
-            pos = torch.as_tensor(positives, device=query.device, dtype=torch.long)
-            if pos.numel() == 0: continue
-            pos_logits = torch.einsum('bhd,bkhd->bhk', q[:, qpos], key.index_select(1, pos)) * scale
-            if bias is not None:
-                if bias.shape[2] == 1:
-                    pos_bias = bias[:, :, 0, pos].expand(b, h, pos.numel())
-                else:
-                    pos_bias = bias[:, :, qpos, pos]
-                pos_logits = pos_logits + pos_bias
-            log_prob = pos_logits - log_denom[:, :, qpos, None]
-            per_head = torch.logsumexp(log_prob, dim=-1)
-            values.append(-torch.logsumexp(per_head - torch.log(torch.tensor(float(h), device=query.device, dtype=log_prob.dtype)), dim=1).mean())
-        if not values: return query.new_zeros(())
-        values = torch.stack(values)
-        if weights is not None:
-            weights = weights.to(device=values.device, dtype=values.dtype)
-            return (values * weights).sum() / weights.sum().clamp_min(1e-8)
-        return values.mean()
+    def correspondence_streaming(self, selected_query, key, plan, additive_bias=None, key_block=256):
+        if selected_query.ndim!=4 or key.ndim!=4: raise ValueError('Q/K must be [B,N,H,D]')
+        bias=selected_query.new_empty(0) if additive_bias is None else additive_bias
+        return _StreamingCorrespondence.apply(selected_query,key,plan.positive_indices,plan.positive_mask,plan.weights,bias,int(key_block))
     @staticmethod
     def lambda_corr(progress, start=.4, initial=.02, final=.005):
         if progress <= start: return initial

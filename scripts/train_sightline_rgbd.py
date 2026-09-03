@@ -12,11 +12,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
+from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
@@ -190,7 +189,11 @@ def _mapped_correspondences(processor,rows,chunk,identity_index=None):
     current=processor.last_current_length; identities=processor.last_key_identities
     if identities is None or len(identities)!=k.shape[1]: raise RuntimeError('explicit attention key identity map is missing or misaligned')
     current_shape=next(shape for shape in processor.ray_provider.context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current)
-    _,height,width=current_shape; q_start=q.shape[1]-current
+    return _map_correspondence_identities(rows,chunk,current_shape,q.shape[1],identities,identity_index)
+
+def _map_correspondence_identities(rows,chunk,current_shape,query_length,identities,identity_index=None):
+    """GT-to-attention mapping using layout metadata only, never Q/K values."""
+    current=int(current_shape[0]*current_shape[1]*current_shape[2]); _,height,width=current_shape; q_start=int(query_length)-current
     identity_index=_identity_lookup(identities) if identity_index is None else identity_index
     columns=_correspondence_columns(rows); grouped={}
     for row_index in range(len(columns['query_chunk'])):
@@ -213,10 +216,10 @@ def _mapped_correspondences(processor,rows,chunk,identity_index=None):
         # actual key axis.  Source/native/current/memory are diagnostics only.
         candidates=sorted(set(native + current_keys + source_keys + memory))
         if not candidates: continue
-        if 0<=qi<q.shape[1]:
+        if 0<=qi<query_length:
             bucket=grouped.setdefault(qi,{})
             for ki in candidates:
-                if 0<=ki<k.shape[1]:
+                if 0<=ki<len(identities):
                     source='memory' if ki in memory else ('native' if ki in native else ('source' if ki in source_keys else 'current'))
                     bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(columns['weight'][row_index])),source)
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
@@ -234,7 +237,23 @@ def _sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sam
     choice=(chosen_memory+[i for i in order if i not in chosen_memory_set])[:max_rows]
     return ([selected[i] for i in choice],[positives[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
 
-def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,backward_scale=None,backward_device=None):
+def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,sampling_seed):
+    """Map GT once before final-stage forward so every layer captures selected Q only."""
+    identities=processor.ray_provider.key_identities(current_length,processor.memory)
+    memory_count=len(processor.memory.active_identity_metadata()) if processor.memory is not None and processor.memory.enabled else 0
+    query_length=len(identities)-memory_count
+    current_shape=next(shape for shape in processor.ray_provider.context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current_length)
+    selected,positives,weights,flags=_map_correspondence_identities(rows,chunk,current_shape,query_length,identities,_identity_lookup(identities))
+    selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
+    max_positive=max(map(len,positives),default=0); device=processor.ray_provider.context['c2w'].device
+    positive_indices=torch.full((len(selected),max_positive),-1,device=device,dtype=torch.long)
+    positive_mask=torch.zeros_like(positive_indices,dtype=torch.bool)
+    for row,keys in enumerate(positives):
+        positive_indices[row,:len(keys)]=torch.as_tensor(keys,device=device); positive_mask[row,:len(keys)]=True
+    return CorrespondencePlan(torch.as_tensor(selected,device=device,dtype=torch.long),positive_indices,positive_mask,
+                              torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags))
+
+def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,plan=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
     missing=[layer for layer in layers if layer not in processors]
     if missing: raise RuntimeError(f'correspondence layers have no Sightline processor: {missing}')
@@ -246,44 +265,40 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
         if not same_identities or processor.last_current_length!=first.last_current_length or processor.last_q.shape[1]!=first.last_q.shape[1] or processor.last_k.shape[1]!=first.last_k.shape[1]:
             raise RuntimeError('correspondence layers must have identical key identity maps for shared mapping')
     mapping_started=time.perf_counter()
-    try: selected,positives,weights,flags=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
-    except RuntimeError as exc:
-        if 'do not map' not in str(exc): raise
-        selected=positives=weights=flags=[]
-    selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
+    if plan is None:
+        try: selected,positives,weights,flags=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
+        except RuntimeError as exc:
+            if 'do not map' not in str(exc): raise
+            selected=positives=weights=flags=[]
+        selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
+    else:
+        if identities != plan.identities: raise RuntimeError('CorrespondencePlan key identities changed during final-stage forward')
+        selected=list(range(plan.query_indices.numel())); positives=weights=None; flags=plan.flags
     if timings is not None: timings['correspondence_mapping_seconds']+=time.perf_counter()-mapping_started
-    if backward_scale is not None:
-        # Gradient-checkpoint recomputation must not overwrite the CPU Q/K
-        # snapshots or retain a second GPU diagnostics bank.
-        for layer in layers: processors[layer].capture_diagnostics=False
     losses=[]; loss_started=time.perf_counter()
     for layer in layers:
         processor=processors[layer]
         if not selected: continue
         captured_q,captured_k,captured_bias=captured[layer]
-        layer_losses=[]
-        for start in range(0,len(selected),64):
-            stop=min(start+64,len(selected)); query_indices=tuple(selected[start:stop])
-            block_positive=tuple((index,tuple(keys)) for index,keys in enumerate(positives[start:stop]))
-            weight=torch.tensor(weights[start:stop],device=captured_q.device)
-            additive_bias=None
-            if captured_bias is not None:
-                if captured_bias.ndim==2: additive_bias=captured_bias
-                elif captured_bias.ndim==3: additive_bias=captured_bias[:,query_indices,:].unsqueeze(1)
-                elif captured_bias.ndim==4: additive_bias=captured_bias[:,:,query_indices,:]
-                else: raise RuntimeError('unsupported captured attention bias shape')
-            block_loss=trainable.correspondence_streaming(captured_q,captured_k,query_indices=query_indices,multi_positive=block_positive,weights=weight,additive_bias=additive_bias)
-            if not block_loss.requires_grad or not captured_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd; disable incompatible gradient checkpointing')
-            layer_losses.append((block_loss,weight.sum()))
-        denom=sum((w for _,w in layer_losses), captured_q.new_zeros(()))
-        layer_loss=sum((loss*w for loss,w in layer_losses), captured_q.new_zeros(()))/denom.clamp_min(1e-8)
-        if backward_scale is not None:
-            if backward_device is None: raise ValueError('sequential correspondence backward requires a target device')
-            (layer_loss.to(backward_device)*(float(backward_scale)/len(layers))).backward(retain_graph=True)
-            losses.append(layer_loss.detach())
-            processor.last_q=processor.last_k=None
+        if plan is None:
+            numerator=captured_q.new_zeros(()); denominator=captured_q.new_zeros(())
+            for start in range(0,len(selected),64):
+                stop=min(start+64,len(selected)); query_indices=selected[start:stop]
+                logits=selected_qk_logits(captured_q,captured_k,query_indices)
+                block_positive=[(i,keys) for i,keys in enumerate(positives[start:stop])]
+                weight=torch.as_tensor(weights[start:stop],device=logits.device)
+                bias=captured_bias
+                if bias is not None and bias.ndim in (3,4): bias=bias[:,:,query_indices,:] if bias.ndim==4 else bias[:,query_indices,:].unsqueeze(1)
+                block=trainable.correspondence(logits,None,weight,multi_positive=block_positive,additive_bias=bias)
+                numerator=numerator+block*weight.sum(); denominator=denominator+weight.sum()
+            layer_loss=numerator/denominator.clamp_min(1e-8)
         else:
-            losses.append(layer_loss)
+            additive_bias=captured_bias
+            if additive_bias is not None and additive_bias.ndim in (3,4):
+                additive_bias=additive_bias[:,:,plan.query_indices,:] if additive_bias.ndim==4 else additive_bias[:,plan.query_indices,:].unsqueeze(1)
+            layer_loss=trainable.correspondence_streaming(captured_q,captured_k,plan,additive_bias=additive_bias)
+        if not layer_loss.requires_grad or not captured_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd')
+        losses.append(layer_loss)
     if timings is not None: timings['correspondence_loss_seconds']+=time.perf_counter()-loss_started
     if not losses: return captured[layers[0]][0].new_zeros(())
     return torch.stack(losses).mean()
@@ -392,13 +407,20 @@ def main():
         if phase['correspondence'] or diagnostic_correspondence:
             if not record.memory_eligible: raise RuntimeError(f"{record.record_id} has no calibrated RGB-D correspondence supervision")
             if not active_corr_layers or any(layer not in pipe.transformer._sightline_processors for layer in active_corr_layers): raise RuntimeError('active correspondence/probe layers are not installed Sightline layers')
-            for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=False
+            for layer in active_corr_layers:
+                pipe.transformer._sightline_processors[layer].capture_diagnostics=False
+                pipe.transformer._sightline_processors[layer].capture_query_indices=None
         minimum_train_chunk=1 if phase['name']=='P3' else 0
         train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'],minimum=minimum_train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
         perf={'prefix_generation_seconds':0.0,'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0,'correspondence_load_seconds':0.0,'correspondence_mapping_seconds':0.0,'correspondence_loss_seconds':0.0,'backward_seconds':0.0}
         def timing_sync():
             if args.profile_timing: torch.cuda.synchronize(device)
+        def record_vram(name):
+            if args.profile_timing:
+                perf[f'{name}_memory_allocated']=int(torch.cuda.memory_allocated(device))
+                perf[f'{name}_max_memory_allocated']=int(torch.cuda.max_memory_allocated(device))
+                perf[f'{name}_memory_reserved']=int(torch.cuda.memory_reserved(device))
         if phase['correspondence'] or diagnostic_correspondence:
             load_started=time.perf_counter(); corr_rows=_load_correspondence(record,train_chunk); perf['correspondence_load_seconds']=time.perf_counter()-load_started
         else: corr_rows=None
@@ -413,6 +435,7 @@ def main():
                 template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:]
                 generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
+                record_vram('prefix_rollout')
             else:
                 target=latents[:,:,chunk*8:chunk*8+9].clone()  # The sole non-source GT read in this step.
                 clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:].detach()
@@ -420,37 +443,35 @@ def main():
                 items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range)
                 if clean_boundary is not None: items=constrain_flow_items(items,clean_boundary)
                 runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
+                record_vram('active_memory')
+                correspondence_plan=None
+                correspondence_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)
+                if corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline:
+                    final_shape=runner.ray_provider.context['stage_shapes'][-1]
+                    current_length=int(final_shape[0]*final_shape[1]*final_shape[2])
+                    correspondence_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],corr_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
                 stage_losses=[]; final_prediction=None
                 for stage_index,item in enumerate(items):
                     capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
                     for layer in active_corr_layers:
-                        pipe.transformer._sightline_processors[layer].capture_diagnostics=capture_correspondence
+                        processor=pipe.transformer._sightline_processors[layer]
+                        processor.capture_diagnostics=capture_correspondence
+                        processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and args.train else None
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
-                    if args.train and capture_correspondence:
-                        # The nine supervised layers retain large Q/K tensors until the
-                        # final backward.  Move this supervision-only branch to CPU while
-                        # preserving its autograd copies back into the Transformer graph.
-                        for layer in active_corr_layers:
-                            processor=pipe.transformer._sightline_processors[layer]
-                            processor.last_q=processor.last_q.to('cpu')
-                            processor.last_k=processor.last_k.to('cpu')
-                            if processor.last_attention_bias is not None:
-                                processor.last_attention_bias=processor.last_attention_bias.to('cpu')
+                    if capture_correspondence: record_vram('final_stage_forward')
                     stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                     if args.train and stage_index+1<len(items):
                         timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_weight=trainable.lambda_corr(step/total_steps)
-                sequential_corr_backward=bool(args.train and phase['correspondence'] and corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline)
-                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16),timings=perf,backward_scale=corr_weight if sequential_corr_backward else None,backward_device=fm.device if sequential_corr_backward else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
-                corr_metric=corr_metric.to(fm.device)
+                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
+                record_vram('correspondence_loss')
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
-                if sequential_corr_backward:
-                    corr=corr.detach()+next(trainable.parameters()).sum()*0.0
                 total=stage_losses[-1]/len(items)+corr_weight*corr if args.train else fm+corr_weight*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
                 if args.train:
                     timing_sync(); backward_started=time.perf_counter(); total.backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                    record_vram('backward')
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -490,7 +511,9 @@ def main():
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
                     first=layer_captures[0]
                     probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha_q=alpha_q,alpha_k=alpha_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
-            for layer in active_corr_layers: pipe.transformer._sightline_processors[layer].capture_diagnostics=False
+            for layer in active_corr_layers:
+                pipe.transformer._sightline_processors[layer].capture_diagnostics=False
+                pipe.transformer._sightline_processors[layer].capture_query_indices=None
             if chunk==0: generated[:,:,0:1]=source
             else: generated[:,:,0:1]=clean_boundary.to(generated)
             capture_history=history
@@ -500,6 +523,7 @@ def main():
             history_state.append_chunk(generated,chunk)
             capture_memory=phase['name']!='P3' or prefix_chunk_should_capture_memory(chunk,train_chunk)
             timing_sync(); memory_timings=runner._finalize_chunk(chunk,clean_latent=generated.detach(),capture_fn=clean_capture,capture_memory=capture_memory); timing_sync()
+            if capture_memory: record_vram('clean_memory_capture')
             for name,value in memory_timings.items(): perf[name]+=value
             for processor in pipe.transformer._sightline_processors.values():
                 processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None

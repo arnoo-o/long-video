@@ -110,6 +110,16 @@ def test_memory_chunk_block_storage_matches_tokenwise_values():
     active_hidden,active_rays=memory.get(32,query_camera_poses=_camera_trajectory(4.),device='cpu',dtype=torch.float32)
     assert torch.equal(active_hidden,hidden[:,1:]) and torch.equal(active_rays,expected_rays)
 
+def test_early_pooled_memory_write_matches_legacy_capture():
+    torch.manual_seed(18); hidden=torch.randn(1,9*4*6,5); rays=torch.randn(1,9*4*6,7); cameras=_camera_trajectory()
+    legacy=LongTermKVMemory(budget=200,pool=2); legacy.capture(hidden,rays,0,grid_shape=(9,4,6),camera_poses=cameras)
+    hh=hidden.reshape(1,9,4,6,5).reshape(1,9,2,2,3,2,5).mean((3,5))[:,1:].reshape(1,-1,5)
+    rr=rays.reshape(1,9,4,6,7).reshape(1,9,2,2,3,2,7).mean((3,5))[:,1:].reshape(1,-1,7)
+    early=LongTermKVMemory(budget=200,pool=2); early.capture_pooled(hh,rr,0,grid_shape=(9,2,3),camera_poses=cameras)
+    a,b=legacy.archive[0],early.archive[0]
+    for name in ('hidden','rays','temporal','pooled_y','pooled_x','global_latent_ids','camera_poses'):
+        assert torch.equal(getattr(a,name),getattr(b,name))
+
 def test_selected_layers_have_independent_qk_geometry_and_alphas():
     from long_video.training.sightline import SightlineTrainable
     trainable=SightlineTrainable(8,layers=(16,20,24),heads=2)
@@ -120,7 +130,7 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
     assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
 
 def test_streaming_correspondence_matches_dense_loss_and_gradients():
-    from long_video.training.sightline import SightlineTrainable
+    from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
     torch.manual_seed(91)
     model=SightlineTrainable(8,layers=(0,),heads=2)
     q=torch.randn(1,17,2,4,requires_grad=True); k=torch.randn(1,23,2,4,requires_grad=True)
@@ -128,12 +138,46 @@ def test_streaming_correspondence_matches_dense_loss_and_gradients():
     selected=q[:,indices]; logits=torch.einsum('bqhd,bkhd->bhqk',selected,k)*0.5
     z=torch.logsumexp(logits.log_softmax(-1),1)-torch.log(torch.tensor(2.))
     dense=-(torch.stack([torch.logsumexp(z[:,i,list(keys)],-1).mean() for i,keys in enumerate((p for _,p in positives))])*weights).sum()/weights.sum()
-    streamed=model.correspondence_streaming(q,k,query_indices=indices,multi_positive=positives,weights=weights,key_block=5)
+    positive_indices=torch.tensor([[1,4],[2,9],[0,22]]); mask=torch.ones_like(positive_indices,dtype=torch.bool)
+    plan=CorrespondencePlan(torch.tensor(indices),positive_indices,mask,weights,(),())
+    streamed=model.correspondence_streaming(q[:,indices],k,plan,key_block=5)
     dq_dense,dk_dense=torch.autograd.grad(dense,(q,k),retain_graph=True)
     dq_stream,dk_stream=torch.autograd.grad(streamed,(q,k))
     assert torch.allclose(dense,streamed,atol=2e-5,rtol=2e-5)
     assert torch.allclose(dq_dense,dq_stream,atol=2e-5,rtol=2e-5)
     assert torch.allclose(dk_dense,dk_stream,atol=2e-5,rtol=2e-5)
+
+@pytest.mark.parametrize('bias_kind',['key','full'])
+def test_streaming_correspondence_bias_matches_dense(bias_kind):
+    from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
+    torch.manual_seed(92); b,qcount,kcount,heads,dim=2,4,19,3,5
+    q=torch.randn(b,qcount,heads,dim,requires_grad=True); k=torch.randn(b,kcount,heads,dim,requires_grad=True)
+    positive=torch.tensor([[1,4,-1],[2,9,11],[0,-1,-1],[3,7,15]]); mask=positive.ge(0); weights=torch.tensor([1.,2.,.5,3.])
+    bias=torch.randn(b,kcount)*.1 if bias_kind=='key' else torch.randn(b,heads,qcount,kcount)*.1
+    logits=torch.einsum('bqhd,bkhd->bhqk',q,k)*(dim**-.5)+(bias[:,None,None] if bias_kind=='key' else bias)
+    z=torch.logsumexp(logits.log_softmax(-1),1)-torch.log(torch.tensor(float(heads)))
+    dense_rows=[-torch.logsumexp(z[:,i,positive[i,mask[i]]],-1).mean() for i in range(qcount)]
+    dense=(torch.stack(dense_rows)*weights).sum()/weights.sum()
+    plan=CorrespondencePlan(torch.arange(qcount),positive,mask,weights,(),())
+    streamed=SightlineTrainable(8,layers=(0,),heads=heads).correspondence_streaming(q,k,plan,additive_bias=bias,key_block=6)
+    dense_grads=torch.autograd.grad(dense,(q,k),retain_graph=True); stream_grads=torch.autograd.grad(streamed,(q,k))
+    assert torch.allclose(dense,streamed,atol=3e-5,rtol=3e-5)
+    assert all(torch.allclose(a,b,atol=3e-5,rtol=3e-5) for a,b in zip(dense_grads,stream_grads))
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA required')
+def test_streaming_correspondence_bfloat16_cuda_is_finite_and_close():
+    from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
+    torch.manual_seed(93); q=torch.randn(1,8,4,8,device='cuda',dtype=torch.bfloat16,requires_grad=True); k=torch.randn(1,37,4,8,device='cuda',dtype=torch.bfloat16,requires_grad=True)
+    positive=torch.tensor([[i,(i+7)%37] for i in range(8)],device='cuda'); mask=torch.ones_like(positive,dtype=torch.bool); weights=torch.ones(8,device='cuda')
+    plan=CorrespondencePlan(torch.arange(8,device='cuda'),positive,mask,weights,(),())
+    dense_q=q.detach().clone().requires_grad_(True); dense_k=k.detach().clone().requires_grad_(True)
+    logits=torch.einsum('bqhd,bkhd->bhqk',dense_q,dense_k)*(8**-.5)
+    z=torch.logsumexp(logits.log_softmax(-1),1)-torch.log(torch.tensor(4.,device='cuda'))
+    dense=-torch.stack([torch.logsumexp(z[:,i,positive[i]],-1).mean() for i in range(8)]).mean()
+    loss=SightlineTrainable(8,layers=(0,),heads=4).correspondence_streaming(q,k,plan,key_block=11)
+    dense_grads=torch.autograd.grad(dense,(dense_q,dense_k)); loss.backward()
+    assert torch.allclose(loss,dense.float(),atol=3e-2,rtol=3e-2)
+    assert torch.allclose(q.grad,dense_grads[0],atol=3e-2,rtol=3e-2) and torch.allclose(k.grad,dense_grads[1],atol=3e-2,rtol=3e-2)
 
 def test_scheduler_provenance_ignores_default_field_order():
     from long_video.training.sightline_checkpoint import scheduler_config_fingerprint
@@ -519,7 +563,7 @@ def test_clean_memory_capture_uses_scheduler_endpoint_and_ignores_stale_hidden()
         context={'stage_shapes':((2,1,1),)}
         def current_rays(self,shape): return torch.ones(1,2,7)
     memory=LongTermKVMemory(budget=8,pool=1)
-    processor=SimpleNamespace(memory=memory,last_hidden_states=torch.full((1,2,4),99.),last_current_length=2)
+    processor=SimpleNamespace(memory=memory,last_hidden_states=torch.full((1,2,4),99.),last_pooled_hidden=None,last_pooled_grid_shape=None,last_current_length=2)
     transformer=SimpleNamespace(_sightline_processors={0:processor})
     helios=SimpleNamespace(transformer=transformer,scheduler=SimpleNamespace(sigmas=torch.tensor([1.,.5,0.]),timesteps=torch.tensor([999,499]),_sigma_to_t=lambda sigma:sigma*1000))
     config=SimpleNamespace(memory_layers=(0,),memory_budget=8,memory_pool=1,memory_write_sigma=0.0,pyramid_steps=(2,2,2))
@@ -527,7 +571,7 @@ def test_clean_memory_capture_uses_scheduler_endpoint_and_ignores_stale_hidden()
     cameras=_camera_trajectory(); runner._pending_camera_chunk=(list(cameras.unbind(1)),[],[])
     seen=[]
     def capture(clean,timestep):
-        seen.append((clean.clone(),timestep.clone())); processor.last_hidden_states=torch.ones(1,2,4)
+        seen.append((clean.clone(),timestep.clone())); processor.last_pooled_hidden=torch.ones(1,1,4); processor.last_pooled_grid_shape=(2,1,1)
     runner._capture_clean_memory(0,torch.zeros(1,1,2,1,1),capture)
     assert seen[0][1].shape==(1,) and int(seen[0][1])==0 and torch.equal(memory.archive[0].hidden[:,0:1],torch.ones(1,1,4))
 
@@ -637,6 +681,34 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     with pytest.raises(RuntimeError,match='identical key identity maps'):
         training._corr_loss(SightlineTrainable(4,layers=layers,heads=2),processors,rows,1,layers,8)
 
+def test_correspondence_plan_exactly_matches_legacy_mapping():
+    from types import SimpleNamespace
+    import scripts.train_sightline_rgbd as training
+    identities=(('native',(1,),0,0,'short'),('current',(8,),0,0,'current'),('memory',(1,),0,0,'memory'))
+    rows=[{'query_chunk':1,'query_latent_temporal':0,'query_y':0,'query_x':0,'key_chunk':0,'key_latent_temporal':1,'key_y':0,'key_x':0,'weight':.9}]
+    class Provider:
+        context={'stage_shapes':((1,1,1),),'c2w':torch.eye(4).view(1,1,4,4)}
+        def key_identities(self,current,memory): return identities
+    memory=SimpleNamespace(enabled=True,active_identity_metadata=lambda:((1,0,0),))
+    processor=SimpleNamespace(ray_provider=Provider(),memory=memory,last_q=torch.empty(1,2,1,1),last_k=torch.empty(1,3,1,1),last_current_length=1,last_key_identities=identities)
+    expected=training._mapped_correspondences(processor,rows,1)
+    plan=training._build_correspondence_plan(processor,rows,1,1,1024,7)
+    assert plan.query_indices.tolist()==expected[0] and [row[row>=0].tolist() for row in plan.positive_indices]==expected[1]
+    assert plan.weights.tolist()==pytest.approx(expected[2]) and plan.flags==tuple(expected[3])
+
+def test_formal_processor_captures_only_selected_queries():
+    class Attention:
+        heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
+    class Provider:
+        context={'stage_shapes':((1,1,6),)}
+        def __call__(self,hidden_states,**kwargs):
+            rays=torch.zeros(hidden_states.shape[0],hidden_states.shape[1],7); return rays,rays
+        def key_identities(self,current,memory): return tuple(('current',(i,),0,i,'current') for i in range(current))
+    proc=SightlineHeliosAttnProcessor(SightlineConditioner(8),Provider(),qkv_projection=lambda a,h,e:(a.to_q(h),a.to_k(h),a.to_v(h)),rotary_apply=lambda x,r:x,attention_dispatch=lambda q,k,v,**kwargs:v)
+    proc.capture_diagnostics=True; proc.capture_query_indices=torch.tensor([1,4]); hidden=torch.randn(1,6,8)
+    proc(Attention(),hidden,original_context_length=6)
+    assert proc.last_q.shape[1]==2 and proc.last_k.shape[1]==6
+
 def test_native_memory_overlap_is_multi_positive_and_memory_rows_survive_sampling():
     from types import SimpleNamespace
     import scripts.train_sightline_rgbd as training
@@ -712,6 +784,10 @@ def test_checkpoint_cadence_switches_after_p2():
     from scripts.train_sightline_rgbd import checkpoint_interval
     assert checkpoint_interval(0)==100 and checkpoint_interval(999)==100
     assert checkpoint_interval(1000)==60 and checkpoint_interval(2499)==60
+
+def test_p3_sigma_range_remains_uniform_zero_to_one():
+    from scripts.train_sightline_rgbd import _sigma_band
+    assert _sigma_band(1000,'P3')==((0.0,1.0),'uniform_0.0_1.0')
 
 def test_teacher_overlap_screening_is_deterministic_and_causal():
     from scripts.build_sightline_correspondences import screen_overlap

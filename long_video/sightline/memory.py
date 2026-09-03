@@ -92,13 +92,20 @@ class LongTermKVMemory:
         hh=hh.reshape(hh.shape[0],T,H//self.pool,self.pool,W//self.pool,self.pool,-1).mean((3,5))
         rr=rr.reshape(rr.shape[0],T,H//self.pool,self.pool,W//self.pool,self.pool,-1).mean((3,5))
         if ray_recompute is not None: rr=ray_recompute((T,H//self.pool,W//self.pool)).reshape_as(rr)
+        pooled_h,pooled_w=H//self.pool,W//self.pool
+        return self.capture_pooled(hh[:,1:].reshape(hh.shape[0],-1,hh.shape[-1]),rr[:,1:].reshape(rr.shape[0],-1,rr.shape[-1]),chunk_index,grid_shape=(T,pooled_h,pooled_w),camera_poses=camera_poses,timestamp=timestamp)
+
+    def capture_pooled(self,hidden,rays,chunk_index,*,grid_shape,camera_poses=None,timestamp=None):
+        """Archive already pooled temporal1..T-1 tensors without pooling twice."""
+        if not self.enabled:return
+        if camera_poses is None or camera_poses.ndim not in (3,4): raise ValueError('Memory chunk requires its known camera trajectory')
+        T,pooled_h,pooled_w=map(int,grid_shape); expected=(T-1)*pooled_h*pooled_w
+        if hidden.ndim!=3 or rays.ndim!=3 or hidden.shape[:2]!=rays.shape[:2] or hidden.shape[1]!=expected or rays.shape[-1]!=7:
+            raise ValueError('pooled Memory hidden/rays do not match temporal1 grid')
+        rr=rays.clone()
         rr[...,:3]=rr[...,:3]/rr[...,:3].norm(dim=-1,keepdim=True).clamp_min(1e-6)
         rr[...,3:6]=rr[...,3:6]/rr[...,3:6].norm(dim=-1,keepdim=True).clamp_min(1e-6)
-        pooled_h,pooled_w=H//self.pool,W//self.pool
-        # Discard temporal0 before flattening.  Each payload crosses to CPU as
-        # one contiguous tensor; never create or transfer per-token tensors.
-        hidden_chunk=hh[:,1:].reshape(hh.shape[0],-1,hh.shape[-1]).contiguous().detach().cpu()
-        ray_chunk=rr[:,1:].reshape(rr.shape[0],-1,rr.shape[-1]).contiguous().detach().cpu()
+        hidden_chunk=hidden.contiguous().detach().cpu(); ray_chunk=rr.contiguous().detach().cpu()
         temporal=torch.arange(1,T,dtype=torch.long).repeat_interleave(pooled_h*pooled_w)
         pooled_y=torch.arange(pooled_h,dtype=torch.long).repeat_interleave(pooled_w).repeat(T-1)
         pooled_x=torch.arange(pooled_w,dtype=torch.long).repeat(pooled_h*(T-1))

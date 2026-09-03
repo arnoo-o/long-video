@@ -18,8 +18,9 @@ class SightlineHeliosAttnProcessor:
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.residual_scale=1.0
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
+        self.capture_query_indices=None
         self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
-        self.capture_memory_hidden=False; self.last_hidden_states=None; self.last_current_length=None; self.last_attention_bias=None
+        self.capture_memory_hidden=False; self.last_hidden_states=None; self.last_pooled_hidden=None; self.last_pooled_grid_shape=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
         if self.qkv_projection is None or self.rotary_apply is None or self.attention_dispatch is None:
@@ -32,7 +33,15 @@ class SightlineHeliosAttnProcessor:
             query=self.rotary_apply(query,rotary_emb); key=self.rotary_apply(key,rotary_emb)
         current_len=original_context_length or query.shape[1]
         if self.capture_memory_hidden:
-            self.last_hidden_states=hidden_states
+            shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==current_len),None)
+            if shape is None: raise RuntimeError('Memory capture hidden shape is not a current Helios grid')
+            t,h,w=shape; pool=int(self.memory.pool)
+            if h%pool or w%pool: raise RuntimeError('Memory capture grid is not divisible by memory_pool')
+            current=hidden_states[:,-current_len:].reshape(hidden_states.shape[0],t,h,w,-1)
+            pooled=current.reshape(current.shape[0],t,h//pool,pool,w//pool,pool,-1).mean((3,5))
+            self.last_pooled_hidden=pooled[:,1:].reshape(pooled.shape[0],-1,pooled.shape[-1]).contiguous()
+            self.last_pooled_grid_shape=(t,h//pool,w//pool)
+            self.last_hidden_states=None
         if self.capture_memory_hidden or self.capture_diagnostics:
             self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
@@ -123,7 +132,12 @@ class SightlineHeliosAttnProcessor:
             if attention_mask is not None and attention_mask.shape[-1] != key.shape[1]:
                 raise RuntimeError('attention mask key axis must equal final K length')
         if self.capture_diagnostics:
-            self.last_q=query; self.last_k=key; self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
+            if self.capture_query_indices is None:
+                self.last_q=query
+            else:
+                indices=torch.as_tensor(self.capture_query_indices,device=query.device,dtype=torch.long)
+                self.last_q=query.index_select(1,indices)
+            self.last_k=key; self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
             if len(self.last_key_identities)!=key.shape[1]: raise RuntimeError('key identity map length does not match attention K axis')
         else:
             self.last_q=None; self.last_k=None

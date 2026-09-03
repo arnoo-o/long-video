@@ -163,6 +163,58 @@ class SightlineTrainable(nn.Module):
             return values.mean()
         if positives is None: raise ValueError('positives are required without multi_positive')
         return correspondence_loss(z.reshape(-1,z.shape[-1]),positives.reshape(-1),weights)
+
+    def correspondence_streaming(self, query, key, *, query_indices, multi_positive,
+                                 weights=None, additive_bias=None, key_block=256):
+        """Exact multi-positive correspondence loss without a dense QxK tensor.
+
+        Helios averages per-head softmax probabilities (rather than logits), so
+        the denominator is accumulated per head and positive logits are visited
+        in a second small pass.  Recomputing each K block preserves gradients.
+        """
+        if query.ndim != 4 or key.ndim != 4:
+            raise ValueError('Q/K must be [B,N,H,D]')
+        qi = torch.as_tensor(query_indices, device=query.device, dtype=torch.long)
+        q = query.index_select(1, qi)
+        scale = q.shape[-1] ** -0.5
+        b, h, nq, nk = q.shape[0], q.shape[2], q.shape[1], key.shape[1]
+        running_max = q.new_full((b, h, nq), -torch.inf)
+        running_sum = q.new_zeros((b, h, nq))
+        bias = additive_bias
+        if bias is not None:
+            if bias.ndim == 2: bias = bias[:, None, None, :]
+            elif bias.ndim == 4: pass
+            else: raise ValueError('additive bias must be [B,K] or [B,H,Q,K]')
+        for start in range(0, nk, int(key_block)):
+            stop = min(nk, start + int(key_block))
+            logits = torch.einsum('bqhd,bkhd->bhqk', q, key[:, start:stop]) * scale
+            if bias is not None:
+                logits = logits + bias[..., start:stop]
+            block_max = logits.amax(dim=-1)
+            new_max = torch.maximum(running_max, block_max)
+            running_sum = running_sum * torch.exp(running_max - new_max) + torch.exp(logits - new_max[..., None]).sum(-1)
+            running_max = new_max
+        log_denom = running_max + torch.log(running_sum.clamp_min(torch.finfo(running_sum.dtype).tiny))
+        values = []
+        for qpos, positives in multi_positive:
+            pos = torch.as_tensor(positives, device=query.device, dtype=torch.long)
+            if pos.numel() == 0: continue
+            pos_logits = torch.einsum('bhd,bkhd->bhk', q[:, qpos], key.index_select(1, pos)) * scale
+            if bias is not None:
+                if bias.shape[2] == 1:
+                    pos_bias = bias[:, :, 0, pos].expand(b, h, pos.numel())
+                else:
+                    pos_bias = bias[:, :, qpos, pos]
+                pos_logits = pos_logits + pos_bias
+            log_prob = pos_logits - log_denom[:, :, qpos, None]
+            per_head = torch.logsumexp(log_prob, dim=-1)
+            values.append(-torch.logsumexp(per_head - torch.log(torch.tensor(float(h), device=query.device, dtype=log_prob.dtype)), dim=1).mean())
+        if not values: return query.new_zeros(())
+        values = torch.stack(values)
+        if weights is not None:
+            weights = weights.to(device=values.device, dtype=values.dtype)
+            return (values * weights).sum() / weights.sum().clamp_min(1e-8)
+        return values.mean()
     @staticmethod
     def lambda_corr(progress, start=.4, initial=.02, final=.005):
         if progress <= start: return initial

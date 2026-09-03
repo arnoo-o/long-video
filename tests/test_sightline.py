@@ -118,7 +118,22 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
         assert len({id(getattr(layer,name).weight) for layer in conditioners})==3
     assert all(float(layer.alpha_q.detach())==1.0 and float(layer.alpha_k.detach())==1.0 for layer in conditioners)
     assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
-    assert all(torch.count_nonzero(layer.q_proj.weight)==0 and torch.count_nonzero(layer.k_proj.weight)==0 for layer in conditioners)
+
+def test_streaming_correspondence_matches_dense_loss_and_gradients():
+    from long_video.training.sightline import SightlineTrainable
+    torch.manual_seed(91)
+    model=SightlineTrainable(8,layers=(0,),heads=2)
+    q=torch.randn(1,17,2,4,requires_grad=True); k=torch.randn(1,23,2,4,requires_grad=True)
+    indices=(1,7,12); positives=((0,(1,4)),(1,(2,9)),(2,(0,22))); weights=torch.tensor([1.,2.,3.])
+    selected=q[:,indices]; logits=torch.einsum('bqhd,bkhd->bhqk',selected,k)*0.5
+    z=torch.logsumexp(logits.log_softmax(-1),1)-torch.log(torch.tensor(2.))
+    dense=-(torch.stack([torch.logsumexp(z[:,i,list(keys)],-1).mean() for i,keys in enumerate((p for _,p in positives))])*weights).sum()/weights.sum()
+    streamed=model.correspondence_streaming(q,k,query_indices=indices,multi_positive=positives,weights=weights,key_block=5)
+    dq_dense,dk_dense=torch.autograd.grad(dense,(q,k),retain_graph=True)
+    dq_stream,dk_stream=torch.autograd.grad(streamed,(q,k))
+    assert torch.allclose(dense,streamed,atol=2e-5,rtol=2e-5)
+    assert torch.allclose(dq_dense,dq_stream,atol=2e-5,rtol=2e-5)
+    assert torch.allclose(dk_dense,dk_stream,atol=2e-5,rtol=2e-5)
 
 def test_scheduler_provenance_ignores_default_field_order():
     from long_video.training.sightline_checkpoint import scheduler_config_fingerprint

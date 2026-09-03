@@ -4,12 +4,15 @@ The historical filename is retained as a legacy compatibility entry point.
 Formal training data is loaded exclusively through RGBDMemoryRecord.
 """
 from __future__ import annotations
-import argparse, hashlib, json, random, sys, time
+import argparse, hashlib, json, os, random, sys, time
+# Must be set before importing/initializing CUDA; callers may override it.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 from dataclasses import asdict
 from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
@@ -108,8 +111,7 @@ def _sigma_band(step, phase):
     if phase=='P1': return (0.9,1.0),'high_0.9_1.0'
     if phase=='P2': return (0.7,1.0),'mid_high_0.7_1.0'
     if phase=='P3':
-        high=(hashlib.sha256(f'sightline-sigma-band:{step}'.encode()).digest()[0]&1)==0
-        return ((0.8,1.0),'high_0.8_1.0') if high else ((0.4,0.8),'mid_0.4_0.8')
+        return (0.0,1.0),'uniform_0.0_1.0'
     raise ValueError(f'unknown phase {phase}')
 
 def _set_gradient_checkpointing(transformer,enabled):
@@ -232,11 +234,12 @@ def _sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sam
     choice=(chosen_memory+[i for i in order if i not in chosen_memory_set])[:max_rows]
     return ([selected[i] for i in choice],[positives[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
 
-def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None):
+def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,backward_scale=None,backward_device=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
     missing=[layer for layer in layers if layer not in processors]
     if missing: raise RuntimeError(f'correspondence layers have no Sightline processor: {missing}')
     first=processors[layers[0]]; identities=first.last_key_identities
+    captured={layer:(processors[layer].last_q,processors[layer].last_k,getattr(processors[layer],'last_attention_bias',None)) for layer in layers}
     for layer in layers[1:]:
         processor=processors[layer]
         same_identities=(processor.last_key_identities is identities or processor.last_key_identities==identities)
@@ -249,29 +252,40 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
         selected=positives=weights=flags=[]
     selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
     if timings is not None: timings['correspondence_mapping_seconds']+=time.perf_counter()-mapping_started
+    if backward_scale is not None:
+        # Gradient-checkpoint recomputation must not overwrite the CPU Q/K
+        # snapshots or retain a second GPU diagnostics bank.
+        for layer in layers: processors[layer].capture_diagnostics=False
     losses=[]; loss_started=time.perf_counter()
     for layer in layers:
         processor=processors[layer]
         if not selected: continue
-        numerator=processor.last_q.new_zeros(()); denominator=processor.last_q.new_zeros(())
+        captured_q,captured_k,captured_bias=captured[layer]
+        layer_losses=[]
         for start in range(0,len(selected),64):
-            stop=min(start+64,len(selected)); sampled=selected_qk_logits(processor.last_q,processor.last_k,selected[start:stop])
-            if not sampled.requires_grad or not processor.last_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd; disable incompatible gradient checkpointing')
-            block_positive=[(index,keys) for index,keys in enumerate(positives[start:stop])]
-            weight=torch.tensor(weights[start:stop],device=sampled.device)
+            stop=min(start+64,len(selected)); query_indices=tuple(selected[start:stop])
+            block_positive=tuple((index,tuple(keys)) for index,keys in enumerate(positives[start:stop]))
+            weight=torch.tensor(weights[start:stop],device=captured_q.device)
             additive_bias=None
-            if getattr(processor,'last_attention_bias',None) is not None:
-                bias=processor.last_attention_bias
-                q_indices=selected[start:stop]
-                if bias.ndim==2: additive_bias=bias
-                elif bias.ndim==3: additive_bias=bias[:,q_indices,:].unsqueeze(1)
-                elif bias.ndim==4: additive_bias=bias[:,:,q_indices,:]
+            if captured_bias is not None:
+                if captured_bias.ndim==2: additive_bias=captured_bias
+                elif captured_bias.ndim==3: additive_bias=captured_bias[:,query_indices,:].unsqueeze(1)
+                elif captured_bias.ndim==4: additive_bias=captured_bias[:,:,query_indices,:]
                 else: raise RuntimeError('unsupported captured attention bias shape')
-            block_loss=trainable.correspondence(sampled,None,weight,multi_positive=block_positive,additive_bias=additive_bias)
-            numerator=numerator+block_loss*weight.sum(); denominator=denominator+weight.sum()
-        losses.append(numerator/denominator.clamp_min(1e-8))
+            block_loss=trainable.correspondence_streaming(captured_q,captured_k,query_indices=query_indices,multi_positive=block_positive,weights=weight,additive_bias=additive_bias)
+            if not block_loss.requires_grad or not captured_k.requires_grad: raise RuntimeError('correspondence Q/K lost autograd; disable incompatible gradient checkpointing')
+            layer_losses.append((block_loss,weight.sum()))
+        denom=sum((w for _,w in layer_losses), captured_q.new_zeros(()))
+        layer_loss=sum((loss*w for loss,w in layer_losses), captured_q.new_zeros(()))/denom.clamp_min(1e-8)
+        if backward_scale is not None:
+            if backward_device is None: raise ValueError('sequential correspondence backward requires a target device')
+            (layer_loss.to(backward_device)*(float(backward_scale)/len(layers))).backward(retain_graph=True)
+            losses.append(layer_loss.detach())
+            processor.last_q=processor.last_k=None
+        else:
+            losses.append(layer_loss)
     if timings is not None: timings['correspondence_loss_seconds']+=time.perf_counter()-loss_started
-    if not losses: return first.last_q.new_zeros(())
+    if not losses: return captured[layers[0]][0].new_zeros(())
     return torch.stack(losses).mean()
 
 def _reset_sequence(runner):
@@ -313,7 +327,13 @@ def main():
     optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
-    prompt_embeds,_=_prompt(pipe,args.prompt,device); config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
+    prompt_embeds,_=_prompt(pipe,args.prompt,device)
+    # T5 is only needed for the fixed prompt above.  Keep its CPU module for
+    # checkpoint/optimizer scope validation, but release its CUDA weights
+    # before the first training forward.
+    pipe.text_encoder.to('cpu'); pipe.text_encoder.eval();
+    if device.type == 'cuda': torch.cuda.empty_cache()
+    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     world_size_migrated=False
@@ -406,13 +426,28 @@ def main():
                     for layer in active_corr_layers:
                         pipe.transformer._sightline_processors[layer].capture_diagnostics=capture_correspondence
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
+                    if args.train and capture_correspondence:
+                        # The nine supervised layers retain large Q/K tensors until the
+                        # final backward.  Move this supervision-only branch to CPU while
+                        # preserving its autograd copies back into the Transformer graph.
+                        for layer in active_corr_layers:
+                            processor=pipe.transformer._sightline_processors[layer]
+                            processor.last_q=processor.last_q.to('cpu')
+                            processor.last_k=processor.last_k.to('cpu')
+                            if processor.last_attention_bias is not None:
+                                processor.last_attention_bias=processor.last_attention_bias.to('cpu')
                     stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                     if args.train and stage_index+1<len(items):
                         timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
-                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16),timings=perf) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
+                corr_weight=trainable.lambda_corr(step/total_steps)
+                sequential_corr_backward=bool(args.train and phase['correspondence'] and corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline)
+                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16),timings=perf,backward_scale=corr_weight if sequential_corr_backward else None,backward_device=fm.device if sequential_corr_backward else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
+                corr_metric=corr_metric.to(fm.device)
                 corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
-                total=stage_losses[-1]/len(items)+trainable.lambda_corr(step/total_steps)*corr if args.train else fm+trainable.lambda_corr(step/total_steps)*corr
+                if sequential_corr_backward:
+                    corr=corr.detach()+next(trainable.parameters()).sum()*0.0
+                total=stage_losses[-1]/len(items)+corr_weight*corr if args.train else fm+corr_weight*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
                 if args.train:
                     timing_sync(); backward_started=time.perf_counter(); total.backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started

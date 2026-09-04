@@ -566,6 +566,32 @@ def test_layer_memory_banks_select_once_and_share_chunk_ids():
     assert calls==[1] and all(bank.last_selected_chunk_ids==(0,1) for bank in memory.banks.values())
     identity_objects=[bank.active_identity_metadata() for bank in memory.banks.values()]
     assert all(value is identity_objects[0] for value in identity_objects)
+    host_metadata=[(bank._host_rays,bank._host_temporal,bank._host_y,bank._host_x,
+                    bank._host_global_ids,bank._host_chunk_ids) for bank in memory.banks.values()]
+    assert all(all(actual is expected for actual,expected in zip(values,host_metadata[0])) for values in host_metadata)
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA staging requires a GPU')
+def test_layer_memory_async_prefetch_is_two_slot_and_recompute_stable():
+    from long_video.sightline.memory import LayerKVMemoryBank
+    layers=(4,8,16,20,24,32,36)
+    memory=LayerKVMemoryBank(layers,budget=100,pool=1)
+    hidden=torch.randn(1,2,4); rays=torch.randn(1,2,7)
+    for bank in memory.banks.values():
+        for chunk in range(2):
+            bank.capture(hidden+chunk,rays,chunk,grid_shape=(2,1,1),camera_poses=_camera_trajectory(float(chunk)))
+    memory.prepare_active_memory(query_chunk=2,query_camera_poses=_camera_trajectory(2.),device='cuda',dtype=torch.float32)
+    expected_identity=memory.for_layer(layers[0]).active_identity_metadata()
+    # Two consecutive native forward passes, then checkpoint recompute in
+    # reverse block order. The selected CPU identity remains immutable.
+    for order in (layers,layers,tuple(reversed(layers))):
+        for layer in order:
+            hidden_cuda,rays_cuda=memory.for_layer(layer).get(16,device='cuda',dtype=torch.bfloat16)
+            assert hidden_cuda.is_cuda and rays_cuda.is_cuda
+            assert hidden_cuda.dtype==rays_cuda.dtype==torch.bfloat16
+            assert len(memory.staging_layer_ids)<=2
+            assert memory.for_layer(layer).active_identity_metadata() is expected_identity
+    torch.cuda.synchronize()
+    assert all(bank.last_selected_chunk_ids==(0,1) for bank in memory.banks.values())
 
 def test_memory_active_empty_bank_does_not_reselect():
     from long_video.sightline.memory import LongTermKVMemory
@@ -854,6 +880,118 @@ def test_checkpoint_cadence_switches_after_p2():
 def test_p3_sigma_range_remains_uniform_zero_to_one():
     from scripts.train_sightline_rgbd import _sigma_band
     assert _sigma_band(1000,'P3')==((0.0,1.0),'uniform_0.0_1.0')
+
+def test_smoke_curriculum_override_is_explicit_and_does_not_change_config():
+    source=Path(__file__).parents[1].joinpath('scripts/train_sightline_rgbd.py').read_text()
+    assert "SIGHTLINE_SMOKE_ALLOW_CURRICULUM_OVERRIDE" in source
+    assert "args.smoke_max_chunks not in (4,5,6)" in source
+    assert "phase={**phase,'max_chunks':int(smoke_max_chunks)}" in source
+    assert "forced_train_chunk=phase['max_chunks']-1 if smoke_chunk_sequence" in source
+    assert "if rank==0 and (args.profile_timing or" in source
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='device placement test requires CUDA')
+def test_training_offloads_only_unused_vae_decode_path():
+    from types import SimpleNamespace
+    from scripts.train_sightline_rgbd import _offload_unused_vae_decode_path
+    encoder=torch.nn.Linear(4,4).cuda()
+    quant_conv=torch.nn.Linear(4,4).cuda()
+    decoder=torch.nn.Linear(4,4).cuda()
+    post_quant_conv=torch.nn.Linear(4,4).cuda()
+    vae=SimpleNamespace(encoder=encoder,quant_conv=quant_conv,decoder=decoder,post_quant_conv=post_quant_conv)
+    expected=sum(p.numel()*p.element_size() for module in (decoder,post_quant_conv) for p in module.parameters())
+    assert _offload_unused_vae_decode_path(vae)==expected
+    assert next(vae.encoder.parameters()).device.type=='cuda'
+    assert next(vae.quant_conv.parameters()).device.type=='cuda'
+    assert next(vae.decoder.parameters()).device.type=='cpu'
+    assert next(vae.post_quant_conv.parameters()).device.type=='cpu'
+
+def test_helios_norm_runtime_patch_records_distinct_fingerprints(tmp_path):
+    import hashlib
+    import scripts.train_sightline_rgbd as training
+    original=(training._IMPORT_ANCHOR+'\n'+training._NORM1_ORIGINAL+'\n'+training._NORM2_ORIGINAL+'\n'
+              +training._NORM3_ORIGINAL+'\n'+training._RESIDUAL1_ORIGINAL+'\n'
+              +training._RESIDUAL3_ORIGINAL+'\n')
+    source=tmp_path/'transformer.py'; source.write_text(original)
+    runtime=training._install_memory_efficient_helios_norm(source)
+    patched=source.read_text()
+    assert 'token_blocked_layer_norm_modulate' in patched
+    assert 'token_blocked_gated_residual' in patched
+    assert runtime['version']==training.HELIOS_RUNTIME_PATCH_VERSION
+    assert runtime['original_source_sha256']==hashlib.sha256(original.encode()).hexdigest()
+    assert runtime['runtime_source_sha256']==hashlib.sha256(patched.encode()).hexdigest()
+    assert runtime['runtime_source_sha256']!=runtime['original_source_sha256']
+    assert training._install_memory_efficient_helios_norm(source)==runtime
+
+def test_runtime_patch_metadata_preserves_legacy_provenance_compatibility():
+    from long_video.training.sightline_checkpoint import _provenance_matches
+    legacy={'transformer_source_sha256':'original','pipeline_source_sha256':'pipeline',
+            'scheduler_class':'Scheduler','scheduler_config_sha256':'scheduler',
+            'model_identity':{'kind':'local','transformer_config_sha256':'model'}}
+    current={**legacy,'runtime_patch':{'version':'bounded-v1','original_source_sha256':'original',
+                                      'runtime_source_sha256':'patched'}}
+    assert _provenance_matches(legacy,current)
+    assert not _provenance_matches(legacy,{**current,'transformer_source_sha256':'different'})
+
+@pytest.mark.parametrize('dtype',[torch.float32,torch.bfloat16])
+def test_token_blocked_norm_and_residual_match_reference(dtype):
+    from long_video.sightline.bounded_ops import token_blocked_gated_residual,token_blocked_layer_norm_modulate
+    torch.manual_seed(123)
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+    if dtype is torch.bfloat16 and device=='cpu': pytest.skip('BF16 gradient comparison requires CUDA')
+    shape=(2,1031,64)
+    hidden=torch.randn(shape,device=device,dtype=dtype,requires_grad=True)
+    scale=torch.randn(shape,device=device,dtype=torch.float32,requires_grad=True)
+    shift=torch.randn(shape,device=device,dtype=torch.float32,requires_grad=True)
+    norm=torch.nn.LayerNorm(shape[-1],eps=1e-6,elementwise_affine=False,device=device,dtype=torch.float32)
+    output=token_blocked_layer_norm_modulate(hidden,norm,scale,shift,token_tile=128)
+    grad_output=torch.randn_like(output)
+    gradients=torch.autograd.grad(output,(hidden,scale,shift),grad_output)
+    ref_hidden=hidden.detach().clone().requires_grad_(); ref_scale=scale.detach().clone().requires_grad_(); ref_shift=shift.detach().clone().requires_grad_()
+    reference=(norm(ref_hidden.float())*(1+ref_scale)+ref_shift).to(dtype)
+    reference_gradients=torch.autograd.grad(reference,(ref_hidden,ref_scale,ref_shift),grad_output)
+    tolerance=4e-3 if dtype is torch.bfloat16 else 3e-6
+    assert torch.allclose(output,reference,atol=tolerance,rtol=tolerance)
+    for actual,expected in zip(gradients,reference_gradients):
+        assert torch.allclose(actual,expected,atol=tolerance,rtol=tolerance)
+
+    update=torch.randn(shape,device=device,dtype=dtype,requires_grad=True)
+    gate=torch.randn(shape,device=device,dtype=torch.float32,requires_grad=True)
+    residual=token_blocked_gated_residual(hidden,update,gate,token_tile=128)
+    residual_grads=torch.autograd.grad(residual,(hidden,update,gate),grad_output)
+    ref_hidden=hidden.detach().clone().requires_grad_(); ref_update=update.detach().clone().requires_grad_(); ref_gate=gate.detach().clone().requires_grad_()
+    ref_residual=(ref_hidden.float()+ref_update.float()*ref_gate).to(dtype)
+    ref_residual_grads=torch.autograd.grad(ref_residual,(ref_hidden,ref_update,ref_gate),grad_output)
+    assert torch.allclose(residual,ref_residual,atol=tolerance,rtol=tolerance)
+    for actual,expected in zip(residual_grads,ref_residual_grads):
+        assert torch.allclose(actual,expected,atol=tolerance,rtol=tolerance)
+
+@pytest.mark.parametrize('kind',['q','k'])
+@pytest.mark.parametrize('dtype',[torch.float32,torch.bfloat16])
+def test_token_blocked_sightline_projection_matches_reference(kind,dtype):
+    from long_video.sightline.bounded_ops import token_blocked_sightline_project
+    if dtype is torch.bfloat16 and not torch.cuda.is_available(): pytest.skip('BF16 projection gradient comparison requires CUDA')
+    device='cuda' if torch.cuda.is_available() else 'cpu'; torch.manual_seed(321)
+    rays=torch.randn(2,1031,7,device=device,dtype=dtype,requires_grad=True)
+    projection=torch.nn.Linear(7,64,device=device,dtype=torch.float32)
+    gate=torch.nn.Linear(1,64,device=device,dtype=torch.float32)
+    norm=torch.nn.RMSNorm(64,eps=1e-6,device=device,dtype=torch.float32)
+    alpha=torch.nn.Parameter(torch.tensor(.7,device=device,dtype=torch.float32)); delta=torch.tensor(.25,device=device,dtype=dtype)
+    parameters=(rays,projection.weight,projection.bias,gate.weight,gate.bias,norm.weight,alpha)
+    output=token_blocked_sightline_project(rays,projection,gate,norm,alpha,kind=kind,scale_delta=delta,token_tile=128)
+    grad_output=torch.randn_like(output); gradients=torch.autograd.grad(output,parameters,grad_output)
+
+    ref_rays=rays.detach().clone().requires_grad_(); ref_projection=torch.nn.Linear(7,64,device=device,dtype=torch.float32)
+    ref_gate=torch.nn.Linear(1,64,device=device,dtype=torch.float32); ref_norm=torch.nn.RMSNorm(64,eps=1e-6,device=device,dtype=torch.float32)
+    ref_projection.load_state_dict(projection.state_dict()); ref_gate.load_state_dict(gate.state_dict()); ref_norm.load_state_dict(norm.state_dict())
+    ref_alpha=alpha.detach().clone().requires_grad_(); scale=ref_rays[...,6:7].float()
+    geometric=torch.cat((ref_rays[...,3:6].float(),ref_rays[...,:3].float(),scale),-1) if kind=='k' else ref_rays.float()
+    reference=(ref_alpha*torch.sigmoid(ref_gate(scale+delta.float()))*ref_norm(ref_projection(geometric))).to(dtype)
+    ref_parameters=(ref_rays,ref_projection.weight,ref_projection.bias,ref_gate.weight,ref_gate.bias,ref_norm.weight,ref_alpha)
+    reference_gradients=torch.autograd.grad(reference,ref_parameters,grad_output)
+    tolerance=8e-3 if dtype is torch.bfloat16 else 5e-5
+    assert torch.allclose(output,reference,atol=tolerance,rtol=tolerance)
+    for actual,expected in zip(gradients,reference_gradients):
+        assert torch.allclose(actual,expected,atol=tolerance,rtol=tolerance)
 
 def test_teacher_overlap_screening_is_deterministic_and_causal():
     from scripts.build_sightline_correspondences import screen_overlap

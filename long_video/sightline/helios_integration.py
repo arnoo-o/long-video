@@ -48,14 +48,15 @@ class SightlineHeliosAttnProcessor:
         if self.conditioner is None:
             scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
         else:
-            condition_dtype=next(self.conditioner.parameters()).dtype
             history_len=max(0,key.shape[1]-current_len)
             # Native history has its own exact camera-footprint projection below.
             # Projecting placeholder/all-token rays here only to overwrite the
             # history prefix was both redundant and a large checkpoint-backward
             # peak. The current suffix is pointwise-identical to the old path.
-            conditioned_q=rays_q[:,-current_len:].to(condition_dtype)
-            conditioned_k=rays_k[:,-current_len:].to(condition_dtype)
+            # Project in FP32 tile math but retain only BF16 deltas, matching
+            # the dtype used when the former full projection was added to Q/K.
+            conditioned_q=rays_q[:,-current_len:].to(query.dtype)
+            conditioned_k=rays_k[:,-current_len:].to(key.dtype)
             scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
             dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
             dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)

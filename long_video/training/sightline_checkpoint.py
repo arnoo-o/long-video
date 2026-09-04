@@ -13,7 +13,7 @@ def scheduler_config_fingerprint(config):
     if '_use_default_values' in config: config['_use_default_values']=sorted(config['_use_default_values'])
     return config_fingerprint(config)
 def _file_sha(path): return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-def runtime_provenance(pipe, model_id, helios_root, model_revision=None):
+def runtime_provenance(pipe, model_id, helios_root, model_revision=None, transformer_source_sha256=None, runtime_patch=None):
     root=Path(helios_root); transformer=root/'helios/diffusers_version/transformer_helios_diffusers.py'; pipeline=root/'helios/diffusers_version/pipeline_helios_diffusers.py'
     if not transformer.is_file() or not pipeline.is_file(): raise FileNotFoundError('pinned Helios source files are required for provenance')
     model_path=Path(model_id); local=model_path.is_dir(); transformer_config=config_fingerprint(dict(pipe.transformer.config))
@@ -36,7 +36,8 @@ def runtime_provenance(pipe, model_id, helios_root, model_revision=None):
         if not revision: raise RuntimeError('HF model provenance requires an explicit revision/commit')
         model_identity={'kind':'huggingface','revision':str(revision),'transformer_config_sha256':transformer_config}
     scheduler_config=dict(pipe.scheduler.config)
-    return {'transformer_source_sha256':hashlib.sha256(transformer.read_bytes()).hexdigest(),'pipeline_source_sha256':hashlib.sha256(pipeline.read_bytes()).hexdigest(),'scheduler_class':type(pipe.scheduler).__module__+'.'+type(pipe.scheduler).__qualname__,'scheduler_config_sha256':scheduler_config_fingerprint(scheduler_config),'model_id':str(model_id),'model_identity':model_identity}
+    transformer_sha=transformer_source_sha256 or hashlib.sha256(transformer.read_bytes()).hexdigest()
+    return {'transformer_source_sha256':transformer_sha,'pipeline_source_sha256':hashlib.sha256(pipeline.read_bytes()).hexdigest(),'scheduler_class':type(pipe.scheduler).__module__+'.'+type(pipe.scheduler).__qualname__,'scheduler_config_sha256':scheduler_config_fingerprint(scheduler_config),'model_id':str(model_id),'model_identity':model_identity,'runtime_patch':runtime_patch}
 
 def _provenance_matches(saved, current):
     """Permit relocating an identical local model while preserving strict fingerprints."""
@@ -97,7 +98,7 @@ def _restore_rng_state(state):
     torch.set_rng_state(state['torch']); random.setstate(state['python']); _restore_numpy_rng_state(state['numpy'])
     if torch.cuda.is_available() and state.get('cuda') is not None: torch.cuda.set_rng_state_all(state['cuda'])
 
-def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, scheduler, step, *, config, helios_fingerprint, layers, memory_config, provenance=None, rng_states=None, world_size=1):
+def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, scheduler, step, *, config, helios_fingerprint, layers, memory_config, provenance=None, rng_states=None, world_size=1, runtime_patch=None):
     if rng_states is None:
         if int(world_size)!=1: raise RuntimeError('multi-rank checkpoints require explicitly gathered RNG states')
         rng_states=[serialize_rng_state(capture_rng_state())]
@@ -108,7 +109,7 @@ def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, sch
         'rng_cuda':torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,'rng_states':rng_states,'rng_world_size':int(world_size),
         'sightline_training_semantics_version':SEMANTICS,'sightline_checkpoint_schema_version':SCHEMA,
         'config':config,'config_fingerprint':config_fingerprint(config),'helios_fingerprint':helios_fingerprint,
-        'layers':list(layers),'memory_config':memory_config,'runtime_provenance':provenance}
+        'layers':list(layers),'memory_config':memory_config,'runtime_provenance':provenance,'helios_runtime_patch':runtime_patch}
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
 
 def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config, optimizer=None, scheduler=None, restore_rng=False, provenance=None, rank=0, world_size=1, allow_memory_layer_migration=False, allow_world_size_migration=False):

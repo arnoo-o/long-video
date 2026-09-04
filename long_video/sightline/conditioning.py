@@ -1,6 +1,7 @@
 """Per-layer Sightline Q/K geometry projections."""
 import torch
 from torch import nn
+from .bounded_ops import token_blocked_sightline_project
 
 class SightlineConditioner(nn.Module):
     def __init__(self, inner_dim: int, hidden_dim: int = 128, eps: float = 1e-6,
@@ -30,21 +31,17 @@ class SightlineConditioner(nn.Module):
     def project(self, rays, *, kind: str, training=None, scale_delta=None):
         if rays.shape[-1] != 7: raise ValueError("rays must contain d, m_hat, log_norm")
         if training is None: training=self.training
-        output_dtype=rays.dtype; parameter_dtype=self.gate.weight.dtype
-        s=rays[...,6:7].to(parameter_dtype); s_in=s if scale_delta is None else s+torch.as_tensor(scale_delta,device=s.device,dtype=parameter_dtype)
-        # Scale augmentation exclusively affects this gate. E_q/E_k always see
-        # true Plücker scale s, never the perturbed value.
-        g=torch.sigmoid(self.gate(s_in))
         if kind not in ('q','k'): raise ValueError("kind must be q or k")
-        q_in=torch.cat((rays[...,:3].to(parameter_dtype),rays[...,3:6].to(parameter_dtype),s),-1)
-        k_in=torch.cat((rays[...,3:6].to(parameter_dtype),rays[...,:3].to(parameter_dtype),s),-1)
-        dim=self.q_proj.out_features
-        value=self.q_proj(q_in) if kind=='q' else self.k_proj(k_in)
-        if self.capture_numeric_diagnostics:
-            self.last_pre_norm_rms[kind]=float(value.detach().float().square().mean().sqrt().cpu())
-        value=(self.rms_norm_q if kind=='q' else self.rms_norm_k)(value)
+        projection=self.q_proj if kind=='q' else self.k_proj
+        norm=self.rms_norm_q if kind=='q' else self.rms_norm_k
         alpha=self.alpha_q if kind=='q' else self.alpha_k
-        return (alpha.to(value.dtype)*g*value).to(output_dtype)
+        if self.capture_numeric_diagnostics:
+            parameter_dtype=self.gate.weight.dtype; s=rays[...,6:7].to(parameter_dtype)
+            q_in=torch.cat((rays[...,:3].to(parameter_dtype),rays[...,3:6].to(parameter_dtype),s),-1)
+            k_in=torch.cat((rays[...,3:6].to(parameter_dtype),rays[...,:3].to(parameter_dtype),s),-1)
+            value=projection(q_in if kind=='q' else k_in)
+            self.last_pre_norm_rms[kind]=float(value.detach().float().square().mean().sqrt().cpu())
+        return token_blocked_sightline_project(rays,projection,self.gate,norm,alpha,kind=kind,scale_delta=scale_delta)
     def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None):
         rays_k = rays_q if rays_k is None else rays_k
         if training is None: training=self.training

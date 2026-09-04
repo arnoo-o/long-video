@@ -5,6 +5,11 @@ import torch
 from torch import nn
 
 
+def _pinned_cpu(value:torch.Tensor) -> torch.Tensor:
+    value=value.detach().to(device='cpu').contiguous()
+    return value.pin_memory() if torch.cuda.is_available() and not value.is_pinned() else value
+
+
 @dataclass
 class MemoryToken:
     chunk_index:int; token_index:int; temporal:int; pooled_y:int; pooled_x:int
@@ -74,8 +79,11 @@ class LongTermKVMemory:
         self.budget=int(budget); self.pool=int(pool); self.tau_pos=float(tau_pos); self.tau_angle=float(tau_angle)
         self.archive:dict[int,MemoryChunk]={}; self.timestamp=None; self.rope=None; self.enabled=True; self.last_active_tokens=[]; self.last_selected_chunk_ids=()
         self._active_query_chunk=None; self._active_hidden=None; self._active_rays=None; self._active_tokens=()
+        self._host_hidden=None; self._host_rays=None
         self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
+        self._host_temporal=self._host_y=self._host_x=self._host_global_ids=self._host_chunk_ids=None
         self._active_identity_metadata=()
+        self.coordinator=None; self.layer=None
         self.protected_archive_chunk_ids=frozenset((0,))
 
     @property
@@ -105,12 +113,12 @@ class LongTermKVMemory:
         rr=rays.clone()
         rr[...,:3]=rr[...,:3]/rr[...,:3].norm(dim=-1,keepdim=True).clamp_min(1e-6)
         rr[...,3:6]=rr[...,3:6]/rr[...,3:6].norm(dim=-1,keepdim=True).clamp_min(1e-6)
-        hidden_chunk=hidden.contiguous().detach().cpu(); ray_chunk=rr.contiguous().detach().cpu()
-        temporal=torch.arange(1,T,dtype=torch.long).repeat_interleave(pooled_h*pooled_w)
-        pooled_y=torch.arange(pooled_h,dtype=torch.long).repeat_interleave(pooled_w).repeat(T-1)
-        pooled_x=torch.arange(pooled_w,dtype=torch.long).repeat(pooled_h*(T-1))
-        global_ids=int(chunk_index)*8+temporal
-        chunk=MemoryChunk(int(chunk_index),hidden_chunk,ray_chunk,temporal,pooled_y,pooled_x,camera_poses.detach().cpu(),global_ids,int(chunk_index if timestamp is None else timestamp))
+        hidden_chunk=_pinned_cpu(hidden); ray_chunk=_pinned_cpu(rr)
+        temporal=_pinned_cpu(torch.arange(1,T,dtype=torch.long).repeat_interleave(pooled_h*pooled_w))
+        pooled_y=_pinned_cpu(torch.arange(pooled_h,dtype=torch.long).repeat_interleave(pooled_w).repeat(T-1))
+        pooled_x=_pinned_cpu(torch.arange(pooled_w,dtype=torch.long).repeat(pooled_h*(T-1)))
+        global_ids=_pinned_cpu(int(chunk_index)*8+temporal)
+        chunk=MemoryChunk(int(chunk_index),hidden_chunk,ray_chunk,temporal,pooled_y,pooled_x,_pinned_cpu(camera_poses),global_ids,int(chunk_index if timestamp is None else timestamp))
         chunk_id=int(chunk_index)
         # A repeated capture must never silently replace the permanent anchor.
         if chunk_id in self.protected_archive_chunk_ids and chunk_id in self.archive:
@@ -139,7 +147,8 @@ class LongTermKVMemory:
         return tokens
 
     def prepare_active_memory(self, *, query_chunk:int, query_camera_poses:torch.Tensor,
-                              native_history_chunk_ids=(), device=None, dtype=None, selected_chunk_ids=None, identity_metadata=None):
+                              native_history_chunk_ids=(), device=None, dtype=None, selected_chunk_ids=None,
+                              identity_metadata=None, shared_host_metadata=None):
         """Select and materialize the complete active chunks once per query chunk."""
         query_chunk=int(query_chunk)
         if self._active_query_chunk == query_chunk: return self.last_selected_chunk_ids
@@ -149,14 +158,24 @@ class LongTermKVMemory:
             raise RuntimeError(f'complete active Memory chunks exceed token budget: {token_count}>{self.budget}')
         self.last_active_tokens=[]; self.last_selected_chunk_ids=tuple(chunk.chunk_id for chunk in chunks)
         self._active_query_chunk=query_chunk; self._active_tokens=()
+        self._active_hidden=self._active_rays=None
+        self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
         if chunks:
-            self._active_hidden=torch.cat([chunk.hidden for chunk in chunks],1).to(device=device,dtype=dtype)
-            self._active_rays=torch.cat([chunk.rays for chunk in chunks],1).to(device=device,dtype=dtype)
-            self._active_temporal=torch.cat([chunk.temporal for chunk in chunks]).to(device=device)
-            self._active_y=torch.cat([chunk.pooled_y for chunk in chunks]).to(device=device)
-            self._active_x=torch.cat([chunk.pooled_x for chunk in chunks]).to(device=device)
-            self._active_global_ids=torch.cat([chunk.global_latent_ids for chunk in chunks]).to(device=device)
-            self._active_chunk_ids=torch.cat([torch.full((chunk.token_count,),chunk.chunk_id,dtype=torch.long) for chunk in chunks]).to(device=device)
+            # Assemble pinned host packs only. The layer coordinator moves at
+            # most two packs to CUDA using its rolling prefetch buffers.
+            self._host_hidden=_pinned_cpu(torch.cat([chunk.hidden for chunk in chunks],1))
+            if shared_host_metadata is None:
+                self._host_rays=_pinned_cpu(torch.cat([chunk.rays for chunk in chunks],1))
+                self._host_temporal=_pinned_cpu(torch.cat([chunk.temporal for chunk in chunks]))
+                self._host_y=_pinned_cpu(torch.cat([chunk.pooled_y for chunk in chunks]))
+                self._host_x=_pinned_cpu(torch.cat([chunk.pooled_x for chunk in chunks]))
+                self._host_global_ids=_pinned_cpu(torch.cat([chunk.global_latent_ids for chunk in chunks]))
+                self._host_chunk_ids=_pinned_cpu(torch.cat([torch.full((chunk.token_count,),chunk.chunk_id,dtype=torch.long) for chunk in chunks]))
+            else:
+                (self._host_rays,self._host_temporal,self._host_y,self._host_x,
+                 self._host_global_ids,self._host_chunk_ids)=shared_host_metadata
+                if self._host_rays.shape[1]!=token_count or any(value.numel()!=token_count for value in shared_host_metadata[1:]):
+                    raise RuntimeError('shared Memory identity metadata differs across layers')
             # Build Python identity data once from CPU archive metadata.  The
             # processor reuses this cache; no GPU tensor is converted to a list
             # while denoising or attending.
@@ -166,14 +185,16 @@ class LongTermKVMemory:
                 for global_id,y,x in zip(chunk.global_latent_ids.tolist(),chunk.pooled_y.tolist(),chunk.pooled_x.tolist())
             ) if identity_metadata is None else tuple(identity_metadata)
         else:
-            self._active_hidden=self._active_rays=None
-            self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
+            self._host_hidden=self._host_rays=None
+            self._host_temporal=self._host_y=self._host_x=self._host_global_ids=self._host_chunk_ids=None
             self._active_identity_metadata=()
         return self.last_selected_chunk_ids
 
     def clear_active_memory(self):
         self._active_query_chunk=None; self._active_hidden=None; self._active_rays=None; self._active_tokens=()
+        self._host_hidden=self._host_rays=None
         self._active_temporal=self._active_y=self._active_x=self._active_global_ids=self._active_chunk_ids=None
+        self._host_temporal=self._host_y=self._host_x=self._host_global_ids=self._host_chunk_ids=None
         self._active_identity_metadata=()
         self.last_active_tokens=[]; self.last_selected_chunk_ids=()
 
@@ -183,8 +204,16 @@ class LongTermKVMemory:
         if self._active_query_chunk != current_chunk:
             if query_camera_poses is None:return None,None
             self.prepare_active_memory(query_chunk=current_chunk,query_camera_poses=query_camera_poses,device=device,dtype=dtype)
-        if self._active_hidden is None:return None,None
-        return self._active_hidden.to(device=device,dtype=dtype),self._active_rays.to(device=device,dtype=dtype)
+        if self._host_hidden is None:return None,None
+        if self.coordinator is not None and torch.device(device).type=='cuda':
+            self.coordinator.acquire_layer(self.layer,device=device,dtype=dtype)
+        else:
+            self._active_hidden=self._host_hidden.to(device=device,dtype=dtype,non_blocking=True)
+            self._active_rays=self._host_rays.to(device=device,dtype=dtype,non_blocking=True)
+            self._active_temporal=self._host_temporal.to(device=device,non_blocking=True)
+            self._active_y=self._host_y.to(device=device,non_blocking=True); self._active_x=self._host_x.to(device=device,non_blocking=True)
+            self._active_global_ids=self._host_global_ids.to(device=device,non_blocking=True); self._active_chunk_ids=self._host_chunk_ids.to(device=device,non_blocking=True)
+        return self._active_hidden,self._active_rays
 
     def __len__(self): return sum(chunk.token_count for chunk in self.archive.values())
 
@@ -241,6 +270,8 @@ class LongTermKVMemory:
 class LayerKVMemoryBank(nn.Module):
     def __init__(self,layers,budget=13312,pool=2,hidden_dim=None,*,tau_pos=1.0,tau_angle=0.78539816339):
         super().__init__(); self.banks={int(layer):LongTermKVMemory(budget,pool,tau_pos=tau_pos,tau_angle=tau_angle) for layer in layers}; self._selected_query_chunk=None; self._selected_chunk_ids=()
+        self._ordered_layers=tuple(sorted(self.banks)); self._prefetch_stream=None; self._staging={}; self._staging_events={}; self._device=None; self._dtype=None; self._last_access_layer=None
+        for layer,bank in self.banks.items(): bank.coordinator=self; bank.layer=layer
         self.timestamp=nn.Embedding(64,hidden_dim) if hidden_dim is not None else None
         self.memory_type_embedding=nn.Parameter(torch.zeros(hidden_dim)) if hidden_dim is not None else None
         if self.timestamp is not None:nn.init.zeros_(self.timestamp.weight)
@@ -254,7 +285,7 @@ class LayerKVMemoryBank(nn.Module):
         for bank in self.banks.values():bank.enabled=bool(enabled)
     def reset(self):
         for bank in self.banks.values():bank.archive.clear();bank.clear_active_memory()
-        self._selected_query_chunk=None; self._selected_chunk_ids=()
+        self._selected_query_chunk=None; self._selected_chunk_ids=(); self._clear_staging()
     def prepare_active_memory(self, *, query_chunk:int, query_camera_poses:torch.Tensor, native_history_chunk_ids=(), device=None, dtype=None):
         """Select once, then materialize the same complete chunks for every layer."""
         if not self.banks:return {}
@@ -265,18 +296,94 @@ class LayerKVMemoryBank(nn.Module):
             self._selected_query_chunk=int(query_chunk); self._selected_chunk_ids=selected_ids
         for bank in self.banks.values():
             if any(chunk_id not in bank.archive for chunk_id in selected_ids): raise RuntimeError('Memory layer archives differ in complete chunk membership')
-        # Capture identity metadata once from the reference archive and share it
-        # across every equal-layout Memory layer.
+        # Build identical pinned host packs for all layers. No Memory hidden or
+        # ray tensor is materialized on CUDA until its processor is reached.
         reference.prepare_active_memory(query_chunk=query_chunk,query_camera_poses=query_camera_poses,
             device=device,dtype=dtype,selected_chunk_ids=selected_ids)
         identity_metadata=reference.active_identity_metadata()
+        shared_host_metadata=(reference._host_rays,reference._host_temporal,reference._host_y,
+                              reference._host_x,reference._host_global_ids,reference._host_chunk_ids)
         result={layer:reference.last_selected_chunk_ids for layer,bank in self.banks.items() if bank is reference}
         for layer,bank in self.banks.items():
             if bank is reference: continue
             result[layer]=bank.prepare_active_memory(query_chunk=query_chunk,query_camera_poses=query_camera_poses,
-                device=device,dtype=dtype,selected_chunk_ids=selected_ids,identity_metadata=identity_metadata)
+                device=device,dtype=dtype,selected_chunk_ids=selected_ids,identity_metadata=identity_metadata,
+                shared_host_metadata=shared_host_metadata)
+        self._clear_staging(); self._device=torch.device(device); self._dtype=dtype
         return result
+
+    def _clear_bank_device_views(self,layer):
+        bank=self.banks[int(layer)]
+        bank._active_hidden=bank._active_rays=None
+        bank._active_temporal=bank._active_y=bank._active_x=bank._active_global_ids=bank._active_chunk_ids=None
+
+    def _clear_staging(self):
+        for layer in tuple(getattr(self,'_staging',{})): self._clear_bank_device_views(layer)
+        self._staging={}; self._staging_events={}; self._last_access_layer=None
+
+    def _prefetch(self,layer):
+        layer=int(layer)
+        if layer in self._staging:return
+        bank=self.banks[layer]
+        if bank._host_hidden is None:return
+        if self._device is None or self._device.type!='cuda':raise RuntimeError('Memory prefetch requires an active CUDA device')
+        if self._prefetch_stream is None or self._prefetch_stream.device!=self._device:
+            self._prefetch_stream=torch.cuda.Stream(device=self._device)
+        with torch.cuda.stream(self._prefetch_stream):
+            pack=(
+                bank._host_hidden.to(self._device,dtype=self._dtype,non_blocking=True),
+                bank._host_rays.to(self._device,dtype=self._dtype,non_blocking=True),
+                bank._host_temporal.to(self._device,non_blocking=True),bank._host_y.to(self._device,non_blocking=True),
+                bank._host_x.to(self._device,non_blocking=True),bank._host_global_ids.to(self._device,non_blocking=True),
+                bank._host_chunk_ids.to(self._device,non_blocking=True),
+            )
+            event=torch.cuda.Event(); event.record(self._prefetch_stream)
+        self._staging[layer]=pack; self._staging_events[layer]=event
+
+    def _next_layer(self,layer):
+        index=self._ordered_layers.index(int(layer))
+        # Normal forward visits ascending layers. Checkpoint recompute visits
+        # them in reverse; a repeated final layer marks that direction change.
+        # Every new native Transformer pass starts at the minimum Memory layer,
+        # including later pyramid/denoise stages after an ascending pass.
+        if int(layer)==self._ordered_layers[0]:
+            return self._ordered_layers[1] if len(self._ordered_layers)>1 else None
+        if self._last_access_layer is not None and int(layer)<self._last_access_layer:
+            return self._ordered_layers[index-1] if index else None
+        if int(layer)==self._ordered_layers[-1] and self._last_access_layer==int(layer):
+            return self._ordered_layers[index-1] if index else None
+        return self._ordered_layers[index+1] if index+1<len(self._ordered_layers) else None
+
+    def acquire_layer(self,layer,*,device=None,dtype=None):
+        layer=int(layer); requested_device=torch.device(device)
+        if requested_device!=self._device or dtype!=self._dtype:
+            # _prepare_chunk may receive an FP32 scheduler/template latent,
+            # while the actual Helios attention projection is BF16. Bind the
+            # rolling buffers to the real K/V contract at first layer use.
+            self._clear_staging(); self._device=requested_device; self._dtype=dtype
+        self._prefetch(layer)
+        event=self._staging_events.get(layer)
+        if event is None:return
+        torch.cuda.current_stream(self._device).wait_event(event)
+        consumer_stream=torch.cuda.current_stream(self._device)
+        pack=self._staging[layer]; bank=self.banks[layer]
+        for value in pack:
+            value.record_stream(consumer_stream)
+        (bank._active_hidden,bank._active_rays,bank._active_temporal,bank._active_y,
+         bank._active_x,bank._active_global_ids,bank._active_chunk_ids)=pack
+        next_layer=self._next_layer(layer)
+        keep={layer,next_layer}
+        for stale in tuple(self._staging):
+            if stale not in keep:
+                self._staging.pop(stale,None); self._staging_events.pop(stale,None); self._clear_bank_device_views(stale)
+        if next_layer is not None:self._prefetch(next_layer)
+        if len(self._staging)>2:raise RuntimeError('Memory staging exceeded the fixed two-slot budget')
+        self._last_access_layer=layer
+
+    @property
+    def staging_layer_ids(self): return tuple(self._staging)
     def clear_active_memory(self):
+        self._clear_staging()
         for bank in self.banks.values(): bank.clear_active_memory()
         self._selected_query_chunk=None; self._selected_chunk_ids=()
     def append_to_attention(self,*args,**kwargs):raise RuntimeError('select a layer bank with for_layer()')

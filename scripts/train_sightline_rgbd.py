@@ -30,6 +30,59 @@ TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
 FORMAL_MEMORY_LAYERS=(4,8,16,20,24,32,36)
 
+HELIOS_RUNTIME_PATCH_VERSION='sightline-token-blocked-v1'
+_PATCH_IMPORT="""from long_video.sightline.bounded_ops import (
+    token_blocked_gated_residual,
+    token_blocked_layer_norm,
+    token_blocked_layer_norm_modulate,
+)"""
+_IMPORT_ANCHOR='import torch\nimport torch.nn as nn'
+_NORM1_ORIGINAL='        norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)'
+_NORM1_EXPERIMENTAL_V1="""        norm_hidden_states = self.norm1(hidden_states.float())
+        norm_hidden_states.mul_(1 + scale_msa).add_(shift_msa)
+        norm_hidden_states = norm_hidden_states.type_as(hidden_states)"""
+_NORM1_EXPERIMENTAL_V2="""        norm_hidden_states = torch.empty_like(hidden_states)
+        norm_hidden_states.copy_(self.norm1(hidden_states.float()).mul_(1 + scale_msa).add_(shift_msa))"""
+_NORM1_PATCHED='        norm_hidden_states = token_blocked_layer_norm_modulate(hidden_states, self.norm1, scale_msa, shift_msa)'
+_NORM2_ORIGINAL='        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)'
+_NORM2_PATCHED='        norm_hidden_states = token_blocked_layer_norm(hidden_states, self.norm2)'
+_NORM3_ORIGINAL="""        norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
+            hidden_states
+        )"""
+_NORM3_EXPERIMENTAL_V1="""        norm_hidden_states = self.norm3(hidden_states.float())
+        norm_hidden_states.mul_(1 + c_scale_msa).add_(c_shift_msa)
+        norm_hidden_states = norm_hidden_states.type_as(hidden_states)"""
+_NORM3_EXPERIMENTAL_V2="""        norm_hidden_states = torch.empty_like(hidden_states)
+        norm_hidden_states.copy_(self.norm3(hidden_states.float()).mul_(1 + c_scale_msa).add_(c_shift_msa))"""
+_NORM3_PATCHED='        norm_hidden_states = token_blocked_layer_norm_modulate(hidden_states, self.norm3, c_scale_msa, c_shift_msa)'
+_RESIDUAL1_ORIGINAL='        hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)'
+_RESIDUAL1_PATCHED='        hidden_states = token_blocked_gated_residual(hidden_states, attn_output, gate_msa)'
+_RESIDUAL3_ORIGINAL='        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)'
+_RESIDUAL3_PATCHED='        hidden_states = token_blocked_gated_residual(hidden_states, ff_output, c_gate_msa)'
+
+def _install_memory_efficient_helios_norm(source_file:Path):
+    """Install and identify the audited token-blocked Helios runtime patch."""
+    text=source_file.read_text()
+    canonical=text.replace(_PATCH_IMPORT+'\n','')
+    for patched,original in (
+        (_NORM1_PATCHED,_NORM1_ORIGINAL),(_NORM1_EXPERIMENTAL_V1,_NORM1_ORIGINAL),(_NORM1_EXPERIMENTAL_V2,_NORM1_ORIGINAL),
+        (_NORM2_PATCHED,_NORM2_ORIGINAL),(_NORM3_PATCHED,_NORM3_ORIGINAL),(_NORM3_EXPERIMENTAL_V1,_NORM3_ORIGINAL),
+        (_NORM3_EXPERIMENTAL_V2,_NORM3_ORIGINAL),(_RESIDUAL1_PATCHED,_RESIDUAL1_ORIGINAL),(_RESIDUAL3_PATCHED,_RESIDUAL3_ORIGINAL),
+    ): canonical=canonical.replace(patched,original)
+    required=(_NORM1_ORIGINAL,_NORM2_ORIGINAL,_NORM3_ORIGINAL,_RESIDUAL1_ORIGINAL,_RESIDUAL3_ORIGINAL)
+    if any(value not in canonical for value in required): raise RuntimeError('pinned Helios source no longer matches the audited runtime patch')
+    patched=canonical.replace(_IMPORT_ANCHOR,_IMPORT_ANCHOR+'\n'+_PATCH_IMPORT)
+    for original,replacement in (
+        (_NORM1_ORIGINAL,_NORM1_PATCHED),(_NORM2_ORIGINAL,_NORM2_PATCHED),(_NORM3_ORIGINAL,_NORM3_PATCHED),
+        (_RESIDUAL1_ORIGINAL,_RESIDUAL1_PATCHED),(_RESIDUAL3_ORIGINAL,_RESIDUAL3_PATCHED),
+    ): patched=patched.replace(original,replacement)
+    if patched!=text: source_file.write_text(patched)
+    return {
+        'version':HELIOS_RUNTIME_PATCH_VERSION,
+        'original_source_sha256':hashlib.sha256(canonical.encode()).hexdigest(),
+        'runtime_source_sha256':hashlib.sha256(patched.encode()).hexdigest(),
+    }
+
 def checkpoint_interval(global_step: int) -> int:
     """Formal cadence: 100-step checkpoints through step 1000, then 60-step."""
     return 100 if int(global_step) < 1000 else 60
@@ -136,6 +189,16 @@ def _assert_optimizer_scope(optimizer,trainable,memory,transformer,text_encoder,
     expected={id(parameter) for parameter in trainable.parameters()}|{id(parameter) for parameter in memory.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' in name}
     forbidden={id(parameter) for module in (text_encoder,vae) for parameter in module.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' not in name}
     if actual!=expected or actual&forbidden: raise RuntimeError('optimizer contains frozen text/VAE/native Helios parameters or misses a Sightline trainable')
+
+def _offload_unused_vae_decode_path(vae):
+    """Keep the training-only VAE encoder on CUDA and park decode-only weights on CPU."""
+    moved=0
+    for name in ('decoder','post_quant_conv'):
+        module=getattr(vae,name,None)
+        if module is None: continue
+        moved += sum(parameter.numel()*parameter.element_size() for parameter in module.parameters())
+        module.to('cpu')
+    return moved
 
 def _prompt(pipe,text,device):
     with torch.no_grad(): result=pipe._get_t5_prompt_embeds(text,device=device,dtype=torch.bfloat16,max_sequence_length=512)
@@ -343,7 +406,7 @@ def _install_oom_profiler(output,device,rank,state):
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
     p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--allow-world-size-migration',action='store_true'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
-    p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--profile-timing',action='store_true'); p.add_argument('--train',action='store_true'); args=p.parse_args()
+    p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--smoke-max-chunks',type=int); p.add_argument('--smoke-max-chunks-sequence'); p.add_argument('--profile-timing',action='store_true'); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
     args.max_steps=args.max_steps or total_steps
@@ -352,14 +415,28 @@ def main():
     rank,world_size,device=_distributed_context()
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
     smoke_world_size_migration=(args.profile_timing and args.allow_world_size_migration and os.environ.get('SIGHTLINE_SMOKE_ALLOW_WORLD_SIZE')=='1')
+    smoke_curriculum_override=(args.profile_timing and os.environ.get('SIGHTLINE_SMOKE_ALLOW_CURRICULUM_OVERRIDE')=='1')
+    smoke_chunk_sequence=tuple(int(value) for value in args.smoke_max_chunks_sequence.split(',')) if args.smoke_max_chunks_sequence else ()
+    if args.smoke_max_chunks is not None and smoke_chunk_sequence:
+        raise ValueError('select only one smoke curriculum override mode')
+    if (args.smoke_max_chunks is not None or smoke_chunk_sequence) and (not smoke_curriculum_override or
+            (args.smoke_max_chunks is not None and args.smoke_max_chunks not in (4,5,6)) or
+            any(value not in (4,5,6) for value in smoke_chunk_sequence)):
+        raise ValueError('--smoke-max-chunks=4/5/6 requires profile timing and the explicit smoke-only environment switch')
+    if smoke_chunk_sequence and args.train_chunk!=-1:
+        raise ValueError('smoke chunk sequences require --train-chunk=-1 to select each last chunk')
     if args.train and world_size!=cfg.ddp_world_size and not smoke_world_size_migration: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
     probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
     p3_records=load_rgbd_memory_manifest(args.p3_manifest) if args.p3_manifest else records
     if cfg.chunk_count!=3 or cfg.chunk_length!=33 or cfg.chunk_stride!=32 or (cfg.source_height,cfg.source_width)!=(480,832): raise ValueError('formal RGB-D training requires 3 chunks, 97 frames, and 480x832 geometry')
     sys.path.insert(0,args.helios_root)
+    source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'
+    runtime_patch=_install_memory_efficient_helios_norm(source_file) if rank==0 else None
+    if world_size>1: dist.barrier()
+    if rank!=0: runtime_patch=_install_memory_efficient_helios_norm(source_file)
+    fingerprint=runtime_patch['original_source_sha256']
     from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
     import helios.diffusers_version.transformer_helios_diffusers as helios_source
-    source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'; fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
     pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
     set_initialization_seed()
@@ -381,9 +458,14 @@ def main():
     # T5 is only needed for the fixed prompt above.  Keep its CPU module for
     # checkpoint/optimizer scope validation, but release its CUDA weights
     # before the first training forward.
-    pipe.text_encoder.to('cpu'); pipe.text_encoder.eval();
+    pipe.text_encoder.to('cpu'); pipe.text_encoder.eval()
+    # Training only calls VAE.encode() for source conditioning. Decoder
+    # weights otherwise consume ~140 MiB per rank throughout P3 backward.
+    # Move them once; there is no per-step CPU/GPU transfer.
+    vae_decode_bytes=_offload_unused_vae_decode_path(pipe.vae)
+    if rank==0: print(f'offloaded unused VAE decode path: {vae_decode_bytes/2**20:.2f} MiB',flush=True)
     if device.type == 'cuda': torch.cuda.empty_cache()
-    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision)
+    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision,transformer_source_sha256=fingerprint,runtime_patch=runtime_patch)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     world_size_migrated=False
@@ -409,7 +491,16 @@ def main():
     for step in range(start_step,stop):
         oom_state.update(stage='step_setup',step=int(step),train_chunk=None,memory_token_count=0,k_length=0,selected_q_count=0)
         if args.profile_timing: torch.cuda.reset_peak_memory_stats(device)
-        phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps); checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
+        phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
+        smoke_max_chunks=args.smoke_max_chunks
+        if smoke_chunk_sequence:
+            smoke_index=step-start_step
+            if smoke_index>=len(smoke_chunk_sequence): raise ValueError('smoke chunk sequence is shorter than the requested run')
+            smoke_max_chunks=smoke_chunk_sequence[smoke_index]
+        if smoke_max_chunks is not None:
+            if phase['name']!='P3': raise ValueError('smoke curriculum override is valid only in P3')
+            phase={**phase,'max_chunks':int(smoke_max_chunks)}
+        checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         phase_records=p3_records if phase['name']=='P3' else records
         eligible_records=[record for record in phase_records if record.chunk_count >= phase['max_chunks'] and (record.memory_eligible or not (phase['memory'] or phase['correspondence'] or bool(args.probe_capture)))]
@@ -431,7 +522,6 @@ def main():
         if all_latents.shape[2] < required_latents: raise ValueError(f'{record.record_id}: latent cache is shorter than record geometry')
         window_start=0
         latent_start=window_start*8; frame_start=window_start*32
-        latents=all_latents[:,:,latent_start:latent_start+1+phase['max_chunks']*8].to(device,dtype=torch.bfloat16)
         rgb_paths=record.rgb_paths()
         if len(rgb_paths)<=frame_start: raise RuntimeError('trajectory RGB frames do not cover sampled chunk window')
         oom_state['stage']='source_condition_vae'
@@ -451,9 +541,14 @@ def main():
                 pipe.transformer._sightline_processors[layer].capture_diagnostics=False
                 pipe.transformer._sightline_processors[layer].capture_query_indices=None
         minimum_train_chunk=1 if phase['name']=='P3' else 0
-        train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,args.train_chunk)
+        forced_train_chunk=phase['max_chunks']-1 if smoke_chunk_sequence else args.train_chunk
+        train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,forced_train_chunk)
         oom_state['train_chunk']=int(train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
+        # Prefix rollout never reads GT latents. Keep only the selected
+        # backward chunk on CUDA instead of retaining the whole curriculum
+        # window for the duration of backward.
+        target_latents=all_latents[:,:,latent_start+train_chunk*8:latent_start+train_chunk*8+9].to(device,dtype=torch.bfloat16)
         perf={'prefix_generation_seconds':0.0,'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0,'correspondence_load_seconds':0.0,'correspondence_mapping_seconds':0.0,'correspondence_loss_seconds':0.0,'backward_seconds':0.0}
         def timing_sync():
             if args.profile_timing: torch.cuda.synchronize(device)
@@ -478,7 +573,7 @@ def main():
                 generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
                 record_vram('prefix_rollout')
             else:
-                target=latents[:,:,chunk*8:chunk*8+9].clone()  # The sole non-source GT read in this step.
+                target=target_latents  # The sole non-source GT read in this step.
                 clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:].detach()
                 if clean_boundary is not None: target[:,:,:1]=clean_boundary.to(target)
                 items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range)
@@ -510,6 +605,13 @@ def main():
                     stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                     if args.train and stage_index+1<len(items):
                         timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                        # The early-stage backward is complete. Retain only its
+                        # scalar metric and sigma; its flow tensors otherwise
+                        # remain referenced by ``items`` during the much larger
+                        # final-stage/correspondence backward.
+                        stage_losses[-1]=stage_loss.detach()
+                        for disposable in ('noisy_latents','target','start_point','end_point','noise','timesteps'):
+                            item.pop(disposable,None)
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_weight=trainable.lambda_corr(step/total_steps)
                 oom_state['stage']='correspondence_forward'
@@ -607,8 +709,8 @@ def main():
         else: grad_norm=torch.tensor(0.)
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
         step_seconds=time.perf_counter()-started
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
-        if rank==0 and ((step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        if rank==0 and (args.profile_timing or (step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)
@@ -616,7 +718,7 @@ def main():
         checkpoint_due=(step+1)%cadence==0 or step+1==args.max_steps or (args.checkpoint_smoke_step is not None and step+1==args.checkpoint_smoke_step)
         if args.train and checkpoint_due:
             rng_states=gather_rank_rng_states(world_size,device)
-            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states,world_size=world_size)
+            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states,world_size=world_size,runtime_patch=runtime_patch)
             if world_size>1: dist.barrier()
     if world_size>1: dist.destroy_process_group()
 

@@ -65,15 +65,19 @@ def main():
     from long_video.config import load_sightline_config
     from long_video.training.sightline import SightlineTrainable, install_lora, configure_alpha_zero_baseline, set_initialization_seed
     from long_video.training.sightline_checkpoint import restore_runtime_checkpoint, runtime_provenance
+    from scripts.train_sightline_rgbd import _install_memory_efficient_helios_norm
     from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
     from long_video.sightline.pipeline import SightlinePipeline
     from long_video.sightline.geometry import padded_size
     from long_video.sightline.rays import canonicalize_c2w, temporal_group_cameras
-    from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
-    import helios.diffusers_version.transformer_helios_diffusers as helios_source
     source_file=Path(a.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'
     if not source_file.is_file(): raise FileNotFoundError(source_file)
-    source_fingerprint=hashlib.sha256(source_file.read_bytes()).hexdigest()
+    # Match training's canonical provenance while using its algebraically
+    # identical low-peak norm implementation at runtime.
+    runtime_patch=_install_memory_efficient_helios_norm(source_file)
+    source_fingerprint=runtime_patch['original_source_sha256']
+    from helios.diffusers_version.pipeline_helios_diffusers import HeliosPipeline
+    import helios.diffusers_version.transformer_helios_diffusers as helios_source
     for symbol in ('_get_qkv_projections','apply_rotary_emb_transposed','dispatch_attention_fn','HeliosAttnProcessor'):
         if not hasattr(helios_source,symbol): raise RuntimeError(f'pinned Helios API missing {symbol}')
     cfg=load_sightline_config(a.config); image=Image.open(a.source); K=np.load(a.intrinsics) if a.intrinsics.endswith('.npy') else np.asarray(json.loads(Path(a.intrinsics).read_text()),np.float32)
@@ -105,7 +109,7 @@ def main():
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
-        provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision)
+        provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision,transformer_source_sha256=source_fingerprint,runtime_patch=runtime_patch)
         restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle},provenance=provenance)
     else:
         configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)

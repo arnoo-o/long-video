@@ -82,6 +82,16 @@ def _ddp_record_index(step,rank,world_size,count,seed=20260823):
     if world_size>count: raise ValueError('DDP world size exceeds record count')
     return random.Random(int(seed)+int(step)).sample(range(count),count)[rank]
 
+def _ddp_train_chunk(max_chunks,minimum,rank,world_size,device,forced=None):
+    """Choose one curriculum path per global step so every rank reaches collectives together."""
+    if forced is not None:
+        return int(forced)
+    if world_size==1:
+        return select_train_chunk(max_chunks,minimum=minimum)
+    value=torch.tensor([select_train_chunk(max_chunks,minimum=minimum) if rank==0 else minimum],device=device,dtype=torch.int64)
+    dist.broadcast(value,src=0)
+    return int(value.item())
+
 def _preflight(cfg,args,probe_layers):
     p1_steps=getattr(cfg,'p1_steps',400); p2_steps=getattr(cfg,'p2_steps',600); p3_steps=getattr(cfg,'p3_steps',1500)
     total_steps=p1_steps+p2_steps+p3_steps
@@ -441,7 +451,7 @@ def main():
                 pipe.transformer._sightline_processors[layer].capture_diagnostics=False
                 pipe.transformer._sightline_processors[layer].capture_query_indices=None
         minimum_train_chunk=1 if phase['name']=='P3' else 0
-        train_chunk=args.train_chunk if args.train_chunk is not None else select_train_chunk(phase['max_chunks'],minimum=minimum_train_chunk)
+        train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,args.train_chunk)
         oom_state['train_chunk']=int(train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
         perf={'prefix_generation_seconds':0.0,'memory_clean_forward_seconds':0.0,'memory_archive_write_seconds':0.0,'correspondence_load_seconds':0.0,'correspondence_mapping_seconds':0.0,'correspondence_loss_seconds':0.0,'backward_seconds':0.0}

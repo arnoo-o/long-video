@@ -817,6 +817,19 @@ def test_bucketed_manual_ddp_preserves_gradient_average_and_reduces_collectives(
     assert torch.equal(first.grad,expected[0]) and torch.equal(second.grad,expected[1]) and unused.grad is None
     assert calls==[3,7]
 
+def test_ddp_train_chunk_is_sampled_once_and_broadcast(monkeypatch):
+    import scripts.train_sightline_rgbd as training
+    calls=[]
+    monkeypatch.setattr(training,'select_train_chunk',lambda max_chunks,minimum:(calls.append((max_chunks,minimum)) or 3))
+    def broadcast(value,src):
+        assert src==0
+        if int(value.item())==1: value.fill_(3)
+    monkeypatch.setattr(training.dist,'broadcast',broadcast)
+    assert training._ddp_train_chunk(4,1,0,4,'cpu')==3
+    assert training._ddp_train_chunk(4,1,2,4,'cpu')==3
+    assert calls==[(4,1)]
+    assert training._ddp_train_chunk(4,1,2,4,'cpu',forced=2)==2
+
 def test_training_preflight_and_fixed_2500_warmup_schedule():
     from types import SimpleNamespace
     from scripts.train_sightline_dl3dv import _preflight,_lr_multiplier,FORMAL_MEMORY_LAYERS

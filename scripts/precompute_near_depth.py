@@ -12,7 +12,9 @@ def near_depth(row, root, samples=16):
     if len(frames)!=count: raise ValueError(f"{row.get('record_id')}: depth frame count")
     indices=np.unique(np.linspace(0,count-1,min(samples,count),dtype=int)); values=[]
     for i in indices:
-        depth=np.asarray(Image.open(frames[int(i)]),dtype=np.float32)
+        # Canonical RGB-D PNG values are millimetres; all v2 geometry metadata
+        # is SI metres before any percentile is calculated.
+        depth=np.asarray(Image.open(frames[int(i)]),dtype=np.float32) / 1000.0
         valid=depth[np.isfinite(depth)&(depth>0)]
         if valid.size: values.append(float(np.quantile(valid,.25)))
     value=float(np.median(values)) if values else float('nan')
@@ -28,6 +30,6 @@ def main():
         if metadata:
             mp=Path(metadata); mp=mp if mp.is_absolute() else root/mp
             if mp.is_file():
-                payload=json.loads(mp.read_text()); payload['near_depth']=value; payload['near_depth_method']='median(frame_valid_depth_q25)'; mp.write_text(json.dumps(payload,indent=2))
+                payload=json.loads(mp.read_text()); payload['near_depth']=value; payload['near_depth_unit']='m'; payload['near_depth_method']='median(frame_valid_depth_q25_m)'; mp.write_text(json.dumps(payload,indent=2))
     path.write_text(json.dumps(data,indent=2))
 if __name__=='__main__': main()

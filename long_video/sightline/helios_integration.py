@@ -6,6 +6,21 @@ from .conditioning import SightlineConditioner, geometry_sigma_gain
 from .rays import token_rays_for_shape, plucker_rays
 from .history import covered_history_chunk_ids
 
+def normalize_geometry_sigma(sigma, *, batch_size:int, device) -> torch.Tensor:
+    """Return scalar or [B,1,1,1], the only valid attention sigma layouts."""
+    value=torch.as_tensor(sigma,device=device,dtype=torch.float32)
+    if not torch.isfinite(value).all(): raise RuntimeError('geometry sigma must be finite')
+    if value.numel()==1: return value.reshape(())
+    if value.numel()!=int(batch_size):
+        raise RuntimeError(f'geometry sigma must be scalar or B values, got {tuple(value.shape)} for B={batch_size}')
+    return value.reshape(int(batch_size),1,1,1)
+
+def publish_geometry_sigma(context:dict|None, sigma, *, batch_size:int, device) -> torch.Tensor:
+    if context is None: raise RuntimeError('Sightline geometry sigma requires an active runtime context')
+    value=normalize_geometry_sigma(sigma,batch_size=batch_size,device=device)
+    context['geometry_sigma']=value
+    return value
+
 def helio_source_fingerprint(source_text: str) -> str:
     return hashlib.sha256(source_text.encode()).hexdigest()
 
@@ -91,7 +106,7 @@ class SightlineHeliosAttnProcessor:
                 'delta_k_over_k_native':ratio(dk,key),
             }
         context=getattr(self.ray_provider,'context',None)
-        sigma = context.get('geometry_sigma', context.get('sigma')) if context is not None else None
+        sigma = context.get('geometry_sigma') if context is not None else None
         if sigma is None:
             # Minimal standalone processor tests have no scheduler context.
             # Formal/inference contexts always carry stage_shapes and must
@@ -99,7 +114,8 @@ class SightlineHeliosAttnProcessor:
             if context is not None and context.get('stage_shapes') is not None:
                 raise RuntimeError('Sightline geometry routing requires the real scheduler sigma')
             sigma=1.0
-        sigma_gain=geometry_sigma_gain(torch.as_tensor(sigma,device=query.device,dtype=torch.float32)).to(query.dtype)
+        sigma=normalize_geometry_sigma(sigma,batch_size=query.shape[0],device=query.device)
+        sigma_gain=geometry_sigma_gain(sigma).to(query.dtype)
         residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
         effective_scale=residual_scale*sigma_gain
         if self.capture_numeric_diagnostics:
@@ -150,6 +166,7 @@ class SightlineHeliosAttnProcessor:
                 scale_delta=scale_delta,
                 query_camera_poses=self.ray_provider.context['c2w'],
                 native_history_chunk_ids=native_chunks,
+                effective_geometry_scale=effective_scale,
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:

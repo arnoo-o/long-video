@@ -233,8 +233,12 @@ def selected_qk_logits(query, key, query_indices):
     return torch.einsum('bqhd,bkhd->bhqk',selected,key)*(selected.shape[-1]**-.5)
 
 class SightlineTrainable(nn.Module):
-    def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16):
+    def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16,
+                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56):
         super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers)
+        self.lambda_corr_initial=float(lambda_corr); self.lambda_corr_final=float(lambda_corr_final); self.lambda_corr_decay_start=float(lambda_corr_decay_start)
+        if not (0. <= self.lambda_corr_decay_start <= 1.) or min(self.lambda_corr_initial,self.lambda_corr_final) < 0.:
+            raise ValueError('invalid correspondence loss schedule')
     def correspondence(self, logits, positives=None, weights=None, multi_positive=None, additive_bias=None):
         if logits.ndim!=4: raise ValueError('logits must be [B,H,Q,K]')
         if additive_bias is not None:
@@ -257,14 +261,16 @@ class SightlineTrainable(nn.Module):
         if selected_query.ndim!=4 or key.ndim!=4: raise ValueError('Q/K must be [B,N,H,D]')
         bias=selected_query.new_empty(0) if additive_bias is None else additive_bias
         return _StreamingCorrespondence.apply(selected_query,key,plan.positive_indices,plan.positive_mask,plan.weights,bias,int(key_block),int(query_block))
-    @staticmethod
-    def lambda_corr(progress, start=.4, initial=.02, final=.005):
-        if progress <= start: return initial
-        return initial+(final-initial)*min(1.,(progress-start)/(1-start))
+    def lambda_corr(self, progress):
+        progress=float(progress); start=self.lambda_corr_decay_start
+        if progress <= start: return self.lambda_corr_initial
+        if start >= 1.: return self.lambda_corr_final
+        return self.lambda_corr_initial+(self.lambda_corr_final-self.lambda_corr_initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
         alpha_q,alpha_k=self.conditioner.alpha_values()
         alpha_grads={name:0.0 if parameter.grad is None else float(parameter.grad.detach().abs()) for name,parameter in self.conditioner.layers.items() for name,parameter in ((f'{name}.q',parameter.alpha_q),(f'{name}.k',parameter.alpha_k))}
-        qgrads=[layer.q_proj.weight.grad for layer in self.conditioner.layers.values()]; kgrads=[layer.k_proj.weight.grad for layer in self.conditioner.layers.values()]
+        qgrads=[parameter.grad for layer in self.conditioner.layers.values() for parameter in layer.q_proj.parameters()]
+        kgrads=[parameter.grad for layer in self.conditioner.layers.values() for parameter in layer.k_proj.parameters()]
         qnorm=sum(float(value.norm()) for value in qgrads if value is not None); knorm=sum(float(value.norm()) for value in kgrads if value is not None)
         return {'alpha_q':alpha_q,'alpha_k':alpha_k,'alpha_grad':alpha_grads,'eq_grad_norm':qnorm,'ek_grad_norm':knorm}
 

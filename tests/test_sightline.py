@@ -1129,3 +1129,33 @@ def test_alpha_zero_baseline_disables_qk_memory_and_lora():
     configure_alpha_zero_baseline(trainable,memory,transformer)
     assert all(float(alpha.detach())==0 for alpha in trainable.conditioner.alpha_parameters())
     assert not memory.banks[0].enabled and not transformer[0].enabled
+
+def test_near_depth_png_is_converted_from_mm_to_m(tmp_path):
+    from PIL import Image
+    from scripts.precompute_near_depth import near_depth
+    depth=tmp_path/'depth'; depth.mkdir()
+    Image.fromarray(np.full((8,8),2000,np.uint16)).save(depth/'000000.png')
+    Image.fromarray(np.full((8,8),4000,np.uint16)).save(depth/'000001.png')
+    row={'record_id':'m','depth_dir':'depth','frame_count':2}
+    assert near_depth(row,tmp_path,samples=2)==pytest.approx(3.0)
+
+def test_near_depth_normalizes_translation_in_metres():
+    from long_video.sightline.rays import canonicalize_c2w
+    c2w=torch.eye(4).view(1,1,4,4).repeat(1,2,1,1); c2w[:,1,0,3]=3.
+    assert canonicalize_c2w(c2w,3.0)[0,1,0,3].item()==pytest.approx(1.)
+
+def test_geometry_sigma_normalizes_to_attention_broadcast_layout():
+    from long_video.sightline.helios_integration import normalize_geometry_sigma,publish_geometry_sigma
+    assert normalize_geometry_sigma(torch.ones(2,1,1,1,1),batch_size=2,device='cpu').shape==(2,1,1,1)
+    context={}; value=publish_geometry_sigma(context,torch.tensor([.4,.8]),batch_size=2,device='cpu')
+    assert context['geometry_sigma'].shape==(2,1,1,1) and torch.equal(value,context['geometry_sigma'])
+    with pytest.raises(RuntimeError): normalize_geometry_sigma(torch.ones(3),batch_size=2,device='cpu')
+
+def test_corr_schedule_and_scope_diagnostics_follow_v2_config():
+    from long_video.training.sightline import SightlineTrainable
+    trainable=SightlineTrainable(8,layers=(0,),lambda_corr=.002,lambda_corr_final=.0005,lambda_corr_decay_start=.56)
+    assert trainable.lambda_corr(.56)==pytest.approx(.002)
+    assert trainable.lambda_corr(1.)==pytest.approx(.0005)
+    loss=trainable.conditioner.for_layer(0).q_proj[2].weight.sum()+trainable.conditioner.for_layer(0).k_proj[2].weight.sum()
+    loss.backward(); diagnostics=trainable.diagnostics()
+    assert diagnostics['eq_grad_norm']>0 and diagnostics['ek_grad_norm']>0

@@ -212,9 +212,8 @@ def _prompt(pipe,text,device):
     return embeds.detach(),mask.detach()
 
 def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
-    provider=getattr(pipe.transformer,'_sightline_ray_provider',None)
-    if provider is not None and provider.context is not None:
-        provider.context['geometry_sigma']=item['sigmas'].detach().float()
+    # The pipeline-installed Transformer pre-hook is the sole geometry-sigma
+    # publisher for active FM, detached rollout, clean capture and inference.
     indices=native_helios_indices(noisy.device,noisy.shape[0])['current']
     output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,
         indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
@@ -450,7 +449,9 @@ def main():
     pipe=HeliosPipeline.from_pretrained(args.model,torch_dtype=torch.bfloat16,revision=args.model_revision).to(device); heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
     set_initialization_seed()
-    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to(device,dtype=torch.float32)
+    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,
+        lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
+        lambda_corr_decay_start=cfg.lambda_corr_decay_start).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)

@@ -34,7 +34,7 @@ def _record(tmp_path: Path):
         "rgb_dir": "record/rgb", "depth_dir": "record/depth", "c2w_abs": "record/c2w_abs.npy",
         "c2w_local": "record/c2w_local.npy", "intrinsics": "record/intrinsics.npy",
         "timestamps": "record/timestamps.npy", "correspondence_cache": "record/correspondence_cache.npz",
-        "frame_count": 97, "chunk_count": 3, "height": 480, "width": 832,
+        "frame_count": 97, "chunk_count": 3, "height": 480, "width": 832, "near_depth": 1.0,
     }
 
 

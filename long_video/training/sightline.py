@@ -134,12 +134,12 @@ def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_
         return {"name":"P1a","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(.8,1.)}
     if step < 500:
         return {"name":"P1b","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
-    if step < 1400:
+    if step < 1000:
         return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
-    if step < 1600: chunks=2
+    if step < 1500: chunks=2
     elif step < 1800: chunks=3
-    elif step < 2000: chunks=4
-    elif step < 2200: chunks=5
+    elif step < 2100: chunks=4
+    elif step < 2300: chunks=5
     else: chunks=6
     return {"name":"P3","max_chunks":chunks,"lora":True,"correspondence":True,"memory":True,"sigma_range":(0.,1.)}
 

@@ -37,7 +37,7 @@ def _scannet_record(tmp_path: Path) -> tuple[dict, Path]:
         "intrinsics": "record/intrinsics.npy", "timestamps": "record/timestamps.npy", "source_timestamps": "record/source_timestamps.npy",
         "source_frame_indices": "record/source_frame_indices.npy", "pointcloud": "record/pointcloud.npz", "metadata": "record/metadata.json",
         "correspondence_cache": "record/correspondence_cache.npz", "frame_count": 193, "chunk_count": 6, "fps": 24,
-        "height": 480, "width": 832, "memory_eligible": True,
+        "height": 480, "width": 832, "near_depth": 1.0, "memory_eligible": True,
     }
     return row, root
 

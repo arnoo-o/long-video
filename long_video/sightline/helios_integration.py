@@ -96,7 +96,7 @@ class SightlineHeliosAttnProcessor:
             # Minimal standalone processor tests have no scheduler context.
             # Formal/inference contexts always carry stage_shapes and must
             # publish the real scheduler sigma.
-            if context is None or context.get('stage_shapes') is not None:
+            if context is not None and context.get('stage_shapes') is not None:
                 raise RuntimeError('Sightline geometry routing requires the real scheduler sigma')
             sigma=1.0
         sigma_gain=geometry_sigma_gain(torch.as_tensor(sigma,device=query.device,dtype=torch.float32)).to(query.dtype)
@@ -109,6 +109,8 @@ class SightlineHeliosAttnProcessor:
                 'delta_q_over_q_native':ratio(dq,query),'delta_k_over_k_native':ratio(dk,key),
                 'effective_delta_q_over_q_native':ratio(effective_scale*dq,query),
                 'effective_delta_k_over_k_native':ratio(effective_scale*dk,key),
+                'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
+                'gate_q':self.conditioner.last_gate_stats['q'],'gate_k':self.conditioner.last_gate_stats['k'],
                 'delta_q_rms':rms(dq),'delta_k_rms':rms(dk),'geometry_sigma':float(torch.as_tensor(sigma).mean()),
                 'geometry_sigma_gain':float(torch.as_tensor(sigma_gain).mean()),
             }

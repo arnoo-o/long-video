@@ -49,7 +49,8 @@ class SightlinePipeline:
             ss=torch.as_tensor(scheduler.sigmas,device=timestep.device,dtype=torch.float32).flatten()
             value=torch.as_tensor(timestep,device=ts.device,dtype=torch.float32).flatten()[0]
             self.ray_provider.context['geometry_sigma']=ss[(ts-value).abs().argmin()]
-        self._sigma_hook=self.helios.transformer.register_forward_pre_hook(_route_sigma,with_kwargs=True)
+        register_hook=getattr(self.helios.transformer,'register_forward_pre_hook',None)
+        self._sigma_hook=register_hook(_route_sigma,with_kwargs=True) if callable(register_hook) else None
 
     @staticmethod
     def append_stride32_latents(accumulated, chunk):

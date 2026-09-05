@@ -23,6 +23,6 @@ def load_sightline_config(path: str|Path) -> SightlineConfig:
         if any(int(x)<0 for x in raw[key]): raise ValueError(f'invalid {key}')
     if not (0<=raw['lambda_corr_decay_start']<=1) or raw['diagnostics_frequency']<1: raise ValueError('invalid schedule/diagnostic configuration')
     if raw['phase'] not in ('P1','P2','P3') or raw['chunk_count'] not in range(1,7) or tuple(raw['pyramid_steps'])!=(2,2,2): raise ValueError('invalid phase/chunk/stage configuration')
-    if (raw['p1_steps'],raw['p2_steps'],raw['p3_steps'])!=(500,900,1100) or raw['ddp_world_size'] not in range(1,5) or raw['checkpoint_every']!=100 or raw['diagnostics_frequency'] not in (5,10): raise ValueError('Sightline-v2 schedule must total 2500 steps, DDP=1..4, checkpoint=100')
+    if (raw['p1_steps'],raw['p2_steps'],raw['p3_steps'])!=(500,500,1500) or raw['ddp_world_size'] not in range(1,5) or raw['checkpoint_every']!=100 or raw['diagnostics_frequency'] not in (5,10): raise ValueError('Sightline-v2 schedule must total 2500 steps, DDP=1..4, checkpoint=100')
     if raw['source_height']<=0 or raw['source_width']<=0 or raw['accumulation_steps']<1 or raw['correspondence_rows_per_batch']<1: raise ValueError('invalid data/training configuration')
     return SightlineConfig(**{k:(tuple(v) if k.endswith('_layers') or k=='history_sizes' else tuple(v) if k=='scale_augmentation_range' else v) for k,v in raw.items()})

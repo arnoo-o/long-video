@@ -83,7 +83,7 @@ def test_camera_first_curriculum_uses_fixed_unit_origin():
     assert curriculum_phase(200)['name']=='P1b' and curriculum_phase(200)['sigma_range']==(0.,1.)
     assert curriculum_phase(500)['lora'] and curriculum_phase(500)['max_chunks']==2
     assert curriculum_phase(999)['max_chunks']==2 and not curriculum_phase(999)['memory']
-    assert curriculum_phase(1400)['memory'] and curriculum_phase(1400)['correspondence'] and curriculum_phase(1400)['max_chunks']==2
+    assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==2
     assert curriculum_phase(2499)['max_chunks']==6
     source=Path(__file__).parents[1].joinpath('scripts/train_sightline_rgbd.py').read_text()
     assert 'window_start=0' in source and 'select_chunk_window' not in source
@@ -659,12 +659,12 @@ def test_inference_global_sightline_residual_scale():
     assert all(processor.residual_scale==.2 for processor in processors.values())
     with pytest.raises(ValueError): configure_sightline_residual_scale(transformer,float('nan'))
 
-def test_inference_dynamic_sigma_scale_uses_active_scheduler_grid():
-    from scripts.infer_sightline import scheduler_sigma_for_timestep,sightline_sigma_scale
-    scheduler=type('Scheduler',(),{'timesteps':torch.tensor([900.,650.,300.]),'sigmas':torch.tensor([.9,.65,.3,0.])})()
-    assert scheduler_sigma_for_timestep(scheduler,torch.tensor([649]))==pytest.approx(.65)
-    assert sightline_sigma_scale(.8)==1.0
-    assert sightline_sigma_scale(.35)==pytest.approx(.5)
+def test_v2_geometry_sigma_routing_is_shared_and_piecewise_linear():
+    from long_video.sightline.conditioning import geometry_sigma_gain
+    assert geometry_sigma_gain(torch.tensor(.8)).item()==pytest.approx(1.)
+    assert geometry_sigma_gain(torch.tensor(.2)).item()==pytest.approx(0.)
+    assert geometry_sigma_gain(torch.tensor(.5)).item()==pytest.approx(.5)
+    assert geometry_sigma_gain(torch.tensor(1.)).item()==pytest.approx(1.)
 
 def test_processor_residual_scale_matches_q_plus_s_delta():
     class A:
@@ -779,7 +779,7 @@ def test_formal_processor_captures_only_selected_queries():
     class Attention:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
     class Provider:
-        context={'stage_shapes':((1,1,6),)}
+        context={'stage_shapes':((1,1,6),),'geometry_sigma':torch.tensor(1.)}
         def __call__(self,hidden_states,**kwargs):
             rays=torch.zeros(hidden_states.shape[0],hidden_states.shape[1],7); return rays,rays
         def key_identities(self,current,memory): return tuple(('current',(i,),0,i,'current') for i in range(current))
@@ -886,7 +886,7 @@ def test_smoke_curriculum_override_is_explicit_and_does_not_change_config():
     assert "SIGHTLINE_SMOKE_ALLOW_CURRICULUM_OVERRIDE" in source
     assert "args.smoke_max_chunks not in (4,5,6)" in source
     assert "phase={**phase,'max_chunks':int(smoke_max_chunks)}" in source
-    assert "forced_train_chunk=phase['max_chunks']-1 if smoke_chunk_sequence" in source
+    assert "forced_train_chunk=(phase['max_chunks']-1 if smoke_chunk_sequence" in source
     assert "if rank==0 and (args.profile_timing or" in source
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='device placement test requires CUDA')

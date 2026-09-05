@@ -502,6 +502,10 @@ def main():
         oom_state.update(stage='step_setup',step=int(step),train_chunk=None,memory_token_count=0,k_length=0,selected_q_count=0)
         if args.profile_timing: torch.cuda.reset_peak_memory_stats(device)
         phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
+        capture_geometry_diagnostics=((step+1) % 10 == 0)
+        for processor in pipe.transformer._sightline_processors.values():
+            processor.capture_numeric_diagnostics=capture_geometry_diagnostics
+            processor.conditioner.capture_numeric_diagnostics=capture_geometry_diagnostics
         smoke_max_chunks=args.smoke_max_chunks
         if smoke_chunk_sequence:
             smoke_index=step-start_step
@@ -637,11 +641,23 @@ def main():
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
                 record_vram('correspondence_loss')
                 corr=corr_metric if (phase['correspondence'] and train_chunk>0) else fm.new_zeros(())
-                total=stage_losses[-1]/len(items)+corr_weight*corr if args.train else fm+corr_weight*corr
+                final_flow=stage_losses[-1]/len(items)
+                total=final_flow+corr_weight*corr if args.train else fm+corr_weight*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
                 if args.train:
                     oom_state['stage']='correspondence_and_fm_backward'
-                    timing_sync(); backward_started=time.perf_counter(); total.backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                    timing_sync(); backward_started=time.perf_counter()
+                    # Geometry alpha controls injection strength and is deliberately
+                    # FM-only: correspondence trains geometric features but cannot
+                    # lower its loss by merely amplifying alpha.
+                    if corr.requires_grad:
+                        final_flow.backward(retain_graph=True)
+                        flow_alpha_grads={id(alpha):None if alpha.grad is None else alpha.grad.detach().clone() for alpha in trainable.conditioner.alpha_parameters()}
+                        (corr_weight*corr).backward()
+                        for alpha in trainable.conditioner.alpha_parameters(): alpha.grad=flow_alpha_grads[id(alpha)]
+                    else:
+                        final_flow.backward()
+                    timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                     record_vram('backward')
                     record_vram('fm_backward')
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
@@ -714,7 +730,7 @@ def main():
         if args.train:
             active_phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
             alpha_grads=[alpha.grad for alpha in trainable.conditioner.alpha_parameters()]
-            if active_phase['name']=='P1' and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
+            if active_phase['name'] in ('P1a','P1b') and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
             if active_phase['name']=='P2':
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
@@ -728,7 +744,8 @@ def main():
         else: grad_norm=torch.tensor(0.)
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
         step_seconds=time.perf_counter()-started
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        diagnostics={str(layer):processor.last_numeric_diagnostics for layer,processor in pipe.transformer._sightline_processors.items() if processor.last_numeric_diagnostics is not None} if (step+1)%10==0 else {}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or (step+1)%10==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

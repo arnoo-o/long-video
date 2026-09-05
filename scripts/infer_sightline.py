@@ -20,33 +20,6 @@ def configure_sightline_residual_scale(transformer, value:float) -> float:
     for processor in processors.values(): processor.residual_scale=value
     return value
 
-def scheduler_sigma_for_timestep(scheduler, timestep) -> float:
-    """Resolve the active sigma from Helios' current scheduler arrays."""
-    timesteps=torch.as_tensor(scheduler.timesteps).detach().float().flatten()
-    sigmas=torch.as_tensor(scheduler.sigmas).detach().float().flatten()
-    if not len(timesteps) or len(sigmas)<len(timesteps): raise RuntimeError('Helios scheduler has no active timestep/sigma grid')
-    value=torch.as_tensor(timestep).detach().float().flatten()[0].to(timesteps.device)
-    index=int((timesteps-value).abs().argmin().item())
-    return float(sigmas[index].item())
-
-def sightline_sigma_scale(sigma:float, threshold:float=.7) -> float:
-    sigma=float(sigma); threshold=float(threshold)
-    if not np.isfinite(sigma) or not np.isfinite(threshold) or threshold<=0: raise ValueError('invalid sigma scaling inputs')
-    return 1.0 if sigma>=threshold else max(0.0,sigma/threshold)
-
-def install_dynamic_sightline_sigma_scale(pipe, threshold:float=.7):
-    """Set all Q/K residual gains once per real Helios Transformer call."""
-    original=pipe.transformer.forward; trace=[]
-    def dynamic_forward(*args,**kwargs):
-        timestep=kwargs.get('timestep')
-        if timestep is None: raise RuntimeError('dynamic Sightline scaling requires the real Helios timestep')
-        sigma=scheduler_sigma_for_timestep(pipe.scheduler,timestep); scale=sightline_sigma_scale(sigma,threshold)
-        configure_sightline_residual_scale(pipe.transformer,scale)
-        trace.append({'timestep':float(torch.as_tensor(timestep).detach().float().flatten()[0].cpu()),'sigma':sigma,'scale':scale})
-        return original(*args,**kwargs)
-    pipe.transformer.forward=dynamic_forward
-    return trace
-
 def resize_source(image, K, height=384, width=640):
     image=image.convert('RGB'); old_w,old_h=image.size; image=image.resize((width,height),Image.Resampling.LANCZOS)
     sx,sy=width/old_w,height/old_h
@@ -57,7 +30,7 @@ def resize_source(image, K, height=384, width=640):
     return image,K
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--disable-memory',action='store_true'); p.add_argument('--sightline-residual-scale',type=float,default=1.0); p.add_argument('--dynamic-sightline-sigma-scale',action='store_true'); p.add_argument('--boundary-off-from-chunk',type=int); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int); p.add_argument('--layers',default=''); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--disable-memory',action='store_true'); p.add_argument('--sightline-residual-scale',type=float,default=1.0); p.add_argument('--near-depth',type=float,default=1.0,help='Trajectory near-depth used to normalize relative translations.'); p.add_argument('--boundary-off-from-chunk',type=int); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int); p.add_argument('--layers',default=''); a=p.parse_args()
     if not 1<=a.chunks<=6: raise ValueError('--chunks must be 1..6')
     if bool(a.c2w)==bool(a.controls): raise ValueError('provide exactly one of --c2w or --controls')
     if bool(a.checkpoint)==bool(a.alpha_zero_baseline): raise ValueError('provide --checkpoint, or explicitly select --alpha-zero-baseline')
@@ -89,7 +62,8 @@ def main():
     needed=1+a.chunks*32
     if c2w.shape[0] < needed: c2w=np.concatenate((c2w,np.repeat(c2w[-1:],needed-c2w.shape[0],0)),0)
     c2w=c2w[:needed]
-    c2w=canonicalize_c2w(torch.from_numpy(c2w[None])).to('cuda',dtype=torch.float32)
+    if not np.isfinite(a.near_depth) or a.near_depth <= 0: raise ValueError('--near-depth must be finite and positive')
+    c2w=canonicalize_c2w(torch.from_numpy(c2w[None]),float(a.near_depth)).to('cuda',dtype=torch.float32)
     if K.ndim==2: K=np.repeat(K[None],needed,axis=0)
     elif K.shape[0]<needed: K=np.concatenate((K,np.repeat(K[-1:],needed-K.shape[0],axis=0)),0)
     K=torch.from_numpy(K[:needed]).to('cuda',dtype=torch.float32)[None]
@@ -115,9 +89,8 @@ def main():
         configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
     memory_enabled=configure_inference_memory(runner,a.alpha_zero_baseline or a.disable_memory)
     residual_scale=configure_sightline_residual_scale(pipe.transformer,a.sightline_residual_scale)
-    sigma_scale_trace=install_dynamic_sightline_sigma_scale(pipe) if a.dynamic_sightline_sigma_scale else []
     trainable.eval(); conditioner.eval()
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K,boundary_off_from_chunk=a.boundary_off_from_chunk)
-    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'memory_enabled':memory_enabled,'sightline_residual_scale':residual_scale,'dynamic_sightline_sigma_scale':bool(a.dynamic_sightline_sigma_scale),'boundary_off_from_chunk':a.boundary_off_from_chunk,'sigma_scale_trace':sigma_scale_trace,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
+    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'memory_enabled':memory_enabled,'sightline_residual_scale':residual_scale,'near_depth':float(a.near_depth),'geometry_sigma_routing':'shared-v2','boundary_off_from_chunk':a.boundary_off_from_chunk,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
 if __name__=='__main__': main()

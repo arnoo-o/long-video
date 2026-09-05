@@ -9,6 +9,7 @@ import argparse, json, sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import numpy as np
+from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 
@@ -19,13 +20,38 @@ def atomic_json(path: Path, value: dict) -> None:
     temporary.replace(path)
 
 
+def unit_near_depth(record, offset: int, *, samples: int = 16) -> float:
+    """Compute a unit-owned SI near-depth without touching parent metadata."""
+    directory=Path(record.raw['depth_dir'])
+    frames=sorted(path for path in directory.iterdir() if path.suffix.lower() in {'.png','.jpg','.jpeg'})
+    parent_start=int(record.raw.get('source_frame_start',0))
+    unit_frames=frames[parent_start+int(offset):parent_start+int(offset)+97]
+    if len(unit_frames)!=97:
+        raise ValueError(f'{record.record_id}: unit at {offset} has {len(unit_frames)} depth frames, expected 97')
+    quantiles=[]
+    for index in np.unique(np.linspace(0,96,min(int(samples),97),dtype=int)):
+        depth_m=np.asarray(Image.open(unit_frames[int(index)]),dtype=np.float32)/1000.0
+        valid=depth_m[np.isfinite(depth_m)&(depth_m>0)]
+        if valid.size:
+            quantiles.append(float(np.quantile(valid,.25)))
+    value=float(np.median(quantiles)) if quantiles else float('nan')
+    if not np.isfinite(value) or value<=0:
+        raise ValueError(f'{record.record_id}: unit at {offset} has invalid near_depth')
+    return value
+
+
 def unit_row(record, output_root: Path, latent_root: Path, offset: int, *, rebuild: bool = False, arrays=None) -> dict:
     row = dict(record.raw)
     # A unit must never retain the parent's continuous_49 cache as a fallback.
     row.pop("latent_cache", None)
     row.pop("gt_latent_cache", None)
+    # The overlapping views have independent depth statistics. They are kept
+    # only in the unit row; never write them into shared parent metadata.
+    row.pop('near_depth',None); row.pop('near_depth_unit',None); row.pop('near_depth_method',None)
+    near_depth=unit_near_depth(record,offset)
     row.update(record_id=f"{record.record_id}__frames_{offset:03d}_{offset + 96:03d}", parent_record_id=record.record_id,
-               source_frame_start=offset, frame_count=97, chunk_count=3)
+               source_frame_start=offset, frame_count=97, chunk_count=3,
+               near_depth=near_depth, near_depth_unit='m', near_depth_method='median(frame_valid_depth_q25_m)')
     cache_dir = output_root / "unit_correspondence"
     cache = cache_dir / f"{row['record_id'].replace(':', '_')}.npz"
     if rebuild or not cache.is_file():

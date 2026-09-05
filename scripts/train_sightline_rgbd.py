@@ -211,18 +211,25 @@ def _prompt(pipe,text,device):
     if mask.ndim!=2 or mask.shape[:2]!=embeds.shape[:2]: raise RuntimeError('pinned Helios prompt mask shape mismatch')
     return embeds.detach(),mask.detach()
 
-def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
+def _transformer_forward(pipe,noisy,timestep,prompt_embeds,history,current_start):
+    """Call native Helios only. Geometry sigma is owned by the caller."""
     indices=native_helios_indices(noisy.device,noisy.shape[0])['current']
-    runner=getattr(pipe,'_sightline_pipeline',None)
-    if runner is None: raise RuntimeError('active FM requires the Sightline pipeline sigma router')
-    with runner.geometry_sigma_override(item['sigmas']):
-        output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,
-            indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
-            latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
-            latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
+    output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=timestep,encoder_hidden_states=prompt_embeds,
+        indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
+        latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
+        latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
     prediction=output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
+
+def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
+    """Active FM only: exact item sigma is scoped to this forward."""
+    if not isinstance(item,dict) or 'sigmas' not in item or 'timesteps' not in item:
+        raise ValueError('active Flow Matching prediction requires item["sigmas"] and item["timesteps"]')
+    runner=getattr(pipe,'_sightline_pipeline',None)
+    if runner is None: raise RuntimeError('active FM requires the Sightline pipeline sigma router')
+    with runner.geometry_sigma_override(item['sigmas']):
+        return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
 
 def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary=None):
     """Native Helios autoregressive inference from noise; no target argument exists."""
@@ -712,7 +719,7 @@ def main():
             else: generated[:,:,0:1]=clean_boundary.to(generated)
             capture_history=history
             def clean_capture(clean_input,timestep, _history=capture_history, _chunk=chunk):
-                return _model_prediction(pipe,clean_input,{'timesteps':timestep},prompt_embeds,_history,_chunk*8)
+                return _transformer_forward(pipe,clean_input,timestep,prompt_embeds,_history,_chunk*8)
             generated_prefix.append(generated.detach())
             history_state.append_chunk(generated,chunk)
             capture_memory=phase['name']!='P3' or prefix_chunk_should_capture_memory(chunk,train_chunk)

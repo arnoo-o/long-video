@@ -1188,3 +1188,25 @@ def test_clean_memory_sigma_zero_override_has_zero_geometry_gain():
         sigma=runner._publish_geometry_sigma(runner._geometry_sigma_override)
         assert sigma.item()==0. and geometry_sigma_gain(sigma).item()==0.
     assert 'geometry_sigma' not in runner.ray_provider.context
+
+def test_active_fm_wraps_only_transformer_call_and_clean_capture_needs_no_item():
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from scripts.train_sightline_rgbd import _model_prediction,_transformer_forward
+    class Scope:
+        def __init__(self): self.events=[]
+        @contextmanager
+        def geometry_sigma_override(self,sigma):
+            self.events.append(('enter',sigma.clone()))
+            try: yield
+            finally: self.events.append(('exit',None))
+    class Transformer:
+        dtype=torch.float32
+        def __call__(self,*,hidden_states,**kwargs): return (hidden_states,)
+    scope=Scope(); pipe=SimpleNamespace(transformer=Transformer(),_sightline_pipeline=scope)
+    x=torch.zeros(1,2,9,1,1); history={name:(None,None) for name in ('long','mid','short')}
+    assert torch.equal(_model_prediction(pipe,x,{'sigmas':torch.tensor(.05),'timesteps':torch.tensor([99])},None,history,0),x)
+    assert [event[0] for event in scope.events]==['enter','exit']
+    assert torch.equal(_transformer_forward(pipe,x,torch.tensor([0]),None,history,0),x)
+    assert [event[0] for event in scope.events]==['enter','exit']
+    with pytest.raises(ValueError,match='sigmas'):_model_prediction(pipe,x,{'timesteps':torch.tensor([0])},None,history,0)

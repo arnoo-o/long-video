@@ -596,7 +596,7 @@ def main():
             load_started=time.perf_counter(); corr_rows=_load_correspondence(record,train_chunk); perf['correspondence_load_seconds']=time.perf_counter()-load_started
         else: corr_rows=None
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
-        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; optimizer.zero_grad(set_to_none=True)
+        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; fm_sigma_trace=[]; optimizer.zero_grad(set_to_none=True)
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
             chunk_started=time.perf_counter()
@@ -627,7 +627,7 @@ def main():
                     correspondence_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],corr_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
                     oom_state['k_length']=len(correspondence_plan.identities)
                     oom_state['selected_q_count']=int(correspondence_plan.query_indices.numel())
-                stage_losses=[]; final_prediction=None; fm_sigma_trace=[]; final_geometry_scope=None
+                stage_losses=[]; final_prediction=None; fm_sigma_trace.clear(); final_geometry_scope=None
                 for stage_index,item in enumerate(items):
                     capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
                     for layer in active_corr_layers:

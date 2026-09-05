@@ -36,14 +36,33 @@ def chunk_cameras(c2w: torch.Tensor, intrinsics: torch.Tensor, chunk_index: int)
     if c2w.shape[1] < sl.stop or intrinsics.shape[1] < sl.stop: raise ValueError("trajectory has fewer than requested chunk frames")
     return c2w[:,sl], intrinsics[:,sl]
 
-def canonicalize_c2w(c2w: torch.Tensor) -> torch.Tensor:
-    """Express trajectory poses in the first-frame coordinate system."""
+def canonicalize_c2w(c2w: torch.Tensor, near_depth: torch.Tensor | float | None = None) -> torch.Tensor:
+    """Express poses relative to frame zero and normalize translations once.
+
+    ``near_depth`` is record metadata, never estimated during a train step.
+    """
     if c2w.ndim == 3:
         if c2w.shape[-2:] != (4,4): raise ValueError('single c2w must be [B,4,4]')
-        return torch.linalg.inv(c2w) @ c2w
+        result = torch.linalg.inv(c2w) @ c2w
+        return normalize_c2w_translation(result, near_depth)
     if c2w.ndim != 4:
         raise ValueError("c2w must be [B,4,4] or [B,T,4,4]")
-    return torch.linalg.inv(c2w[:, :1]) @ c2w
+    return normalize_c2w_translation(torch.linalg.inv(c2w[:, :1]) @ c2w, near_depth)
+
+
+def normalize_c2w_translation(c2w: torch.Tensor, near_depth: torch.Tensor | float | None) -> torch.Tensor:
+    if near_depth is None:
+        return c2w
+    depth = torch.as_tensor(near_depth, device=c2w.device, dtype=c2w.dtype)
+    if not torch.isfinite(depth).all() or torch.any(depth <= 0):
+        raise ValueError("near_depth must be finite and positive")
+    while depth.ndim < c2w.ndim - 2:
+        depth = depth.unsqueeze(-1)
+    result = c2w.clone()
+    result[..., :3, 3] = result[..., :3, 3] / depth.unsqueeze(-1)
+    if not torch.isfinite(result).all():
+        raise ValueError("near-depth normalized c2w is non-finite")
+    return result
 
 def temporal_group_cameras(c2w: torch.Tensor, intrinsics: torch.Tensor) -> tuple[torch.Tensor,torch.Tensor]:
     if c2w.ndim == 3: c2w=c2w[:,None].expand(-1,33,-1,-1)

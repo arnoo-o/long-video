@@ -128,25 +128,20 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
     return min(maximum, 1 + step // warmup_steps)
 
 def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_steps: int = 1500):
-    """Formal 400/600/1500 curriculum with a 1→6 chunk P3 rollout."""
-    if step < 0 or min(p1_steps, p2_steps, p3_steps) < 1:
-        raise ValueError("invalid curriculum schedule")
-    if step < p1_steps - 100:
-        return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False}
-    if step < p1_steps:
-        return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False}
-    if step < p1_steps + p2_steps:
-        return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False}
-    p3_step = step - p1_steps - p2_steps
-    if p3_step < p3_steps:
-        # Fixed global-step boundaries keep checkpoint resumes deterministic.
-        if p3_step < 500: chunks = 2
-        elif p3_step < 800: chunks = 3
-        elif p3_step < 1100: chunks = 4
-        elif p3_step < 1300: chunks = 5
-        else: chunks = 6
-        return {"name":"P3","max_chunks":chunks,"lora":True,"correspondence":True,"memory":True}
-    raise ValueError("step is outside the configured training schedule")
+    """Sightline-v2 curriculum; step intervals are checkpoint-stable."""
+    if not 0 <= int(step) < 2500: raise ValueError("step is outside the configured training schedule")
+    if step < 200:
+        return {"name":"P1a","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(.8,1.)}
+    if step < 500:
+        return {"name":"P1b","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
+    if step < 1400:
+        return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
+    if step < 1600: chunks=2
+    elif step < 1800: chunks=3
+    elif step < 2000: chunks=4
+    elif step < 2200: chunks=5
+    else: chunks=6
+    return {"name":"P3","max_chunks":chunks,"lora":True,"correspondence":True,"memory":True,"sigma_range":(0.,1.)}
 
 INIT_SEED = 20260826
 

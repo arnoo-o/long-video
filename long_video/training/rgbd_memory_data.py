@@ -19,7 +19,7 @@ WIDTH = 832
 REQUIRED_KEYS = (
     "dataset", "scene_id", "sequence_id", "rgb_dir", "depth_dir",
     "c2w_abs", "c2w_local", "intrinsics", "timestamps",
-    "frame_count", "chunk_count", "height", "width",
+    "frame_count", "chunk_count", "height", "width", "near_depth",
 )
 SCANNET_REQUIRED_KEYS = (
     "source_timestamps", "source_frame_indices", "pointcloud", "metadata", "fps",
@@ -78,6 +78,12 @@ class RGBDMemoryRecord:
     @property
     def memory_eligible(self) -> bool:
         return bool(self.raw.get("memory_eligible", self.training_scope == "rgbd_memory"))
+
+    @property
+    def near_depth(self) -> float:
+        value=float(self.raw["near_depth"])
+        if not np.isfinite(value) or value<=0: raise ValueError(f"{self.record_id}: near_depth must be finite and positive")
+        return value
 
     def path(self, key: str) -> Path:
         value = Path(self.raw[key])
@@ -196,6 +202,7 @@ class RGBDMemoryRecord:
             raise ValueError(f"{self.record_id}: frame_count must equal 1 + 32 * chunk_count")
         if (int(self.raw.get("height", -1)), int(self.raw.get("width", -1))) != (HEIGHT, WIDTH):
             raise ValueError(f"{self.record_id}: unsupported image geometry")
+        _=self.near_depth
         rgb, depth = self.rgb_paths(), self.depth_paths()
         if [p.stem for p in rgb] != [p.stem for p in depth]:
             raise ValueError(f"{self.record_id}: RGB/depth frame names are not aligned")

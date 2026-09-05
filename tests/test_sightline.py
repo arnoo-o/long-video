@@ -26,7 +26,7 @@ def test_scale_augmentation_gate_only_and_zero_alpha():
 
 def test_conditioner_numeric_capture_is_opt_in_and_value_preserving():
     torch.manual_seed(7); module=SightlineConditioner(16).eval(); rays=torch.randn(2,3,7)
-    module.q_proj.weight.data.normal_(std=.01)
+    module.q_proj[2].weight.data.normal_(std=.01)
     expected=module.project(rays,kind='q',training=False)
     assert module.last_pre_norm_rms['q'] is None
     module.capture_numeric_diagnostics=True
@@ -78,12 +78,12 @@ def test_train_chunk_policy_is_single_and_causal():
 
 def test_camera_first_curriculum_uses_fixed_unit_origin():
     from long_video.training.sightline import curriculum_phase
-    assert curriculum_phase(0)=={'name':'P1','max_chunks':1,'lora':False,'correspondence':False,'memory':False}
-    assert curriculum_phase(299)['max_chunks']==1
-    assert not curriculum_phase(300)['lora'] and curriculum_phase(300)['max_chunks']==2
-    assert curriculum_phase(400)['lora'] and curriculum_phase(400)['max_chunks']==2
-    assert curriculum_phase(999)['max_chunks']==2
-    assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==2
+    assert curriculum_phase(0)['name']=='P1a' and curriculum_phase(0)['sigma_range']==(.8,1.)
+    assert curriculum_phase(199)['max_chunks']==1
+    assert curriculum_phase(200)['name']=='P1b' and curriculum_phase(200)['sigma_range']==(0.,1.)
+    assert curriculum_phase(500)['lora'] and curriculum_phase(500)['max_chunks']==2
+    assert curriculum_phase(999)['max_chunks']==2 and not curriculum_phase(999)['memory']
+    assert curriculum_phase(1400)['memory'] and curriculum_phase(1400)['correspondence'] and curriculum_phase(1400)['max_chunks']==2
     assert curriculum_phase(2499)['max_chunks']==6
     source=Path(__file__).parents[1].joinpath('scripts/train_sightline_rgbd.py').read_text()
     assert 'window_start=0' in source and 'select_chunk_window' not in source
@@ -125,7 +125,7 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
     trainable=SightlineTrainable(8,layers=(16,20,24),heads=2)
     conditioners=[trainable.conditioner.for_layer(layer) for layer in (16,20,24)]
     for name in ('q_proj','k_proj','gate','rms_norm_q','rms_norm_k'):
-        assert len({id(getattr(layer,name).weight) for layer in conditioners})==3
+        assert len({id(next(getattr(layer,name).parameters())) for layer in conditioners})==3
     assert all(float(layer.alpha_q.detach())==1.0 and float(layer.alpha_k.detach())==1.0 for layer in conditioners)
     assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
 
@@ -670,7 +670,7 @@ def test_processor_residual_scale_matches_q_plus_s_delta():
     class A:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
     a=A(); c=SightlineConditioner(8).eval()
-    torch.nn.init.constant_(c.q_proj.weight,.1); torch.nn.init.constant_(c.k_proj.weight,.2)
+    torch.nn.init.constant_(c.q_proj[2].weight,.1); torch.nn.init.constant_(c.k_proj[2].weight,.2)
     rays=torch.ones(1,4,7); provider=lambda h,**kw:(rays,rays); h=torch.randn(1,4,8); seen=[]
     def qkv(attn,states,_): return attn.to_q(states),attn.to_k(states),attn.to_v(states)
     def dispatch(q,k,v,**kw): seen.append((q.clone(),k.clone())); return v

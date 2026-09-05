@@ -1,71 +1,90 @@
-"""Per-layer Sightline Q/K geometry projections."""
+"""Per-layer SCoPE-style Sightline Q/K geometry projections."""
+from __future__ import annotations
+
 import torch
 from torch import nn
-from .bounded_ops import token_blocked_sightline_project
+
+DEFAULT_TOKEN_TILE = 512
+
+
+def geometry_sigma_gain(sigma: torch.Tensor | float) -> torch.Tensor:
+    """The single training/inference geometry routing rule."""
+    value = torch.as_tensor(sigma)
+    if not torch.isfinite(value).all():
+        raise ValueError("geometry sigma must be finite")
+    return ((value - .2) / .6).clamp_(0., 1.)
+
 
 class SightlineConditioner(nn.Module):
-    def __init__(self, inner_dim: int, hidden_dim: int = 128, eps: float = 1e-6,
+    def __init__(self, inner_dim: int, eps: float = 1e-6,
                  scale_aug_prob: float = .3, scale_aug_range=(-1.2, 1.6)):
-        super().__init__(); self.eps=eps; self.scale_aug_prob=scale_aug_prob; self.scale_aug_range=scale_aug_range
-        self.q_proj=nn.Linear(7,inner_dim)
-        self.k_proj=nn.Linear(7,inner_dim)
-        self.gate=nn.Linear(1,inner_dim)
-        self.rms_norm_q=nn.RMSNorm(inner_dim,eps=eps)
-        self.rms_norm_k=nn.RMSNorm(inner_dim,eps=eps)
-        # Opt-in, detached scalars for the standalone numerical diagnostic.
-        # Formal training never enables this flag and follows the exact same
-        # projection/RMSNorm path as before.
-        self.capture_numeric_diagnostics=False
-        self.last_pre_norm_rms={'q':None,'k':None}
-        # Separate per-layer Q/K gains.  The terminal projections start at
-        # zero, so alpha=1 still yields an exact native-Helios forward pass.
-        self.alpha_q=nn.Parameter(torch.ones(())); self.alpha_k=nn.Parameter(torch.ones(()))
-        nn.init.zeros_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
-        nn.init.zeros_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
-        nn.init.zeros_(self.gate.weight); nn.init.zeros_(self.gate.bias)
+        super().__init__()
+        self.inner_dim = int(inner_dim)
+        self.eps = float(eps)
+        self.scale_aug_prob = float(scale_aug_prob)
+        self.scale_aug_range = tuple(float(x) for x in scale_aug_range)
+        hidden = max(self.inner_dim // 4, 1)
+        self.q_proj = nn.Sequential(nn.Linear(7, 64, bias=False), nn.GELU(), nn.Linear(64, self.inner_dim, bias=False))
+        self.k_proj = nn.Sequential(nn.Linear(7, 64, bias=False), nn.GELU(), nn.Linear(64, self.inner_dim, bias=False))
+        self.gate = nn.Sequential(nn.Linear(1, hidden), nn.SiLU(), nn.Linear(hidden, self.inner_dim), nn.Sigmoid())
+        self.rms_norm_q = nn.RMSNorm(self.inner_dim, eps=self.eps)
+        self.rms_norm_k = nn.RMSNorm(self.inner_dim, eps=self.eps)
+        self.alpha_q = nn.Parameter(torch.ones(())); self.alpha_k = nn.Parameter(torch.ones(()))
+        self.capture_numeric_diagnostics = False; self.last_pre_norm_rms = {'q': None, 'k': None}
+        for projection in (self.q_proj, self.k_proj):
+            nn.init.kaiming_uniform_(projection[0].weight, a=5**.5)
+            nn.init.zeros_(projection[2].weight)
+        nn.init.zeros_(self.gate[0].bias); nn.init.zeros_(self.gate[2].bias)
+
     def sample_scale_delta(self, rays, training=None):
-        if training is None: training=self.training
-        if training and torch.rand((),device=rays.device) < self.scale_aug_prob:
-            return torch.empty((),device=rays.device,dtype=rays.dtype).uniform_(*self.scale_aug_range)
+        if training is None: training = self.training
+        if training and torch.rand((), device=rays.device) < self.scale_aug_prob:
+            return torch.empty((), device=rays.device, dtype=rays.dtype).uniform_(*self.scale_aug_range)
         return None
-    def project(self, rays, *, kind: str, training=None, scale_delta=None):
+
+    def project(self, rays, *, kind: str, training=None, scale_delta=None, detach_alpha: bool = False):
         if rays.shape[-1] != 7: raise ValueError("rays must contain d, m_hat, log_norm")
-        if training is None: training=self.training
-        if kind not in ('q','k'): raise ValueError("kind must be q or k")
-        projection=self.q_proj if kind=='q' else self.k_proj
-        norm=self.rms_norm_q if kind=='q' else self.rms_norm_k
-        alpha=self.alpha_q if kind=='q' else self.alpha_k
+        if kind not in ('q', 'k'): raise ValueError("kind must be q or k")
+        projection = self.q_proj if kind == 'q' else self.k_proj
+        norm = self.rms_norm_q if kind == 'q' else self.rms_norm_k
+        alpha = self.alpha_q if kind == 'q' else self.alpha_k
+        flat = rays.reshape(-1, 7).to(next(projection.parameters()).dtype)
+        values = []; pre_norm_sq = 0.0
+        for start in range(0, flat.shape[0], DEFAULT_TOKEN_TILE):
+            ray = flat[start:start + DEFAULT_TOKEN_TILE].float(); scale = ray[:, 6:7]
+            geometric = torch.cat((ray[:, 3:6], ray[:, :3], scale), -1) if kind == 'k' else ray
+            # Scale augmentation is intentionally gate-only; projector sees physical log_norm.
+            gate_input = scale if scale_delta is None else scale + scale_delta
+            raw = projection.float()(geometric)
+            value = (alpha.detach() if detach_alpha else alpha).float() * self.gate.float()(gate_input) * norm.float()(raw)
+            values.append(value.to(rays.dtype))
+            if self.capture_numeric_diagnostics: pre_norm_sq += float(raw.detach().square().sum())
+        output = torch.cat(values, 0).reshape(*rays.shape[:-1], self.inner_dim)
         if self.capture_numeric_diagnostics:
-            parameter_dtype=self.gate.weight.dtype; s=rays[...,6:7].to(parameter_dtype)
-            q_in=torch.cat((rays[...,:3].to(parameter_dtype),rays[...,3:6].to(parameter_dtype),s),-1)
-            k_in=torch.cat((rays[...,3:6].to(parameter_dtype),rays[...,:3].to(parameter_dtype),s),-1)
-            value=projection(q_in if kind=='q' else k_in)
-            self.last_pre_norm_rms[kind]=float(value.detach().float().square().mean().sqrt().cpu())
-        return token_blocked_sightline_project(rays,projection,self.gate,norm,alpha,kind=kind,scale_delta=scale_delta)
-    def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None):
+            self.last_pre_norm_rms[kind] = (pre_norm_sq / max(1, flat.shape[0] * self.inner_dim)) ** .5
+        return output
+
+    def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None, detach_alpha: bool = False):
         rays_k = rays_q if rays_k is None else rays_k
-        if training is None: training=self.training
-        if scale_delta is None: scale_delta=self.sample_scale_delta(rays_q,training)
-        return (self.project(rays_q,kind='q',training=training,scale_delta=scale_delta), self.project(rays_k,kind='k',training=training,scale_delta=scale_delta))
+        if training is None: training = self.training
+        if scale_delta is None: scale_delta = self.sample_scale_delta(rays_q, training)
+        return (self.project(rays_q, kind='q', training=training, scale_delta=scale_delta, detach_alpha=detach_alpha),
+                self.project(rays_k, kind='k', training=training, scale_delta=scale_delta, detach_alpha=detach_alpha))
+
 
 class LayeredSightlineConditioner(nn.Module):
-    """Independent Q/K geometry projections and gains for every selected layer."""
     def __init__(self, inner_dim: int, layers, **conditioner_kwargs):
         super().__init__(); layers=tuple(int(layer) for layer in layers)
-        if not layers or len(set(layers))!=len(layers): raise ValueError('Sightline geometry layers must be non-empty and unique')
+        if not layers or len(set(layers)) != len(layers): raise ValueError('Sightline geometry layers must be non-empty and unique')
         self.inner_dim=int(inner_dim)
-        self.layers=nn.ModuleDict({str(layer):SightlineConditioner(inner_dim,**conditioner_kwargs) for layer in layers})
+        self.layers=nn.ModuleDict({str(layer): SightlineConditioner(self.inner_dim, **conditioner_kwargs) for layer in layers})
     def for_layer(self, layer):
         key=str(int(layer))
         if key not in self.layers: raise KeyError(f'layer {layer} has no Sightline geometry conditioner')
         return self.layers[key]
     def geometry_parameters(self):
-        for layer in self.layers.values():
-            yield layer.alpha_q; yield layer.alpha_k
-            yield from layer.q_proj.parameters(); yield from layer.k_proj.parameters(); yield from layer.gate.parameters()
-            yield from layer.rms_norm_q.parameters(); yield from layer.rms_norm_k.parameters()
+        for layer in self.layers.values(): yield from layer.parameters()
     def alpha_parameters(self):
         for layer in self.layers.values(): yield layer.alpha_q; yield layer.alpha_k
     def alpha_values(self):
-        return ({key:float(layer.alpha_q.detach()) for key,layer in self.layers.items()},
-                {key:float(layer.alpha_k.detach()) for key,layer in self.layers.items()})
+        return ({key:float(layer.alpha_q.detach()) for key,layer in self.layers.items()}, {key:float(layer.alpha_k.detach()) for key,layer in self.layers.items()})

@@ -34,9 +34,22 @@ class SightlineRuntimeContext:
 class SightlinePipeline:
     def __init__(self, helios_pipeline, *, config, conditioner=None, ray_provider=None):
         self.helios=helios_pipeline; self.config=config; self.conditioner=conditioner; self.ray_provider=ray_provider
-        inner_dim=int(getattr(conditioner,'inner_dim',conditioner.q_proj.out_features if conditioner is not None and hasattr(conditioner,'q_proj') else 0)) if conditioner is not None else None
+        inner_dim=int(getattr(conditioner,'inner_dim',0)) if conditioner is not None else None
         self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim,tau_pos=getattr(config,'memory_tau_pos',1.0),tau_angle=getattr(config,'memory_tau_angle',0.78539816339))
         self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None
+        # Every native sampler Transformer call publishes its real scheduler
+        # sigma to the attention processors; training overrides this with the
+        # exact sampled flow sigma immediately before its own forward.
+        def _route_sigma(_module, _args, kwargs):
+            if self.ray_provider is None or self.ray_provider.context is None: return
+            timestep=kwargs.get('timestep')
+            scheduler=getattr(self.helios,'scheduler',None)
+            if timestep is None or scheduler is None: return
+            ts=torch.as_tensor(scheduler.timesteps,device=timestep.device,dtype=torch.float32).flatten()
+            ss=torch.as_tensor(scheduler.sigmas,device=timestep.device,dtype=torch.float32).flatten()
+            value=torch.as_tensor(timestep,device=ts.device,dtype=torch.float32).flatten()[0]
+            self.ray_provider.context['geometry_sigma']=ss[(ts-value).abs().argmin()]
+        self._sigma_hook=self.helios.transformer.register_forward_pre_hook(_route_sigma,with_kwargs=True)
 
     @staticmethod
     def append_stride32_latents(accumulated, chunk):

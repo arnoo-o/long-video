@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib
 import torch
-from .conditioning import SightlineConditioner
+from .conditioning import SightlineConditioner, geometry_sigma_gain
 from .rays import token_rays_for_shape, plucker_rays
 from .history import covered_history_chunk_ids
 
@@ -16,7 +16,7 @@ class SightlineHeliosAttnProcessor:
         self.conditioner=conditioner; self.ray_provider=ray_provider; self.memory=memory
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
-        self.residual_scale=1.0
+        self.residual_scale=1.0  # legacy user ablation multiplier; default 1.
         self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.capture_query_indices=None
         self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
@@ -90,8 +90,29 @@ class SightlineHeliosAttnProcessor:
                 'delta_q_over_q_native':ratio(dq,query),
                 'delta_k_over_k_native':ratio(dk,key),
             }
+        context=getattr(self.ray_provider,'context',None)
+        sigma = context.get('geometry_sigma', context.get('sigma')) if context is not None else None
+        if sigma is None:
+            # Minimal standalone processor tests have no scheduler context.
+            # Formal/inference contexts always carry stage_shapes and must
+            # publish the real scheduler sigma.
+            if context is None or context.get('stage_shapes') is not None:
+                raise RuntimeError('Sightline geometry routing requires the real scheduler sigma')
+            sigma=1.0
+        sigma_gain=geometry_sigma_gain(torch.as_tensor(sigma,device=query.device,dtype=torch.float32)).to(query.dtype)
         residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
-        query=query+residual_scale*dq; key=key+residual_scale.to(key.dtype)*dk
+        effective_scale=residual_scale*sigma_gain
+        if self.capture_numeric_diagnostics:
+            def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
+            def ratio(delta,native): return float((delta.detach().float().norm()/native.detach().float().norm().clamp_min(1e-30)).cpu())
+            self.last_numeric_diagnostics={
+                'delta_q_over_q_native':ratio(dq,query),'delta_k_over_k_native':ratio(dk,key),
+                'effective_delta_q_over_q_native':ratio(effective_scale*dq,query),
+                'effective_delta_k_over_k_native':ratio(effective_scale*dk,key),
+                'delta_q_rms':rms(dq),'delta_k_rms':rms(dk),'geometry_sigma':float(torch.as_tensor(sigma).mean()),
+                'geometry_sigma_gain':float(torch.as_tensor(sigma_gain).mean()),
+            }
+        query=query+effective_scale*dq; key=key+effective_scale.to(key.dtype)*dk
         history_len=max(0,key.shape[1]-current_len)
         if getattr(attn,'is_amplify_history',False) and history_len:
             scale=1.0+__import__('torch').sigmoid(attn.history_key_scale)*(attn.max_scale-1.0)
@@ -235,6 +256,7 @@ class SightlineRayProvider:
         T,H,W=token_shape; return token_rays_for_shape(self.context['c2w'],self.context['intrinsics'],(self.context['c2w'].shape[0],T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(self.context['c2w'].shape[0],-1,7)
 
 def install_sightline_attention(transformer, conditioner, ray_provider, *, layers, helios_module, memory=None, memory_layers=None):
+    transformer._sightline_ray_provider=ray_provider
     blocks=list(getattr(transformer,'transformer_blocks',None) or getattr(transformer,'blocks',()))
     if not layers: raise ValueError("Sightline selected layers must be explicit")
     installed=[]

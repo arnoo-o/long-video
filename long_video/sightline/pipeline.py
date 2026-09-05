@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from contextlib import contextmanager
 import time
 import torch
-from .helios_integration import publish_geometry_sigma
+from .helios_integration import publish_geometry_noise_level
 from .history import CameraHistoryState,NativeHistoryState,native_helios_indices,covered_history_chunk_ids
 from .memory import LayerKVMemoryBank
 from .rays import chunk_cameras, temporal_group_cameras
@@ -38,52 +38,44 @@ class SightlinePipeline:
         self.helios=helios_pipeline; self.config=config; self.conditioner=conditioner; self.ray_provider=ray_provider
         inner_dim=int(getattr(conditioner,'inner_dim',0)) if conditioner is not None else None
         self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim,tau_pos=getattr(config,'memory_tau_pos',1.0),tau_angle=getattr(config,'memory_tau_angle',0.78539816339))
-        self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None; self._geometry_sigma_override=None
-        # The single source of geometry sigma for every Transformer call.
+        self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None; self._geometry_timestep_override=None; self._active_geometry_timestep_scope=None
+        # The single source of global geometry routing for every Transformer call.
         # This covers active FM, detached rollout, clean capture and inference.
         def _route_sigma(_module, _args, kwargs):
             timestep=kwargs.get('timestep')
-            if self._geometry_sigma_override is not None: self._publish_geometry_sigma(self._geometry_sigma_override)
-            else: self.publish_geometry_sigma_for_timestep(timestep)
+            self.publish_geometry_noise_for_timestep(self._geometry_timestep_override if self._geometry_timestep_override is not None else timestep)
         register_hook=getattr(self.helios.transformer,'register_forward_pre_hook',None)
         self._sigma_hook=register_hook(_route_sigma,with_kwargs=True) if callable(register_hook) else None
 
-    def _publish_geometry_sigma(self, sigma):
+    def _publish_geometry_noise_level(self, noise_level, *, timestep=None):
         if self.ray_provider is None or self.ray_provider.context is None: raise RuntimeError('formal Helios forward has no active Sightline context')
-        return publish_geometry_sigma(self.ray_provider.context,sigma,batch_size=int(self.ray_provider.context['c2w'].shape[0]),device=self.ray_provider.context['c2w'].device)
+        context=self.ray_provider.context; context['geometry_timestep']=None if timestep is None else torch.as_tensor(timestep).detach().float().cpu().tolist()
+        return publish_geometry_noise_level(context,noise_level,batch_size=int(context['c2w'].shape[0]),device=context['c2w'].device)
 
     @contextmanager
-    def geometry_sigma_override(self, sigma):
-        """Publish exact FM/clean sigma only for this Transformer call scope."""
-        if self._geometry_sigma_override is not None: raise RuntimeError('nested Sightline geometry sigma override is forbidden')
-        self._geometry_sigma_override=sigma
+    def geometry_timestep_override(self, timestep):
+        """Keep global-timestep routing alive through checkpoint recompute."""
+        if self._geometry_timestep_override is not None: raise RuntimeError('nested Sightline geometry timestep override is forbidden')
+        self._geometry_timestep_override=timestep
         try: yield
         finally:
-            self._geometry_sigma_override=None
-            if self.ray_provider is not None and self.ray_provider.context is not None: self.ray_provider.context.pop('geometry_sigma',None)
+            self._geometry_timestep_override=None
+            if self.ray_provider is not None and self.ray_provider.context is not None:
+                self.ray_provider.context.pop('geometry_noise_level',None); self.ray_provider.context.pop('geometry_timestep',None)
 
-    def publish_geometry_sigma_for_timestep(self, timestep):
-        """Resolve every real Helios timestep through the active scheduler."""
+    def publish_geometry_noise_for_timestep(self, timestep):
+        """Use global Helios train-time coordinate, never stage-local sigma."""
         if self.ray_provider is None or self.ray_provider.context is None:
             raise RuntimeError('formal Helios forward has no active Sightline context')
         if timestep is None: raise RuntimeError('formal Helios forward is missing its scheduler timestep')
         scheduler=getattr(self.helios,'scheduler',None)
-        if scheduler is None or not hasattr(scheduler,'timesteps') or not hasattr(scheduler,'sigmas'):
-            raise RuntimeError('formal Helios forward has no scheduler timestep/sigma mapping')
+        config=getattr(scheduler,'config',None)
+        count=getattr(config,'num_train_timesteps',None)
+        if count is None or int(count)<2: raise RuntimeError('formal Helios scheduler has no valid num_train_timesteps')
         values=torch.as_tensor(timestep,device=self.ray_provider.context['c2w'].device,dtype=torch.float32).flatten()
-        ts=torch.as_tensor(scheduler.timesteps,device=values.device,dtype=torch.float32).flatten()
-        ss=torch.as_tensor(scheduler.sigmas,device=values.device,dtype=torch.float32).flatten()
-        if not len(values) or not len(ts) or len(ss)<len(ts):
-            raise RuntimeError('formal Helios scheduler has no valid timestep/sigma grid')
-        indices=[]
-        for value in values:
-            matches=torch.nonzero(torch.isclose(ts,value,rtol=0.,atol=1e-4),as_tuple=False).flatten()
-            if not len(matches): matches=torch.nonzero(torch.trunc(ts).eq(torch.trunc(value)),as_tuple=False).flatten()
-            if len(matches)!=1: raise RuntimeError(f'cannot uniquely map local Helios timestep {float(value)} to scheduler sigma')
-            indices.append(matches[0])
-        indices=torch.stack(indices)
-        sigma=ss.index_select(0,indices)
-        return self._publish_geometry_sigma(sigma)
+        if not len(values): raise RuntimeError('formal Helios forward has an empty timestep')
+        level=(values/float(int(count)-1)).clamp_(0.,1.)
+        return self._publish_geometry_noise_level(level,timestep=values)
 
     @staticmethod
     def append_stride32_latents(accumulated, chunk):
@@ -97,7 +89,7 @@ class SightlinePipeline:
         return steps
 
     def reset_sequence(self):
-        self._active_chunk=0; self.runtime=SightlineRuntimeContext(); self.camera_history=CameraHistoryState(); self.history_state=None; self._pending_camera_chunk=None
+        self._active_chunk=0; self.runtime=SightlineRuntimeContext(); self.camera_history=CameraHistoryState(); self.history_state=None; self._pending_camera_chunk=None; self._geometry_timestep_override=None; self._active_geometry_timestep_scope=None
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
@@ -152,6 +144,11 @@ class SightlinePipeline:
     def _resolve_memory_timestep(self, sigma:float, device):
         """Map the configured memory-write sigma through Helios' scheduler API."""
         scheduler=getattr(self.helios,'scheduler',None); sigma=float(sigma)
+        # The clean endpoint is the global denoising coordinate t=0.  Do not
+        # infer it through a stage-local sigma table: the geometry router is
+        # intentionally expressed in Helios' global training timestep.
+        if sigma == 0.0:
+            return torch.zeros((),device=device,dtype=torch.float32)
         sigma_to_t=getattr(scheduler,'_sigma_to_t',None) if scheduler is not None else None
         if callable(sigma_to_t):
             timestep=torch.as_tensor(sigma_to_t(sigma),device=device,dtype=torch.float32)
@@ -185,7 +182,7 @@ class SightlinePipeline:
             processor.last_hidden_states=None; processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None; processor.capture_memory_hidden=True
         clean_started=time.perf_counter()
         try:
-            with self.geometry_sigma_override(sigma): capture_fn(capture_input,timestep)
+            with self.geometry_timestep_override(timestep): capture_fn(capture_input,timestep)
         finally:
             clean_seconds=time.perf_counter()-clean_started
             for processor in memory_processors: processor.capture_memory_hidden=False

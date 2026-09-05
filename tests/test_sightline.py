@@ -659,12 +659,12 @@ def test_inference_global_sightline_residual_scale():
     assert all(processor.residual_scale==.2 for processor in processors.values())
     with pytest.raises(ValueError): configure_sightline_residual_scale(transformer,float('nan'))
 
-def test_v2_geometry_sigma_routing_is_shared_and_piecewise_linear():
-    from long_video.sightline.conditioning import geometry_sigma_gain
-    assert geometry_sigma_gain(torch.tensor(.8)).item()==pytest.approx(1.)
-    assert geometry_sigma_gain(torch.tensor(.2)).item()==pytest.approx(0.)
-    assert geometry_sigma_gain(torch.tensor(.5)).item()==pytest.approx(.5)
-    assert geometry_sigma_gain(torch.tensor(1.)).item()==pytest.approx(1.)
+def test_v2_global_geometry_noise_routing_is_shared_and_piecewise_linear():
+    from long_video.sightline.conditioning import geometry_gain
+    assert geometry_gain(torch.tensor(.8)).item()==pytest.approx(1.)
+    assert geometry_gain(torch.tensor(.2)).item()==pytest.approx(0.)
+    assert geometry_gain(torch.tensor(.5)).item()==pytest.approx(.5)
+    assert geometry_gain(torch.tensor(1.)).item()==pytest.approx(1.)
 
 def test_processor_residual_scale_matches_q_plus_s_delta():
     class A:
@@ -779,7 +779,7 @@ def test_formal_processor_captures_only_selected_queries():
     class Attention:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
     class Provider:
-        context={'stage_shapes':((1,1,6),),'geometry_sigma':torch.tensor(1.)}
+        context={'stage_shapes':((1,1,6),),'geometry_noise_level':torch.tensor(1.)}
         def __call__(self,hidden_states,**kwargs):
             rays=torch.zeros(hidden_states.shape[0],hidden_states.shape[1],7); return rays,rays
         def key_identities(self,current,memory): return tuple(('current',(i,),0,i,'current') for i in range(current))
@@ -1144,12 +1144,12 @@ def test_near_depth_normalizes_translation_in_metres():
     c2w=torch.eye(4).view(1,1,4,4).repeat(1,2,1,1); c2w[:,1,0,3]=3.
     assert canonicalize_c2w(c2w,3.0)[0,1,0,3].item()==pytest.approx(1.)
 
-def test_geometry_sigma_normalizes_to_attention_broadcast_layout():
-    from long_video.sightline.helios_integration import normalize_geometry_sigma,publish_geometry_sigma
-    assert normalize_geometry_sigma(torch.ones(2,1,1,1,1),batch_size=2,device='cpu').shape==(2,1,1,1)
-    context={}; value=publish_geometry_sigma(context,torch.tensor([.4,.8]),batch_size=2,device='cpu')
-    assert context['geometry_sigma'].shape==(2,1,1,1) and torch.equal(value,context['geometry_sigma'])
-    with pytest.raises(RuntimeError): normalize_geometry_sigma(torch.ones(3),batch_size=2,device='cpu')
+def test_geometry_noise_level_normalizes_to_attention_broadcast_layout():
+    from long_video.sightline.helios_integration import normalize_geometry_noise_level,publish_geometry_noise_level
+    assert normalize_geometry_noise_level(torch.ones(2,1,1,1,1),batch_size=2,device='cpu').shape==(2,1,1,1)
+    context={}; value=publish_geometry_noise_level(context,torch.tensor([.4,.8]),batch_size=2,device='cpu')
+    assert context['geometry_noise_level'].shape==(2,1,1,1) and torch.equal(value,context['geometry_noise_level'])
+    with pytest.raises(RuntimeError): normalize_geometry_noise_level(torch.ones(3),batch_size=2,device='cpu')
 
 def test_corr_schedule_and_scope_diagnostics_follow_v2_config():
     from long_video.training.sightline import SightlineTrainable
@@ -1160,34 +1160,32 @@ def test_corr_schedule_and_scope_diagnostics_follow_v2_config():
     loss.backward(); diagnostics=trainable.diagnostics()
     assert diagnostics['eq_grad_norm']>0 and diagnostics['ek_grad_norm']>0
 
-def test_local_scheduler_sigma_and_scoped_override_are_exact():
+def test_global_timestep_noise_level_and_scoped_override_are_exact():
     from types import SimpleNamespace
     from long_video.sightline.pipeline import SightlinePipeline
     runner=SightlinePipeline.__new__(SightlinePipeline)
     runner.ray_provider=SimpleNamespace(context={'c2w':torch.eye(4).view(1,1,4,4).repeat(3,1,1,1)})
-    runner.helios=SimpleNamespace(scheduler=SimpleNamespace(timesteps=torch.tensor([998.999,512.,100.]),sigmas=torch.tensor([.05,.5,.95,.0])))
-    runner._geometry_sigma_override=None
-    resolved=runner.publish_geometry_sigma_for_timestep(torch.tensor([998,512,100]))
-    assert torch.allclose(resolved.flatten(),torch.tensor([.05,.5,.95]))
-    with runner.geometry_sigma_override(torch.tensor([.05,.5,.95])):
-        actual=runner._publish_geometry_sigma(runner._geometry_sigma_override)
-        assert torch.allclose(actual.flatten(),torch.tensor([.05,.5,.95]))
-    assert 'geometry_sigma' not in runner.ray_provider.context and runner._geometry_sigma_override is None
-    runner.helios.scheduler.timesteps=torch.tensor([1.1,1.9])
-    runner.helios.scheduler.sigmas=torch.tensor([.1,.9,.0])
-    with pytest.raises(RuntimeError,match='uniquely'): runner.publish_geometry_sigma_for_timestep(torch.tensor([1]))
+    runner.helios=SimpleNamespace(scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000)))
+    runner._geometry_timestep_override=None
+    resolved=runner.publish_geometry_noise_for_timestep(torch.tensor([50,500,950]))
+    assert torch.allclose(resolved.flatten(),torch.tensor([50/999,500/999,950/999]))
+    with runner.geometry_timestep_override(torch.tensor([50,500,950])):
+        actual=runner.publish_geometry_noise_for_timestep(runner._geometry_timestep_override)
+        assert torch.allclose(actual.flatten(),torch.tensor([50/999,500/999,950/999]))
+    assert 'geometry_noise_level' not in runner.ray_provider.context and runner._geometry_timestep_override is None
 
 def test_clean_memory_sigma_zero_override_has_zero_geometry_gain():
     from types import SimpleNamespace
     from long_video.sightline.pipeline import SightlinePipeline
-    from long_video.sightline.conditioning import geometry_sigma_gain
+    from long_video.sightline.conditioning import geometry_gain
     runner=SightlinePipeline.__new__(SightlinePipeline)
     runner.ray_provider=SimpleNamespace(context={'c2w':torch.eye(4).view(1,1,4,4)})
-    runner._geometry_sigma_override=None
-    with runner.geometry_sigma_override(0.0):
-        sigma=runner._publish_geometry_sigma(runner._geometry_sigma_override)
-        assert sigma.item()==0. and geometry_sigma_gain(sigma).item()==0.
-    assert 'geometry_sigma' not in runner.ray_provider.context
+    runner.helios=SimpleNamespace(scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000)))
+    runner._geometry_timestep_override=None
+    with runner.geometry_timestep_override(0.0):
+        level=runner.publish_geometry_noise_for_timestep(runner._geometry_timestep_override)
+        assert level.item()==0. and geometry_gain(level).item()==0.
+    assert 'geometry_noise_level' not in runner.ray_provider.context
 
 def test_active_fm_wraps_only_transformer_call_and_clean_capture_needs_no_item():
     from contextlib import contextmanager
@@ -1196,8 +1194,8 @@ def test_active_fm_wraps_only_transformer_call_and_clean_capture_needs_no_item()
     class Scope:
         def __init__(self): self.events=[]
         @contextmanager
-        def geometry_sigma_override(self,sigma):
-            self.events.append(('enter',sigma.clone()))
+        def geometry_timestep_override(self,timestep):
+            self.events.append(('enter',timestep.clone()))
             try: yield
             finally: self.events.append(('exit',None))
     class Transformer:

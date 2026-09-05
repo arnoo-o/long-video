@@ -7,12 +7,15 @@ from torch import nn
 DEFAULT_TOKEN_TILE = 512
 
 
-def geometry_sigma_gain(sigma: torch.Tensor | float) -> torch.Tensor:
-    """The single training/inference geometry routing rule."""
-    value = torch.as_tensor(sigma)
+def geometry_gain(noise_level: torch.Tensor | float) -> torch.Tensor:
+    """Global Helios denoising-coordinate geometry routing rule."""
+    value = torch.as_tensor(noise_level)
     if not torch.isfinite(value).all():
-        raise ValueError("geometry sigma must be finite")
+        raise ValueError("geometry noise level must be finite")
     return ((value - .2) / .6).clamp_(0., 1.)
+
+# Compatibility import only; every runtime caller uses ``geometry_gain``.
+geometry_sigma_gain = geometry_gain
 
 
 class SightlineConditioner(nn.Module):

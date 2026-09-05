@@ -5,6 +5,7 @@ Formal training data is loaded exclusively through RGBDMemoryRecord.
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, random, sys, time
+from contextlib import nullcontext
 # Must be set before importing/initializing CUDA; callers may override it.
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
@@ -222,13 +223,15 @@ def _transformer_forward(pipe,noisy,timestep,prompt_embeds,history,current_start
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
 
-def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
-    """Active FM only: exact item sigma is scoped to this forward."""
+def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,*,routing_scope_active=False):
+    """Active FM only; routing is always based on the exact item timestep."""
     if not isinstance(item,dict) or 'sigmas' not in item or 'timesteps' not in item:
         raise ValueError('active Flow Matching prediction requires item["sigmas"] and item["timesteps"]')
     runner=getattr(pipe,'_sightline_pipeline',None)
     if runner is None: raise RuntimeError('active FM requires the Sightline pipeline sigma router')
-    with runner.geometry_sigma_override(item['sigmas']):
+    if routing_scope_active:
+        return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
+    with runner.geometry_timestep_override(item['timesteps']):
         return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
 
 def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary=None):
@@ -624,7 +627,7 @@ def main():
                     correspondence_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],corr_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
                     oom_state['k_length']=len(correspondence_plan.identities)
                     oom_state['selected_q_count']=int(correspondence_plan.query_indices.numel())
-                stage_losses=[]; final_prediction=None; fm_sigma_trace=[]
+                stage_losses=[]; final_prediction=None; fm_sigma_trace=[]; final_geometry_scope=None
                 for stage_index,item in enumerate(items):
                     capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
                     for layer in active_corr_layers:
@@ -632,22 +635,41 @@ def main():
                         processor.capture_diagnostics=capture_correspondence
                         processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and args.train else None
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
-                    prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
-                    if capture_geometry_diagnostics:
-                        first_processor=pipe.transformer._sightline_processors[int(cfg.sightline_layers[0])]
-                        diagnostic=first_processor.last_numeric_diagnostics or {}
-                        fm_sigma_trace.append({'stage':stage_index,'item_sigma':float(item['sigmas'].detach().float().mean()),'processor_sigma':diagnostic.get('geometry_sigma'),'g_sigma':diagnostic.get('geometry_sigma_gain')})
-                    if capture_correspondence: record_vram('final_stage_forward')
-                    stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
-                    if args.train and stage_index+1<len(items):
-                        timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
-                        # The early-stage backward is complete. Retain only its
-                        # scalar metric and sigma; its flow tensors otherwise
-                        # remain referenced by ``items`` during the much larger
-                        # final-stage/correspondence backward.
-                        stage_losses[-1]=stage_loss.detach()
-                        for disposable in ('noisy_latents','target','start_point','end_point','noise','timesteps'):
-                            item.pop(disposable,None)
+                    is_final_stage=stage_index+1==len(items)
+                    if is_final_stage:
+                        # The final stage owns tensors whose checkpoint backward
+                        # (including correspondence) happens below.  Keep its
+                        # exact global timestep route alive until that backward.
+                        final_geometry_scope=runner.geometry_timestep_override(item['timesteps'])
+                        final_geometry_scope.__enter__()
+                        runner._active_geometry_timestep_scope=final_geometry_scope
+                        stage_scope=nullcontext()
+                    else:
+                        # Each earlier stage immediately backpropagates while
+                        # its exact route is still installed.
+                        stage_scope=runner.geometry_timestep_override(item['timesteps'])
+                    with stage_scope:
+                        prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
+                        if capture_geometry_diagnostics:
+                            first_processor=pipe.transformer._sightline_processors[int(cfg.sightline_layers[0])]
+                            diagnostic=first_processor.last_numeric_diagnostics or {}
+                            fm_sigma_trace.append({'stage':stage_index,
+                                'item_timestep':float(item['timesteps'].detach().float().mean()),
+                                'processor_timestep':diagnostic.get('timestep'),
+                                'geometry_noise_level':diagnostic.get('geometry_noise_level'),
+                                'geometry_gain':diagnostic.get('geometry_gain'),
+                                'item_sigma':float(item['sigmas'].detach().float().mean())})
+                        if capture_correspondence: record_vram('final_stage_forward')
+                        stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
+                        if args.train and not is_final_stage:
+                            timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                            # The early-stage backward is complete. Retain only its
+                            # scalar metric and sigma; its flow tensors otherwise
+                            # remain referenced by ``items`` during the much larger
+                            # final-stage/correspondence backward.
+                            stage_losses[-1]=stage_loss.detach()
+                            for disposable in ('noisy_latents','target','start_point','end_point','noise','timesteps'):
+                                item.pop(disposable,None)
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_weight=trainable.lambda_corr(step/total_steps)
                 oom_state['stage']='correspondence_forward'
@@ -673,6 +695,13 @@ def main():
                     timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                     record_vram('backward')
                     record_vram('fm_backward')
+                # No checkpoint recompute remains after FM/correspondence
+                # backward.  Subsequent clean capture and probes get their own
+                # scope instead of inheriting the final active-FM route.
+                if final_geometry_scope is not None:
+                    final_geometry_scope.__exit__(None,None,None)
+                    runner._active_geometry_timestep_scope=None
+                    final_geometry_scope=None
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -732,12 +761,26 @@ def main():
                 processor.last_attention_bias=None
             if not keep_graph: perf['prefix_generation_seconds']+=time.perf_counter()-chunk_started
             return generated
-        if phase['name']=='P3':
-            _,policies=run_causal_prefix_chunks(phase['max_chunks'],train_chunk,forward_chunk)
-        elif args.probe_only and args.alpha_zero_baseline:
-            with torch.no_grad(): _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
-        else:
-            _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
+        try:
+            if phase['name']=='P3':
+                _,policies=run_causal_prefix_chunks(phase['max_chunks'],train_chunk,forward_chunk)
+            elif args.probe_only and args.alpha_zero_baseline:
+                with torch.no_grad(): _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
+            else:
+                _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
+        finally:
+            # A failed final-stage forward/backward must never leak routing
+            # state into the next batch. Normal paths already exit their
+            # scopes at the precise backward boundary above.
+            active_scope=getattr(runner,'_active_geometry_timestep_scope',None)
+            if active_scope is not None:
+                active_scope.__exit__(*sys.exc_info())
+                runner._active_geometry_timestep_scope=None
+            elif getattr(runner,'_geometry_timestep_override',None) is not None:
+                runner._geometry_timestep_override=None
+                if runner.ray_provider is not None and runner.ray_provider.context is not None:
+                    runner.ray_provider.context.pop('geometry_noise_level',None)
+                    runner.ray_provider.context.pop('geometry_timestep',None)
         if args.probe_capture:
             probe_payload['alpha_grad']={name:0.0 if alpha.grad is None else float(alpha.grad.detach().abs()) for name,alpha in ((f'{index}.q',layer.alpha_q) for index,layer in trainable.conditioner.layers.items())}
         if args.train:

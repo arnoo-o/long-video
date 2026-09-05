@@ -212,13 +212,14 @@ def _prompt(pipe,text,device):
     return embeds.detach(),mask.detach()
 
 def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
-    # The pipeline-installed Transformer pre-hook is the sole geometry-sigma
-    # publisher for active FM, detached rollout, clean capture and inference.
     indices=native_helios_indices(noisy.device,noisy.shape[0])['current']
-    output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,
-        indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
-        latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
-        latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
+    runner=getattr(pipe,'_sightline_pipeline',None)
+    if runner is None: raise RuntimeError('active FM requires the Sightline pipeline sigma router')
+    with runner.geometry_sigma_override(item['sigmas']):
+        output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,
+            indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
+            latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
+            latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
     prediction=output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
@@ -455,7 +456,7 @@ def main():
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
-    provider=SightlineRayProvider(source_height=padded_h,source_width=padded_w); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
+    provider=SightlineRayProvider(source_height=padded_h,source_width=padded_w); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider); pipe._sightline_pipeline=runner
     runner.memory.to(device=device,dtype=torch.bfloat16)
     installed_layers=tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers).union(probe_layers))) if args.probe_only else tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers)))
     install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=installed_layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
@@ -616,7 +617,7 @@ def main():
                     correspondence_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],corr_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
                     oom_state['k_length']=len(correspondence_plan.identities)
                     oom_state['selected_q_count']=int(correspondence_plan.query_indices.numel())
-                stage_losses=[]; final_prediction=None
+                stage_losses=[]; final_prediction=None; fm_sigma_trace=[]
                 for stage_index,item in enumerate(items):
                     capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
                     for layer in active_corr_layers:
@@ -625,6 +626,10 @@ def main():
                         processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and args.train else None
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8); final_prediction=prediction
+                    if capture_geometry_diagnostics:
+                        first_processor=pipe.transformer._sightline_processors[int(cfg.sightline_layers[0])]
+                        diagnostic=first_processor.last_numeric_diagnostics or {}
+                        fm_sigma_trace.append({'stage':stage_index,'item_sigma':float(item['sigmas'].detach().float().mean()),'processor_sigma':diagnostic.get('geometry_sigma'),'g_sigma':diagnostic.get('geometry_sigma_gain')})
                     if capture_correspondence: record_vram('final_stage_forward')
                     stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                     if args.train and stage_index+1<len(items):
@@ -746,7 +751,7 @@ def main():
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
         step_seconds=time.perf_counter()-started
         diagnostics={str(layer):processor.last_numeric_diagnostics for layer,processor in pipe.transformer._sightline_processors.items() if processor.last_numeric_diagnostics is not None} if (step+1)%10==0 else {}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or (step+1)%10==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

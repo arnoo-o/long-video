@@ -19,7 +19,7 @@ WIDTH = 832
 REQUIRED_KEYS = (
     "dataset", "scene_id", "sequence_id", "rgb_dir", "depth_dir",
     "c2w_abs", "c2w_local", "intrinsics", "timestamps",
-    "frame_count", "chunk_count", "height", "width", "near_depth",
+    "frame_count", "chunk_count", "height", "width", "near_depth", "near_depth_unit", "near_depth_method",
 )
 SCANNET_REQUIRED_KEYS = (
     "source_timestamps", "source_frame_indices", "pointcloud", "metadata", "fps",
@@ -83,6 +83,8 @@ class RGBDMemoryRecord:
     def near_depth(self) -> float:
         value=float(self.raw["near_depth"])
         if not np.isfinite(value) or value<=0: raise ValueError(f"{self.record_id}: near_depth must be finite and positive")
+        if self.raw.get('near_depth_unit') != 'm': raise ValueError(f"{self.record_id}: near_depth_unit must be 'm'")
+        if self.raw.get('near_depth_method') != 'median(frame_valid_depth_q25_m)': raise ValueError(f"{self.record_id}: unsupported near_depth_method")
         return value
 
     def path(self, key: str) -> Path:

@@ -25,7 +25,7 @@ def main():
     p=argparse.ArgumentParser(); p.add_argument('manifest'); p.add_argument('--samples',type=int,default=16); a=p.parse_args()
     path=Path(a.manifest); data=json.loads(path.read_text()); root=path.parent
     for row in data['records']:
-        value=near_depth(row,root,a.samples); row['near_depth']=value
+        value=near_depth(row,root,a.samples); row['near_depth']=value; row['near_depth_unit']='m'; row['near_depth_method']='median(frame_valid_depth_q25_m)'
         metadata=row.get('metadata')
         if metadata:
             mp=Path(metadata); mp=mp if mp.is_absolute() else root/mp

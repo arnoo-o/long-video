@@ -34,7 +34,7 @@ def _record(tmp_path: Path):
         "rgb_dir": "record/rgb", "depth_dir": "record/depth", "c2w_abs": "record/c2w_abs.npy",
         "c2w_local": "record/c2w_local.npy", "intrinsics": "record/intrinsics.npy",
         "timestamps": "record/timestamps.npy", "correspondence_cache": "record/correspondence_cache.npz",
-        "frame_count": 97, "chunk_count": 3, "height": 480, "width": 832, "near_depth": 1.0,
+        "frame_count": 97, "chunk_count": 3, "height": 480, "width": 832, "near_depth": 1.0, "near_depth_unit":"m", "near_depth_method":"median(frame_valid_depth_q25_m)",
     }
 
 
@@ -47,6 +47,15 @@ def test_strict_rgbd_manifest_loads_97_frame_record(tmp_path):
     assert len(list(record.correspondence_rows())) == 1
     first=record.correspondences_for_chunk(1); second=record.correspondences_for_chunk(1)
     assert len(first)==1 and first.arrays is second.arrays and record.correspondences_for_chunk(0).indices.size==0
+
+@pytest.mark.parametrize('field,value',[('near_depth_unit',None),('near_depth_unit','mm'),('near_depth_method','legacy')])
+def test_manifest_rejects_non_metric_or_legacy_near_depth(tmp_path,field,value):
+    row=_record(tmp_path)
+    if value is None: row.pop(field)
+    else: row[field]=value
+    manifest=tmp_path/'manifest.json'; manifest.write_text(json.dumps({'records':[row]}))
+    with pytest.raises(ValueError,match='near_depth|missing keys'):
+        load_rgbd_memory_manifest(manifest)
 
 
 def test_rgbd_manifest_rejects_noncausal_cache(tmp_path):

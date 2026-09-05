@@ -1159,3 +1159,32 @@ def test_corr_schedule_and_scope_diagnostics_follow_v2_config():
     loss=trainable.conditioner.for_layer(0).q_proj[2].weight.sum()+trainable.conditioner.for_layer(0).k_proj[2].weight.sum()
     loss.backward(); diagnostics=trainable.diagnostics()
     assert diagnostics['eq_grad_norm']>0 and diagnostics['ek_grad_norm']>0
+
+def test_local_scheduler_sigma_and_scoped_override_are_exact():
+    from types import SimpleNamespace
+    from long_video.sightline.pipeline import SightlinePipeline
+    runner=SightlinePipeline.__new__(SightlinePipeline)
+    runner.ray_provider=SimpleNamespace(context={'c2w':torch.eye(4).view(1,1,4,4).repeat(3,1,1,1)})
+    runner.helios=SimpleNamespace(scheduler=SimpleNamespace(timesteps=torch.tensor([998.999,512.,100.]),sigmas=torch.tensor([.05,.5,.95,.0])))
+    runner._geometry_sigma_override=None
+    resolved=runner.publish_geometry_sigma_for_timestep(torch.tensor([998,512,100]))
+    assert torch.allclose(resolved.flatten(),torch.tensor([.05,.5,.95]))
+    with runner.geometry_sigma_override(torch.tensor([.05,.5,.95])):
+        actual=runner._publish_geometry_sigma(runner._geometry_sigma_override)
+        assert torch.allclose(actual.flatten(),torch.tensor([.05,.5,.95]))
+    assert 'geometry_sigma' not in runner.ray_provider.context and runner._geometry_sigma_override is None
+    runner.helios.scheduler.timesteps=torch.tensor([1.1,1.9])
+    runner.helios.scheduler.sigmas=torch.tensor([.1,.9,.0])
+    with pytest.raises(RuntimeError,match='uniquely'): runner.publish_geometry_sigma_for_timestep(torch.tensor([1]))
+
+def test_clean_memory_sigma_zero_override_has_zero_geometry_gain():
+    from types import SimpleNamespace
+    from long_video.sightline.pipeline import SightlinePipeline
+    from long_video.sightline.conditioning import geometry_sigma_gain
+    runner=SightlinePipeline.__new__(SightlinePipeline)
+    runner.ray_provider=SimpleNamespace(context={'c2w':torch.eye(4).view(1,1,4,4)})
+    runner._geometry_sigma_override=None
+    with runner.geometry_sigma_override(0.0):
+        sigma=runner._publish_geometry_sigma(runner._geometry_sigma_override)
+        assert sigma.item()==0. and geometry_sigma_gain(sigma).item()==0.
+    assert 'geometry_sigma' not in runner.ray_provider.context

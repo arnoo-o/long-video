@@ -21,6 +21,7 @@ from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
+from long_video.sightline.rays import canonicalize_c2w
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
 from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
 from long_video.sightline.geometry import assert_latent_geometry, padded_size
@@ -29,6 +30,7 @@ from long_video.sightline.boundary import constrain_flow_items, stage2_sample_wi
 TOTAL_TRAINING_STEPS=2500
 WARMUP_STEPS=100
 FORMAL_MEMORY_LAYERS=(4,8,16,20,24,32,36)
+LEGACY_999_MEMORY_LAYERS=(4,6,8,16,20,24,32,34,36)
 
 HELIOS_RUNTIME_PATCH_VERSION='sightline-token-blocked-v1'
 _PATCH_IMPORT="""from long_video.sightline.bounded_ops import (
@@ -145,14 +147,19 @@ def _ddp_train_chunk(max_chunks,minimum,rank,world_size,device,forced=None):
     dist.broadcast(value,src=0)
     return int(value.item())
 
+def p3_chunk0_scheduled(step,p1_steps=500,p2_steps=900):
+    """Deterministic 20% direct-source slots from step 500 onward."""
+    return int(step)>=500 and (int(step)-500)%5==0
+
 def _preflight(cfg,args,probe_layers):
     p1_steps=getattr(cfg,'p1_steps',400); p2_steps=getattr(cfg,'p2_steps',600); p3_steps=getattr(cfg,'p3_steps',1500)
     total_steps=p1_steps+p2_steps+p3_steps
     sightline=set(cfg.sightline_layers)
     if not cfg.sightline_layers:
         raise ValueError('formal training requires non-empty sightline_layers')
-    if tuple(cfg.memory_layers)!=FORMAL_MEMORY_LAYERS or tuple(cfg.correspondence_layers)!=FORMAL_MEMORY_LAYERS:
-        raise ValueError(f'Memory/correspondence layers must be {FORMAL_MEMORY_LAYERS}')
+    memory_layers=tuple(cfg.memory_layers); correspondence_layers=tuple(cfg.correspondence_layers)
+    if memory_layers not in (FORMAL_MEMORY_LAYERS,LEGACY_999_MEMORY_LAYERS) or correspondence_layers!=memory_layers:
+        raise ValueError(f'Memory/correspondence layers must be one matching supported set: {FORMAL_MEMORY_LAYERS} or {LEGACY_999_MEMORY_LAYERS}')
     if args.train and (cfg.memory_layers or cfg.correspondence_layers):
         # These modules remain reserved but are intentionally disabled in the
         # camera-only retraining curriculum.
@@ -171,11 +178,8 @@ def _lr_multiplier(step,total_steps=TOTAL_TRAINING_STEPS):
     return 0.5*(1.0+__import__('math').cos(__import__('math').pi*progress))
 
 def _sigma_band(step, phase):
-    if phase=='P1': return (0.9,1.0),'high_0.9_1.0'
-    if phase=='P2': return (0.7,1.0),'mid_high_0.7_1.0'
-    if phase=='P3':
-        return (0.0,1.0),'uniform_0.0_1.0'
-    raise ValueError(f'unknown phase {phase}')
+    if phase=='P1a': return (.8,1.),'high_0.8_1.0'
+    return (0.,1.),'uniform_0.0_1.0'
 
 def _set_gradient_checkpointing(transformer,enabled):
     method=getattr(transformer,'enable_gradient_checkpointing' if enabled else 'disable_gradient_checkpointing',None)
@@ -208,6 +212,9 @@ def _prompt(pipe,text,device):
     return embeds.detach(),mask.detach()
 
 def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start):
+    provider=getattr(pipe.transformer,'_sightline_ray_provider',None)
+    if provider is not None and provider.context is not None:
+        provider.context['geometry_sigma']=item['sigmas'].detach().float()
     indices=native_helios_indices(noisy.device,noisy.shape[0])['current']
     output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=item['timesteps'],encoder_hidden_states=prompt_embeds,
         indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
@@ -414,7 +421,10 @@ def main():
     if args.train and args.save_every is not None and args.save_every not in (60,100): raise ValueError('formal checkpoint cadence only permits 100 before step 1000 or 60 afterward')
     rank,world_size,device=_distributed_context()
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
-    smoke_world_size_migration=(args.profile_timing and args.allow_world_size_migration and os.environ.get('SIGHTLINE_SMOKE_ALLOW_WORLD_SIZE')=='1')
+    # An explicit CLI opt-in is required when resuming with a different DDP
+    # world size. restore_runtime_checkpoint then rejects shared RNG state and
+    # deterministically reseeds each new rank after state restoration.
+    world_size_migration=bool(args.allow_world_size_migration)
     smoke_curriculum_override=(args.profile_timing and os.environ.get('SIGHTLINE_SMOKE_ALLOW_CURRICULUM_OVERRIDE')=='1')
     smoke_chunk_sequence=tuple(int(value) for value in args.smoke_max_chunks_sequence.split(',')) if args.smoke_max_chunks_sequence else ()
     if args.smoke_max_chunks is not None and smoke_chunk_sequence:
@@ -425,7 +435,7 @@ def main():
         raise ValueError('--smoke-max-chunks=4/5/6 requires profile timing and the explicit smoke-only environment switch')
     if smoke_chunk_sequence and args.train_chunk!=-1:
         raise ValueError('smoke chunk sequences require --train-chunk=-1 to select each last chunk')
-    if args.train and world_size!=cfg.ddp_world_size and not smoke_world_size_migration: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks, got {world_size}')
+    if args.train and world_size!=cfg.ddp_world_size and not world_size_migration: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks; pass --allow-world-size-migration for an explicit deterministic resume, got {world_size}')
     probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
     p3_records=load_rgbd_memory_manifest(args.p3_manifest) if args.p3_manifest else records
     if cfg.chunk_count!=3 or cfg.chunk_length!=33 or cfg.chunk_stride!=32 or (cfg.source_height,cfg.source_width)!=(480,832): raise ValueError('formal RGB-D training requires 3 chunks, 97 frames, and 480x832 geometry')
@@ -513,7 +523,7 @@ def main():
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
         validate_rgbd_record_latent(record,latent_path)
-        if phase['name'] in ('P1','P2'):
+        if phase['name'] in ('P1a','P1b','P2'):
             if record.frame_count!=97 or record.chunk_count!=3 or latent_schema!='continuous_25': raise ValueError(f'{record.record_id}: P1/P2 requires a unit-owned 97-frame continuous_25 cache')
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
@@ -527,7 +537,8 @@ def main():
         oom_state['stage']='source_condition_vae'
         source,fake,_,_=prepare_source_condition(pipe,Image.open(rgb_paths[frame_start]).convert('RGB'),height=cfg.source_height,width=cfg.source_width,device=device)
         c2w_np,K_np=record.load_cameras(); c2w_np=np.array(c2w_np[frame_start:frame_start+1+phase['max_chunks']*32],copy=True); K_np=np.array(K_np[frame_start:frame_start+1+phase['max_chunks']*32],copy=True)
-        c2w=torch.from_numpy(c2w_np).to(device,dtype=torch.float32).unsqueeze(0); c2w=torch.linalg.inv(c2w[:,:1])@c2w
+        near_depth=float(record.near_depth)
+        c2w=torch.from_numpy(c2w_np).to(device,dtype=torch.float32).unsqueeze(0); c2w=canonicalize_c2w(c2w,near_depth)
         K=torch.from_numpy(K_np).to(device,dtype=torch.float32).unsqueeze(0)
         _reset_sequence(runner); runner._trajectory_c2w=c2w; runner._trajectory_K=K; runner._source_camera=c2w[:,0]; runner._source_intrinsics=K[:,0]; runner.memory.set_enabled(phase['memory'])
         for name,parameter in pipe.transformer.named_parameters():
@@ -540,8 +551,16 @@ def main():
             for layer in active_corr_layers:
                 pipe.transformer._sightline_processors[layer].capture_diagnostics=False
                 pipe.transformer._sightline_processors[layer].capture_query_indices=None
-        minimum_train_chunk=1 if phase['name']=='P3' else 0
-        forced_train_chunk=phase['max_chunks']-1 if smoke_chunk_sequence else args.train_chunk
+        # Keep direct source supervision throughout P3.  The cadence is
+        # aligned to each requested global-step interval: every 2 P3 steps
+        # through step 1299, every 3 steps through 1699, then every 4 steps.
+        scheduled_chunk0=(step>=500
+                          and p3_chunk0_scheduled(step,cfg.p1_steps,cfg.p2_steps)
+                          and not smoke_chunk_sequence
+                          and (args.train_chunk is None or args.train_chunk<0))
+        minimum_train_chunk=0 if (phase['max_chunks']==1 or scheduled_chunk0) else 1
+        forced_train_chunk=(phase['max_chunks']-1 if smoke_chunk_sequence
+                            else (0 if scheduled_chunk0 else args.train_chunk))
         train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,forced_train_chunk)
         oom_state['train_chunk']=int(train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
@@ -617,7 +636,7 @@ def main():
                 oom_state['stage']='correspondence_forward'
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
                 record_vram('correspondence_loss')
-                corr=corr_metric if phase['correspondence'] else fm.new_zeros(())
+                corr=corr_metric if (phase['correspondence'] and train_chunk>0) else fm.new_zeros(())
                 total=stage_losses[-1]/len(items)+corr_weight*corr if args.train else fm+corr_weight*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])
                 if args.train:
@@ -710,7 +729,7 @@ def main():
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
         step_seconds=time.perf_counter()-started
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
-        if rank==0 and (args.profile_timing or (step+1)%cfg.diagnostics_frequency==0 or step==start_step or step+1==stop):
+        if rank==0 and (args.profile_timing or (step+1)%10==0 or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)

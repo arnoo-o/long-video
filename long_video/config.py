@@ -4,7 +4,7 @@ from pathlib import Path
 import yaml
 @dataclass(frozen=True)
 class SightlineConfig:
-    ray_epsilon: float; scale_augmentation_probability: float; scale_augmentation_range: tuple[float,float]; sightline_enabled:bool; alpha_init:float
+    ray_epsilon: float; geometry_rms_epsilon: float; scale_augmentation_probability: float; scale_augmentation_range: tuple[float,float]; sightline_enabled:bool; alpha_init:float
     history_sizes: tuple[int,int,int]; chunk_length:int; chunk_stride:int; sightline_layers:tuple[int,...]; memory_layers:tuple[int,...]; correspondence_layers:tuple[int,...]
     lora_layers:tuple[int,...]; lora_rank:int; lora_scope:str; memory_pool:int; memory_budget:int; memory_tau_pos:float; memory_tau_angle:float; lambda_corr:float; lambda_corr_final:float
     lambda_corr_decay_start:float; learning_rate:float; beta_learning_rate:float; lora_learning_rate:float; memory_learning_rate:float; warmup_ratio:float; grad_clip:float; bf16:bool; accumulation_steps:int; high_noise_bias:float; teacher_forcing_ratio:float; self_rollout_ratio:float; memory_write_sigma:float; correspondence_rows_per_batch:int; gradient_checkpointing:bool; diagnostics_frequency:int; phase:str; model_id:str; source_height:int; source_width:int; chunk_count:int; pyramid_steps:tuple[int,...]; data_path:str; latent_cache_path:str; correspondence_cache_path:str; output_path:str
@@ -16,7 +16,7 @@ def load_sightline_config(path: str|Path) -> SightlineConfig:
     required=allowed-set(raw)
     if required: raise ValueError(f'missing Sightline config keys: {sorted(required)}')
     if tuple(raw['history_sizes'])!=(16,2,1) or raw['chunk_length']!=33 or raw['chunk_stride']!=32: raise ValueError('invalid causal history/chunk semantics')
-    if not (raw['ray_epsilon']>0 and 0<=raw['scale_augmentation_probability']<=1): raise ValueError('invalid ray/augmentation values')
+    if not (raw['ray_epsilon']>0 and raw['geometry_rms_epsilon']>0 and 0<=raw['scale_augmentation_probability']<=1): raise ValueError('invalid ray/augmentation values')
     if not 0.<float(raw['alpha_init'])<1.: raise ValueError('alpha_init must be strictly inside (0, 1)')
     if raw['scale_augmentation_range'][0]>=raw['scale_augmentation_range'][1] or raw['lora_rank'] not in (8,16) or raw['lora_scope']!='v_o' or raw['memory_pool']!=2 or raw['memory_budget']<1 or raw['memory_tau_pos']<=0 or raw['memory_tau_angle']<=0: raise ValueError('invalid memory/LoRA configuration')
     for key in ('sightline_layers','memory_layers','correspondence_layers','lora_layers'):

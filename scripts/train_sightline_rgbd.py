@@ -456,7 +456,7 @@ def main():
     set_initialization_seed()
     trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
-        lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init).to(device,dtype=torch.float32)
+        lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init,geometry_rms_epsilon=cfg.geometry_rms_epsilon).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
@@ -507,9 +507,9 @@ def main():
     stop=args.max_steps if args.train else min(args.max_steps,start_step+1)
     for step in range(start_step,stop):
         oom_state.update(stage='step_setup',step=int(step),train_chunk=None,memory_token_count=0,k_length=0,selected_q_count=0)
-        if args.profile_timing: torch.cuda.reset_peak_memory_stats(device)
+        if args.profile_timing or (step+1) % cfg.diagnostics_frequency == 0: torch.cuda.reset_peak_memory_stats(device)
         phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
-        capture_geometry_diagnostics=((step+1) % 10 == 0)
+        capture_geometry_diagnostics=((step+1) % cfg.diagnostics_frequency == 0)
         for processor in pipe.transformer._sightline_processors.values():
             processor.capture_numeric_diagnostics=capture_geometry_diagnostics
             processor.conditioner.capture_numeric_diagnostics=capture_geometry_diagnostics
@@ -594,6 +594,13 @@ def main():
             load_started=time.perf_counter(); corr_rows=_load_correspondence(record,train_chunk); perf['correspondence_load_seconds']=time.perf_counter()-load_started
         else: corr_rows=None
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
+        geometry_memory_diagnostics={}
+        def record_geometry_memory(name):
+            if capture_geometry_diagnostics and device.type=='cuda':
+                geometry_memory_diagnostics[name]={
+                    'memory_allocated':int(torch.cuda.memory_allocated(device)),
+                    'max_memory_allocated':int(torch.cuda.max_memory_allocated(device)),
+                }
         history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; fm_sigma_trace=[]; optimizer.zero_grad(set_to_none=True)
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
@@ -636,7 +643,9 @@ def main():
                     is_final_stage=stage_index+1==len(items)
                     stage_scope=nullcontext()
                     with stage_scope:
+                        if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_before')
                         prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
+                        if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_after')
                         if capture_geometry_diagnostics:
                             first_processor=pipe.transformer._sightline_processors[int(cfg.sightline_layers[0])]
                             diagnostic=first_processor.last_numeric_diagnostics or {}
@@ -680,6 +689,7 @@ def main():
                     timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                     record_vram('backward')
                     record_vram('fm_backward')
+                    record_geometry_memory('backward_after')
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -767,9 +777,32 @@ def main():
         else: grad_norm=torch.tensor(0.)
         alpha_q,alpha_k=trainable.conditioner.alpha_values()
         step_seconds=time.perf_counter()-started
-        diagnostics={str(layer):processor.last_numeric_diagnostics for layer,processor in pipe.transformer._sightline_processors.items() if processor.last_numeric_diagnostics is not None} if (step+1)%10==0 else {}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
-        if rank==0 and (args.profile_timing or (step+1)%10==0 or step==start_step or step+1==stop):
+        diagnostics={str(layer):dict(processor.last_numeric_diagnostics) for layer,processor in pipe.transformer._sightline_processors.items() if processor.last_numeric_diagnostics is not None} if capture_geometry_diagnostics else {}
+        if capture_geometry_diagnostics:
+            def _parameter_rms(parameter): return float(parameter.detach().float().square().mean().sqrt().cpu())
+            def _grad_rms(parameter): return None if parameter.grad is None else float(parameter.grad.detach().float().square().mean().sqrt().cpu())
+            for layer_text,diagnostic in diagnostics.items():
+                conditioner=trainable.conditioner.for_layer(int(layer_text))
+                diagnostic.update({
+                    'q_projector_weight_rms':_parameter_rms(conditioner.q_proj.weight),'k_projector_weight_rms':_parameter_rms(conditioner.k_proj.weight),
+                    'q_projector_grad_rms':_grad_rms(conditioner.q_proj.weight),'k_projector_grad_rms':_grad_rms(conditioner.k_proj.weight),
+                    'gate_weight_rms':_parameter_rms(conditioner.gate[0].weight),'gate_weight_grad_rms':_grad_rms(conditioner.gate[0].weight),
+                    'beta_q':float(conditioner.beta_q.detach().cpu()),'beta_k':float(conditioner.beta_k.detach().cpu()),
+                    'beta_q_grad_rms':_grad_rms(conditioner.beta_q),'beta_k_grad_rms':_grad_rms(conditioner.beta_k),
+                    'alpha_q':float(conditioner.alpha_q.detach().cpu()),'alpha_k':float(conditioner.alpha_k.detach().cpu()),
+                })
+        def _summary(field):
+            values=[float(value[field]) for value in diagnostics.values() if value.get(field) is not None]
+            if not values: return {}
+            ordered=sorted(values); return {'mean':sum(values)/len(values),'p50':ordered[len(ordered)//2],'p95':ordered[min(len(ordered)-1,round(.95*(len(ordered)-1)))],'max':max(values),'min':min(values)}
+        geometry_aggregate={} if not capture_geometry_diagnostics else {
+            'q_residual_ratio':_summary('delta_q_over_q_native'),'k_residual_ratio':_summary('delta_k_over_k_native'),
+            'q_projector_pre_norm_rms':_summary('proj_q_rms_before_norm'),'k_projector_pre_norm_rms':_summary('proj_k_rms_before_norm'),
+            'alpha_q':_summary('alpha_q'),'alpha_k':_summary('alpha_k'),
+        }
+        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'geometry_rms_epsilon':cfg.geometry_rms_epsilon,'sightline_residual_scale':1.0}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:
             Path(args.probe_capture).parent.mkdir(parents=True,exist_ok=True); torch.save(probe_payload,args.probe_capture)

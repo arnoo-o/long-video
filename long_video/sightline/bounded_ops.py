@@ -310,6 +310,61 @@ def token_blocked_sightline_project(rays, projection, gate, norm, alpha, *, kind
     )
 
 
+class _TokenBlockedSightlineFixedRMSProject(torch.autograd.Function):
+    """Linear ray projector + fixed RMSNorm, recomputed one token tile at a time."""
+    @staticmethod
+    def forward(ctx, rays, proj_weight, gate_weight, gate_bias, beta, scale_delta, eps, swap, token_tile):
+        flat=rays.reshape(-1,7); output=torch.empty((flat.shape[0],proj_weight.shape[0]),device=rays.device,dtype=rays.dtype)
+        has_delta=scale_delta.numel()!=0; delta=scale_delta.float() if has_delta else None
+        alpha=beta.float().sigmoid()
+        for start in range(0,flat.shape[0],int(token_tile)):
+            stop=min(flat.shape[0],start+int(token_tile)); ray=flat[start:stop].float(); scale=ray[:,6:7]
+            geometric=torch.cat((ray[:,3:6],ray[:,:3],scale),-1) if swap else ray
+            raw=F.linear(geometric,proj_weight.float()); gate=F.linear(scale if delta is None else scale+delta,gate_weight.float(),gate_bias.float()).sigmoid()
+            norm=raw*(raw.square().mean(-1,keepdim=True)+float(eps)).rsqrt()
+            output[start:stop].copy_(alpha*gate*norm)
+        ctx.save_for_backward(rays,proj_weight,gate_weight,gate_bias,beta,scale_delta)
+        ctx.eps=float(eps); ctx.swap=bool(swap); ctx.tile=int(token_tile); ctx.has_delta=has_delta
+        return output.reshape(*rays.shape[:-1],proj_weight.shape[0])
+    @staticmethod
+    def backward(ctx,grad_output):
+        rays,proj_weight,gate_weight,gate_bias,beta,scale_delta=ctx.saved_tensors
+        flat=rays.reshape(-1,7); grad_flat=grad_output.reshape(-1,grad_output.shape[-1])
+        grad_rays=torch.empty_like(flat) if ctx.needs_input_grad[0] else None
+        grad_proj=torch.zeros_like(proj_weight) if ctx.needs_input_grad[1] else None
+        grad_gate_weight=torch.zeros_like(gate_weight) if ctx.needs_input_grad[2] else None
+        grad_gate_bias=torch.zeros_like(gate_bias) if ctx.needs_input_grad[3] else None
+        grad_beta=torch.zeros_like(beta) if ctx.needs_input_grad[4] else None
+        grad_delta=torch.zeros_like(scale_delta) if ctx.has_delta and ctx.needs_input_grad[5] else None
+        delta=scale_delta.float() if ctx.has_delta else None; alpha=beta.float().sigmoid()
+        for start in range(0,flat.shape[0],ctx.tile):
+            stop=min(flat.shape[0],start+ctx.tile); ray=flat[start:stop].float(); scale=ray[:,6:7]; gate_input=scale if delta is None else scale+delta
+            geometric=torch.cat((ray[:,3:6],ray[:,:3],scale),-1) if ctx.swap else ray
+            raw=F.linear(geometric,proj_weight.float()); rstd=(raw.square().mean(-1,keepdim=True)+ctx.eps).rsqrt(); norm=raw*rstd
+            gate=F.linear(gate_input,gate_weight.float(),gate_bias.float()).sigmoid(); grad=grad_flat[start:stop].float()
+            if grad_beta is not None: grad_beta.add_(((grad*gate*norm).sum()*alpha*(1-alpha)).to(grad_beta.dtype))
+            grad_norm=grad*alpha*gate; grad_gate=grad*alpha*norm
+            grad_raw=rstd*(grad_norm-raw*rstd.square()*(grad_norm*raw).mean(-1,keepdim=True))
+            if grad_proj is not None: grad_proj.add_((grad_raw.transpose(0,1)@geometric).to(grad_proj.dtype))
+            grad_geometric=grad_raw@proj_weight.float(); grad_logits=grad_gate*gate*(1-gate)
+            if grad_gate_weight is not None: grad_gate_weight.add_((grad_logits.transpose(0,1)@gate_input).to(grad_gate_weight.dtype))
+            if grad_gate_bias is not None: grad_gate_bias.add_(grad_logits.sum(0).to(grad_gate_bias.dtype))
+            grad_scale=grad_logits@gate_weight.float()
+            if grad_delta is not None: grad_delta.add_(grad_scale.sum_to_size(scale_delta.shape).to(grad_delta.dtype))
+            if grad_rays is not None:
+                ray_grad=torch.zeros_like(ray)
+                if ctx.swap: ray_grad[:,:3]=grad_geometric[:,3:6]; ray_grad[:,3:6]=grad_geometric[:,:3]
+                else: ray_grad[:,:6]=grad_geometric[:,:6]
+                ray_grad[:,6:7]=grad_geometric[:,6:7]+grad_scale; grad_rays[start:stop].copy_(ray_grad.to(grad_rays.dtype))
+        return (None if grad_rays is None else grad_rays.reshape_as(rays),grad_proj,grad_gate_weight,grad_gate_bias,grad_beta,grad_delta,None,None,None)
+
+
+def token_blocked_sightline_fixed_rms_project(rays, projection, gate, beta, *, kind, eps, scale_delta=None, token_tile=DEFAULT_TOKEN_TILE):
+    if kind not in ('q','k'): raise ValueError('kind must be q or k')
+    delta=rays.new_empty(0) if scale_delta is None else torch.as_tensor(scale_delta,device=rays.device,dtype=rays.dtype)
+    return _TokenBlockedSightlineFixedRMSProject.apply(rays,projection.weight,gate[0].weight,gate[0].bias,beta,delta,float(eps),kind=='k',int(token_tile))
+
+
 def token_blocked_sightline_mlp_project(rays, projection, gate, norm, alpha, *, kind,
                                         scale_delta=None, token_tile=DEFAULT_TOKEN_TILE):
     if kind not in ('q','k'): raise ValueError('kind must be q or k')

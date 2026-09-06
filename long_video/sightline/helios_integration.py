@@ -80,29 +80,30 @@ class SightlineHeliosAttnProcessor:
                 dk=torch.cat((dk[:,:len(flags)].masked_fill(~valid_mask,0),dk[:,len(flags):]),dim=1)
                 dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
-        if self.capture_numeric_diagnostics:
-            def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
-            def ratio(delta,native):
-                denominator=native.detach().float().norm().clamp_min(1e-30)
-                return float((delta.detach().float().norm()/denominator).cpu())
-            self.last_numeric_diagnostics={
-                'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],
-                'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
-                'delta_q_rms':rms(dq),'delta_k_rms':rms(dk),
-                'delta_q_over_q_native':ratio(dq,query),
-                'delta_k_over_k_native':ratio(dk,key),
-            }
         residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
         effective_scale=residual_scale if geometry_enabled else torch.zeros_like(residual_scale)
         if self.capture_numeric_diagnostics:
             def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
             def ratio(delta,native): return float((delta.detach().float().norm()/native.detach().float().norm().clamp_min(1e-30)).cpu())
+            def parameter_rms(parameter): return float(parameter.detach().float().square().mean().sqrt().cpu())
+            def grad_rms(parameter): return None if parameter.grad is None else float(parameter.grad.detach().float().square().mean().sqrt().cpu())
+            raw_q,raw_k=ratio(dq,query),ratio(dk,key)
+            effective_q,effective_k=ratio(effective_scale*dq,query),ratio(effective_scale*dk,key)
+            if geometry_enabled and float(residual_scale.detach()) == 1.0 and (abs(raw_q-effective_q)>1e-7 or abs(raw_k-effective_k)>1e-7):
+                raise RuntimeError('Geometry raw/effective residual ratios diverged at residual_scale=1')
             self.last_numeric_diagnostics={
-                'delta_q_over_q_native':ratio(dq,query),'delta_k_over_k_native':ratio(dk,key),
-                'effective_delta_q_over_q_native':ratio(effective_scale*dq,query),
-                'effective_delta_k_over_k_native':ratio(effective_scale*dk,key),
+                'alpha_q':float(self.conditioner.alpha_q.detach().cpu()),'alpha_k':float(self.conditioner.alpha_k.detach().cpu()),
+                'beta_q':float(self.conditioner.beta_q.detach().cpu()),'beta_k':float(self.conditioner.beta_k.detach().cpu()),
+                'beta_q_grad_rms':grad_rms(self.conditioner.beta_q),'beta_k_grad_rms':grad_rms(self.conditioner.beta_k),
+                'delta_q_over_q_native':raw_q,'delta_k_over_k_native':raw_k,
+                'effective_delta_q_over_q_native':effective_q,'effective_delta_k_over_k_native':effective_k,
                 'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
+                'proj_q_rms_after_norm':self.conditioner.last_post_norm_rms['q'],'proj_k_rms_after_norm':self.conditioner.last_post_norm_rms['k'],
                 'gate_q':self.conditioner.last_gate_stats['q'],'gate_k':self.conditioner.last_gate_stats['k'],
+                'q_projector_weight_rms':parameter_rms(self.conditioner.q_proj.weight),'k_projector_weight_rms':parameter_rms(self.conditioner.k_proj.weight),
+                'q_projector_grad_rms':grad_rms(self.conditioner.q_proj.weight),'k_projector_grad_rms':grad_rms(self.conditioner.k_proj.weight),
+                'gate_weight_rms':parameter_rms(self.conditioner.gate[0].weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate[0].weight),
+                'geometry_rms_epsilon':self.conditioner.geometry_rms_epsilon,'sightline_residual_scale':float(residual_scale.detach().cpu()),
                 'timestep':None,
                 'geometry_enabled':geometry_enabled,
             }

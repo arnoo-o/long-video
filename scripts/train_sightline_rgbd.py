@@ -561,12 +561,6 @@ def main():
             if 'lora_' in name: parameter.requires_grad_(phase['lora'] and not args.alpha_zero_baseline)
         set_lora_enabled(pipe.transformer,phase['lora'] and not args.alpha_zero_baseline)
         active_corr_layers=probe_layers or tuple(cfg.correspondence_layers); diagnostic_correspondence=bool(args.probe_capture)
-        if phase['correspondence'] or diagnostic_correspondence:
-            if not record.memory_eligible: raise RuntimeError(f"{record.record_id} has no calibrated RGB-D correspondence supervision")
-            if not active_corr_layers or any(layer not in pipe.transformer._sightline_processors for layer in active_corr_layers): raise RuntimeError('active correspondence/probe layers are not installed Sightline layers')
-            for layer in active_corr_layers:
-                pipe.transformer._sightline_processors[layer].capture_diagnostics=False
-                pipe.transformer._sightline_processors[layer].capture_query_indices=None
         # Keep direct source supervision throughout P3.  The cadence is
         # aligned to each requested global-step interval: every 2 P3 steps
         # through step 1299, every 3 steps through 1699, then every 4 steps.
@@ -580,6 +574,18 @@ def main():
         train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,forced_train_chunk)
         oom_state['train_chunk']=int(train_chunk)
         if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
+        # Direct-source (chunk0) P3 steps are intentionally FM-only.  There is
+        # neither a causal correspondence target nor an earlier Memory chunk to
+        # read, so do not retain seven layers of final-stage Q/K solely to later
+        # multiply their unused correspondence loss by zero.
+        train_correspondence=bool(phase['correspondence'] and train_chunk>0 and not args.alpha_zero_baseline)
+        runner.memory.set_enabled(phase['memory'] and train_chunk>0)
+        if train_correspondence or diagnostic_correspondence:
+            if not record.memory_eligible: raise RuntimeError(f"{record.record_id} has no calibrated RGB-D correspondence supervision")
+            if not active_corr_layers or any(layer not in pipe.transformer._sightline_processors for layer in active_corr_layers): raise RuntimeError('active correspondence/probe layers are not installed Sightline layers')
+            for layer in active_corr_layers:
+                pipe.transformer._sightline_processors[layer].capture_diagnostics=False
+                pipe.transformer._sightline_processors[layer].capture_query_indices=None
         # Prefix rollout never reads GT latents. Keep only the selected
         # backward chunk on CUDA instead of retaining the whole curriculum
         # window for the duration of backward.
@@ -592,7 +598,7 @@ def main():
                 perf[f'{name}_memory_allocated']=int(torch.cuda.memory_allocated(device))
                 perf[f'{name}_max_memory_allocated']=int(torch.cuda.max_memory_allocated(device))
                 perf[f'{name}_memory_reserved']=int(torch.cuda.memory_reserved(device))
-        if phase['correspondence'] or diagnostic_correspondence:
+        if train_correspondence or diagnostic_correspondence:
             load_started=time.perf_counter(); corr_rows=_load_correspondence(record,train_chunk); perf['correspondence_load_seconds']=time.perf_counter()-load_started
         else: corr_rows=None
         sigma_range,sigma_band=_sigma_band(step,phase['name'])
@@ -629,7 +635,7 @@ def main():
                     oom_state['selected_q_count']=int(correspondence_plan.query_indices.numel())
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear(); final_geometry_scope=None
                 for stage_index,item in enumerate(items):
-                    capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),phase['correspondence'] or diagnostic_correspondence)
+                    capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),train_correspondence or diagnostic_correspondence)
                     for layer in active_corr_layers:
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=capture_correspondence
@@ -673,9 +679,9 @@ def main():
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 corr_weight=trainable.lambda_corr(step/total_steps)
                 oom_state['stage']='correspondence_forward'
-                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (corr_rows is not None and len(corr_rows) and not args.alpha_zero_baseline) else fm.new_zeros(())
+                corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,corr_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=correspondence_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (train_correspondence or diagnostic_correspondence) and corr_rows is not None and len(corr_rows) else fm.new_zeros(())
                 record_vram('correspondence_loss')
-                corr=corr_metric if (phase['correspondence'] and train_chunk>0) else fm.new_zeros(())
+                corr=corr_metric if train_correspondence else fm.new_zeros(())
                 final_flow=stage_losses[-1]/len(items)
                 total=final_flow+corr_weight*corr if args.train else fm+corr_weight*corr
                 losses.update(fm=fm,corr=corr,total=total,stage=stage_losses,sigmas=[float(item['sigmas'].mean()) for item in items])

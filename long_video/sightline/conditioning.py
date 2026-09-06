@@ -6,6 +6,16 @@ from torch import nn
 from .bounded_ops import token_blocked_sightline_mlp_project
 
 DEFAULT_TOKEN_TILE = 512
+MAX_DIAGNOSTIC_QUANTILE_VALUES = 262_144
+
+
+def _bounded_quantile_sample(values: torch.Tensor) -> torch.Tensor:
+    """Return a deterministic, evenly-spaced sample accepted by CUDA quantile."""
+    flat = values.reshape(-1)
+    if flat.numel() <= MAX_DIAGNOSTIC_QUANTILE_VALUES:
+        return flat
+    stride = (flat.numel() + MAX_DIAGNOSTIC_QUANTILE_VALUES - 1) // MAX_DIAGNOSTIC_QUANTILE_VALUES
+    return flat[::stride]
 
 
 def geometry_gain(noise_level: torch.Tensor | float) -> torch.Tensor:
@@ -64,8 +74,9 @@ class SightlineConditioner(nn.Module):
                 raw=projection[2](torch.nn.functional.gelu(projection[0](geometric)))
                 gate_input=scale if scale_delta is None else scale+scale_delta
                 sample=self.gate(gate_input).flatten().float()
+                quantile_sample = _bounded_quantile_sample(sample)
             self.last_pre_norm_rms[kind] = float(raw.square().mean().sqrt().cpu())
-            self.last_gate_stats[kind] = {'mean':float(sample.mean().cpu()),'p05':float(torch.quantile(sample,.05).cpu()),'p50':float(torch.quantile(sample,.5).cpu()),'p95':float(torch.quantile(sample,.95).cpu())} if sample.numel() else None
+            self.last_gate_stats[kind] = {'mean':float(sample.mean().cpu()),'p05':float(torch.quantile(quantile_sample,.05).cpu()),'p50':float(torch.quantile(quantile_sample,.5).cpu()),'p95':float(torch.quantile(quantile_sample,.95).cpu())} if sample.numel() else None
         return output
 
     def forward(self, rays_q, rays_k=None, *, training=None, scale_delta=None, detach_alpha: bool = False):

@@ -4,7 +4,11 @@ import os, sys
 from pathlib import Path
 torch=pytest.importorskip('torch')
 from long_video.sightline.rays import plucker_rays, temporal_group_cameras
-from long_video.sightline.conditioning import SightlineConditioner
+from long_video.sightline.conditioning import (
+    MAX_DIAGNOSTIC_QUANTILE_VALUES,
+    SightlineConditioner,
+    _bounded_quantile_sample,
+)
 from long_video.sightline.history import HistoryManager, CameraHistoryState
 from long_video.sightline.memory import LongTermKVMemory
 from long_video.sightline.rays import temporal_group_cameras
@@ -33,6 +37,15 @@ def test_conditioner_numeric_capture_is_opt_in_and_value_preserving():
     actual=module.project(rays,kind='q',training=False)
     assert torch.equal(expected,actual)
     assert module.last_pre_norm_rms['q'] > 0
+
+
+def test_conditioner_quantile_diagnostics_use_a_bounded_deterministic_sample():
+    values = torch.arange(MAX_DIAGNOSTIC_QUANTILE_VALUES * 3 + 17)
+    first = _bounded_quantile_sample(values)
+    second = _bounded_quantile_sample(values)
+    assert first.numel() <= MAX_DIAGNOSTIC_QUANTILE_VALUES
+    assert torch.equal(first, second)
+    assert first[0] == values[0]
 
 def test_history_six_chunks_causal_and_shared_boundary():
     h=HistoryManager(); src=torch.zeros(1); h.set_source(src)

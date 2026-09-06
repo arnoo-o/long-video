@@ -422,7 +422,7 @@ def _install_oom_profiler(output,device,rank,state):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
-    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--allow-world-size-migration',action='store_true'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
+    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--allow-world-size-migration',action='store_true'); p.add_argument('--skip-manifest-validation',action='store_true',help='Skip repeated per-record validation only when these exact manifests were already validated successfully.'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A stable realistic view of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--smoke-max-chunks',type=int); p.add_argument('--smoke-max-chunks-sequence'); p.add_argument('--profile-timing',action='store_true'); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
@@ -446,8 +446,8 @@ def main():
     if smoke_chunk_sequence and args.train_chunk!=-1:
         raise ValueError('smoke chunk sequences require --train-chunk=-1 to select each last chunk')
     if args.train and world_size!=cfg.ddp_world_size and not world_size_migration: raise ValueError(f'formal training requires exactly {cfg.ddp_world_size} DDP ranks; pass --allow-world-size-migration for an explicit deterministic resume, got {world_size}')
-    probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records)
-    p3_records=load_rgbd_memory_manifest(args.p3_manifest) if args.p3_manifest else records
+    probe_layers=tuple(int(x) for x in args.probe_layers.split(',') if x); _preflight(cfg,args,probe_layers); records=load_rgbd_memory_manifest(args.manifest,expected_count=args.expected_records,validate=not args.skip_manifest_validation)
+    p3_records=load_rgbd_memory_manifest(args.p3_manifest,validate=not args.skip_manifest_validation) if args.p3_manifest else records
     if cfg.chunk_count!=3 or cfg.chunk_length!=33 or cfg.chunk_stride!=32 or (cfg.source_height,cfg.source_width)!=(480,832): raise ValueError('formal RGB-D training requires 3 chunks, 97 frames, and 480x832 geometry')
     sys.path.insert(0,args.helios_root)
     source_file=Path(args.helios_root)/'helios/diffusers_version/transformer_helios_diffusers.py'

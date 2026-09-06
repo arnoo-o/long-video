@@ -381,13 +381,19 @@ class RGBDMemoryRecord:
             raise ValueError(f"{self.record_id}: ScanNet correspondence cache is empty")
 
 
-def load_rgbd_memory_manifest(path: str | Path, *, expected_count: int | None = None) -> list[RGBDMemoryRecord]:
+def load_rgbd_memory_manifest(
+    path: str | Path,
+    *,
+    expected_count: int | None = None,
+    validate: bool = True,
+) -> list[RGBDMemoryRecord]:
     manifest = Path(path)
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     records = payload.get("records")
     if not isinstance(records, list) or (expected_count is not None and len(records) != expected_count):
         raise ValueError("invalid RGB-D memory manifest record count")
     result = [RGBDMemoryRecord(row, manifest.parent) for row in records]
-    for record in result:
-        record.validate()
+    if validate:
+        for record in result:
+            record.validate()
     return result

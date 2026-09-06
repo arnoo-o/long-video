@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from .bounded_ops import token_blocked_sightline_mlp_project
 
 DEFAULT_TOKEN_TILE = 512
 
@@ -52,23 +53,18 @@ class SightlineConditioner(nn.Module):
         norm = self.rms_norm_q if kind == 'q' else self.rms_norm_k
         alpha = self.alpha_q if kind == 'q' else self.alpha_k
         flat = rays.reshape(-1, 7).to(next(projection.parameters()).dtype)
-        values = []; pre_norm_sq = 0.0; gate_samples=[]
-        for start in range(0, flat.shape[0], DEFAULT_TOKEN_TILE):
-            ray = flat[start:start + DEFAULT_TOKEN_TILE].float(); scale = ray[:, 6:7]
-            geometric = torch.cat((ray[:, 3:6], ray[:, :3], scale), -1) if kind == 'k' else ray
-            # Scale augmentation is intentionally gate-only; projector sees physical log_norm.
-            gate_input = scale if scale_delta is None else scale + scale_delta
-            raw = projection.float()(geometric)
-            gate = self.gate.float()(gate_input)
-            value = (alpha.detach() if detach_alpha else alpha).float() * gate * norm.float()(raw)
-            values.append(value.to(rays.dtype))
-            if self.capture_numeric_diagnostics:
-                pre_norm_sq += float(raw.detach().square().sum())
-                gate_samples.append(gate.detach().flatten()[::max(1, gate.numel() // 4096)].float())
-        output = torch.cat(values, 0).reshape(*rays.shape[:-1], self.inner_dim)
+        output = token_blocked_sightline_mlp_project(
+            flat, projection, self.gate, norm, alpha.detach() if detach_alpha else alpha,
+            kind=kind, scale_delta=scale_delta, token_tile=DEFAULT_TOKEN_TILE,
+        ).reshape(*rays.shape[:-1], self.inner_dim).to(rays.dtype)
         if self.capture_numeric_diagnostics:
-            self.last_pre_norm_rms[kind] = (pre_norm_sq / max(1, flat.shape[0] * self.inner_dim)) ** .5
-            sample=torch.cat(gate_samples) if gate_samples else torch.empty(0,device=rays.device)
+            with torch.no_grad():
+                sampled=flat[::max(1,flat.shape[0]//4096)].float(); scale=sampled[:,6:7]
+                geometric=torch.cat((sampled[:,3:6],sampled[:,:3],scale),-1) if kind=='k' else sampled
+                raw=projection[2](torch.nn.functional.gelu(projection[0](geometric)))
+                gate_input=scale if scale_delta is None else scale+scale_delta
+                sample=self.gate(gate_input).flatten().float()
+            self.last_pre_norm_rms[kind] = float(raw.square().mean().sqrt().cpu())
             self.last_gate_stats[kind] = {'mean':float(sample.mean().cpu()),'p05':float(torch.quantile(sample,.05).cpu()),'p50':float(torch.quantile(sample,.5).cpu()),'p95':float(torch.quantile(sample,.95).cpu())} if sample.numel() else None
         return output
 

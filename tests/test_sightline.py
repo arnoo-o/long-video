@@ -993,6 +993,27 @@ def test_token_blocked_sightline_projection_matches_reference(kind,dtype):
     for actual,expected in zip(gradients,reference_gradients):
         assert torch.allclose(actual,expected,atol=tolerance,rtol=tolerance)
 
+@pytest.mark.parametrize('kind',['q','k'])
+def test_token_blocked_sightline_v2_mlp_matches_reference(kind):
+    from long_video.sightline.bounded_ops import token_blocked_sightline_mlp_project
+    device='cuda' if torch.cuda.is_available() else 'cpu'; torch.manual_seed(322)
+    rays=torch.randn(2,259,7,device=device,requires_grad=True)
+    projection=torch.nn.Sequential(torch.nn.Linear(7,13,bias=False),torch.nn.GELU(),torch.nn.Linear(13,32,bias=False)).to(device)
+    gate=torch.nn.Sequential(torch.nn.Linear(1,9),torch.nn.SiLU(),torch.nn.Linear(9,32),torch.nn.Sigmoid()).to(device)
+    norm=torch.nn.RMSNorm(32,eps=1e-6).to(device); alpha=torch.nn.Parameter(torch.tensor(.7,device=device)); delta=torch.tensor(.25,device=device)
+    params=(rays,projection[0].weight,projection[2].weight,gate[0].weight,gate[0].bias,gate[2].weight,gate[2].bias,norm.weight,alpha)
+    output=token_blocked_sightline_mlp_project(rays,projection,gate,norm,alpha,kind=kind,scale_delta=delta,token_tile=64)
+    grad_output=torch.randn_like(output); gradients=torch.autograd.grad(output,params,grad_output)
+    copies=[value.detach().clone().requires_grad_() for value in params]
+    rr,p1,p2,g1w,g1b,g2w,g2b,nw,aa=copies; scale=rr[...,6:7]
+    geometric=torch.cat((rr[...,3:6],rr[...,:3],scale),-1) if kind=='k' else rr
+    raw=torch.nn.functional.linear(torch.nn.functional.gelu(torch.nn.functional.linear(geometric,p1)),p2)
+    gated=torch.sigmoid(torch.nn.functional.linear(torch.nn.functional.silu(torch.nn.functional.linear(scale+delta,g1w,g1b)),g2w,g2b))
+    reference=aa*gated*torch.nn.functional.rms_norm(raw,(32,),nw,1e-6)
+    reference_gradients=torch.autograd.grad(reference,copies,grad_output)
+    assert torch.allclose(output,reference,atol=5e-5,rtol=5e-5)
+    for actual,expected in zip(gradients,reference_gradients): assert torch.allclose(actual,expected,atol=8e-5,rtol=8e-5)
+
 def test_teacher_overlap_screening_is_deterministic_and_causal():
     from scripts.build_sightline_correspondences import screen_overlap
     xyz=torch.tensor([[[[0.,0.,1.],[1.,0.,1.]],[[0.,1.,1.],[1.,1.,1.]]]]).numpy()

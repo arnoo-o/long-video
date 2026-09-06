@@ -2,24 +2,9 @@
 from __future__ import annotations
 import hashlib
 import torch
-from .conditioning import SightlineConditioner, geometry_gain
+from .conditioning import SightlineConditioner
 from .rays import token_rays_for_shape, plucker_rays
 from .history import covered_history_chunk_ids
-
-def normalize_geometry_noise_level(noise_level, *, batch_size:int, device) -> torch.Tensor:
-    """Return scalar or [B,1,1,1], the only valid attention routing layouts."""
-    value=torch.as_tensor(noise_level,device=device,dtype=torch.float32)
-    if not torch.isfinite(value).all() or torch.any((value<0)|(value>1)): raise RuntimeError('geometry noise level must be finite in [0,1]')
-    if value.numel()==1: return value.reshape(())
-    if value.numel()!=int(batch_size):
-        raise RuntimeError(f'geometry noise level must be scalar or B values, got {tuple(value.shape)} for B={batch_size}')
-    return value.reshape(int(batch_size),1,1,1)
-
-def publish_geometry_noise_level(context:dict|None, noise_level, *, batch_size:int, device) -> torch.Tensor:
-    if context is None: raise RuntimeError('Sightline geometry noise level requires an active runtime context')
-    value=normalize_geometry_noise_level(noise_level,batch_size=batch_size,device=device)
-    context['geometry_noise_level']=value
-    return value
 
 def helio_source_fingerprint(source_text: str) -> str:
     return hashlib.sha256(source_text.encode()).hexdigest()
@@ -60,7 +45,9 @@ class SightlineHeliosAttnProcessor:
         if self.capture_memory_hidden or self.capture_diagnostics:
             self.last_current_length=current_len
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
-        if self.conditioner is None:
+        provider_context=getattr(self.ray_provider,'context',None)
+        geometry_enabled=bool(provider_context.get('geometry_enabled',True)) if provider_context is not None else True
+        if self.conditioner is None or not geometry_enabled:
             scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
         else:
             history_len=max(0,key.shape[1]-current_len)
@@ -105,19 +92,8 @@ class SightlineHeliosAttnProcessor:
                 'delta_q_over_q_native':ratio(dq,query),
                 'delta_k_over_k_native':ratio(dk,key),
             }
-        context=getattr(self.ray_provider,'context',None)
-        noise_level = context.get('geometry_noise_level') if context is not None else None
-        if noise_level is None:
-            # Minimal standalone processor tests have no scheduler context.
-            # Formal/inference contexts always carry stage_shapes and must
-            # publish the real scheduler sigma.
-            if context is not None and context.get('stage_shapes') is not None:
-                raise RuntimeError('Sightline geometry routing requires the real global scheduler timestep')
-            noise_level=1.0
-        noise_level=normalize_geometry_noise_level(noise_level,batch_size=query.shape[0],device=query.device)
-        geometry_gain_value=geometry_gain(noise_level).to(query.dtype)
         residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
-        effective_scale=residual_scale*geometry_gain_value
+        effective_scale=residual_scale if geometry_enabled else torch.zeros_like(residual_scale)
         if self.capture_numeric_diagnostics:
             def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
             def ratio(delta,native): return float((delta.detach().float().norm()/native.detach().float().norm().clamp_min(1e-30)).cpu())
@@ -127,9 +103,8 @@ class SightlineHeliosAttnProcessor:
                 'effective_delta_k_over_k_native':ratio(effective_scale*dk,key),
                 'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
                 'gate_q':self.conditioner.last_gate_stats['q'],'gate_k':self.conditioner.last_gate_stats['k'],
-                'timestep':context.get('geometry_timestep') if context is not None else None,
-                'geometry_noise_level':float(noise_level.mean()),
-                'geometry_gain':float(geometry_gain_value.mean()),
+                'timestep':None,
+                'geometry_enabled':geometry_enabled,
             }
         query=query+effective_scale*dq; key=key+effective_scale.to(key.dtype)*dk
         history_len=max(0,key.shape[1]-current_len)
@@ -168,6 +143,7 @@ class SightlineHeliosAttnProcessor:
                 query_camera_poses=self.ray_provider.context['c2w'],
                 native_history_chunk_ids=native_chunks,
                 effective_geometry_scale=effective_scale,
+                geometry_enabled=geometry_enabled,
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:

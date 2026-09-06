@@ -87,8 +87,8 @@ def _install_memory_efficient_helios_norm(source_file:Path):
     }
 
 def checkpoint_interval(global_step: int) -> int:
-    """Formal cadence: 100-step checkpoints through step 1000, then 60-step."""
-    return 100 if int(global_step) < 1000 else 60
+    """The v3 checkpoint contract is one strict 100-step cadence."""
+    return 100
 
 def _distributed_context():
     world_size=int(__import__('os').environ.get('WORLD_SIZE','1'))
@@ -148,9 +148,9 @@ def _ddp_train_chunk(max_chunks,minimum,rank,world_size,device,forced=None):
     dist.broadcast(value,src=0)
     return int(value.item())
 
-def p3_chunk0_scheduled(step,p1_steps=500,p2_steps=900):
-    """Deterministic 20% direct-source slots from step 500 onward."""
-    return int(step)>=500 and (int(step)-500)%5==0
+def p3_chunk0_scheduled(step,p1_steps=500,p2_steps=500):
+    """Rank-stable Bernoulli(0.25) source supervision for P3."""
+    return random.Random(20260907+int(step)).random() < .25
 
 def _preflight(cfg,args,probe_layers):
     p1_steps=getattr(cfg,'p1_steps',400); p2_steps=getattr(cfg,'p2_steps',600); p3_steps=getattr(cfg,'p3_steps',1500)
@@ -179,7 +179,6 @@ def _lr_multiplier(step,total_steps=TOTAL_TRAINING_STEPS):
     return 0.5*(1.0+__import__('math').cos(__import__('math').pi*progress))
 
 def _sigma_band(step, phase):
-    if phase=='P1a': return (.8,1.),'high_0.8_1.0'
     return (0.,1.),'uniform_0.0_1.0'
 
 def _set_gradient_checkpointing(transformer,enabled):
@@ -224,15 +223,10 @@ def _transformer_forward(pipe,noisy,timestep,prompt_embeds,history,current_start
     return prediction
 
 def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,*,routing_scope_active=False):
-    """Active FM only; routing is always based on the exact item timestep."""
+    """Active FM wrapper; Geometry is timestep-independent."""
     if not isinstance(item,dict) or 'sigmas' not in item or 'timesteps' not in item:
         raise ValueError('active Flow Matching prediction requires item["sigmas"] and item["timesteps"]')
-    runner=getattr(pipe,'_sightline_pipeline',None)
-    if runner is None: raise RuntimeError('active FM requires the Sightline pipeline sigma router')
-    if routing_scope_active:
-        return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
-    with runner.geometry_timestep_override(item['timesteps']):
-        return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
+    return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
 
 def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary=None):
     """Native Helios autoregressive inference from noise; no target argument exists."""
@@ -462,7 +456,7 @@ def main():
     set_initialization_seed()
     trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
-        lambda_corr_decay_start=cfg.lambda_corr_decay_start).to(device,dtype=torch.float32)
+        lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
@@ -473,7 +467,8 @@ def main():
     initialization_hash=broadcast_and_assert_trainables(trainable,runner.memory,pipe.transformer,world_size)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     memory_params=list(runner.memory.parameters())
-    optimizer=torch.optim.AdamW([{'params':list(trainable.parameters()),'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.learning_rate}],weight_decay=.01)
+    geometry_params=list(trainable.conditioner.geometry_parameters()); beta_params=list(trainable.conditioner.alpha_parameters())
+    optimizer=torch.optim.AdamW([{'params':geometry_params,'lr':cfg.learning_rate},{'params':beta_params,'lr':cfg.beta_learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.memory_learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
     prompt_embeds,_=_prompt(pipe,args.prompt,device)
@@ -487,7 +482,7 @@ def main():
     vae_decode_bytes=_offload_unused_vae_decode_path(pipe.vae)
     if rank==0: print(f'offloaded unused VAE decode path: {vae_decode_bytes/2**20:.2f} MiB',flush=True)
     if device.type == 'cuda': torch.cuda.empty_cache()
-    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision,transformer_source_sha256=fingerprint,runtime_patch=runtime_patch)
+    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision,transformer_source_sha256=fingerprint,runtime_patch=runtime_patch,lora_scope=cfg.lora_scope)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     world_size_migrated=False
@@ -539,7 +534,7 @@ def main():
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
         validate_rgbd_record_latent(record,latent_path)
-        if phase['name'] in ('P1a','P1b','P2'):
+        if phase['name'] in ('P1','P2a','P2b'):
             if record.frame_count!=97 or record.chunk_count!=3 or latent_schema!='continuous_25': raise ValueError(f'{record.record_id}: P1/P2 requires a unit-owned 97-frame continuous_25 cache')
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
@@ -561,14 +556,11 @@ def main():
             if 'lora_' in name: parameter.requires_grad_(phase['lora'] and not args.alpha_zero_baseline)
         set_lora_enabled(pipe.transformer,phase['lora'] and not args.alpha_zero_baseline)
         active_corr_layers=probe_layers or tuple(cfg.correspondence_layers); diagnostic_correspondence=bool(args.probe_capture)
-        # Keep direct source supervision throughout P3.  The cadence is
-        # aligned to each requested global-step interval: every 2 P3 steps
-        # through step 1299, every 3 steps through 1699, then every 4 steps.
-        scheduled_chunk0=(step>=500
+        scheduled_chunk0=(phase['name']=='P3'
                           and p3_chunk0_scheduled(step,cfg.p1_steps,cfg.p2_steps)
                           and not smoke_chunk_sequence
                           and (args.train_chunk is None or args.train_chunk<0))
-        minimum_train_chunk=0 if (phase['max_chunks']==1 or scheduled_chunk0) else 1
+        minimum_train_chunk=0 if (phase['name']!='P3' or scheduled_chunk0) else 1
         forced_train_chunk=(phase['max_chunks']-1 if smoke_chunk_sequence
                             else (0 if scheduled_chunk0 else args.train_chunk))
         train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,forced_train_chunk)
@@ -633,7 +625,7 @@ def main():
                     correspondence_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],corr_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
                     oom_state['k_length']=len(correspondence_plan.identities)
                     oom_state['selected_q_count']=int(correspondence_plan.query_indices.numel())
-                stage_losses=[]; final_prediction=None; fm_sigma_trace.clear(); final_geometry_scope=None
+                stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
                     capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),train_correspondence or diagnostic_correspondence)
                     for layer in active_corr_layers:
@@ -642,18 +634,7 @@ def main():
                         processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and args.train else None
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     is_final_stage=stage_index+1==len(items)
-                    if is_final_stage:
-                        # The final stage owns tensors whose checkpoint backward
-                        # (including correspondence) happens below.  Keep its
-                        # exact global timestep route alive until that backward.
-                        final_geometry_scope=runner.geometry_timestep_override(item['timesteps'])
-                        final_geometry_scope.__enter__()
-                        runner._active_geometry_timestep_scope=final_geometry_scope
-                        stage_scope=nullcontext()
-                    else:
-                        # Each earlier stage immediately backpropagates while
-                        # its exact route is still installed.
-                        stage_scope=runner.geometry_timestep_override(item['timesteps'])
+                    stage_scope=nullcontext()
                     with stage_scope:
                         prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
                         if capture_geometry_diagnostics:
@@ -662,8 +643,6 @@ def main():
                             fm_sigma_trace.append({'stage':stage_index,
                                 'item_timestep':float(item['timesteps'].detach().float().mean()),
                                 'processor_timestep':diagnostic.get('timestep'),
-                                'geometry_noise_level':diagnostic.get('geometry_noise_level'),
-                                'geometry_gain':diagnostic.get('geometry_gain'),
                                 'item_sigma':float(item['sigmas'].detach().float().mean())})
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
@@ -701,13 +680,6 @@ def main():
                     timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                     record_vram('backward')
                     record_vram('fm_backward')
-                # No checkpoint recompute remains after FM/correspondence
-                # backward.  Subsequent clean capture and probes get their own
-                # scope instead of inheriting the final active-FM route.
-                if final_geometry_scope is not None:
-                    final_geometry_scope.__exit__(None,None,None)
-                    runner._active_geometry_timestep_scope=None
-                    final_geometry_scope=None
                 final=items[-1]; generated=(final['noisy_latents']-final['sigmas']*final_prediction).detach()
                 if args.probe_capture:
                     layer_captures=[]
@@ -775,25 +747,14 @@ def main():
             else:
                 _,policies=run_single_graph_chunks(phase['max_chunks'],train_chunk,forward_chunk)
         finally:
-            # A failed final-stage forward/backward must never leak routing
-            # state into the next batch. Normal paths already exit their
-            # scopes at the precise backward boundary above.
-            active_scope=getattr(runner,'_active_geometry_timestep_scope',None)
-            if active_scope is not None:
-                active_scope.__exit__(*sys.exc_info())
-                runner._active_geometry_timestep_scope=None
-            elif getattr(runner,'_geometry_timestep_override',None) is not None:
-                runner._geometry_timestep_override=None
-                if runner.ray_provider is not None and runner.ray_provider.context is not None:
-                    runner.ray_provider.context.pop('geometry_noise_level',None)
-                    runner.ray_provider.context.pop('geometry_timestep',None)
+            pass
         if args.probe_capture:
-            probe_payload['alpha_grad']={name:0.0 if alpha.grad is None else float(alpha.grad.detach().abs()) for name,alpha in ((f'{index}.q',layer.alpha_q) for index,layer in trainable.conditioner.layers.items())}
+            probe_payload['alpha_grad']={name:0.0 if beta.grad is None else float(beta.grad.detach().abs()) for name,beta in ((f'{index}.q',layer.beta_q) for index,layer in trainable.conditioner.layers.items())}
         if args.train:
             active_phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
             alpha_grads=[alpha.grad for alpha in trainable.conditioner.alpha_parameters()]
-            if active_phase['name'] in ('P1a','P1b') and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
-            if active_phase['name']=='P2':
+            if active_phase['name']=='P1' and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
+            if active_phase['name'] in ('P2a','P2b'):
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:

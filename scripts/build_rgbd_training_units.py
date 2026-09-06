@@ -22,7 +22,7 @@ def atomic_json(path: Path, value: dict) -> None:
 
 def unit_near_depth(record, offset: int, *, samples: int = 16) -> float:
     """Compute a unit-owned SI near-depth without touching parent metadata."""
-    directory=Path(record.raw['depth_dir'])
+    directory=record.path('depth_dir')
     frames=sorted(path for path in directory.iterdir() if path.suffix.lower() in {'.png','.jpg','.jpeg'})
     parent_start=int(record.raw.get('source_frame_start',0))
     unit_frames=frames[parent_start+int(offset):parent_start+int(offset)+97]

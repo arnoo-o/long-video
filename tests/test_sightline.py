@@ -26,11 +26,11 @@ def test_plucker_ray_geometry():
 
 def test_scale_augmentation_gate_only_and_zero_alpha():
     torch.manual_seed(1); m=SightlineConditioner(16); r=torch.randn(2,3,7); q,k=m(r,training=False); assert q.shape==k.shape==(2,3,16)
-    m.alpha_q.data.zero_(); m.alpha_k.data.zero_(); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
+    m.beta_q.data.fill_(-30.); m.beta_k.data.fill_(-30.); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
 
 def test_conditioner_numeric_capture_is_opt_in_and_value_preserving():
     torch.manual_seed(7); module=SightlineConditioner(16).eval(); rays=torch.randn(2,3,7)
-    module.q_proj[2].weight.data.normal_(std=.01)
+    module.q_proj.weight.data.normal_(std=.01)
     expected=module.project(rays,kind='q',training=False)
     assert module.last_pre_norm_rms['q'] is None
     module.capture_numeric_diagnostics=True
@@ -91,10 +91,10 @@ def test_train_chunk_policy_is_single_and_causal():
 
 def test_camera_first_curriculum_uses_fixed_unit_origin():
     from long_video.training.sightline import curriculum_phase
-    assert curriculum_phase(0)['name']=='P1a' and curriculum_phase(0)['sigma_range']==(.8,1.)
-    assert curriculum_phase(199)['max_chunks']==1
-    assert curriculum_phase(200)['name']=='P1b' and curriculum_phase(200)['sigma_range']==(0.,1.)
-    assert curriculum_phase(500)['lora'] and curriculum_phase(500)['max_chunks']==2
+    assert curriculum_phase(0)['name']=='P1' and curriculum_phase(0)['sigma_range']==(0.,1.)
+    assert curriculum_phase(499)['max_chunks']==1
+    assert curriculum_phase(500)['name']=='P2a' and curriculum_phase(500)['max_chunks']==1
+    assert curriculum_phase(700)['lora'] and curriculum_phase(700)['max_chunks']==2
     assert curriculum_phase(999)['max_chunks']==2 and not curriculum_phase(999)['memory']
     assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==2
     assert curriculum_phase(2499)['max_chunks']==6
@@ -137,10 +137,10 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
     from long_video.training.sightline import SightlineTrainable
     trainable=SightlineTrainable(8,layers=(16,20,24),heads=2)
     conditioners=[trainable.conditioner.for_layer(layer) for layer in (16,20,24)]
-    for name in ('q_proj','k_proj','gate','rms_norm_q','rms_norm_k'):
+    for name in ('q_proj','k_proj','gate'):
         assert len({id(next(getattr(layer,name).parameters())) for layer in conditioners})==3
-    assert all(float(layer.alpha_q.detach())==1.0 and float(layer.alpha_k.detach())==1.0 for layer in conditioners)
-    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
+    assert all(float(layer.alpha_q.detach())==pytest.approx(.7) and float(layer.alpha_k.detach())==pytest.approx(.7) for layer in conditioners)
+    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('beta_q','beta_k'))])==6
 
 def test_streaming_correspondence_matches_dense_loss_and_gradients():
     from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
@@ -330,8 +330,9 @@ def test_lora_fused_and_unfused_change_real_projection():
         def __init__(self,fused): super().__init__(); self.transformer_blocks=torch.nn.ModuleList([Block(fused)])
     for fused in (False,True):
         model=T(fused); assert install_lora(model,[0])==(0,)
-        target=model.transformer_blocks[0].attn1.to_q
+        attn=model.transformer_blocks[0].attn1; target=attn.to_v
         assert isinstance(target,LoRALinear)
+        assert isinstance(attn.to_q,torch.nn.Linear) and isinstance(attn.to_k,torch.nn.Linear)
         with torch.no_grad(): target.lora_up.weight.fill_(0.1)
         assert not torch.equal(target(torch.ones(1,4)),target.base(torch.ones(1,4)))
 
@@ -672,18 +673,15 @@ def test_inference_global_sightline_residual_scale():
     assert all(processor.residual_scale==.2 for processor in processors.values())
     with pytest.raises(ValueError): configure_sightline_residual_scale(transformer,float('nan'))
 
-def test_v2_global_geometry_noise_routing_is_shared_and_piecewise_linear():
-    from long_video.sightline.conditioning import geometry_gain
-    assert geometry_gain(torch.tensor(.8)).item()==pytest.approx(1.)
-    assert geometry_gain(torch.tensor(.2)).item()==pytest.approx(0.)
-    assert geometry_gain(torch.tensor(.5)).item()==pytest.approx(.5)
-    assert geometry_gain(torch.tensor(1.)).item()==pytest.approx(1.)
+def test_geometry_has_no_timestep_routing_api():
+    import long_video.sightline.conditioning as conditioning
+    assert not hasattr(conditioning,'geometry_gain')
 
 def test_processor_residual_scale_matches_q_plus_s_delta():
     class A:
         heads=2; is_amplify_history=False; to_q=torch.nn.Linear(8,8); to_k=torch.nn.Linear(8,8); to_v=torch.nn.Linear(8,8); norm_q=torch.nn.Identity(); norm_k=torch.nn.Identity(); to_out=torch.nn.ModuleList([torch.nn.Identity(),torch.nn.Identity()])
     a=A(); c=SightlineConditioner(8).eval()
-    torch.nn.init.constant_(c.q_proj[2].weight,.1); torch.nn.init.constant_(c.k_proj[2].weight,.2)
+    torch.nn.init.constant_(c.q_proj.weight,.1); torch.nn.init.constant_(c.k_proj.weight,.2)
     rays=torch.ones(1,4,7); provider=lambda h,**kw:(rays,rays); h=torch.randn(1,4,8); seen=[]
     def qkv(attn,states,_): return attn.to_q(states),attn.to_k(states),attn.to_v(states)
     def dispatch(q,k,v,**kw): seen.append((q.clone(),k.clone())); return v
@@ -885,10 +883,10 @@ def test_p3_chunk_curriculum_has_fixed_global_step_boundaries():
     generator=torch.Generator().manual_seed(9); selected=[select_train_chunk(6,generator,minimum=1) for _ in range(200)]
     assert 0 not in selected and set(selected)==set(range(1,6))
 
-def test_checkpoint_cadence_switches_after_p2():
+def test_checkpoint_cadence_is_fixed_by_v3_contract():
     from scripts.train_sightline_rgbd import checkpoint_interval
     assert checkpoint_interval(0)==100 and checkpoint_interval(999)==100
-    assert checkpoint_interval(1000)==60 and checkpoint_interval(2499)==60
+    assert checkpoint_interval(1000)==100 and checkpoint_interval(2499)==100
 
 def test_p3_sigma_range_remains_uniform_zero_to_one():
     from scripts.train_sightline_rgbd import _sigma_band
@@ -1161,7 +1159,7 @@ def test_alpha_zero_baseline_disables_qk_memory_and_lora():
     trainable=SightlineTrainable(4,layers=(0,)); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4)
     transformer=torch.nn.Sequential(LoRALinear(torch.nn.Linear(4,4)))
     configure_alpha_zero_baseline(trainable,memory,transformer)
-    assert all(float(alpha.detach())==0 for alpha in trainable.conditioner.alpha_parameters())
+    assert all(float(layer.alpha_q.detach())<1e-12 and float(layer.alpha_k.detach())<1e-12 for layer in trainable.conditioner.layers.values())
     assert not memory.banks[0].enabled and not transformer[0].enabled
 
 def test_near_depth_png_is_converted_from_mm_to_m(tmp_path):
@@ -1178,48 +1176,14 @@ def test_near_depth_normalizes_translation_in_metres():
     c2w=torch.eye(4).view(1,1,4,4).repeat(1,2,1,1); c2w[:,1,0,3]=3.
     assert canonicalize_c2w(c2w,3.0)[0,1,0,3].item()==pytest.approx(1.)
 
-def test_geometry_noise_level_normalizes_to_attention_broadcast_layout():
-    from long_video.sightline.helios_integration import normalize_geometry_noise_level,publish_geometry_noise_level
-    assert normalize_geometry_noise_level(torch.ones(2,1,1,1,1),batch_size=2,device='cpu').shape==(2,1,1,1)
-    context={}; value=publish_geometry_noise_level(context,torch.tensor([.4,.8]),batch_size=2,device='cpu')
-    assert context['geometry_noise_level'].shape==(2,1,1,1) and torch.equal(value,context['geometry_noise_level'])
-    with pytest.raises(RuntimeError): normalize_geometry_noise_level(torch.ones(3),batch_size=2,device='cpu')
-
 def test_corr_schedule_and_scope_diagnostics_follow_v2_config():
     from long_video.training.sightline import SightlineTrainable
     trainable=SightlineTrainable(8,layers=(0,),lambda_corr=.002,lambda_corr_final=.0005,lambda_corr_decay_start=.56)
     assert trainable.lambda_corr(.56)==pytest.approx(.002)
     assert trainable.lambda_corr(1.)==pytest.approx(.0005)
-    loss=trainable.conditioner.for_layer(0).q_proj[2].weight.sum()+trainable.conditioner.for_layer(0).k_proj[2].weight.sum()
+    loss=trainable.conditioner.for_layer(0).q_proj.weight.sum()+trainable.conditioner.for_layer(0).k_proj.weight.sum()
     loss.backward(); diagnostics=trainable.diagnostics()
     assert diagnostics['eq_grad_norm']>0 and diagnostics['ek_grad_norm']>0
-
-def test_global_timestep_noise_level_and_scoped_override_are_exact():
-    from types import SimpleNamespace
-    from long_video.sightline.pipeline import SightlinePipeline
-    runner=SightlinePipeline.__new__(SightlinePipeline)
-    runner.ray_provider=SimpleNamespace(context={'c2w':torch.eye(4).view(1,1,4,4).repeat(3,1,1,1)})
-    runner.helios=SimpleNamespace(scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000)))
-    runner._geometry_timestep_override=None
-    resolved=runner.publish_geometry_noise_for_timestep(torch.tensor([50,500,950]))
-    assert torch.allclose(resolved.flatten(),torch.tensor([50/999,500/999,950/999]))
-    with runner.geometry_timestep_override(torch.tensor([50,500,950])):
-        actual=runner.publish_geometry_noise_for_timestep(runner._geometry_timestep_override)
-        assert torch.allclose(actual.flatten(),torch.tensor([50/999,500/999,950/999]))
-    assert 'geometry_noise_level' not in runner.ray_provider.context and runner._geometry_timestep_override is None
-
-def test_clean_memory_sigma_zero_override_has_zero_geometry_gain():
-    from types import SimpleNamespace
-    from long_video.sightline.pipeline import SightlinePipeline
-    from long_video.sightline.conditioning import geometry_gain
-    runner=SightlinePipeline.__new__(SightlinePipeline)
-    runner.ray_provider=SimpleNamespace(context={'c2w':torch.eye(4).view(1,1,4,4)})
-    runner.helios=SimpleNamespace(scheduler=SimpleNamespace(config=SimpleNamespace(num_train_timesteps=1000)))
-    runner._geometry_timestep_override=None
-    with runner.geometry_timestep_override(0.0):
-        level=runner.publish_geometry_noise_for_timestep(runner._geometry_timestep_override)
-        assert level.item()==0. and geometry_gain(level).item()==0.
-    assert 'geometry_noise_level' not in runner.ray_provider.context
 
 def test_active_fm_wraps_only_transformer_call_and_clean_capture_needs_no_item():
     from contextlib import contextmanager
@@ -1238,7 +1202,7 @@ def test_active_fm_wraps_only_transformer_call_and_clean_capture_needs_no_item()
     scope=Scope(); pipe=SimpleNamespace(transformer=Transformer(),_sightline_pipeline=scope)
     x=torch.zeros(1,2,9,1,1); history={name:(None,None) for name in ('long','mid','short')}
     assert torch.equal(_model_prediction(pipe,x,{'sigmas':torch.tensor(.05),'timesteps':torch.tensor([99])},None,history,0),x)
-    assert [event[0] for event in scope.events]==['enter','exit']
+    assert scope.events==[]
     assert torch.equal(_transformer_forward(pipe,x,torch.tensor([0]),None,history,0),x)
-    assert [event[0] for event in scope.events]==['enter','exit']
+    assert scope.events==[]
     with pytest.raises(ValueError,match='sigmas'):_model_prediction(pipe,x,{'timesteps':torch.tensor([0])},None,history,0)

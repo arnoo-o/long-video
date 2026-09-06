@@ -77,7 +77,7 @@ def main():
         raise RuntimeError('formal inference requires the configured all-layer geometry set; refusing partial Sightline layer installation')
     layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers)))
     set_initialization_seed()
-    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
+    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width); provider=SightlineRayProvider(c2w,K,source_height=padded_h,source_width=padded_w)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
@@ -85,7 +85,7 @@ def main():
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
-        provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision,transformer_source_sha256=source_fingerprint,runtime_patch=runtime_patch)
+        provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision,transformer_source_sha256=source_fingerprint,runtime_patch=runtime_patch,lora_scope=cfg.lora_scope)
         restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle},provenance=provenance)
     else:
         configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
@@ -94,5 +94,5 @@ def main():
     trainable.eval(); conditioner.eval()
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K,boundary_off_from_chunk=a.boundary_off_from_chunk)
-    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'memory_enabled':memory_enabled,'sightline_residual_scale':residual_scale,'near_depth':near_depth,'trajectory_near_depth_normalized':bool(a.trajectory_near_depth_normalized),'geometry_sigma_routing':'shared-v2','boundary_off_from_chunk':a.boundary_off_from_chunk,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
+    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'memory_enabled':memory_enabled,'sightline_residual_scale':residual_scale,'near_depth':near_depth,'trajectory_near_depth_normalized':bool(a.trajectory_near_depth_normalized),'geometry_routing':'none','boundary_off_from_chunk':a.boundary_off_from_chunk,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
 if __name__=='__main__': main()

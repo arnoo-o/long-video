@@ -127,15 +127,15 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
         raise ValueError("invalid curriculum arguments")
     return min(maximum, 1 + step // warmup_steps)
 
-def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_steps: int = 1500):
-    """Sightline-v2 curriculum; step intervals are checkpoint-stable."""
+def curriculum_phase(step: int, *, p1_steps: int = 500, p2_steps: int = 500, p3_steps: int = 1500):
+    """Fixed 2500-step Geometry/V-O-LoRA/Memory curriculum."""
     if not 0 <= int(step) < 2500: raise ValueError("step is outside the configured training schedule")
-    if step < 200:
-        return {"name":"P1a","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(.8,1.)}
     if step < 500:
-        return {"name":"P1b","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
+        return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
+    if step < 700:
+        return {"name":"P2a","max_chunks":1,"lora":True,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
     if step < 1000:
-        return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
+        return {"name":"P2b","max_chunks":2,"lora":True,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
     if step < 1500: chunks=2
     elif step < 1800: chunks=3
     elif step < 2100: chunks=4
@@ -234,8 +234,8 @@ def selected_qk_logits(query, key, query_indices):
 
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16,
-                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56):
-        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers)
+                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, alpha_init=.7):
+        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,alpha_init=alpha_init)
         self.lambda_corr_initial=float(lambda_corr); self.lambda_corr_final=float(lambda_corr_final); self.lambda_corr_decay_start=float(lambda_corr_decay_start)
         if not (0. <= self.lambda_corr_decay_start <= 1.) or min(self.lambda_corr_initial,self.lambda_corr_final) < 0.:
             raise ValueError('invalid correspondence loss schedule')
@@ -268,7 +268,7 @@ class SightlineTrainable(nn.Module):
         return self.lambda_corr_initial+(self.lambda_corr_final-self.lambda_corr_initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
         alpha_q,alpha_k=self.conditioner.alpha_values()
-        alpha_grads={name:0.0 if parameter.grad is None else float(parameter.grad.detach().abs()) for name,parameter in self.conditioner.layers.items() for name,parameter in ((f'{name}.q',parameter.alpha_q),(f'{name}.k',parameter.alpha_k))}
+        alpha_grads={name:0.0 if parameter.grad is None else float(parameter.grad.detach().abs()) for name,parameter in self.conditioner.layers.items() for name,parameter in ((f'{name}.q',parameter.beta_q),(f'{name}.k',parameter.beta_k))}
         qgrads=[parameter.grad for layer in self.conditioner.layers.values() for parameter in layer.q_proj.parameters()]
         kgrads=[parameter.grad for layer in self.conditioner.layers.values() for parameter in layer.k_proj.parameters()]
         qnorm=sum(float(value.norm()) for value in qgrads if value is not None); knorm=sum(float(value.norm()) for value in kgrads if value is not None)
@@ -289,12 +289,12 @@ def set_lora_enabled(transformer: nn.Module, enabled: bool) -> None:
 
 def configure_alpha_zero_baseline(trainable, memory, transformer) -> None:
     """Disable every Sightline modification while retaining native Helios V."""
-    for alpha in trainable.conditioner.alpha_parameters(): alpha.data.zero_()
+    for beta in trainable.conditioner.alpha_parameters(): beta.data.fill_(-30.)
     memory.set_enabled(False)
     set_lora_enabled(transformer,False)
 
 def install_lora(transformer: nn.Module, layers, rank=8):
-    """Wrap only Q/K/V/O of explicitly selected self-attention blocks."""
+    """Wrap only V and output projections; Q/K remain frozen Geometry inputs."""
     if rank not in (8,16): raise ValueError("LoRA rank must be 8 or 16")
     blocks=list(getattr(transformer,"transformer_blocks",None) or getattr(transformer,"blocks",())); installed=[]
     for index in layers:
@@ -307,7 +307,7 @@ def install_lora(transformer: nn.Module, layers, rank=8):
         attn.to_qkv=None
         if getattr(attn,'fused_projections',False):
             raise RuntimeError(f"layer {index} remained fused after unfuse_projections(); LoRA would be bypassed")
-        for name in ("to_q","to_k","to_v"):
+        for name in ("to_v",):
             module=getattr(attn,name,None)
             if not isinstance(module,nn.Linear): raise RuntimeError(f'layer {index} missing unfused {name}')
             if not isinstance(module,LoRALinear): setattr(attn,name,LoRALinear(module,rank))

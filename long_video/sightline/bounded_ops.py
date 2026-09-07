@@ -333,8 +333,9 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
         native_sq = torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
         u_sq = torch.zeros_like(native_sq)
         count = float(tokens * width)
-        # Pass 1: one RMS for the complete token/head/channel axis of each
-        # sample.  The per-token RMSNorm above remains unchanged.
+        # Single heavy pass: compute the projector/RMSNorm/gate once per tile,
+        # accumulate sample-wide statistics, and retain only the BF16 u tile.
+        # The per-token RMSNorm above remains unchanged.
         for start in range(0, tokens, int(token_tile)):
             stop = min(tokens, start + int(token_tile))
             ray = flat_rays[:, start:stop].float()
@@ -349,30 +350,25 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
             u = gate * normalized
             native_sq.add_(xnative.square().sum((1, 2), keepdim=False).unsqueeze(1))
             u_sq.add_(u.square().sum((1, 2), keepdim=False).unsqueeze(1))
+            output[:, start:stop].copy_(u.to(output.dtype))
         native_rms = (native_sq / count + float(eps)).sqrt().detach()
         u_rms = (u_sq / count + float(eps)).sqrt()
-        # Pass 2: use the sample-wide statistics to emit each tile.
+        # Once the statistics are known, scale the retained BF16 u tiles.  No
+        # second projector/RMSNorm/gate pass is needed.
+        sample_scale = rho * native_rms / u_rms
         for start in range(0, tokens, int(token_tile)):
             stop = min(tokens, start + int(token_tile))
-            ray = flat_rays[:, start:stop].float()
-            scale = ray[:, :, 6:7]
-            gate_input = scale if delta is None else scale + delta
-            gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
-            geometric = torch.cat((ray[:, :, 3:6], ray[:, :, :3], scale), -1) if swap else ray
-            projected = F.linear(geometric, proj_weight.float(), proj_bias.float())
-            rstd = (projected.square().mean(-1, keepdim=True) + float(eps)).rsqrt()
-            normalized = projected * rstd * norm_weight.float()
-            u = gate * normalized
-            output[:, start:stop].copy_((rho * native_rms[:, None, :] * u / u_rms[:, None, :]).to(output.dtype))
+            output[:, start:stop].mul_(sample_scale[:, None, :].to(output.dtype))
         ctx.save_for_backward(rays, proj_weight, proj_bias, gate_weight, gate_bias,
-                              norm_weight, beta, scale_delta, native_rms, u_rms)
+                              norm_weight, beta, scale_delta, native_rms, u_rms,
+                              output)
         ctx.eps = float(eps); ctx.swap = bool(swap); ctx.tile = int(token_tile)
         ctx.has_delta = has_delta; ctx.rho_max = float(rho_max); ctx.tokens = int(tokens); ctx.width = int(width)
         return output.reshape_as(native)
 
     @staticmethod
     def backward(ctx, grad_output):
-        rays, proj_weight, proj_bias, gate_weight, gate_bias, norm_weight, beta, scale_delta, native_rms, u_rms = ctx.saved_tensors
+        rays, proj_weight, proj_bias, gate_weight, gate_bias, norm_weight, beta, scale_delta, native_rms, u_rms, saved_delta = ctx.saved_tensors
         batch = rays.shape[0]; tokens = ctx.tokens; width = ctx.width
         flat_rays = rays.reshape(batch, tokens, 7)
         flat_grad = grad_output.reshape(batch, tokens, width).float()
@@ -387,21 +383,10 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
         delta = scale_delta.float() if ctx.has_delta else None
         rho = ctx.rho_max * beta.float().sigmoid()
         rho_deriv = ctx.rho_max * beta.float().sigmoid() * (1 - beta.float().sigmoid())
-        # The derivative of u / RMS(u) couples every token in a sample.  First
-        # accumulate the global dot product, then make the normal bounded tile
-        # pass.  No dense [B,N,D] FP32 activation is retained.
-        global_dot = torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
-        for start in range(0, tokens, ctx.tile):
-            stop = min(tokens, start + ctx.tile)
-            ray = flat_rays[:, start:stop].float(); scale = ray[:, :, 6:7]
-            gate_input = scale if delta is None else scale + delta
-            geometric = torch.cat((ray[:, :, 3:6], ray[:, :, :3], scale), -1) if ctx.swap else ray
-            projected = F.linear(geometric, proj_weight.float(), proj_bias.float())
-            rstd = (projected.square().mean(-1, keepdim=True) + ctx.eps).rsqrt()
-            normalized = projected * rstd * norm_weight.float()
-            gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
-            u = gate * normalized
-            global_dot.add_((flat_grad[:, start:stop] * (rho * native_rms[:, None, :] * u)).sum((1, 2), keepdim=False).unsqueeze(1))
+        # The saved final delta makes the global term cheap; only one heavy
+        # projector/RMSNorm/gate recomputation pass remains.
+        saved_delta = saved_delta.reshape(batch, tokens, width).float()
+        global_dot = (flat_grad * saved_delta).sum((1, 2), keepdim=False).unsqueeze(1)
         for start in range(0, tokens, ctx.tile):
             stop = min(tokens, start + ctx.tile)
             ray = flat_rays[:, start:stop].float(); scale = ray[:, :, 6:7]
@@ -416,8 +401,9 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
             if grad_beta is not None:
                 grad_beta.add_((grad * (native_rms[:, None, :] * ubar)).sum() * rho_deriv)
             grad_u = grad * (rho * native_rms[:, None, :] / u_rms[:, None, :])
-            # d(u/s) = du/s - u (du·u)/(M s^3), M=tokens*width.
-            grad_u.add_(-u * (global_dot[:, None, :] / (float(tokens * width) * u_rms[:, None, :] ** 3)))
+            # d(u/s) = du/s - u (dL·delta)/(M s^2), M=tokens*width.
+            grad_u.add_(-u * (global_dot[:, None, :] /
+                              (float(tokens * width) * u_rms[:, None, :].square())))
             grad_normalized = grad_u * gate
             grad_gate = grad_u * normalized
             weighted = grad_normalized * norm_weight.float()

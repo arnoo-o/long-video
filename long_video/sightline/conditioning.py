@@ -28,17 +28,29 @@ class SightlineConditioner(nn.Module):
     def _ordered_rays(rays,kind): return torch.cat((rays[...,3:6],rays[...,:3],rays[...,6:7]),-1) if kind=='k' else rays
     def rho_values(self):
         return torch.sigmoid(self.beta_q), torch.sigmoid(self.beta_k)
+
+    @staticmethod
+    def native_rms(native, eps=1e-6):
+        if native is None:
+            return None
+        if native.ndim < 2:
+            raise ValueError(f'native Q/K tensor must include token and channel dimensions, got {tuple(native.shape)}')
+        dims=tuple(range(1,native.ndim))
+        return native.float().square().mean(dim=dims, keepdim=False).add(float(eps)).sqrt().detach().reshape(native.shape[0],1)
     # Compatibility accessors for older runner diagnostics.  They intentionally
     # expose the bounded-rho logits, never a second amplitude parameter.
     @property
     def alpha_q(self): return self.beta_q
     @property
     def alpha_k(self): return self.beta_k
-    def project(self,rays,native=None,*,kind:str,training=None,scale_delta=None,detach_rho:bool=False):
+    def project(self,rays,native=None,*,kind:str,training=None,scale_delta=None,native_rms=None,detach_rho:bool=False):
         if rays.shape[-1]!=7 or kind not in ('q','k'): raise ValueError('rays must be 7D and kind must be q or k')
         if native is None: native=rays.new_zeros((*rays.shape[:-1],self.inner_dim))
         projection=self.q_proj if kind=='q' else self.k_proj; norm=self.rms_norm_q if kind=='q' else self.rms_norm_k; beta=self.beta_q if kind=='q' else self.beta_k
-        output=token_blocked_sightline_relative_project(rays,native,projection,self.gate,norm,beta.detach() if detach_rho else beta,kind=kind,scale_delta=scale_delta,token_tile=self.token_tile,eps=1e-6)
+        output=token_blocked_sightline_relative_project(
+            rays,native,projection,self.gate,norm,beta.detach() if detach_rho else beta,
+            kind=kind,scale_delta=scale_delta,native_rms=native_rms,
+            token_tile=self.token_tile,eps=1e-6)
         if self.capture_numeric_diagnostics:
             with torch.no_grad():
                 flat=self._ordered_rays(rays,kind).reshape(-1,7); sample_flat=flat[::max(1,(flat.shape[0]+4095)//4096)].to(projection.weight.dtype)
@@ -52,7 +64,9 @@ class SightlineConditioner(nn.Module):
         if native_q is None: native_q=rays_q.new_zeros((*rays_q.shape[:-1],self.inner_dim))
         if native_k is None: native_k=rays_k.new_zeros((*rays_k.shape[:-1],self.inner_dim))
         if scale_delta is None: scale_delta=self.sample_scale_delta(rays_q,training)
-        return self.project(rays_q,native=native_q,kind='q',training=training,scale_delta=scale_delta,detach_rho=detach_rho),self.project(rays_k,native=native_k,kind='k',training=training,scale_delta=scale_delta,detach_rho=detach_rho)
+        q_rms=self.native_rms(native_q) if native_q is not None else None
+        k_rms=self.native_rms(native_k) if native_k is not None else None
+        return self.project(rays_q,native=native_q,kind='q',training=training,scale_delta=scale_delta,native_rms=q_rms,detach_rho=detach_rho),self.project(rays_k,native=native_k,kind='k',training=training,scale_delta=scale_delta,native_rms=k_rms,detach_rho=detach_rho)
 
 class LayeredSightlineConditioner(nn.Module):
     def __init__(self,inner_dim:int,layers,**kwargs):

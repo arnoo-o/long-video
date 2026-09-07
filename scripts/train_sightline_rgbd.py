@@ -478,12 +478,12 @@ def main():
         gate_params.extend(layer.gate.parameters())
         beta_params.extend((layer.beta_q,layer.beta_k))
     optimizer=torch.optim.AdamW([
-        {'params':projector_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_projector_weight_decay},
-        {'params':rmsnorm_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_rmsnorm_weight_decay},
-        {'params':gate_params,'lr':cfg.geometry_gate_learning_rate,'weight_decay':0.0},
-        {'params':beta_params,'lr':cfg.geometry_beta_learning_rate,'weight_decay':0.0},
-        {'params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01},
-        {'params':memory_params,'lr':cfg.memory_learning_rate,'weight_decay':0.01},
+        {'name':'projector','params':projector_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_projector_weight_decay},
+        {'name':'rmsnorm','params':rmsnorm_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_rmsnorm_weight_decay},
+        {'name':'gate','params':gate_params,'lr':cfg.geometry_gate_learning_rate,'weight_decay':0.0},
+        {'name':'beta','params':beta_params,'lr':cfg.geometry_beta_learning_rate,'weight_decay':0.0},
+        {'name':'lora','params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01},
+        {'name':'memory','params':memory_params,'lr':cfg.memory_learning_rate,'weight_decay':0.01},
     ],weight_decay=0.0)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
@@ -793,6 +793,7 @@ def main():
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
         rho_q,rho_k=trainable.conditioner.rho_values()
+        lr_groups={f"lr_{group.get('name', index)}":float(group['lr']) for index,group in enumerate(optimizer.param_groups)}
         step_seconds=time.perf_counter()-started
         diagnostics={str(layer):dict(processor.last_numeric_diagnostics) for layer,processor in pipe.transformer._sightline_processors.items() if processor.last_numeric_diagnostics is not None} if capture_geometry_diagnostics else {}
         if capture_geometry_diagnostics:
@@ -821,7 +822,7 @@ def main():
             'rho_q':_summary('rho_q'),'rho_k':_summary('rho_k'),
         }
         geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-6,'sightline_residual_scale':1.0}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

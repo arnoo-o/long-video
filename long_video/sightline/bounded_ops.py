@@ -321,7 +321,7 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
     """
     @staticmethod
     def forward(ctx, rays, native, proj_weight, proj_bias, gate_weight, gate_bias,
-                norm_weight, beta, scale_delta, eps, swap, token_tile):
+                norm_weight, beta, scale_delta, native_rms_input, eps, swap, token_tile):
         batch = rays.shape[0]
         tokens = rays.numel() // (batch * 7)
         width = native.shape[-1]
@@ -331,7 +331,7 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
         has_delta = scale_delta.numel() != 0
         delta = scale_delta.float() if has_delta else None
         rho = beta.float().sigmoid()
-        native_sq = torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
+        native_sq = None if native_rms_input.numel() else torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
         count = float(tokens * width)
         # Single bounded pass: compute projector -> RMSNorm -> gate once per
         # tile and retain only the unscaled geometry direction in output.
@@ -347,9 +347,15 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
             rstd = (projected.square().mean(-1, keepdim=True) + float(eps)).rsqrt()
             normalized = projected * rstd * norm_weight.float()
             u = gate * normalized
-            native_sq.add_(xnative.square().sum((1, 2), keepdim=False).unsqueeze(1))
+            if native_sq is not None:
+                native_sq.add_(xnative.square().sum((1, 2), keepdim=False).unsqueeze(1))
             output[:, start:stop].copy_(u.to(output.dtype))
-        native_rms = (native_sq / count + float(eps)).sqrt().detach()
+        if native_rms_input.numel():
+            native_rms = native_rms_input.reshape(batch, -1).mean(dim=1, keepdim=True).float().detach()
+            if native_rms.shape != (batch, 1) or not torch.isfinite(native_rms).all():
+                raise ValueError(f'native_rms_input must be finite [B,1], got {tuple(native_rms.shape)}')
+        else:
+            native_rms = (native_sq / count + float(eps)).sqrt().detach()
         # Apply the true Geometry amplitude.  Gate is intentionally not
         # normalized by a second global RMS, so its magnitude is observable.
         amplitude = rho * native_rms
@@ -423,11 +429,12 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
                 grad_rays[:, start:stop].copy_(ray_grad.to(grad_rays.dtype))
         return (None if grad_rays is None else grad_rays.reshape_as(rays), None,
                 grad_proj, grad_proj_bias, grad_gate_w, grad_gate_b, grad_norm,
-                grad_beta, grad_delta, None, None, None)
+                grad_beta, grad_delta, None, None, None, None)
 
 
 def token_blocked_sightline_relative_project(rays, native, projection, gate, norm, beta, *, kind,
-                                             scale_delta=None, token_tile=DEFAULT_TOKEN_TILE,
+                                             scale_delta=None, native_rms=None,
+                                             token_tile=DEFAULT_TOKEN_TILE,
                                              eps=1e-6):
     if kind not in ('q', 'k'):
         raise ValueError('kind must be q or k')
@@ -435,10 +442,12 @@ def token_blocked_sightline_relative_project(rays, native, projection, gate, nor
         raise ValueError(f'rays/native shape mismatch: {tuple(rays.shape)} vs {tuple(native.shape)}')
     delta = rays.new_empty(0) if scale_delta is None else torch.as_tensor(
         scale_delta, device=rays.device, dtype=rays.dtype)
+    rms = rays.new_empty(0, dtype=torch.float32) if native_rms is None else torch.as_tensor(
+        native_rms, device=rays.device, dtype=torch.float32)
     return _TokenBlockedRelativeSightlineProject.apply(
         rays, native, projection.weight, projection.bias, gate.weight, gate.bias,
         norm.weight,
-        beta, delta, float(eps), kind == 'k', int(token_tile))
+        beta, delta, rms, float(eps), kind == 'k', int(token_tile))
 
 
 class _TokenBlockedSightlineFixedRMSProject(torch.autograd.Function):

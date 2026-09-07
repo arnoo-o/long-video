@@ -236,7 +236,7 @@ class LongTermKVMemory:
         if positions is None:return None
         return self.rope.forward_with_positions(*positions,device=device).flatten(2).transpose(1,2)
 
-    def append_native_attention(self,attn,key,value,rotary_emb,rotary_apply,*,current_chunk,current_global_start,timestamp_embedding=None,sightline_projector=None,scale_delta=None,query_camera_poses=None,native_history_chunk_ids=(),effective_geometry_scale=None,geometry_enabled=True,**kwargs):
+    def append_native_attention(self,attn,key,value,rotary_emb,rotary_apply,*,current_chunk,current_global_start,timestamp_embedding=None,sightline_projector=None,scale_delta=None,query_camera_poses=None,native_history_chunk_ids=(),effective_geometry_scale=None,geometry_enabled=True,native_k_rms=None,**kwargs):
         hidden,rays=self.get(current_global_start,query_camera_poses=query_camera_poses,native_history_chunk_ids=native_history_chunk_ids,device=key.device,dtype=key.dtype)
         if not self.enabled or hidden is None:return key,value,{'memory_tokens':0,'memory_chunk_ids':[]}
         if hidden.shape[0]!=key.shape[0]:
@@ -248,7 +248,9 @@ class LongTermKVMemory:
         mem_k=rotary_apply(mem_k,memory_rotary)
         if sightline_projector is not None and geometry_enabled:
             native_mem_k=mem_k.flatten(2,3)
-            delta=sightline_projector.project(rays.to(hidden),native_mem_k,kind='k',training=sightline_projector.training,scale_delta=scale_delta)
+            delta=sightline_projector.project(
+                rays.to(hidden),native_mem_k,kind='k',training=sightline_projector.training,
+                scale_delta=scale_delta,native_rms=native_k_rms)
             if effective_geometry_scale is None: raise RuntimeError('Memory K requires the current Sightline residual scale')
             mem_k=mem_k+effective_geometry_scale.to(mem_k)*delta.unflatten(-1,(attn.heads,-1))
         if timestamp_embedding is not None:

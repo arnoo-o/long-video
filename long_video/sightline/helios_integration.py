@@ -47,6 +47,7 @@ class SightlineHeliosAttnProcessor:
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
         provider_context=getattr(self.ray_provider,'context',None)
         geometry_enabled=bool(provider_context.get('geometry_enabled',True)) if provider_context is not None else True
+        native_q_rms=None; native_k_rms=None
         if self.conditioner is None or not geometry_enabled:
             scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
         else:
@@ -62,11 +63,16 @@ class SightlineHeliosAttnProcessor:
             scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
             native_q_all=query.flatten(2,3)
             native_k_all=key.flatten(2,3)
+            # Compute one detached RMS per batch sample over the complete
+            # native Q/K sequence for this layer.  All current/history
+            # projections and Memory K reuse these exact values.
+            native_q_rms=SightlineConditioner.native_rms(native_q_all)
+            native_k_rms=SightlineConditioner.native_rms(native_k_all)
             native_q=native_q_all[:,-current_len:]
             native_k=native_k_all[:,-current_len:]
             try:
-                dq=self.conditioner.project(conditioned_q,native_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
-                dk=self.conditioner.project(conditioned_k,native_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
+                dq=self.conditioner.project(conditioned_q,native_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta,native_rms=native_q_rms)
+                dk=self.conditioner.project(conditioned_k,native_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta,native_rms=native_k_rms)
             except TypeError as exc:
                 # Lightweight test doubles from the native-equivalence suite
                 # still expose the pre-relative one-argument API.
@@ -74,8 +80,8 @@ class SightlineHeliosAttnProcessor:
                 dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
                 dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
             if history_len:
-                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta,native=native_q_all[:,:history_len])
-                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta,native=native_k_all[:,:history_len])
+                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta,native=native_q_all[:,:history_len],native_rms=native_q_rms)
+                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta,native=native_k_all[:,:history_len],native_rms=native_k_rms)
                 if pooled_q.shape[1]!=history_len or pooled_k.shape[1]!=history_len: raise RuntimeError('pooled history ray embedding count differs from Helios history tokens')
                 dq=torch.cat((pooled_q.to(dq),dq[:,-current_len:]),1)
                 dk=torch.cat((pooled_k.to(dk),dk[:,-current_len:]),1)
@@ -166,6 +172,7 @@ class SightlineHeliosAttnProcessor:
                 native_history_chunk_ids=native_chunks,
                 effective_geometry_scale=effective_scale,
                 geometry_enabled=geometry_enabled,
+                native_k_rms=native_k_rms,
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:
@@ -255,7 +262,7 @@ class SightlineRayProvider:
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
 
-    def project_history(self,conditioner,*,kind,scale_delta,native=None):
+    def project_history(self,conditioner,*,kind,scale_delta,native=None,native_rms=None):
         """Project each real camera ray first, then pool temporal embeddings."""
         context=self.context; groups=context.get('history_groups'); shapes=context.get('history_token_shapes')
         if groups is None or not shapes: raise RuntimeError('history camera footprints are unavailable')
@@ -274,14 +281,14 @@ class SightlineRayProvider:
                 raise RuntimeError(f'{name} native history shape mismatch: {native_group.shape[1]} != {count}')
             rays_t=rays.to(next(conditioner.parameters()).dtype)
             if native_group is None:
-                projected=conditioner.project(rays_t,kind=kind,training=conditioner.training,scale_delta=scale_delta)
+                projected=conditioner.project(rays_t,kind=kind,training=conditioner.training,scale_delta=scale_delta,native_rms=native_rms)
             else:
                 bsz=native_group.shape[0]; width_native=native_group.shape[-1]
                 native_grid=native_group.reshape(bsz,out_t,height,width,width_native)
                 # Repeat each pooled temporal plane over the real camera
                 # footprint before applying the per-token native RMS.
                 native_grid=native_grid.unsqueeze(2).expand(-1,-1,factor,-1,-1,-1).reshape(bsz,out_t*factor,height,width,width_native)
-                projected=conditioner.project(rays_t,native_grid,kind=kind,training=conditioner.training,scale_delta=scale_delta)
+                projected=conditioner.project(rays_t,native_grid,kind=kind,training=conditioner.training,scale_delta=scale_delta,native_rms=native_rms)
             offset += count
             # Never average poses or raw Plücker rays: only projected embeddings.
             projected=projected.reshape(projected.shape[0],out_t,factor,height,width,-1).mean(2)

@@ -321,39 +321,61 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
     @staticmethod
     def forward(ctx, rays, native, proj_weight, proj_bias, gate_weight, gate_bias,
                 norm_weight, beta, scale_delta, eps, swap, token_tile, rho_max):
-        flat_rays = rays.reshape(-1, 7)
-        flat_native = native.reshape(-1, native.shape[-1])
+        batch = rays.shape[0]
+        tokens = rays.numel() // (batch * 7)
+        width = native.shape[-1]
+        flat_rays = rays.reshape(batch, tokens, 7)
+        flat_native = native.reshape(batch, tokens, width)
         output = torch.empty_like(flat_native)
         has_delta = scale_delta.numel() != 0
         delta = scale_delta.float() if has_delta else None
         rho = float(rho_max) * beta.float().sigmoid()
-        for start in range(0, flat_rays.shape[0], int(token_tile)):
-            stop = min(flat_rays.shape[0], start + int(token_tile))
-            ray = flat_rays[start:stop].float()
-            xnative = flat_native[start:stop].float()
-            scale = ray[:, 6:7]
+        native_sq = torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
+        u_sq = torch.zeros_like(native_sq)
+        count = float(tokens * width)
+        # Pass 1: one RMS for the complete token/head/channel axis of each
+        # sample.  The per-token RMSNorm above remains unchanged.
+        for start in range(0, tokens, int(token_tile)):
+            stop = min(tokens, start + int(token_tile))
+            ray = flat_rays[:, start:stop].float()
+            xnative = flat_native[:, start:stop].float()
+            scale = ray[:, :, 6:7]
             gate_input = scale if delta is None else scale + delta
             gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
-            geometric = torch.cat((ray[:, 3:6], ray[:, :3], scale), -1) if swap else ray
+            geometric = torch.cat((ray[:, :, 3:6], ray[:, :, :3], scale), -1) if swap else ray
             projected = F.linear(geometric, proj_weight.float(), proj_bias.float())
             rstd = (projected.square().mean(-1, keepdim=True) + float(eps)).rsqrt()
             normalized = projected * rstd * norm_weight.float()
             u = gate * normalized
-            u_rms = (u.square().mean(-1, keepdim=True) + float(eps)).sqrt()
-            native_rms = (xnative.square().mean(-1, keepdim=True) + float(eps)).sqrt()
-            output[start:stop].copy_((rho * native_rms * (u / u_rms)).to(output.dtype))
-        ctx.save_for_backward(rays, native, proj_weight, proj_bias, gate_weight,
-                              gate_bias, norm_weight, beta, scale_delta)
+            native_sq.add_(xnative.square().sum((1, 2), keepdim=False).unsqueeze(1))
+            u_sq.add_(u.square().sum((1, 2), keepdim=False).unsqueeze(1))
+        native_rms = (native_sq / count + float(eps)).sqrt().detach()
+        u_rms = (u_sq / count + float(eps)).sqrt()
+        # Pass 2: use the sample-wide statistics to emit each tile.
+        for start in range(0, tokens, int(token_tile)):
+            stop = min(tokens, start + int(token_tile))
+            ray = flat_rays[:, start:stop].float()
+            scale = ray[:, :, 6:7]
+            gate_input = scale if delta is None else scale + delta
+            gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
+            geometric = torch.cat((ray[:, :, 3:6], ray[:, :, :3], scale), -1) if swap else ray
+            projected = F.linear(geometric, proj_weight.float(), proj_bias.float())
+            rstd = (projected.square().mean(-1, keepdim=True) + float(eps)).rsqrt()
+            normalized = projected * rstd * norm_weight.float()
+            u = gate * normalized
+            output[:, start:stop].copy_((rho * native_rms[:, None, :] * u / u_rms[:, None, :]).to(output.dtype))
+        ctx.save_for_backward(rays, proj_weight, proj_bias, gate_weight, gate_bias,
+                              norm_weight, beta, scale_delta, native_rms, u_rms)
         ctx.eps = float(eps); ctx.swap = bool(swap); ctx.tile = int(token_tile)
-        ctx.has_delta = has_delta; ctx.rho_max = float(rho_max)
+        ctx.has_delta = has_delta; ctx.rho_max = float(rho_max); ctx.tokens = int(tokens); ctx.width = int(width)
         return output.reshape_as(native)
 
     @staticmethod
     def backward(ctx, grad_output):
-        rays, native, proj_weight, proj_bias, gate_weight, gate_bias, norm_weight, beta, scale_delta = ctx.saved_tensors
-        flat_rays = rays.reshape(-1, 7)
-        flat_native = native.reshape(-1, native.shape[-1])
-        flat_grad = grad_output.reshape(-1, grad_output.shape[-1])
+        rays, proj_weight, proj_bias, gate_weight, gate_bias, norm_weight, beta, scale_delta, native_rms, u_rms = ctx.saved_tensors
+        batch = rays.shape[0]; tokens = ctx.tokens; width = ctx.width
+        flat_rays = rays.reshape(batch, tokens, 7)
+        flat_grad = grad_output.reshape(batch, tokens, width).float()
         grad_rays = torch.empty_like(flat_rays) if ctx.needs_input_grad[0] else None
         grad_proj = torch.zeros_like(proj_weight) if ctx.needs_input_grad[2] else None
         grad_proj_bias = torch.zeros_like(proj_bias) if ctx.needs_input_grad[3] else None
@@ -365,55 +387,66 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
         delta = scale_delta.float() if ctx.has_delta else None
         rho = ctx.rho_max * beta.float().sigmoid()
         rho_deriv = ctx.rho_max * beta.float().sigmoid() * (1 - beta.float().sigmoid())
-        for start in range(0, flat_rays.shape[0], ctx.tile):
-            stop = min(flat_rays.shape[0], start + ctx.tile)
-            ray = flat_rays[start:stop].float(); xnative = flat_native[start:stop].float()
-            scale = ray[:, 6:7]; gate_input = scale if delta is None else scale + delta
-            geometric = torch.cat((ray[:, 3:6], ray[:, :3], scale), -1) if ctx.swap else ray
+        # The derivative of u / RMS(u) couples every token in a sample.  First
+        # accumulate the global dot product, then make the normal bounded tile
+        # pass.  No dense [B,N,D] FP32 activation is retained.
+        global_dot = torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
+        for start in range(0, tokens, ctx.tile):
+            stop = min(tokens, start + ctx.tile)
+            ray = flat_rays[:, start:stop].float(); scale = ray[:, :, 6:7]
+            gate_input = scale if delta is None else scale + delta
+            geometric = torch.cat((ray[:, :, 3:6], ray[:, :, :3], scale), -1) if ctx.swap else ray
             projected = F.linear(geometric, proj_weight.float(), proj_bias.float())
             rstd = (projected.square().mean(-1, keepdim=True) + ctx.eps).rsqrt()
             normalized = projected * rstd * norm_weight.float()
             gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
             u = gate * normalized
-            u_rms = (u.square().mean(-1, keepdim=True) + ctx.eps).sqrt()
-            native_rms = (xnative.square().mean(-1, keepdim=True) + ctx.eps).sqrt()
-            grad = flat_grad[start:stop].float()
-            ubar = u / u_rms
+            global_dot.add_((flat_grad[:, start:stop] * (rho * native_rms[:, None, :] * u)).sum((1, 2), keepdim=False).unsqueeze(1))
+        for start in range(0, tokens, ctx.tile):
+            stop = min(tokens, start + ctx.tile)
+            ray = flat_rays[:, start:stop].float(); scale = ray[:, :, 6:7]
+            gate_input = scale if delta is None else scale + delta
+            geometric = torch.cat((ray[:, :, 3:6], ray[:, :, :3], scale), -1) if ctx.swap else ray
+            projected = F.linear(geometric, proj_weight.float(), proj_bias.float())
+            rstd = (projected.square().mean(-1, keepdim=True) + ctx.eps).rsqrt()
+            normalized = projected * rstd * norm_weight.float()
+            gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
+            u = gate * normalized; grad = flat_grad[:, start:stop]
+            ubar = u / u_rms[:, None, :]
             if grad_beta is not None:
-                grad_beta.add_((grad * (native_rms * ubar)).sum() * rho_deriv)
-            grad_u = grad * (rho * native_rms / u_rms)
-            # d(u/s) = du/s - u (du·u)/(D s^3)
-            grad_u.add_(-u * ((grad * (rho * native_rms) * u).sum(-1, keepdim=True) /
-                              (u_rms.square() * u_rms * u.shape[-1])))
+                grad_beta.add_((grad * (native_rms[:, None, :] * ubar)).sum() * rho_deriv)
+            grad_u = grad * (rho * native_rms[:, None, :] / u_rms[:, None, :])
+            # d(u/s) = du/s - u (du·u)/(M s^3), M=tokens*width.
+            grad_u.add_(-u * (global_dot[:, None, :] / (float(tokens * width) * u_rms[:, None, :] ** 3)))
             grad_normalized = grad_u * gate
             grad_gate = grad_u * normalized
             weighted = grad_normalized * norm_weight.float()
             grad_projected = rstd * (weighted - projected * rstd.square() *
                                      (weighted * projected).mean(-1, keepdim=True))
             if grad_norm is not None:
-                grad_norm.add_((grad_normalized * projected * rstd).sum(0).to(grad_norm.dtype))
+                grad_norm.add_((grad_normalized * projected * rstd).sum((0, 1)).to(grad_norm.dtype))
             if grad_proj is not None:
-                grad_proj.add_((grad_projected.transpose(0, 1) @ geometric).to(grad_proj.dtype))
+                grad_proj.add_(torch.einsum('bld,blf->df', grad_projected, geometric).to(grad_proj.dtype))
             if grad_proj_bias is not None:
-                grad_proj_bias.add_(grad_projected.sum(0).to(grad_proj_bias.dtype))
+                grad_proj_bias.add_(grad_projected.sum((0, 1)).to(grad_proj_bias.dtype))
             grad_geometric = grad_projected @ proj_weight.float()
             grad_gate_logits = grad_gate * gate * (1 - gate)
             if grad_gate_w is not None:
-                grad_gate_w.add_((grad_gate_logits.transpose(0, 1) @ gate_input).to(grad_gate_w.dtype))
+                grad_gate_w.add_(torch.einsum('bld,blf->df', grad_gate_logits, gate_input).to(grad_gate_w.dtype))
             if grad_gate_b is not None:
-                grad_gate_b.add_(grad_gate_logits.sum(0).to(grad_gate_b.dtype))
+                grad_gate_b.add_(grad_gate_logits.sum((0, 1)).to(grad_gate_b.dtype))
             grad_scale_gate = grad_gate_logits @ gate_weight.float()
             if grad_delta is not None:
                 grad_delta.add_(grad_scale_gate.sum_to_size(scale_delta.shape).to(grad_delta.dtype))
             if grad_rays is not None:
                 ray_grad = torch.zeros_like(ray)
                 if ctx.swap:
-                    ray_grad[:, :3] = grad_geometric[:, 3:6]
-                    ray_grad[:, 3:6] = grad_geometric[:, :3]
+                    ray_grad[:, :, :3] = grad_geometric[:, :, 3:6]
+                    ray_grad[:, :, 3:6] = grad_geometric[:, :, :3]
                 else:
-                    ray_grad[:, :6] = grad_geometric[:, :6]
-                ray_grad[:, 6:7] = grad_geometric[:, 6:7] + grad_scale_gate
-                grad_rays[start:stop].copy_(ray_grad.to(grad_rays.dtype))
+                    ray_grad[:, :, :6] = grad_geometric[:, :, :6]
+                ray_grad[:, :, 6:7] = grad_geometric[:, :, 6:7] + grad_scale_gate
+                grad_rays[:, start:stop].copy_(ray_grad.to(grad_rays.dtype))
         return (None if grad_rays is None else grad_rays.reshape_as(rays), None,
                 grad_proj, grad_proj_bias, grad_gate_w, grad_gate_b, grad_norm,
                 grad_beta, grad_delta, None, None, None, None)

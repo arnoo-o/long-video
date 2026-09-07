@@ -7,9 +7,13 @@ from long_video.training.sightline import curriculum_phase, install_lora, LoRALi
 
 def _dense(c,rays,native,kind):
     proj=c.q_proj if kind=='q' else c.k_proj; norm=c.rms_norm_q if kind=='q' else c.rms_norm_k; beta=c.beta_q if kind=='q' else c.beta_k
-    flat=c._ordered_rays(rays,kind).reshape(-1,7); raw=F.linear(flat,proj.weight,proj.bias); u=c.gate(flat[:,6:7]).sigmoid()*norm(raw)
-    rho=.4*beta.sigmoid(); urms=(u.square().mean(-1,keepdim=True)+1e-6).sqrt(); nrms=(native.reshape(-1,native.shape[-1]).detach().square().mean(-1,keepdim=True)+1e-6).sqrt()
-    return (rho*nrms*u/urms).reshape(*rays.shape[:-1],c.inner_dim)
+    ordered=c._ordered_rays(rays,kind); flat=ordered.reshape(-1,7); raw=F.linear(flat,proj.weight,proj.bias)
+    u=(c.gate(flat[:,6:7]).sigmoid()*norm(raw)).reshape(*rays.shape[:-1],c.inner_dim)
+    rho=.4*beta.sigmoid()
+    reduce_dims=tuple(range(1,u.ndim))
+    urms=(u.float().square().mean(dim=reduce_dims,keepdim=True)+1e-6).sqrt()
+    nrms=(native.detach().float().square().mean(dim=tuple(range(1,native.ndim)),keepdim=True)+1e-6).sqrt()
+    return (rho*nrms*u/urms).to(native.dtype)
 
 def test_zero_initialized_geometry_and_affine_rms_contract():
     c=SightlineConditioner(8,rho_init=.2); rays=torch.randn(2,5,7); native=torch.randn(2,5,8)
@@ -44,3 +48,26 @@ def test_curriculum_boundaries():
     assert curriculum_phase(299)['max_chunks']==1 and curriculum_phase(300)['max_chunks']==2
     assert not curriculum_phase(399)['lora'] and curriculum_phase(400)['lora']
     assert curriculum_phase(999)['name']=='P2' and curriculum_phase(1000)['name']=='P3'
+
+def test_relative_rms_is_sample_wide_and_batch_independent():
+    torch.manual_seed(17)
+    c=SightlineConditioner(8); c.q_proj.weight.data.normal_(); c.q_proj.bias.data.normal_()
+    c.gate.weight.data.normal_(); c.gate.bias.data.normal_(); c.rms_norm_q.weight.data.uniform_(.5,1.5)
+    rays=torch.randn(2,7,7); native=torch.randn(2,7,8)
+    baseline=c.project(rays,native,kind='q')
+    changed_native=native.clone(); changed_native[0,0].mul_(7.0)
+    changed=c.project(rays,changed_native,kind='q')
+    # Changing one token's native scale changes the single sample-wide scale,
+    # hence every token in that sample, but never the other batch element.
+    assert torch.all((baseline[0,1:]-changed[0,1:]).abs().sum(-1)>0)
+    assert torch.allclose(baseline[1],changed[1])
+    single=c.project(rays[:1],native[:1],kind='q')
+    assert torch.allclose(single,baseline[:1],atol=2e-6,rtol=2e-6)
+
+def test_relative_native_rms_scale_is_detached():
+    torch.manual_seed(19)
+    c=SightlineConditioner(8); c.q_proj.weight.data.normal_(); c.gate.weight.data.normal_()
+    rays=torch.randn(2,9,7,requires_grad=True); native=torch.randn(2,9,8,requires_grad=True)
+    c.project(rays,native,kind='q').square().mean().backward()
+    assert native.grad is None
+    assert rays.grad is not None and torch.isfinite(rays.grad).all()

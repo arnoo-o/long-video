@@ -234,7 +234,7 @@ def selected_qk_logits(query, key, query_indices):
 
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16,
-                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, rho_init=.2):
+                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, rho_init=.6):
         super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,rho_init=rho_init)
         self.lambda_corr_initial=float(lambda_corr); self.lambda_corr_final=float(lambda_corr_final); self.lambda_corr_decay_start=float(lambda_corr_decay_start)
         if not (0. <= self.lambda_corr_decay_start <= 1.) or min(self.lambda_corr_initial,self.lambda_corr_final) < 0.:

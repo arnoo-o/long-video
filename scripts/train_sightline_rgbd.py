@@ -467,8 +467,24 @@ def main():
     initialization_hash=broadcast_and_assert_trainables(trainable,runner.memory,pipe.transformer,world_size)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     memory_params=list(runner.memory.parameters())
-    geometry_params=list(trainable.conditioner.geometry_parameters())
-    optimizer=torch.optim.AdamW([{'params':geometry_params,'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.memory_learning_rate}],weight_decay=.01)
+    # Keep Geometry optimization semantics explicit: projector matrices/biases
+    # use decoupled weight decay, while RMSNorm affine, gate, and rho logits
+    # each have their own no-decay/learning-rate policy.  Do not collapse these
+    # into one Geometry group, since their scales and regularization differ.
+    projector_params=[]; rmsnorm_params=[]; gate_params=[]; beta_params=[]
+    for layer in trainable.conditioner.layers.values():
+        projector_params.extend(layer.q_proj.parameters()); projector_params.extend(layer.k_proj.parameters())
+        rmsnorm_params.extend(layer.rms_norm_q.parameters()); rmsnorm_params.extend(layer.rms_norm_k.parameters())
+        gate_params.extend(layer.gate.parameters())
+        beta_params.extend((layer.beta_q,layer.beta_k))
+    optimizer=torch.optim.AdamW([
+        {'params':projector_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_projector_weight_decay},
+        {'params':rmsnorm_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_rmsnorm_weight_decay},
+        {'params':gate_params,'lr':cfg.geometry_gate_learning_rate,'weight_decay':0.0},
+        {'params':beta_params,'lr':cfg.geometry_beta_learning_rate,'weight_decay':0.0},
+        {'params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01},
+        {'params':memory_params,'lr':cfg.memory_learning_rate,'weight_decay':0.01},
+    ],weight_decay=0.0)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
     prompt_embeds,_=_prompt(pipe,args.prompt,device)

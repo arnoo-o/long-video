@@ -2,7 +2,7 @@ ray_epsilon: 1.0e-6
 scale_augmentation_probability: 0.3
 scale_augmentation_range: [-1.2, 1.6]
 sightline_enabled: true
-rho_init: 0.2
+rho_init: 0.6
 history_sizes: [16, 2, 1]
 chunk_length: 33
 chunk_stride: 32
@@ -20,6 +20,10 @@ lambda_corr: 0.002
 lambda_corr_final: 0.0005
 lambda_corr_decay_start: 0.56
 learning_rate: 0.0001
+geometry_projector_weight_decay: 0.01
+geometry_rmsnorm_weight_decay: 0.0
+geometry_gate_learning_rate: 0.0003
+geometry_beta_learning_rate: 0.0003
 lora_learning_rate: 0.00003
 memory_learning_rate: 0.00001
 warmup_ratio: 0.04
@@ -43,9 +47,9 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v5-native-relative-bounded-qkvo-lora
+sightline_training_semantics_version: sightline-v6-native-rms-gated-rho-qkvo-lora
 sightline_correspondence_schema_version: sightline-correspondence-v8-rho-detached
-sightline_checkpoint_schema_version: sightline-checkpoint-v16
+sightline_checkpoint_schema_version: sightline-checkpoint-v17
 p1_steps: 400
 p2_steps: 600
 p3_steps: 1500

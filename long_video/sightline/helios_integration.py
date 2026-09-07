@@ -100,8 +100,8 @@ class SightlineHeliosAttnProcessor:
             def grad_rms(parameter): return None if parameter.grad is None else float(parameter.grad.detach().float().square().mean().sqrt().cpu())
             raw_q,raw_k=ratio(dq,query),ratio(dk,key)
             effective_q,effective_k=ratio(effective_scale*dq,query),ratio(effective_scale*dk,key)
-            if geometry_enabled and (raw_q > 0.400001 or raw_k > 0.400001 or effective_q > 0.400001 or effective_k > 0.400001):
-                raise RuntimeError(f'bounded native-relative Geometry ratio exceeded 0.4: q={raw_q}/{effective_q}, k={raw_k}/{effective_k}')
+            if geometry_enabled and not all(torch.isfinite(torch.as_tensor(v, device=query.device)) for v in (raw_q, raw_k, effective_q, effective_k)):
+                raise RuntimeError(f'native-relative Geometry residual ratio is non-finite: q={raw_q}/{effective_q}, k={raw_k}/{effective_k}')
             if geometry_enabled and float(residual_scale.detach()) == 1.0 and (abs(raw_q-effective_q)>1e-7 or abs(raw_k-effective_k)>1e-7):
                 raise RuntimeError('Geometry raw/effective residual ratios diverged at residual_scale=1')
             rho_q,rho_k=self.conditioner.rho_values()

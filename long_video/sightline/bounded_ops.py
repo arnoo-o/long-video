@@ -311,16 +311,17 @@ def token_blocked_sightline_project(rays, projection, gate, norm, alpha, *, kind
 
 
 class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
-    """Native-relative bounded residual.
+    """Native-relative residual with sample-wide detached native RMS.
 
-    The native Q/K RMS is deliberately detached.  All geometry arithmetic is
-    performed per token tile in FP32 and the returned residual is written in
-    the ray/native dtype, so the native attention path never receives a
-    gradient through its scale normalization.
+    Each tile computes only ``gate * RMSNorm(project(ray))``.  The native
+    Q/K RMS is accumulated per batch sample across all token/channel values,
+    detached, and then applied as the residual amplitude.  No global RMS of
+    the geometry vector is used: gate amplitude therefore directly controls
+    the residual as specified by the Geometry contract.
     """
     @staticmethod
     def forward(ctx, rays, native, proj_weight, proj_bias, gate_weight, gate_bias,
-                norm_weight, beta, scale_delta, eps, swap, token_tile, rho_max):
+                norm_weight, beta, scale_delta, eps, swap, token_tile):
         batch = rays.shape[0]
         tokens = rays.numel() // (batch * 7)
         width = native.shape[-1]
@@ -329,13 +330,11 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
         output = torch.empty_like(flat_native)
         has_delta = scale_delta.numel() != 0
         delta = scale_delta.float() if has_delta else None
-        rho = float(rho_max) * beta.float().sigmoid()
+        rho = beta.float().sigmoid()
         native_sq = torch.zeros((batch, 1), device=rays.device, dtype=torch.float32)
-        u_sq = torch.zeros_like(native_sq)
         count = float(tokens * width)
-        # Single heavy pass: compute the projector/RMSNorm/gate once per tile,
-        # accumulate sample-wide statistics, and retain only the BF16 u tile.
-        # The per-token RMSNorm above remains unchanged.
+        # Single bounded pass: compute projector -> RMSNorm -> gate once per
+        # tile and retain only the unscaled geometry direction in output.
         for start in range(0, tokens, int(token_tile)):
             stop = min(tokens, start + int(token_tile))
             ray = flat_rays[:, start:stop].float()
@@ -349,26 +348,23 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
             normalized = projected * rstd * norm_weight.float()
             u = gate * normalized
             native_sq.add_(xnative.square().sum((1, 2), keepdim=False).unsqueeze(1))
-            u_sq.add_(u.square().sum((1, 2), keepdim=False).unsqueeze(1))
             output[:, start:stop].copy_(u.to(output.dtype))
         native_rms = (native_sq / count + float(eps)).sqrt().detach()
-        u_rms = (u_sq / count + float(eps)).sqrt()
-        # Once the statistics are known, scale the retained BF16 u tiles.  No
-        # second projector/RMSNorm/gate pass is needed.
-        sample_scale = rho * native_rms / u_rms
+        # Apply the true Geometry amplitude.  Gate is intentionally not
+        # normalized by a second global RMS, so its magnitude is observable.
+        amplitude = rho * native_rms
         for start in range(0, tokens, int(token_tile)):
             stop = min(tokens, start + int(token_tile))
-            output[:, start:stop].mul_(sample_scale[:, None, :].to(output.dtype))
+            output[:, start:stop].mul_(amplitude[:, None, :].to(output.dtype))
         ctx.save_for_backward(rays, proj_weight, proj_bias, gate_weight, gate_bias,
-                              norm_weight, beta, scale_delta, native_rms, u_rms,
-                              output)
+                              norm_weight, beta, scale_delta, native_rms)
         ctx.eps = float(eps); ctx.swap = bool(swap); ctx.tile = int(token_tile)
-        ctx.has_delta = has_delta; ctx.rho_max = float(rho_max); ctx.tokens = int(tokens); ctx.width = int(width)
+        ctx.has_delta = has_delta; ctx.tokens = int(tokens); ctx.width = int(width)
         return output.reshape_as(native)
 
     @staticmethod
     def backward(ctx, grad_output):
-        rays, proj_weight, proj_bias, gate_weight, gate_bias, norm_weight, beta, scale_delta, native_rms, u_rms, saved_delta = ctx.saved_tensors
+        rays, proj_weight, proj_bias, gate_weight, gate_bias, norm_weight, beta, scale_delta, native_rms = ctx.saved_tensors
         batch = rays.shape[0]; tokens = ctx.tokens; width = ctx.width
         flat_rays = rays.reshape(batch, tokens, 7)
         flat_grad = grad_output.reshape(batch, tokens, width).float()
@@ -381,12 +377,8 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
         grad_beta = torch.zeros_like(beta) if ctx.needs_input_grad[7] else None
         grad_delta = torch.zeros_like(scale_delta) if ctx.has_delta and ctx.needs_input_grad[8] else None
         delta = scale_delta.float() if ctx.has_delta else None
-        rho = ctx.rho_max * beta.float().sigmoid()
-        rho_deriv = ctx.rho_max * beta.float().sigmoid() * (1 - beta.float().sigmoid())
-        # The saved final delta makes the global term cheap; only one heavy
-        # projector/RMSNorm/gate recomputation pass remains.
-        saved_delta = saved_delta.reshape(batch, tokens, width).float()
-        global_dot = (flat_grad * saved_delta).sum((1, 2), keepdim=False).unsqueeze(1)
+        rho = beta.float().sigmoid()
+        rho_deriv = rho * (1 - rho)
         for start in range(0, tokens, ctx.tile):
             stop = min(tokens, start + ctx.tile)
             ray = flat_rays[:, start:stop].float(); scale = ray[:, :, 6:7]
@@ -397,13 +389,9 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
             normalized = projected * rstd * norm_weight.float()
             gate = F.linear(gate_input, gate_weight.float(), gate_bias.float()).sigmoid()
             u = gate * normalized; grad = flat_grad[:, start:stop]
-            ubar = u / u_rms[:, None, :]
             if grad_beta is not None:
-                grad_beta.add_((grad * (native_rms[:, None, :] * ubar)).sum() * rho_deriv)
-            grad_u = grad * (rho * native_rms[:, None, :] / u_rms[:, None, :])
-            # d(u/s) = du/s - u (dL·delta)/(M s^2), M=tokens*width.
-            grad_u.add_(-u * (global_dot[:, None, :] /
-                              (float(tokens * width) * u_rms[:, None, :].square())))
+                grad_beta.add_((grad * (native_rms[:, None, :] * u)).sum() * rho_deriv)
+            grad_u = grad * (rho * native_rms[:, None, :])
             grad_normalized = grad_u * gate
             grad_gate = grad_u * normalized
             weighted = grad_normalized * norm_weight.float()
@@ -435,12 +423,12 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
                 grad_rays[:, start:stop].copy_(ray_grad.to(grad_rays.dtype))
         return (None if grad_rays is None else grad_rays.reshape_as(rays), None,
                 grad_proj, grad_proj_bias, grad_gate_w, grad_gate_b, grad_norm,
-                grad_beta, grad_delta, None, None, None, None)
+                grad_beta, grad_delta, None, None, None)
 
 
 def token_blocked_sightline_relative_project(rays, native, projection, gate, norm, beta, *, kind,
                                              scale_delta=None, token_tile=DEFAULT_TOKEN_TILE,
-                                             eps=1e-6, rho_max=0.4):
+                                             eps=1e-6):
     if kind not in ('q', 'k'):
         raise ValueError('kind must be q or k')
     if rays.shape[:-1] != native.shape[:-1]:
@@ -450,7 +438,7 @@ def token_blocked_sightline_relative_project(rays, native, projection, gate, nor
     return _TokenBlockedRelativeSightlineProject.apply(
         rays, native, projection.weight, projection.bias, gate.weight, gate.bias,
         norm.weight,
-        beta, delta, float(eps), kind == 'k', int(token_tile), float(rho_max))
+        beta, delta, float(eps), kind == 'k', int(token_tile))
 
 
 class _TokenBlockedSightlineFixedRMSProject(torch.autograd.Function):

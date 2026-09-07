@@ -456,7 +456,7 @@ def main():
     set_initialization_seed()
     trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
-        lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init,geometry_rms_epsilon=cfg.geometry_rms_epsilon).to(device,dtype=torch.float32)
+        lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
@@ -467,8 +467,8 @@ def main():
     initialization_hash=broadcast_and_assert_trainables(trainable,runner.memory,pipe.transformer,world_size)
     lora_params=[p for n,p in pipe.transformer.named_parameters() if 'lora_' in n]
     memory_params=list(runner.memory.parameters())
-    geometry_params=list(trainable.conditioner.geometry_parameters()); beta_params=list(trainable.conditioner.alpha_parameters())
-    optimizer=torch.optim.AdamW([{'params':geometry_params,'lr':cfg.learning_rate},{'params':beta_params,'lr':cfg.beta_learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.memory_learning_rate}],weight_decay=.01)
+    geometry_params=list(trainable.conditioner.geometry_parameters())
+    optimizer=torch.optim.AdamW([{'params':geometry_params,'lr':cfg.learning_rate},{'params':lora_params,'lr':cfg.lora_learning_rate},{'params':memory_params,'lr':cfg.memory_learning_rate}],weight_decay=.01)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
     prompt_embeds,_=_prompt(pipe,args.prompt,device)
@@ -534,7 +534,7 @@ def main():
         latent_root=args.latent_cache_root or cfg.latent_cache_path or None
         latent_path=resolve_continuous_latent_cache(record,cache_root=latent_root); latent_schema,_=validate_latent_cache(latent_path)
         validate_rgbd_record_latent(record,latent_path)
-        if phase['name'] in ('P1','P2a','P2b'):
+        if phase['name'] in ('P1','P2'):
             if record.frame_count!=97 or record.chunk_count!=3 or latent_schema!='continuous_25': raise ValueError(f'{record.record_id}: P1/P2 requires a unit-owned 97-frame continuous_25 cache')
         if args.train and latent_schema=='overlap_chunks_6x9': require_overlap_validation(latent_path,expected_provenance=str(provenance['model_identity']))
         all_latents=load_latent_tensor(latent_path)
@@ -759,12 +759,12 @@ def main():
         finally:
             pass
         if args.probe_capture:
-            probe_payload['alpha_grad']={name:0.0 if beta.grad is None else float(beta.grad.detach().abs()) for name,beta in ((f'{index}.q',layer.beta_q) for index,layer in trainable.conditioner.layers.items())}
+            probe_payload['alpha_grad']={name:0.0 if alpha.grad is None else float(alpha.grad.detach().abs()) for name,alpha in ((f'{index}.q',layer.alpha_q) for index,layer in trainable.conditioner.layers.items())}
         if args.train:
             active_phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
             alpha_grads=[alpha.grad for alpha in trainable.conditioner.alpha_parameters()]
             if active_phase['name']=='P1' and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
-            if active_phase['name'] in ('P2a','P2b'):
+            if active_phase['name']=='P2':
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
@@ -786,9 +786,12 @@ def main():
                 diagnostic.update({
                     'q_projector_weight_rms':_parameter_rms(conditioner.q_proj.weight),'k_projector_weight_rms':_parameter_rms(conditioner.k_proj.weight),
                     'q_projector_grad_rms':_grad_rms(conditioner.q_proj.weight),'k_projector_grad_rms':_grad_rms(conditioner.k_proj.weight),
-                    'gate_weight_rms':_parameter_rms(conditioner.gate[0].weight),'gate_weight_grad_rms':_grad_rms(conditioner.gate[0].weight),
-                    'beta_q':float(conditioner.beta_q.detach().cpu()),'beta_k':float(conditioner.beta_k.detach().cpu()),
-                    'beta_q_grad_rms':_grad_rms(conditioner.beta_q),'beta_k_grad_rms':_grad_rms(conditioner.beta_k),
+                    'gate_weight_rms':_parameter_rms(conditioner.gate.weight),'gate_weight_grad_rms':_grad_rms(conditioner.gate.weight),
+                    'rms_norm_q_weight_rms':_parameter_rms(conditioner.rms_norm_q.weight),'rms_norm_k_weight_rms':_parameter_rms(conditioner.rms_norm_k.weight),
+                    'rms_norm_q_weight_min':float(conditioner.rms_norm_q.weight.detach().min().cpu()),'rms_norm_q_weight_max':float(conditioner.rms_norm_q.weight.detach().max().cpu()),
+                    'rms_norm_k_weight_min':float(conditioner.rms_norm_k.weight.detach().min().cpu()),'rms_norm_k_weight_max':float(conditioner.rms_norm_k.weight.detach().max().cpu()),
+                    'rms_norm_q_weight_grad_rms':_grad_rms(conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':_grad_rms(conditioner.rms_norm_k.weight),
+                    'alpha_q_grad_rms':_grad_rms(conditioner.alpha_q),'alpha_k_grad_rms':_grad_rms(conditioner.alpha_k),
                     'alpha_q':float(conditioner.alpha_q.detach().cpu()),'alpha_k':float(conditioner.alpha_k.detach().cpu()),
                 })
         def _summary(field):
@@ -800,7 +803,7 @@ def main():
             'q_projector_pre_norm_rms':_summary('proj_q_rms_before_norm'),'k_projector_pre_norm_rms':_summary('proj_k_rms_before_norm'),
             'alpha_q':_summary('alpha_q'),'alpha_k':_summary('alpha_k'),
         }
-        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'geometry_rms_epsilon':cfg.geometry_rms_epsilon,'sightline_residual_scale':1.0}
+        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-6,'sightline_residual_scale':1.0}
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')

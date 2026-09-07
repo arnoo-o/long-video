@@ -26,7 +26,7 @@ def test_plucker_ray_geometry():
 
 def test_scale_augmentation_gate_only_and_zero_alpha():
     torch.manual_seed(1); m=SightlineConditioner(16); r=torch.randn(2,3,7); q,k=m(r,training=False); assert q.shape==k.shape==(2,3,16)
-    m.beta_q.data.fill_(-30.); m.beta_k.data.fill_(-30.); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
+    m.alpha_q.data.zero_(); m.alpha_k.data.zero_(); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
 
 def test_conditioner_numeric_capture_is_opt_in_and_value_preserving():
     torch.manual_seed(7); module=SightlineConditioner(16).eval(); rays=torch.randn(2,3,7)
@@ -92,8 +92,8 @@ def test_train_chunk_policy_is_single_and_causal():
 def test_camera_first_curriculum_uses_fixed_unit_origin():
     from long_video.training.sightline import curriculum_phase
     assert curriculum_phase(0)['name']=='P1' and curriculum_phase(0)['sigma_range']==(0.,1.)
-    assert curriculum_phase(499)['max_chunks']==1
-    assert curriculum_phase(500)['name']=='P2a' and curriculum_phase(500)['max_chunks']==1
+    assert curriculum_phase(299)['max_chunks']==1 and curriculum_phase(300)['max_chunks']==2
+    assert curriculum_phase(500)['name']=='P2' and curriculum_phase(500)['max_chunks']==2
     assert curriculum_phase(700)['lora'] and curriculum_phase(700)['max_chunks']==2
     assert curriculum_phase(999)['max_chunks']==2 and not curriculum_phase(999)['memory']
     assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==2
@@ -140,7 +140,7 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
     for name in ('q_proj','k_proj','gate'):
         assert len({id(next(getattr(layer,name).parameters())) for layer in conditioners})==3
     assert all(float(layer.alpha_q.detach())==pytest.approx(.7) and float(layer.alpha_k.detach())==pytest.approx(.7) for layer in conditioners)
-    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('beta_q','beta_k'))])==6
+    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
 
 def test_streaming_correspondence_matches_dense_loss_and_gradients():
     from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
@@ -332,7 +332,7 @@ def test_lora_fused_and_unfused_change_real_projection():
         model=T(fused); assert install_lora(model,[0])==(0,)
         attn=model.transformer_blocks[0].attn1; target=attn.to_v
         assert isinstance(target,LoRALinear)
-        assert isinstance(attn.to_q,torch.nn.Linear) and isinstance(attn.to_k,torch.nn.Linear)
+        assert isinstance(attn.to_q,LoRALinear) and isinstance(attn.to_k,LoRALinear)
         with torch.no_grad(): target.lora_up.weight.fill_(0.1)
         assert not torch.equal(target(torch.ones(1,4)),target.base(torch.ones(1,4)))
 

@@ -93,8 +93,7 @@ class SightlineHeliosAttnProcessor:
                 raise RuntimeError('Geometry raw/effective residual ratios diverged at residual_scale=1')
             self.last_numeric_diagnostics={
                 'alpha_q':float(self.conditioner.alpha_q.detach().cpu()),'alpha_k':float(self.conditioner.alpha_k.detach().cpu()),
-                'beta_q':float(self.conditioner.beta_q.detach().cpu()),'beta_k':float(self.conditioner.beta_k.detach().cpu()),
-                'beta_q_grad_rms':grad_rms(self.conditioner.beta_q),'beta_k_grad_rms':grad_rms(self.conditioner.beta_k),
+                'alpha_q_grad_rms':grad_rms(self.conditioner.alpha_q),'alpha_k_grad_rms':grad_rms(self.conditioner.alpha_k),
                 'delta_q_over_q_native':raw_q,'delta_k_over_k_native':raw_k,
                 'effective_delta_q_over_q_native':effective_q,'effective_delta_k_over_k_native':effective_k,
                 'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
@@ -102,8 +101,10 @@ class SightlineHeliosAttnProcessor:
                 'gate_q':self.conditioner.last_gate_stats['q'],'gate_k':self.conditioner.last_gate_stats['k'],
                 'q_projector_weight_rms':parameter_rms(self.conditioner.q_proj.weight),'k_projector_weight_rms':parameter_rms(self.conditioner.k_proj.weight),
                 'q_projector_grad_rms':grad_rms(self.conditioner.q_proj.weight),'k_projector_grad_rms':grad_rms(self.conditioner.k_proj.weight),
-                'gate_weight_rms':parameter_rms(self.conditioner.gate[0].weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate[0].weight),
-                'geometry_rms_epsilon':self.conditioner.geometry_rms_epsilon,'sightline_residual_scale':float(residual_scale.detach().cpu()),
+                'gate_weight_rms':parameter_rms(self.conditioner.gate.weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate.weight),
+                'rms_norm_q_weight_rms':parameter_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_rms':parameter_rms(self.conditioner.rms_norm_k.weight),
+                'rms_norm_q_weight_grad_rms':grad_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':grad_rms(self.conditioner.rms_norm_k.weight),
+                'rms_norm_epsilon':1e-6,'sightline_residual_scale':float(residual_scale.detach().cpu()),
                 'timestep':None,
                 'geometry_enabled':geometry_enabled,
             }

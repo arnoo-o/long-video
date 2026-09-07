@@ -247,7 +247,8 @@ class LongTermKVMemory:
         if memory_rotary.shape[1]!=mem_k.shape[1]:raise RuntimeError('memory rotary embedding count mismatch')
         mem_k=rotary_apply(mem_k,memory_rotary)
         if sightline_projector is not None and geometry_enabled:
-            delta=sightline_projector.project(rays.to(hidden),kind='k',training=sightline_projector.training,scale_delta=scale_delta)
+            native_mem_k=mem_k.flatten(2,3)
+            delta=sightline_projector.project(rays.to(hidden),native_mem_k,kind='k',training=sightline_projector.training,scale_delta=scale_delta)
             if effective_geometry_scale is None: raise RuntimeError('Memory K requires the current Sightline residual scale')
             mem_k=mem_k+effective_geometry_scale.to(mem_k)*delta.unflatten(-1,(attn.heads,-1))
         if timestamp_embedding is not None:

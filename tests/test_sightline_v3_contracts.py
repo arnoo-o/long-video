@@ -5,14 +5,16 @@ from torch import nn
 from long_video.sightline.conditioning import SightlineConditioner
 from long_video.training.sightline import curriculum_phase, install_lora, LoRALinear
 
-def _dense(c,rays,kind):
-    proj=c.q_proj if kind=='q' else c.k_proj; norm=c.rms_norm_q if kind=='q' else c.rms_norm_k; alpha=c.alpha_q if kind=='q' else c.alpha_k
-    flat=c._ordered_rays(rays,kind).reshape(-1,7); return (alpha*c.gate(flat[:,6:7]).sigmoid()*norm(F.linear(flat,proj.weight,proj.bias))).reshape(*rays.shape[:-1],c.inner_dim)
+def _dense(c,rays,native,kind):
+    proj=c.q_proj if kind=='q' else c.k_proj; norm=c.rms_norm_q if kind=='q' else c.rms_norm_k; beta=c.beta_q if kind=='q' else c.beta_k
+    flat=c._ordered_rays(rays,kind).reshape(-1,7); raw=F.linear(flat,proj.weight,proj.bias); u=c.gate(flat[:,6:7]).sigmoid()*norm(raw)
+    rho=.4*beta.sigmoid(); urms=(u.square().mean(-1,keepdim=True)+1e-6).sqrt(); nrms=(native.reshape(-1,native.shape[-1]).detach().square().mean(-1,keepdim=True)+1e-6).sqrt()
+    return (rho*nrms*u/urms).reshape(*rays.shape[:-1],c.inner_dim)
 
 def test_zero_initialized_geometry_and_affine_rms_contract():
-    c=SightlineConditioner(8,alpha_init=.7); rays=torch.randn(2,5,7)
-    assert torch.equal(c.project(rays,kind='q'),torch.zeros(2,5,8))
-    assert c.alpha_q.item()==pytest.approx(.7) and c.alpha_k.item()==pytest.approx(.7)
+    c=SightlineConditioner(8,rho_init=.2); rays=torch.randn(2,5,7); native=torch.randn(2,5,8)
+    assert torch.equal(c.project(rays,native,kind='q'),torch.zeros(2,5,8))
+    assert c.rho_values()[0].item()==pytest.approx(.2) and c.rho_values()[1].item()==pytest.approx(.2)
     assert c.q_proj.bias is not None and c.k_proj.bias is not None and c.gate.bias is not None
     assert torch.count_nonzero(c.q_proj.bias)==0 and torch.count_nonzero(c.gate.bias)==0
     assert c.rms_norm_q.eps==1e-6 and c.rms_norm_q.weight.requires_grad
@@ -20,11 +22,11 @@ def test_zero_initialized_geometry_and_affine_rms_contract():
 @pytest.mark.parametrize('kind',['q','k'])
 def test_blocked_affine_rms_matches_dense_forward_and_gradients(kind):
     torch.manual_seed(7); a=SightlineConditioner(9); b=SightlineConditioner(9); a.q_proj.weight.data.normal_(); a.q_proj.bias.data.normal_(); a.k_proj.weight.data.normal_(); a.k_proj.bias.data.normal_(); a.gate.weight.data.normal_(); a.gate.bias.data.normal_(); a.rms_norm_q.weight.data.uniform_(.5,1.5); a.rms_norm_k.weight.data.uniform_(.5,1.5); b.load_state_dict(a.state_dict()); a.token_tile=17
-    ra=torch.randn(2,37,7,requires_grad=True); rb=ra.detach().clone().requires_grad_(); up=torch.randn(2,37,9)
-    (a.project(ra,kind=kind)*up).sum().backward(); (_dense(b,rb,kind)*up).sum().backward()
-    assert torch.allclose(a.project(ra.detach(),kind=kind),_dense(b,rb.detach(),kind),atol=3e-6,rtol=3e-6)
+    ra=torch.randn(2,37,7,requires_grad=True); rb=ra.detach().clone().requires_grad_(); na=torch.randn(2,37,9); nb=na.detach().clone(); up=torch.randn(2,37,9)
+    (a.project(ra,na,kind=kind)*up).sum().backward(); (_dense(b,rb,nb,kind)*up).sum().backward()
+    assert torch.allclose(a.project(ra.detach(),na,kind=kind),_dense(b,rb.detach(),nb,kind),atol=3e-6,rtol=3e-6)
     assert torch.allclose(ra.grad,rb.grad,atol=5e-6,rtol=5e-6)
-    for name in ('q_proj.weight','q_proj.bias','k_proj.weight','k_proj.bias','gate.weight','gate.bias','rms_norm_q.weight','rms_norm_k.weight','alpha_q','alpha_k'):
+    for name in ('q_proj.weight','q_proj.bias','k_proj.weight','k_proj.bias','gate.weight','gate.bias','rms_norm_q.weight','rms_norm_k.weight','beta_q','beta_k'):
         pa=dict(a.named_parameters())[name]; pb=dict(b.named_parameters())[name]
         if pa.grad is not None: assert torch.allclose(pa.grad,pb.grad,atol=6e-6,rtol=6e-6)
 

@@ -37,7 +37,7 @@ def main():
     if bool(a.near_depth is not None)==bool(a.trajectory_near_depth_normalized): raise ValueError('provide exactly one of --near-depth (metres) or --trajectory-near-depth-normalized')
     sys.path.insert(0,a.helios_root)
     from long_video.config import load_sightline_config
-    from long_video.training.sightline import SightlineTrainable, install_lora, configure_alpha_zero_baseline, set_initialization_seed
+    from long_video.training.sightline import SightlineTrainable, install_lora, configure_geometry_zero_baseline, set_initialization_seed
     from long_video.training.sightline_checkpoint import restore_runtime_checkpoint, runtime_provenance
     from scripts.train_sightline_rgbd import _install_memory_efficient_helios_norm
     from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
@@ -77,7 +77,7 @@ def main():
         raise RuntimeError('formal inference requires the configured all-layer geometry set; refusing partial Sightline layer installation')
     layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers)))
     set_initialization_seed()
-    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
+    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width); provider=SightlineRayProvider(c2w,K,source_height=padded_h,source_width=padded_w)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
@@ -88,7 +88,7 @@ def main():
         provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision,transformer_source_sha256=source_fingerprint,runtime_patch=runtime_patch,lora_scope=cfg.lora_scope)
         restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle},provenance=provenance)
     else:
-        configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
+        configure_geometry_zero_baseline(trainable,runner.memory,pipe.transformer)
     memory_enabled=configure_inference_memory(runner,a.alpha_zero_baseline or a.disable_memory)
     residual_scale=configure_sightline_residual_scale(pipe.transformer,a.sightline_residual_scale)
     trainable.eval(); conditioner.eval()

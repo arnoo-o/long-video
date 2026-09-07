@@ -17,7 +17,7 @@ import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_alpha_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
+from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_geometry_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
@@ -456,7 +456,7 @@ def main():
     set_initialization_seed()
     trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
-        lambda_corr_decay_start=cfg.lambda_corr_decay_start,alpha_init=cfg.alpha_init).to(device,dtype=torch.float32)
+        lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
@@ -496,7 +496,7 @@ def main():
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
         payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
     if args.alpha_zero_baseline:
-        configure_alpha_zero_baseline(trainable,runner.memory,pipe.transformer)
+        configure_geometry_zero_baseline(trainable,runner.memory,pipe.transformer)
     if args.resume:
         initialization_hash=broadcast_and_assert_trainables(trainable,runner.memory,pipe.transformer,world_size)
     else:
@@ -609,15 +609,15 @@ def main():
             if not keep_graph:
                 oom_state['stage']='prefix_rollout'
                 template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
-                clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:]
+                clean_boundary=source if chunk==0 else generated_prefix[-1][:,:,-1:]
                 generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
                 record_vram('prefix_rollout')
             else:
                 target=target_latents  # The sole non-source GT read in this step.
-                clean_boundary=None if chunk==0 else generated_prefix[-1][:,:,-1:].detach()
-                if clean_boundary is not None: target[:,:,:1]=clean_boundary.to(target)
+                clean_boundary=source if chunk==0 else generated_prefix[-1][:,:,-1:].detach()
+                target[:,:,:1]=clean_boundary.to(target)
                 items=exact_flow_matching_items(pipe,target,stage_steps=cfg.pyramid_steps,device=target.device,sigma_range=sigma_range)
-                if clean_boundary is not None: items=constrain_flow_items(items,clean_boundary)
+                items=constrain_flow_items(items,clean_boundary)
                 runner._prepare_chunk(chunk,target,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 oom_state['stage']='active_memory'
                 if active_corr_layers:
@@ -676,14 +676,14 @@ def main():
                 if args.train:
                     oom_state['stage']='correspondence_and_fm_backward'
                     timing_sync(); backward_started=time.perf_counter()
-                    # Geometry alpha controls injection strength and is deliberately
+                    # Geometry rho controls the bounded residual and is deliberately
                     # FM-only: correspondence trains geometric features but cannot
-                    # lower its loss by merely amplifying alpha.
+                    # lower its loss by merely amplifying rho.
                     if corr.requires_grad:
                         final_flow.backward(retain_graph=True)
-                        flow_alpha_grads={id(alpha):None if alpha.grad is None else alpha.grad.detach().clone() for alpha in trainable.conditioner.alpha_parameters()}
+                        flow_rho_grads={id(beta):None if beta.grad is None else beta.grad.detach().clone() for beta in trainable.conditioner.rho_parameters()}
                         (corr_weight*corr).backward()
-                        for alpha in trainable.conditioner.alpha_parameters(): alpha.grad=flow_alpha_grads[id(alpha)]
+                        for beta in trainable.conditioner.rho_parameters(): beta.grad=flow_rho_grads[id(beta)]
                     else:
                         final_flow.backward()
                     timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
@@ -725,15 +725,16 @@ def main():
                         for bank_layer,hiddens in originals.items():
                             for chunk_id,hidden in hiddens.items(): runner.memory.banks[bank_layer].archive[chunk_id].hidden=hidden
                         provider.context=base_context
-                    alpha_q,alpha_k=trainable.conditioner.alpha_values()
+                    rho_q,rho_k=trainable.conditioner.rho_values()
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
                     first=layer_captures[0]
-                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),alpha_q=alpha_q,alpha_k=alpha_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),rho_q=rho_q,rho_k=rho_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             for layer in active_corr_layers:
                 pipe.transformer._sightline_processors[layer].capture_diagnostics=False
                 pipe.transformer._sightline_processors[layer].capture_query_indices=None
-            if chunk==0: generated[:,:,0:1]=source
-            else: generated[:,:,0:1]=clean_boundary.to(generated)
+            # Numerical closure only; the actual source/previous-chunk boundary
+            # was enforced by the three-stage flow and constrain_flow_items.
+            generated[:,:,0:1]=clean_boundary.to(generated)
             capture_history=history
             def clean_capture(clean_input,timestep, _history=capture_history, _chunk=chunk):
                 return _transformer_forward(pipe,clean_input,timestep,prompt_embeds,_history,_chunk*8)
@@ -759,23 +760,23 @@ def main():
         finally:
             pass
         if args.probe_capture:
-            probe_payload['alpha_grad']={name:0.0 if alpha.grad is None else float(alpha.grad.detach().abs()) for name,alpha in ((f'{index}.q',layer.alpha_q) for index,layer in trainable.conditioner.layers.items())}
+            probe_payload['rho_grad']={name:0.0 if beta.grad is None else float(beta.grad.detach().abs()) for name,beta in ((f'{index}.q',layer.beta_q) for index,layer in trainable.conditioner.layers.items())}
         if args.train:
             active_phase=curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps)
-            alpha_grads=[alpha.grad for alpha in trainable.conditioner.alpha_parameters()]
-            if active_phase['name']=='P1' and (any(grad is None for grad in alpha_grads) or not all(torch.isfinite(grad).all() for grad in alpha_grads)): raise RuntimeError('P1 alpha gradient missing or non-finite')
+            rho_grads=[beta.grad for beta in trainable.conditioner.rho_parameters()]
+            if active_phase['name']=='P1' and (any(grad is None for grad in rho_grads) or not all(torch.isfinite(grad).all() for grad in rho_grads)): raise RuntimeError('P1 rho gradient missing or non-finite')
             if active_phase['name']=='P2':
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
                 if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
-                if any(alpha.abs().detach()>1e-6 for alpha in trainable.conditioner.alpha_parameters()):
+                if any(beta.abs().detach()>1e-6 for beta in trainable.conditioner.rho_parameters()):
                     geometry_params=list(trainable.conditioner.geometry_parameters())
                     corr_grads=[p.grad for p in geometry_params if p.grad is not None]
                     if not corr_grads or not all(torch.isfinite(g).all() for g in corr_grads): raise RuntimeError('P3 geometry gradient missing or non-finite')
             oom_state['stage']='ddp_gradient_average'; record_vram('pre_ddp')
             optimized=[p for group in optimizer.param_groups for p in group['params']]; _average_gradients(optimized,world_size); grad_norm=torch.nn.utils.clip_grad_norm_([p for p in optimized if p.grad is not None],cfg.grad_clip); optimizer.step(); scheduler.step()
         else: grad_norm=torch.tensor(0.)
-        alpha_q,alpha_k=trainable.conditioner.alpha_values()
+        rho_q,rho_k=trainable.conditioner.rho_values()
         step_seconds=time.perf_counter()-started
         diagnostics={str(layer):dict(processor.last_numeric_diagnostics) for layer,processor in pipe.transformer._sightline_processors.items() if processor.last_numeric_diagnostics is not None} if capture_geometry_diagnostics else {}
         if capture_geometry_diagnostics:
@@ -791,8 +792,8 @@ def main():
                     'rms_norm_q_weight_min':float(conditioner.rms_norm_q.weight.detach().min().cpu()),'rms_norm_q_weight_max':float(conditioner.rms_norm_q.weight.detach().max().cpu()),
                     'rms_norm_k_weight_min':float(conditioner.rms_norm_k.weight.detach().min().cpu()),'rms_norm_k_weight_max':float(conditioner.rms_norm_k.weight.detach().max().cpu()),
                     'rms_norm_q_weight_grad_rms':_grad_rms(conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':_grad_rms(conditioner.rms_norm_k.weight),
-                    'alpha_q_grad_rms':_grad_rms(conditioner.alpha_q),'alpha_k_grad_rms':_grad_rms(conditioner.alpha_k),
-                    'alpha_q':float(conditioner.alpha_q.detach().cpu()),'alpha_k':float(conditioner.alpha_k.detach().cpu()),
+                    'rho_q_grad_rms':_grad_rms(conditioner.beta_q),'rho_k_grad_rms':_grad_rms(conditioner.beta_k),
+                    'rho_q':float(conditioner.rho_values()[0].detach().cpu()),'rho_k':float(conditioner.rho_values()[1].detach().cpu()),
                 })
         def _summary(field):
             values=[float(value[field]) for value in diagnostics.values() if value.get(field) is not None]
@@ -801,10 +802,10 @@ def main():
         geometry_aggregate={} if not capture_geometry_diagnostics else {
             'q_residual_ratio':_summary('delta_q_over_q_native'),'k_residual_ratio':_summary('delta_k_over_k_native'),
             'q_projector_pre_norm_rms':_summary('proj_q_rms_before_norm'),'k_projector_pre_norm_rms':_summary('proj_k_rms_before_norm'),
-            'alpha_q':_summary('alpha_q'),'alpha_k':_summary('alpha_k'),
+            'rho_q':_summary('rho_q'),'rho_k':_summary('rho_k'),
         }
         geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-6,'sightline_residual_scale':1.0}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'alpha_q':alpha_q,'alpha_k':alpha_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

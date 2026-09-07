@@ -24,9 +24,9 @@ def test_plucker_ray_geometry():
     r=plucker_rays(c,K,4,4,source_height=4,source_width=4); assert r.shape==(1,1,4,4,7)
     assert torch.allclose(r[0,0,2,2,:3],torch.tensor([0.,0.,1.]),atol=1e-5)
 
-def test_scale_augmentation_gate_only_and_zero_alpha():
+def test_scale_augmentation_gate_only_and_zero_rho():
     torch.manual_seed(1); m=SightlineConditioner(16); r=torch.randn(2,3,7); q,k=m(r,training=False); assert q.shape==k.shape==(2,3,16)
-    m.alpha_q.data.zero_(); m.alpha_k.data.zero_(); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
+    m.beta_q.data.fill_(-30.); m.beta_k.data.fill_(-30.); q,k=m(r,training=True); assert torch.count_nonzero(q)==0 and torch.count_nonzero(k)==0
 
 def test_conditioner_numeric_capture_is_opt_in_and_value_preserving():
     torch.manual_seed(7); module=SightlineConditioner(16).eval(); rays=torch.randn(2,3,7)
@@ -139,8 +139,8 @@ def test_selected_layers_have_independent_qk_geometry_and_alphas():
     conditioners=[trainable.conditioner.for_layer(layer) for layer in (16,20,24)]
     for name in ('q_proj','k_proj','gate'):
         assert len({id(next(getattr(layer,name).parameters())) for layer in conditioners})==3
-    assert all(float(layer.alpha_q.detach())==pytest.approx(.7) and float(layer.alpha_k.detach())==pytest.approx(.7) for layer in conditioners)
-    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('alpha_q','alpha_k'))])==6
+    assert all(float(layer.rho_values()[0].detach())==pytest.approx(.2) and float(layer.rho_values()[1].detach())==pytest.approx(.2) for layer in conditioners)
+    assert len([name for name,_ in trainable.named_parameters() if name.endswith(('beta_q','beta_k'))])==6
 
 def test_streaming_correspondence_matches_dense_loss_and_gradients():
     from long_video.training.sightline import CorrespondencePlan,SightlineTrainable
@@ -472,7 +472,7 @@ def test_native_helios_attention_equivalence_alpha_zero_cpu():
     import helios.diffusers_version.transformer_helios_diffusers as native
     torch.manual_seed(4); attention=native.HeliosAttention(dim=8,heads=2,dim_head=4,is_cross_attention=False,is_amplify_history=False).float(); hidden=torch.randn(1,5,8)
     expected=native.HeliosAttnProcessor()(attention,hidden,original_context_length=5)
-    conditioner=SightlineConditioner(8).float(); conditioner.alpha_q.data.zero_(); conditioner.alpha_k.data.zero_()
+    conditioner=SightlineConditioner(8).float(); conditioner.beta_q.data.fill_(-30.); conditioner.beta_k.data.fill_(-30.)
     provider=lambda states,**kwargs:(torch.zeros(states.shape[0],states.shape[1],7),torch.zeros(states.shape[0],kwargs['key_length'],7))
     memory=LongTermKVMemory(); memory.enabled=False
     processor=SightlineHeliosAttnProcessor(conditioner,provider,memory=memory,qkv_projection=native._get_qkv_projections,rotary_apply=native.apply_rotary_emb_transposed,attention_dispatch=native.dispatch_attention_fn,attention_backend=native.HeliosAttnProcessor._attention_backend,parallel_config=native.HeliosAttnProcessor._parallel_config)
@@ -687,8 +687,9 @@ def test_processor_residual_scale_matches_q_plus_s_delta():
     def dispatch(q,k,v,**kw): seen.append((q.clone(),k.clone())); return v
     proc=SightlineHeliosAttnProcessor(c,provider,qkv_projection=qkv,rotary_apply=lambda x,r:x,attention_dispatch=dispatch); proc.residual_scale=.2
     proc(a,h)
-    native_q=a.to_q(h).unflatten(2,(a.heads,-1)); native_k=a.to_k(h).unflatten(2,(a.heads,-1))
-    dq=c.project(rays,kind='q',training=False).unflatten(-1,(a.heads,-1)); dk=c.project(rays,kind='k',training=False).unflatten(-1,(a.heads,-1))
+    native_q_flat=a.to_q(h); native_k_flat=a.to_k(h)
+    dq=c.project(rays,native_q_flat,kind='q',training=False).unflatten(-1,(a.heads,-1)); dk=c.project(rays,native_k_flat,kind='k',training=False).unflatten(-1,(a.heads,-1))
+    native_q=native_q_flat.unflatten(2,(a.heads,-1)); native_k=native_k_flat.unflatten(2,(a.heads,-1))
     assert torch.allclose(seen[0][0],native_q+.2*dq) and torch.allclose(seen[0][1],native_k+.2*dk)
 
 def test_key_identity_map_contains_native_current_and_memory():
@@ -1153,13 +1154,13 @@ def test_inference_boundary_off_is_diagnostic_and_never_affects_chunk0():
     assert boundary_enabled_for_chunk(1,None)
     with pytest.raises(ValueError): boundary_enabled_for_chunk(1,0)
 
-def test_alpha_zero_baseline_disables_qk_memory_and_lora():
-    from long_video.training.sightline import SightlineTrainable,LoRALinear,configure_alpha_zero_baseline
+def test_geometry_zero_baseline_disables_qk_memory_and_lora():
+    from long_video.training.sightline import SightlineTrainable,LoRALinear,configure_geometry_zero_baseline
     from long_video.sightline.memory import LayerKVMemoryBank
     trainable=SightlineTrainable(4,layers=(0,)); memory=LayerKVMemoryBank((0,),8,2,hidden_dim=4)
     transformer=torch.nn.Sequential(LoRALinear(torch.nn.Linear(4,4)))
-    configure_alpha_zero_baseline(trainable,memory,transformer)
-    assert all(float(layer.alpha_q.detach())<1e-12 and float(layer.alpha_k.detach())<1e-12 for layer in trainable.conditioner.layers.values())
+    configure_geometry_zero_baseline(trainable,memory,transformer)
+    assert all(float(layer.rho_values()[0].detach())<1e-12 and float(layer.rho_values()[1].detach())<1e-12 for layer in trainable.conditioner.layers.values())
     assert not memory.banks[0].enabled and not transformer[0].enabled
 
 def test_near_depth_png_is_converted_from_mm_to_m(tmp_path):

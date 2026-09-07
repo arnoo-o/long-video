@@ -234,8 +234,8 @@ def selected_qk_logits(query, key, query_indices):
 
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16,
-                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, alpha_init=.7):
-        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,alpha_init=alpha_init)
+                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, rho_init=.2):
+        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,rho_init=rho_init)
         self.lambda_corr_initial=float(lambda_corr); self.lambda_corr_final=float(lambda_corr_final); self.lambda_corr_decay_start=float(lambda_corr_decay_start)
         if not (0. <= self.lambda_corr_decay_start <= 1.) or min(self.lambda_corr_initial,self.lambda_corr_final) < 0.:
             raise ValueError('invalid correspondence loss schedule')
@@ -267,12 +267,12 @@ class SightlineTrainable(nn.Module):
         if start >= 1.: return self.lambda_corr_final
         return self.lambda_corr_initial+(self.lambda_corr_final-self.lambda_corr_initial)*min(1.,(progress-start)/(1-start))
     def diagnostics(self):
-        alpha_q,alpha_k=self.conditioner.alpha_values()
-        alpha_grads={name:0.0 if parameter.grad is None else float(parameter.grad.detach().abs()) for name,layer in self.conditioner.layers.items() for name,parameter in ((f'{name}.q',layer.alpha_q),(f'{name}.k',layer.alpha_k))}
+        rho_q,rho_k=self.conditioner.rho_values()
+        rho_grads={name:0.0 if parameter.grad is None else float(parameter.grad.detach().abs()) for name,layer in self.conditioner.layers.items() for name,parameter in ((f'{name}.q',layer.beta_q),(f'{name}.k',layer.beta_k))}
         qgrads=[parameter.grad for layer in self.conditioner.layers.values() for parameter in layer.q_proj.parameters()]
         kgrads=[parameter.grad for layer in self.conditioner.layers.values() for parameter in layer.k_proj.parameters()]
         qnorm=sum(float(value.norm()) for value in qgrads if value is not None); knorm=sum(float(value.norm()) for value in kgrads if value is not None)
-        return {'alpha_q':alpha_q,'alpha_k':alpha_k,'alpha_grad':alpha_grads,'eq_grad_norm':qnorm,'ek_grad_norm':knorm}
+        return {'rho_q':rho_q,'rho_k':rho_k,'rho_grad':rho_grads,'eq_grad_norm':qnorm,'ek_grad_norm':knorm}
 
 class LoRALinear(nn.Module):
     def __init__(self, base: nn.Linear, rank=8, scale=None):
@@ -287,9 +287,9 @@ def set_lora_enabled(transformer: nn.Module, enabled: bool) -> None:
     for module in transformer.modules():
         if isinstance(module,LoRALinear): module.enabled=bool(enabled)
 
-def configure_alpha_zero_baseline(trainable, memory, transformer) -> None:
+def configure_geometry_zero_baseline(trainable, memory, transformer) -> None:
     """Disable every Sightline modification while retaining native Helios V."""
-    for alpha in trainable.conditioner.alpha_parameters(): alpha.data.zero_()
+    for beta in trainable.conditioner.rho_parameters(): beta.data.fill_(-30.0)
     memory.set_enabled(False)
     set_lora_enabled(transformer,False)
 

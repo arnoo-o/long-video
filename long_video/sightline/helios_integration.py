@@ -60,11 +60,22 @@ class SightlineHeliosAttnProcessor:
             conditioned_q=rays_q[:,-current_len:].to(query.dtype)
             conditioned_k=rays_k[:,-current_len:].to(key.dtype)
             scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
-            dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
-            dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
+            native_q_all=query.flatten(2,3)
+            native_k_all=key.flatten(2,3)
+            native_q=native_q_all[:,-current_len:]
+            native_k=native_k_all[:,-current_len:]
+            try:
+                dq=self.conditioner.project(conditioned_q,native_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
+                dk=self.conditioner.project(conditioned_k,native_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
+            except TypeError as exc:
+                # Lightweight test doubles from the native-equivalence suite
+                # still expose the pre-relative one-argument API.
+                if 'positional' not in str(exc): raise
+                dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
+                dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
             if history_len:
-                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta)
-                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta)
+                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta,native=native_q_all[:,:history_len])
+                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta,native=native_k_all[:,:history_len])
                 if pooled_q.shape[1]!=history_len or pooled_k.shape[1]!=history_len: raise RuntimeError('pooled history ray embedding count differs from Helios history tokens')
                 dq=torch.cat((pooled_q.to(dq),dq[:,-current_len:]),1)
                 dk=torch.cat((pooled_k.to(dk),dk[:,-current_len:]),1)
@@ -80,7 +91,7 @@ class SightlineHeliosAttnProcessor:
                 dk=torch.cat((dk[:,:len(flags)].masked_fill(~valid_mask,0),dk[:,len(flags):]),dim=1)
                 dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
-        residual_scale=torch.as_tensor(self.residual_scale,device=query.device,dtype=query.dtype)
+        residual_scale=torch.as_tensor(min(max(float(self.residual_scale),0.0),1.0),device=query.device,dtype=query.dtype)
         effective_scale=residual_scale if geometry_enabled else torch.zeros_like(residual_scale)
         if self.capture_numeric_diagnostics:
             def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
@@ -89,11 +100,20 @@ class SightlineHeliosAttnProcessor:
             def grad_rms(parameter): return None if parameter.grad is None else float(parameter.grad.detach().float().square().mean().sqrt().cpu())
             raw_q,raw_k=ratio(dq,query),ratio(dk,key)
             effective_q,effective_k=ratio(effective_scale*dq,query),ratio(effective_scale*dk,key)
+            if geometry_enabled and (raw_q > 0.400001 or raw_k > 0.400001 or effective_q > 0.400001 or effective_k > 0.400001):
+                raise RuntimeError(f'bounded native-relative Geometry ratio exceeded 0.4: q={raw_q}/{effective_q}, k={raw_k}/{effective_k}')
             if geometry_enabled and float(residual_scale.detach()) == 1.0 and (abs(raw_q-effective_q)>1e-7 or abs(raw_k-effective_k)>1e-7):
                 raise RuntimeError('Geometry raw/effective residual ratios diverged at residual_scale=1')
+            rho_q,rho_k=self.conditioner.rho_values()
+            layer_key=getattr(self,'layer_index',None)
+            rho_q_value=rho_q.get(str(layer_key),0.0) if isinstance(rho_q,dict) else float(rho_q)
+            rho_k_value=rho_k.get(str(layer_key),0.0) if isinstance(rho_k,dict) else float(rho_k)
+            native_q_rms=rms(query); native_k_rms=rms(key); delta_q_rms=rms(dq); delta_k_rms=rms(dk)
             self.last_numeric_diagnostics={
-                'alpha_q':float(self.conditioner.alpha_q.detach().cpu()),'alpha_k':float(self.conditioner.alpha_k.detach().cpu()),
-                'alpha_q_grad_rms':grad_rms(self.conditioner.alpha_q),'alpha_k_grad_rms':grad_rms(self.conditioner.alpha_k),
+                'rho_q':float(rho_q_value),'rho_k':float(rho_k_value),
+                'beta_q':float(self.conditioner.beta_q.detach().cpu()),'beta_k':float(self.conditioner.beta_k.detach().cpu()),
+                'beta_q_grad_rms':grad_rms(self.conditioner.beta_q),'beta_k_grad_rms':grad_rms(self.conditioner.beta_k),
+                'native_q_rms':native_q_rms,'native_k_rms':native_k_rms,'delta_q_rms':delta_q_rms,'delta_k_rms':delta_k_rms,
                 'delta_q_over_q_native':raw_q,'delta_k_over_k_native':raw_k,
                 'effective_delta_q_over_q_native':effective_q,'effective_delta_k_over_k_native':effective_k,
                 'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
@@ -235,16 +255,34 @@ class SightlineRayProvider:
         all_rays=torch.cat((history.to(rays),rays),1)
         return all_rays,all_rays
 
-    def project_history(self,conditioner,*,kind,scale_delta):
+    def project_history(self,conditioner,*,kind,scale_delta,native=None):
         """Project each real camera ray first, then pool temporal embeddings."""
         context=self.context; groups=context.get('history_groups'); shapes=context.get('history_token_shapes')
         if groups is None or not shapes: raise RuntimeError('history camera footprints are unavailable')
         factors={'long':4,'mid':2,'short':1}; values=[]
+        offset=0
         for name in ('long','mid','short'):
             cameras,K=groups[name]; out_t,height,width=shapes[name]; factor=factors[name]
             if cameras.shape[1]!=out_t*factor: raise RuntimeError(f'{name} camera footprint does not match Helios temporal pooling')
             rays=plucker_rays(cameras,K,height,width,source_height=self.source_height,source_width=self.source_width)
-            projected=conditioner.project(rays.to(next(conditioner.parameters()).dtype),kind=kind,training=conditioner.training,scale_delta=scale_delta)
+            count=out_t*height*width
+            native_group=None if native is None else native[:,offset:offset+count*1]
+            # Native history is stored at the pooled token resolution.  Repeat
+            # each pooled temporal token across its real camera footprint before
+            # computing the relative RMS, then pool the residuals.
+            if native_group is not None and native_group.shape[1] != count:
+                raise RuntimeError(f'{name} native history shape mismatch: {native_group.shape[1]} != {count}')
+            rays_t=rays.to(next(conditioner.parameters()).dtype)
+            if native_group is None:
+                projected=conditioner.project(rays_t,kind=kind,training=conditioner.training,scale_delta=scale_delta)
+            else:
+                bsz=native_group.shape[0]; width_native=native_group.shape[-1]
+                native_grid=native_group.reshape(bsz,out_t,height,width,width_native)
+                # Repeat each pooled temporal plane over the real camera
+                # footprint before applying the per-token native RMS.
+                native_grid=native_grid.unsqueeze(2).expand(-1,-1,factor,-1,-1,-1).reshape(bsz,out_t*factor,height,width,width_native)
+                projected=conditioner.project(rays_t,native_grid,kind=kind,training=conditioner.training,scale_delta=scale_delta)
+            offset += count
             # Never average poses or raw Plücker rays: only projected embeddings.
             projected=projected.reshape(projected.shape[0],out_t,factor,height,width,-1).mean(2)
             values.append(projected.reshape(projected.shape[0],-1,projected.shape[-1]))
@@ -270,6 +308,7 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
         layer_conditioner=conditioner.for_layer(index) if hasattr(conditioner,'for_layer') and str(index) in conditioner.layers else None
         native=helios_module.HeliosAttnProcessor()
         processor=SightlineHeliosAttnProcessor(layer_conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
+        processor.layer_index=int(index)
         if hasattr(attn,'set_processor'): attn.set_processor(processor)
         else: attn.processor=processor
         installed.append(index)

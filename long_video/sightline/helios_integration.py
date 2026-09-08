@@ -99,7 +99,7 @@ class SightlineHeliosAttnProcessor:
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         residual_scale=torch.as_tensor(min(max(float(self.residual_scale),0.0),1.0),device=query.device,dtype=query.dtype)
         effective_scale=residual_scale if geometry_enabled else torch.zeros_like(residual_scale)
-        if self.capture_numeric_diagnostics:
+        if self.capture_numeric_diagnostics and self.conditioner is not None:
             def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
             def ratio(delta,native): return float((delta.detach().float().norm()/native.detach().float().norm().clamp_min(1e-30)).cpu())
             def parameter_rms(parameter): return float(parameter.detach().float().square().mean().sqrt().cpu())

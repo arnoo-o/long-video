@@ -4,7 +4,7 @@ import hashlib,io,json,random
 import numpy as np
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v6-native-rms-gated-rho-qkvo-lora'; SCHEMA='sightline-checkpoint-v17'
+SEMANTICS='sightline-v9-layers2-15-no-lora'; SCHEMA='sightline-checkpoint-v18'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)
@@ -37,7 +37,7 @@ def runtime_provenance(pipe, model_id, helios_root, model_revision=None, transfo
         model_identity={'kind':'huggingface','revision':str(revision),'transformer_config_sha256':transformer_config}
     scheduler_config=dict(pipe.scheduler.config)
     transformer_sha=transformer_source_sha256 or hashlib.sha256(transformer.read_bytes()).hexdigest()
-    if lora_scope!='q_k_v_o': raise ValueError('Sightline-v4 requires Q/K/V/O LoRA')
+    if lora_scope not in ('q_k_v_o','disabled'): raise ValueError('unsupported Sightline LoRA scope')
     return {'transformer_source_sha256':transformer_sha,'pipeline_source_sha256':hashlib.sha256(pipeline.read_bytes()).hexdigest(),'scheduler_class':type(pipe.scheduler).__module__+'.'+type(pipe.scheduler).__qualname__,'scheduler_config_sha256':scheduler_config_fingerprint(scheduler_config),'model_id':str(model_id),'model_identity':model_identity,'runtime_patch':runtime_patch,'lora_scope':lora_scope}
 
 def _provenance_matches(saved, current):

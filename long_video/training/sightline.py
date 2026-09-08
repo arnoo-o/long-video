@@ -109,7 +109,15 @@ class _StreamingCorrespondence(torch.autograd.Function):
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:
     if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
     if not 0<=minimum<max_chunks: raise ValueError('minimum train chunk must be inside the rollout')
-    return int(torch.randint(minimum,max_chunks,(1,),generator=generator).item())
+    if max_chunks == 1: return 0
+    # The newest frontier is sampled with probability .45; all earlier
+    # chunks share the remaining .55 uniformly. Formal callers use minimum=0.
+    if minimum != 0:
+        candidates=tuple(range(minimum,max_chunks))
+        return int(candidates[int(torch.randint(0,len(candidates),(1,),generator=generator).item())])
+    if float(torch.rand((),generator=generator).item()) < 0.45:
+        return max_chunks-1
+    return int(torch.randint(0,max_chunks-1,(1,),generator=generator).item())
 
 def assert_trainable_whitelist(module: nn.Module) -> None:
     allowed=("conditioner.","memory.timestamp.","memory.memory_type_embedding","lora_")
@@ -127,21 +135,30 @@ def curriculum_max_chunks(step: int, *, warmup_steps: int, maximum: int = 6) -> 
         raise ValueError("invalid curriculum arguments")
     return min(maximum, 1 + step // warmup_steps)
 
+def gt_prefix_probability(step: int) -> float:
+    """Continuous cosine GT-prefix teacher-forcing schedule for steps 300-599."""
+    step=int(step)
+    if step < 300 or step >= 600: return 0.0
+    progress=(step-300)/299.0
+    return 0.35*(1.0+math.cos(math.pi*progress))
+
 def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_steps: int = 1500):
-    """400/600/1500 Geometry/QKVO-LoRA/Memory curriculum."""
+    """Sightline-v9 2500-step Geometry-only then Memory/correspondence curriculum."""
     if not 0 <= int(step) < 2500: raise ValueError("step is outside the configured training schedule")
-    if step < p1_steps-100:
-        return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
-    if step < p1_steps:
-        return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
-    if step < p1_steps+p2_steps:
-        return {"name":"P2","max_chunks":2,"lora":True,"correspondence":False,"memory":False,"sigma_range":(0.,1.)}
-    if step < 1500: chunks=2
-    elif step < 1800: chunks=3
-    elif step < 2100: chunks=4
-    elif step < 2300: chunks=5
+    if step < 300:
+        return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+    if step < 600:
+        return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False,"gt_prefix_probability":gt_prefix_probability(step),"sigma_range":(0.,1.)}
+    if step < 900:
+        return {"name":"P2","max_chunks":2,"lora":False,"correspondence":False,"memory":False,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+    if step < 1000:
+        return {"name":"P2","max_chunks":2,"lora":False,"correspondence":False,"memory":True,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+    if step < 1100: chunks=2
+    elif step < 1400: chunks=3
+    elif step < 1700: chunks=4
+    elif step < 2000: chunks=5
     else: chunks=6
-    return {"name":"P3","max_chunks":chunks,"lora":True,"correspondence":True,"memory":True,"sigma_range":(0.,1.)}
+    return {"name":"P3","max_chunks":chunks,"lora":False,"correspondence":True,"memory":True,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
 
 INIT_SEED = 20260826
 

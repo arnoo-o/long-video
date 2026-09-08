@@ -17,7 +17,7 @@ import torch.distributed as dist
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
-from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_geometry_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
+from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, gt_prefix_probability, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_geometry_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
@@ -166,11 +166,12 @@ def _preflight(cfg,args,probe_layers):
         # camera-only retraining curriculum.
         pass
     if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
-    if tuple(cfg.sightline_layers) != tuple(range(12)):
-        raise ValueError('formal training requires sightline_layers=[0..11]')
+    if tuple(cfg.sightline_layers) != tuple(range(2,16)):
+        raise ValueError('formal training requires sightline_layers=[2..15]')
+    if cfg.lora_layers or cfg.lora_scope!='disabled':
+        raise ValueError('formal Sightline-v9 training requires LoRA disabled and lora_layers=[]')
     if total_steps!=TOTAL_TRAINING_STEPS or int(total_steps*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('formal schedule must preserve the configured 100/2500-step warmup')
-    if args.train and args.max_steps>p1_steps and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty')
-    if args.train and args.max_steps>p1_steps+p2_steps and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches P3 but Memory/correspondence layers are empty')
+    if args.train and args.max_steps>1000 and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches Memory/correspondence stages but layers are empty')
     if not 1<=args.max_steps<=total_steps: raise ValueError(f'--max-steps must be in 1..{total_steps}')
 
 def _lr_multiplier(step,total_steps=TOTAL_TRAINING_STEPS):
@@ -477,14 +478,15 @@ def main():
         rmsnorm_params.extend(layer.rms_norm_q.parameters()); rmsnorm_params.extend(layer.rms_norm_k.parameters())
         gate_params.extend(layer.gate.parameters())
         beta_params.extend((layer.beta_q,layer.beta_k))
-    optimizer=torch.optim.AdamW([
+    optimizer_groups=[
         {'name':'projector','params':projector_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_projector_weight_decay},
         {'name':'rmsnorm','params':rmsnorm_params,'lr':cfg.learning_rate,'weight_decay':cfg.geometry_rmsnorm_weight_decay},
         {'name':'gate','params':gate_params,'lr':cfg.geometry_gate_learning_rate,'weight_decay':0.0},
         {'name':'beta','params':beta_params,'lr':cfg.geometry_beta_learning_rate,'weight_decay':0.0},
-        {'name':'lora','params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01},
         {'name':'memory','params':memory_params,'lr':cfg.memory_learning_rate,'weight_decay':0.01},
-    ],weight_decay=0.0)
+    ]
+    if lora_params: optimizer_groups.insert(-1,{'name':'lora','params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01})
+    optimizer=torch.optim.AdamW(optimizer_groups,weight_decay=0.0)
     _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
     prompt_embeds,_=_prompt(pipe,args.prompt,device)
@@ -573,16 +575,14 @@ def main():
             if 'lora_' in name: parameter.requires_grad_(phase['lora'] and not args.alpha_zero_baseline)
         set_lora_enabled(pipe.transformer,phase['lora'] and not args.alpha_zero_baseline)
         active_corr_layers=probe_layers or tuple(cfg.correspondence_layers); diagnostic_correspondence=bool(args.probe_capture)
-        scheduled_chunk0=(phase['name']=='P3'
-                          and p3_chunk0_scheduled(step,cfg.p1_steps,cfg.p2_steps)
-                          and not smoke_chunk_sequence
-                          and (args.train_chunk is None or args.train_chunk<0))
-        minimum_train_chunk=0 if (phase['name']!='P3' or scheduled_chunk0) else 1
-        forced_train_chunk=(phase['max_chunks']-1 if smoke_chunk_sequence
-                            else (0 if scheduled_chunk0 else args.train_chunk))
-        train_chunk=_ddp_train_chunk(phase['max_chunks'],minimum_train_chunk,rank,world_size,device,forced_train_chunk)
+        # Every multi-chunk phase samples the newest frontier with p=.45 and
+        # distributes the remaining p=.55 uniformly over earlier chunks.
+        forced_train_chunk=(phase['max_chunks']-1 if smoke_chunk_sequence else args.train_chunk)
+        train_chunk=_ddp_train_chunk(phase['max_chunks'],0,rank,world_size,device,forced_train_chunk)
         oom_state['train_chunk']=int(train_chunk)
-        if not minimum_train_chunk<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum or lacks required real past history')
+        if not 0<=train_chunk<phase['max_chunks']: raise ValueError('train_chunk outside curriculum')
+        gt_prefix_p=float(phase.get('gt_prefix_probability',0.0))
+        use_gt_prefix=bool(train_chunk>0 and gt_prefix_p>0.0 and random.Random(20260908+int(step)).random()<gt_prefix_p)
         # Direct-source (chunk0) P3 steps are intentionally FM-only.  There is
         # neither a causal correspondence target nor an earlier Memory chunk to
         # read, so do not retain seven layers of final-stage Q/K solely to later
@@ -627,7 +627,12 @@ def main():
                 oom_state['stage']='prefix_rollout'
                 template=torch.empty((source.shape[0],source.shape[1],9,*source.shape[-2:]),device=source.device,dtype=source.dtype); runner._prepare_chunk(chunk,template,{},history_global_coverages=coverage,history_validity=history_state.validity())
                 clean_boundary=source if chunk==0 else generated_prefix[-1][:,:,-1:]
-                generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
+                if use_gt_prefix and chunk < train_chunk:
+                    gt_start=latent_start+chunk*8
+                    generated=all_latents[:,:,gt_start:gt_start+9].to(device,dtype=torch.bfloat16).detach()
+                    generated[:,:,:1]=clean_boundary.to(generated)
+                else:
+                    generated=_generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary).detach()
                 record_vram('prefix_rollout')
             else:
                 target=target_latents  # The sole non-source GT read in this step.
@@ -745,7 +750,10 @@ def main():
                     rho_q,rho_k=trainable.conditioner.rho_values()
                     final_stage_loss=float((final_prediction.float()-final['target'].float()).square().mean())
                     first=layer_captures[0]
-                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean()),memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),rho_q=rho_q,rho_k=rho_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
+                    correct_ray_loss=final_stage_loss
+                    wrong_ray_loss=float((wrong.float()-final['target'].float()).square().mean())
+                    camera_sensitivity=(wrong_ray_loss-correct_ray_loss)/max(correct_ray_loss,1e-8)
+                    probe_payload.update(source='real_helios_forward',baseline=bool(args.alpha_zero_baseline),layer=first['layer'],sigma=float(final['sigmas'].mean()),attention_logits=first['attention_logits'],positive_key_indices=first['positive_key_indices'],memory_count=first['memory_count'],layer_captures=layer_captures,fm_loss=float(fm.detach()),baseline_final_stage_loss=final_stage_loss,correct_ray_loss=correct_ray_loss,wrong_ray_loss=wrong_ray_loss,camera_sensitivity=camera_sensitivity,memory_zero_loss=float((zero.float()-final['target'].float()).square().mean()),memory_shuffle_loss=float((shuffled_prediction.float()-final['target'].float()).square().mean()),corr_loss=float(corr_metric.detach()),rho_q=rho_q,rho_k=rho_k,vram_gb=float(torch.cuda.max_memory_allocated()/2**30),step_time_sec=normal_step_time,ablation_time_sec=time.perf_counter()-ablation_started)
             for layer in active_corr_layers:
                 pipe.transformer._sightline_processors[layer].capture_diagnostics=False
                 pipe.transformer._sightline_processors[layer].capture_query_indices=None
@@ -823,7 +831,7 @@ def main():
             'rho_q':_summary('rho_q'),'rho_k':_summary('rho_k'),
         }
         geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-4,'sightline_residual_scale':1.0}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

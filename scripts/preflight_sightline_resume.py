@@ -46,9 +46,13 @@ def main() -> None:
     }
     if checks['completed_step']!=599 or checks['next_step']!=600 or checks['semantics']!=SEMANTICS or checks['schema']!=SCHEMA or not all(checks[key] for key in ('config_fingerprint_match','helios_fingerprint_match','optimizer','scheduler','rng')):
         raise RuntimeError(f'checkpoint-599 resume preflight failed: {checks}')
-    phases={step:curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps) for step in (599,600,999,1000,1499,1500,1799,1800,2099,2100,2299,2300,2499)}
-    if phases[599]['name']!='P2' or phases[600]['name']!='P2' or phases[999]['name']!='P2' or phases[1000]!={'name':'P3','max_chunks':2,'lora':True,'correspondence':True,'memory':True} or phases[2499]['max_chunks']!=6:
-        raise RuntimeError(f'curriculum boundary mismatch: {phases}')
+    boundaries=(299,300,599,600,899,900,999,1000,1099,1100,1399,1400,1699,1700,1999,2000,2499)
+    phases={step:curriculum_phase(step,p1_steps=cfg.p1_steps,p2_steps=cfg.p2_steps,p3_steps=cfg.p3_steps) for step in boundaries}
+    expected={299:(1,False,False,False),300:(2,False,False,False),599:(2,False,False,False),600:(2,False,False,False),899:(2,False,False,False),900:(2,False,False,True),999:(2,False,False,True),1000:(2,False,True,True),1099:(2,False,True,True),1100:(3,False,True,True),1399:(3,False,True,True),1400:(4,False,True,True),1699:(4,False,True,True),1700:(5,False,True,True),1999:(5,False,True,True),2000:(6,False,True,True),2499:(6,False,True,True)}
+    for step,expected_values in expected.items():
+        phase=phases[step]
+        actual=(phase['max_chunks'],phase['lora'],phase['correspondence'],phase['memory'])
+        if actual!=expected_values: raise RuntimeError(f'curriculum boundary mismatch at {step}: {actual} != {expected_values}')
     units=records(args.unit_manifest);p3=records(args.p3_manifest)
     if any(int(row['chunk_count'])!=3 or int(row['frame_count'])!=97 for row in units):
         raise RuntimeError('P1/P2 manifest contains a non-3-chunk unit')

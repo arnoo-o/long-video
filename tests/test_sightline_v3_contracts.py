@@ -45,7 +45,7 @@ def test_lora_wraps_qkvo():
     assert all(isinstance(getattr(a,n),LoRALinear) for n in ('to_q','to_k','to_v')) and isinstance(a.to_out[0],LoRALinear)
 def test_curriculum_boundaries():
     assert curriculum_phase(299)['max_chunks']==1 and curriculum_phase(300)['max_chunks']==2
-    assert not curriculum_phase(399)['lora'] and curriculum_phase(400)['lora']
+    assert not curriculum_phase(399)['lora'] and not curriculum_phase(400)['lora'] and curriculum_phase(1000)['correspondence']
     assert curriculum_phase(999)['name']=='P2' and curriculum_phase(1000)['name']=='P3'
 
 def test_relative_rms_is_sample_wide_and_batch_independent():

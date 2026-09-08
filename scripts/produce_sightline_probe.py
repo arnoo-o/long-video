@@ -8,7 +8,7 @@ import argparse, json, subprocess, sys, tempfile
 from pathlib import Path
 import torch
 
-REQUIRED=("attention_logits","positive_key_indices","memory_count","fm_loss","baseline_final_stage_loss","wrong_ray_loss","memory_zero_loss","memory_shuffle_loss","corr_loss","alpha","alpha_grad","vram_gb","step_time_sec","ablation_time_sec")
+REQUIRED=("attention_logits","positive_key_indices","memory_count","fm_loss","baseline_final_stage_loss","correct_ray_loss","wrong_ray_loss","camera_sensitivity","memory_zero_loss","memory_shuffle_loss","corr_loss","alpha","alpha_grad","vram_gb","step_time_sec","ablation_time_sec")
 
 def _ranking(logits,positive_lists):
     if logits.ndim==3: logits=logits[:,None]
@@ -41,7 +41,7 @@ def measured_row(capture):
     if memory_count<0 or memory_count>head_logits.shape[-1]: raise RuntimeError('invalid captured memory token count')
     baseline_final_stage_loss=float(capture['baseline_final_stage_loss'])
     return {"layer":int(capture["layer"]),"sigma":float(capture["sigma"]),"ranking_source":"raw_qk","correspondence_mrr":raw_mrr,"top1":raw_top1,"top5":raw_top5,"raw_qk_mrr":raw_mrr,"raw_qk_top1":raw_top1,"raw_qk_top5":raw_top5,
-         "positive_attention_mass":float(mass),"wrong_ray_delta":float(capture["wrong_ray_loss"]-baseline_final_stage_loss),
+         "positive_attention_mass":float(mass),"correct_ray_loss":float(capture["correct_ray_loss"]),"wrong_ray_delta":float(capture["wrong_ray_loss"]-capture["correct_ray_loss"]),"camera_sensitivity":float(capture["camera_sensitivity"]),
          "memory_attention_mass":0.0 if memory_count==0 else float(native_attention[...,-memory_count:].sum(-1).mean()),"memory_zero_delta":float(capture["memory_zero_loss"]-baseline_final_stage_loss),
          "memory_shuffle_delta":float(capture["memory_shuffle_loss"]-baseline_final_stage_loss),"fm_loss":float(capture["fm_loss"]),
         "corr_loss":float(capture["corr_loss"]),"alpha":float(capture['alpha']),"alpha_grad":float(capture['alpha_grad']),"vram_gb":float(capture["vram_gb"]),"step_time_sec":float(capture["step_time_sec"]),"ablation_time_sec":float(capture['ablation_time_sec'])}
@@ -63,11 +63,11 @@ def main():
         checkpoint_meta=torch.load(args.checkpoint,map_location='cpu'); probe_step=int(checkpoint_meta['step'])
     else: probe_step=1000
     if probe_step<300: train_chunk=0
-    elif probe_step<1000: train_chunk=0
-    elif probe_step<1500: train_chunk=1
-    elif probe_step<1800: train_chunk=2
-    elif probe_step<2100: train_chunk=3
-    elif probe_step<2300: train_chunk=4
+    elif probe_step<1000: train_chunk=1
+    elif probe_step<1100: train_chunk=1
+    elif probe_step<1400: train_chunk=2
+    elif probe_step<1700: train_chunk=3
+    elif probe_step<2000: train_chunk=4
     else: train_chunk=5
     with tempfile.TemporaryDirectory(prefix='sightline_probe_') as directory:
       for index in range(args.samples):

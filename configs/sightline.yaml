@@ -6,12 +6,12 @@ rho_init: 0.4
 history_sizes: [16, 2, 1]
 chunk_length: 33
 chunk_stride: 32
-sightline_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+sightline_layers: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 memory_layers: [4, 8, 16, 20, 24, 32, 36]
 correspondence_layers: [4, 8, 16, 20, 24, 32, 36]
-lora_layers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+lora_layers: []
 lora_rank: 16
-lora_scope: q_k_v_o
+lora_scope: disabled
 memory_pool: 2
 memory_budget: 13312
 memory_tau_pos: 1.0
@@ -47,11 +47,11 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v6-native-rms-gated-rho-qkvo-lora
+sightline_training_semantics_version: sightline-v9-layers2-15-no-lora
 sightline_correspondence_schema_version: sightline-correspondence-v8-rho-detached
-sightline_checkpoint_schema_version: sightline-checkpoint-v17
-p1_steps: 400
-p2_steps: 600
+sightline_checkpoint_schema_version: sightline-checkpoint-v18
+p1_steps: 600
+p2_steps: 400
 p3_steps: 1500
 ddp_world_size: 4
 checkpoint_every: 100

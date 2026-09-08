@@ -93,11 +93,13 @@ def test_camera_first_curriculum_uses_fixed_unit_origin():
     from long_video.training.sightline import curriculum_phase
     assert curriculum_phase(0)['name']=='P1' and curriculum_phase(0)['sigma_range']==(0.,1.)
     assert curriculum_phase(299)['max_chunks']==1 and curriculum_phase(300)['max_chunks']==2
-    assert curriculum_phase(500)['name']=='P2' and curriculum_phase(500)['max_chunks']==2
-    assert curriculum_phase(700)['lora'] and curriculum_phase(700)['max_chunks']==2
-    assert curriculum_phase(999)['max_chunks']==2 and not curriculum_phase(999)['memory']
+    assert curriculum_phase(500)['name']=='P1' and curriculum_phase(500)['max_chunks']==2 and curriculum_phase(500)['lora'] is False
+    assert curriculum_phase(700)['name']=='P2' and curriculum_phase(700)['max_chunks']==2 and curriculum_phase(700)['lora'] is False
+    assert curriculum_phase(999)['max_chunks']==2 and curriculum_phase(999)['memory']
     assert curriculum_phase(1000)['memory'] and curriculum_phase(1000)['correspondence'] and curriculum_phase(1000)['max_chunks']==2
-    assert curriculum_phase(2499)['max_chunks']==6
+    assert curriculum_phase(2499)['max_chunks']==6 and curriculum_phase(2499)['lora'] is False
+    from long_video.training.sightline import gt_prefix_probability
+    assert gt_prefix_probability(300)==pytest.approx(.7) and gt_prefix_probability(599)==pytest.approx(0.) and gt_prefix_probability(600)==0.
     source=Path(__file__).parents[1].joinpath('scripts/train_sightline_rgbd.py').read_text()
     assert 'window_start=0' in source and 'select_chunk_window' not in source
 
@@ -880,9 +882,9 @@ def test_training_preflight_and_fixed_2500_warmup_schedule():
 
 def test_p3_chunk_curriculum_has_fixed_global_step_boundaries():
     from long_video.training.sightline import curriculum_phase,select_train_chunk
-    assert [curriculum_phase(step)['max_chunks'] for step in (1000,1499,1500,1799,1800,2099,2100,2299,2300,2499)] == [2,2,3,3,4,4,5,5,6,6]
-    generator=torch.Generator().manual_seed(9); selected=[select_train_chunk(6,generator,minimum=1) for _ in range(200)]
-    assert 0 not in selected and set(selected)==set(range(1,6))
+    assert [curriculum_phase(step)['max_chunks'] for step in (1000,1099,1100,1399,1400,1699,1700,1999,2000,2499)] == [2,2,3,3,4,4,5,5,6,6]
+    generator=torch.Generator().manual_seed(9); selected=[select_train_chunk(6,generator) for _ in range(1000)]
+    assert 0 in selected and set(selected)==set(range(6))
 
 def test_checkpoint_cadence_is_fixed_by_v3_contract():
     from scripts.train_sightline_rgbd import checkpoint_interval

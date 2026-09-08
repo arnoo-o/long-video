@@ -166,8 +166,8 @@ def _preflight(cfg,args,probe_layers):
         # camera-only retraining curriculum.
         pass
     if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
-    if tuple(cfg.sightline_layers) != tuple(range(4,28)):
-        raise ValueError('formal training requires sightline_layers=[4..27]')
+    if tuple(cfg.sightline_layers) != tuple(range(12)):
+        raise ValueError('formal training requires sightline_layers=[0..11]')
     if total_steps!=TOTAL_TRAINING_STEPS or int(total_steps*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('formal schedule must preserve the configured 100/2500-step warmup')
     if args.train and args.max_steps>p1_steps and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty')
     if args.train and args.max_steps>p1_steps+p2_steps and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches P3 but Memory/correspondence layers are empty')

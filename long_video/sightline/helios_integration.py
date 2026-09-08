@@ -2,7 +2,7 @@
 from __future__ import annotations
 import hashlib
 import torch
-from .conditioning import SightlineConditioner
+from .conditioning import GEOMETRY_RMS_EPSILON, SightlineConditioner
 from .rays import token_rays_for_shape, plucker_rays
 from .history import covered_history_chunk_ids
 
@@ -130,7 +130,7 @@ class SightlineHeliosAttnProcessor:
                 'gate_weight_rms':parameter_rms(self.conditioner.gate.weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate.weight),
                 'rms_norm_q_weight_rms':parameter_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_rms':parameter_rms(self.conditioner.rms_norm_k.weight),
                 'rms_norm_q_weight_grad_rms':grad_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':grad_rms(self.conditioner.rms_norm_k.weight),
-                'rms_norm_epsilon':1e-6,'sightline_residual_scale':float(residual_scale.detach().cpu()),
+                'rms_norm_epsilon':GEOMETRY_RMS_EPSILON,'sightline_residual_scale':float(residual_scale.detach().cpu()),
                 'timestep':None,
                 'geometry_enabled':geometry_enabled,
             }

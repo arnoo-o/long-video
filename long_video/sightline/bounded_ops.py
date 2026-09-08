@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 
 DEFAULT_TOKEN_TILE = 512
+GEOMETRY_RMS_EPSILON = 1.0e-4
 
 
 def _slice_token(value: torch.Tensor | None, start: int, stop: int, tokens: int):
@@ -435,7 +436,7 @@ class _TokenBlockedRelativeSightlineProject(torch.autograd.Function):
 def token_blocked_sightline_relative_project(rays, native, projection, gate, norm, beta, *, kind,
                                              scale_delta=None, native_rms=None,
                                              token_tile=DEFAULT_TOKEN_TILE,
-                                             eps=1e-6):
+                                             eps=GEOMETRY_RMS_EPSILON):
     if kind not in ('q', 'k'):
         raise ValueError('kind must be q or k')
     if rays.shape[:-1] != native.shape[:-1]:

@@ -15,12 +15,12 @@ def _dense(c,rays,native,kind):
     return (rho*nrms*u).to(native.dtype)
 
 def test_zero_initialized_geometry_and_affine_rms_contract():
-    c=SightlineConditioner(8,rho_init=.6); rays=torch.randn(2,5,7); native=torch.randn(2,5,8)
+    c=SightlineConditioner(8,rho_init=.4); rays=torch.randn(2,5,7); native=torch.randn(2,5,8)
     assert torch.equal(c.project(rays,native,kind='q'),torch.zeros(2,5,8))
-    assert c.rho_values()[0].item()==pytest.approx(.6) and c.rho_values()[1].item()==pytest.approx(.6)
+    assert c.rho_values()[0].item()==pytest.approx(.4) and c.rho_values()[1].item()==pytest.approx(.4)
     assert c.q_proj.bias is not None and c.k_proj.bias is not None and c.gate.bias is not None
     assert torch.count_nonzero(c.q_proj.bias)==0 and torch.count_nonzero(c.gate.bias)==0
-    assert c.rms_norm_q.eps==1e-6 and c.rms_norm_q.weight.requires_grad
+    assert c.rms_norm_q.eps==1e-4 and c.rms_norm_q.weight.requires_grad
 
 @pytest.mark.parametrize('kind',['q','k'])
 def test_blocked_affine_rms_matches_dense_forward_and_gradients(kind):

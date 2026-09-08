@@ -166,8 +166,8 @@ def _preflight(cfg,args,probe_layers):
         # camera-only retraining curriculum.
         pass
     if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
-    if not set(cfg.lora_layers).issubset(sightline): raise ValueError('lora_layers must be a subset of sightline_layers')
-    if not set(cfg.memory_layers).issubset(sightline) or not set(cfg.correspondence_layers).issubset(sightline): raise ValueError('memory/correspondence layers must be a subset of sightline_layers')
+    if tuple(cfg.sightline_layers) != tuple(range(4,28)):
+        raise ValueError('formal training requires sightline_layers=[4..27]')
     if total_steps!=TOTAL_TRAINING_STEPS or int(total_steps*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('formal schedule must preserve the configured 100/2500-step warmup')
     if args.train and args.max_steps>p1_steps and not cfg.lora_layers: raise ValueError('training reaches P2 but lora_layers is empty')
     if args.train and args.max_steps>p1_steps+p2_steps and (not cfg.memory_layers or not cfg.correspondence_layers): raise ValueError('training reaches P3 but Memory/correspondence layers are empty')
@@ -821,7 +821,7 @@ def main():
             'q_projector_pre_norm_rms':_summary('proj_q_rms_before_norm'),'k_projector_pre_norm_rms':_summary('proj_k_rms_before_norm'),
             'rho_q':_summary('rho_q'),'rho_k':_summary('rho_k'),
         }
-        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-6,'sightline_residual_scale':1.0}
+        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-4,'sightline_residual_scale':1.0}
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')

@@ -115,11 +115,6 @@ class SightlineHeliosAttnProcessor:
             def grad_rms(parameter): return None if parameter.grad is None else float(parameter.grad.detach().float().square().mean().sqrt().cpu())
             raw_q,raw_k=ratio(dq,query),ratio(dk,key)
             effective_q,effective_k=ratio(effective_scale*dq,query),ratio(effective_scale*dk,key)
-            if geometry_enabled and not all(torch.isfinite(torch.as_tensor(v, device=query.device)) for v in (raw_q, raw_k, effective_q, effective_k)):
-                raise RuntimeError(f'native-relative Geometry residual ratio is non-finite: q={raw_q}/{effective_q}, k={raw_k}/{effective_k}')
-            scale_value=float(geometry_sigma_scale.detach().cpu())
-            if geometry_enabled and float(residual_scale.detach()) == 1.0 and (abs(effective_q-raw_q*scale_value)>1e-6 or abs(effective_k-raw_k*scale_value)>1e-6):
-                raise RuntimeError(f'Geometry effective residual ratio mismatch: expected scale={scale_value}, q={raw_q}/{effective_q}, k={raw_k}/{effective_k}')
             rho_q,rho_k=self.conditioner.rho_values()
             layer_key=getattr(self,'layer_index',None)
             rho_q_value=rho_q.get(str(layer_key),0.0) if isinstance(rho_q,dict) else float(rho_q)

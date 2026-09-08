@@ -38,6 +38,32 @@ class SightlinePipeline:
         inner_dim=int(getattr(conditioner,'inner_dim',0)) if conditioner is not None else None
         self.camera_history=CameraHistoryState(); self.memory=LayerKVMemoryBank(getattr(config,'memory_layers',()),config.memory_budget,config.memory_pool,hidden_dim=inner_dim,tau_pos=getattr(config,'memory_tau_pos',1.0),tau_angle=getattr(config,'memory_tau_angle',0.78539816339))
         self.runtime=SightlineRuntimeContext(); self._source_initialized=False; self._trajectory_c2w=None; self._trajectory_K=None; self._source_camera=None; self._source_intrinsics=None; self._active_chunk=0; self.history_state=None
+        # Publish local scheduler sigma immediately before every Transformer
+        # forward used by detached rollout and inference. Active FM and clean
+        # capture may mark an explicit override that survives checkpoint
+        # recomputation for the lifetime of that stage.
+        self._geometry_sigma_hook=self.helios.transformer.register_forward_pre_hook(self._publish_geometry_sigma,with_kwargs=True)
+
+    def _publish_geometry_sigma(self, _module, args, call_kwargs):
+        context=getattr(self.ray_provider,'context',None)
+        if context is None or context.get('sigma_override',False):
+            return args,call_kwargs
+        timestep=call_kwargs.get('timestep')
+        scheduler=getattr(self.helios,'scheduler',None)
+        if timestep is None or scheduler is None or not hasattr(scheduler,'timesteps') or not hasattr(scheduler,'sigmas'):
+            raise RuntimeError('cannot resolve real local scheduler timestep for Geometry routing')
+        raw=torch.as_tensor(timestep,device=scheduler.timesteps.device)
+        needle=raw.reshape(-1)[0].to(torch.float32)
+        times=torch.as_tensor(scheduler.timesteps,device=needle.device).float()
+        matches=torch.nonzero(torch.isclose(times,needle),as_tuple=False).flatten()
+        if not len(matches) and not torch.is_floating_point(raw):
+            matches=torch.nonzero(torch.as_tensor(scheduler.timesteps,device=needle.device,dtype=raw.dtype)==raw.reshape(-1)[0],as_tuple=False).flatten()
+        if len(matches)!=1:
+            raise RuntimeError(f'local scheduler timestep {float(needle)} is not uniquely resolvable')
+        index=int(matches[0]); sigmas=torch.as_tensor(scheduler.sigmas,device=needle.device,dtype=torch.float32)
+        if index>=len(sigmas): raise RuntimeError('local scheduler sigma index is out of range')
+        context['sigma']=sigmas[index].detach()
+        return args,call_kwargs
 
     @staticmethod
     def append_stride32_latents(accumulated, chunk):
@@ -141,12 +167,18 @@ class SightlinePipeline:
             processor.last_hidden_states=None; processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None; processor.capture_memory_hidden=True
         clean_started=time.perf_counter()
         previous_geometry=self.ray_provider.context.get('geometry_enabled',True)
+        previous_sigma=self.ray_provider.context.get('sigma',0.0)
+        previous_override=self.ray_provider.context.get('sigma_override',False)
         self.ray_provider.context['geometry_enabled']=False
+        self.ray_provider.context['sigma']=sigma
+        self.ray_provider.context['sigma_override']=True
         try:
             capture_fn(capture_input,timestep)
         finally:
             clean_seconds=time.perf_counter()-clean_started
             self.ray_provider.context['geometry_enabled']=previous_geometry
+            self.ray_provider.context['sigma']=previous_sigma
+            self.ray_provider.context['sigma_override']=previous_override
             for processor in memory_processors: processor.capture_memory_hidden=False
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is None: raise RuntimeError('Memory capture has no camera trajectory metadata')

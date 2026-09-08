@@ -174,7 +174,7 @@ def set_rank_runtime_seed(rank: int, step: int = 0) -> int:
 
 def synchronized_trainable_parameters(trainable, memory, transformer):
     values=list(trainable.named_parameters())+[(f'memory.{n}',p) for n,p in memory.named_parameters()]
-    values += [(f'transformer.{n}',p) for n,p in transformer.named_parameters() if 'lora_' in n]
+    values += [(f'transformer.{n}',p) for n,p in transformer.named_parameters() if p.requires_grad]
     return sorted(values,key=lambda item:item[0])
 
 def parameter_digest(named_parameters) -> str:

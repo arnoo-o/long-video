@@ -6,7 +6,7 @@ rho_init: 0.4
 history_sizes: [16, 2, 1]
 chunk_length: 33
 chunk_stride: 32
-sightline_layers: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+sightline_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 memory_layers: [4, 8, 16, 20, 24, 32, 36]
 correspondence_layers: [4, 8, 16, 20, 24, 32, 36]
 lora_layers: []
@@ -19,13 +19,15 @@ memory_tau_angle: 0.78539816339
 lambda_corr: 0.002
 lambda_corr_final: 0.0005
 lambda_corr_decay_start: 0.56
-learning_rate: 0.0001
+learning_rate: 0.00006
 geometry_projector_weight_decay: 0.01
 geometry_rmsnorm_weight_decay: 0.0
-geometry_gate_learning_rate: 0.0003
-geometry_beta_learning_rate: 0.0003
+geometry_gate_learning_rate: 0.0001
+geometry_beta_learning_rate: 0.0001
 lora_learning_rate: 0.00003
 memory_learning_rate: 0.00001
+helios_modulation_norm_learning_rate: 0.00001
+helios_modulation_norm_weight_decay: 0.0
 warmup_ratio: 0.04
 grad_clip: 1.0
 bf16: true
@@ -47,9 +49,9 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v9-layers2-15-no-lora
+sightline_training_semantics_version: sightline-v9-layers0-11-helios-modnorm-sigma-smooth
 sightline_correspondence_schema_version: sightline-correspondence-v8-rho-detached
-sightline_checkpoint_schema_version: sightline-checkpoint-v18
+sightline_checkpoint_schema_version: sightline-checkpoint-v19
 p1_steps: 600
 p2_steps: 400
 p3_steps: 1500

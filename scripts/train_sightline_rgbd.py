@@ -166,8 +166,8 @@ def _preflight(cfg,args,probe_layers):
         # camera-only retraining curriculum.
         pass
     if args.train and not set(probe_layers).issubset(sightline): raise ValueError('formal training probe layers must be a subset of sightline_layers')
-    if tuple(cfg.sightline_layers) != tuple(range(2,16)):
-        raise ValueError('formal training requires sightline_layers=[2..15]')
+    if tuple(cfg.sightline_layers) != tuple(range(12)):
+        raise ValueError('formal training requires sightline_layers=[0..11]')
     if cfg.lora_layers or cfg.lora_scope!='disabled':
         raise ValueError('formal Sightline-v9 training requires LoRA disabled and lora_layers=[]')
     if total_steps!=TOTAL_TRAINING_STEPS or int(total_steps*cfg.warmup_ratio)!=WARMUP_STEPS: raise ValueError('formal schedule must preserve the configured 100/2500-step warmup')
@@ -189,11 +189,11 @@ def _set_gradient_checkpointing(transformer,enabled):
         return
     method()
 
-def _assert_optimizer_scope(optimizer,trainable,memory,transformer,text_encoder,vae):
+def _assert_optimizer_scope(optimizer,trainable,memory,transformer,text_encoder,vae,helios_trainable):
     actual={id(parameter) for group in optimizer.param_groups for parameter in group['params']}
-    expected={id(parameter) for parameter in trainable.parameters()}|{id(parameter) for parameter in memory.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' in name}
-    forbidden={id(parameter) for module in (text_encoder,vae) for parameter in module.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if 'lora_' not in name}
-    if actual!=expected or actual&forbidden: raise RuntimeError('optimizer contains frozen text/VAE/native Helios parameters or misses a Sightline trainable')
+    expected={id(parameter) for parameter in trainable.parameters()}|{id(parameter) for parameter in memory.parameters()}|{id(parameter) for parameter in helios_trainable}
+    forbidden={id(parameter) for module in (text_encoder,vae) for parameter in module.parameters()}|{id(parameter) for name,parameter in transformer.named_parameters() if not parameter.requires_grad}
+    if actual!=expected or actual&forbidden: raise RuntimeError('optimizer contains frozen text/VAE/native Helios parameters or misses a declared trainable parameter')
 
 def _offload_unused_vae_decode_path(vae):
     """Keep the training-only VAE encoder on CUDA and park decode-only weights on CPU."""
@@ -227,6 +227,13 @@ def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,*,rout
     """Active FM wrapper; Geometry is timestep-independent."""
     if not isinstance(item,dict) or 'sigmas' not in item or 'timesteps' not in item:
         raise ValueError('active Flow Matching prediction requires item["sigmas"] and item["timesteps"]')
+    runner=getattr(pipe,'_sightline_pipeline',None)
+    if runner is None or runner.ray_provider.context is None:
+        raise RuntimeError('active FM Geometry routing requires a bound Sightline pipeline context')
+    # Keep this override alive through loss construction and checkpoint
+    # recomputation of the stage. The next active stage replaces it.
+    runner.ray_provider.context['sigma']=item['sigmas'].detach().float().mean()
+    runner.ray_provider.context['sigma_override']=True
     return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
 
 def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary=None):
@@ -365,7 +372,7 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
     for layer in layers:
         processor=processors[layer]
         if not selected:
-            processor.last_q=None; processor.last_k=None; processor.last_attention_bias=None
+            if plan is not None: processor.last_q=None; processor.last_k=None; processor.last_attention_bias=None
             continue
         captured_q=processor.last_q; captured_k=processor.last_k; captured_bias=getattr(processor,'last_attention_bias',None)
         if plan is None:
@@ -391,7 +398,7 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
         losses.append(layer_loss)
         # The autograd node is now the sole owner of Q/K and compact plan state.
         # Do not pin nine full K tensors through processor diagnostics/finalize.
-        processor.last_q=None; processor.last_k=None; processor.last_attention_bias=None
+        if plan is not None: processor.last_q=None; processor.last_k=None; processor.last_attention_bias=None
     if timings is not None: timings['correspondence_loss_seconds']+=time.perf_counter()-loss_started
     if not losses: return torch.zeros((),device=first.ray_provider.context['c2w'].device)
     return torch.stack(losses).mean()
@@ -459,6 +466,20 @@ def main():
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
         lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
+    # Helios adaptation is deliberately restricted to modulation and norm
+    # parameters in blocks 0..11. Attention/FFN projections and blocks 12+
+    # remain frozen; the names are discovered from this pinned model, never
+    # guessed from an external architecture table.
+    helios_trainable_names=[]; helios_trainable=[]
+    for name,parameter in pipe.transformer.named_parameters():
+        parts=name.split('.')
+        if len(parts)>=3 and parts[0]=='blocks' and parts[1].isdigit() and int(parts[1]) < 12:
+            is_modulation=name.endswith('scale_shift_table')
+            is_norm=('.norm_q.' in name or '.norm_k.' in name or '.norm2.' in name)
+            if is_modulation or is_norm:
+                parameter.requires_grad_(True); helios_trainable_names.append(name); helios_trainable.append(parameter)
+    if not helios_trainable_names: raise RuntimeError('pinned Helios exposes no block0..11 modulation/norm parameters')
+    if rank==0: print('Helios trainable modulation/norm parameters:', *helios_trainable_names, sep='\n  ', flush=True)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
     provider=SightlineRayProvider(source_height=padded_h,source_width=padded_w); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider); pipe._sightline_pipeline=runner
@@ -484,10 +505,11 @@ def main():
         {'name':'gate','params':gate_params,'lr':cfg.geometry_gate_learning_rate,'weight_decay':0.0},
         {'name':'beta','params':beta_params,'lr':cfg.geometry_beta_learning_rate,'weight_decay':0.0},
         {'name':'memory','params':memory_params,'lr':cfg.memory_learning_rate,'weight_decay':0.01},
+        {'name':'helios_modulation_norm','params':helios_trainable,'lr':cfg.helios_modulation_norm_learning_rate,'weight_decay':cfg.helios_modulation_norm_weight_decay},
     ]
     if lora_params: optimizer_groups.insert(-1,{'name':'lora','params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01})
     optimizer=torch.optim.AdamW(optimizer_groups,weight_decay=0.0)
-    _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae)
+    _assert_optimizer_scope(optimizer,trainable,runner.memory,pipe.transformer,pipe.text_encoder,pipe.vae,helios_trainable)
     scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,lambda step:_lr_multiplier(step,total_steps))
     prompt_embeds,_=_prompt(pipe,args.prompt,device)
     # T5 is only needed for the fixed prompt above.  Keep its CPU module for
@@ -500,19 +522,19 @@ def main():
     vae_decode_bytes=_offload_unused_vae_decode_path(pipe.vae)
     if rank==0: print(f'offloaded unused VAE decode path: {vae_decode_bytes/2**20:.2f} MiB',flush=True)
     if device.type == 'cuda': torch.cuda.empty_cache()
-    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision,transformer_source_sha256=fingerprint,runtime_patch=runtime_patch,lora_scope=cfg.lora_scope)
+    config=asdict(cfg); memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle}; provenance=runtime_provenance(pipe,args.model,args.helios_root,model_revision=args.model_revision,transformer_source_sha256=fingerprint,runtime_patch=runtime_patch,lora_scope=cfg.lora_scope,helios_trainable_scope=helios_trainable_names)
     trainable.eval() if args.probe_only else trainable.train()
     start_step=args.probe_step if args.probe_only else 0
     world_size_migrated=False
     if args.resume:
         payload=torch.load(args.resume,map_location='cpu'); world_size_migrated=int(payload.get('rng_world_size',-1))!=world_size
-        completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration,allow_world_size_migration=args.allow_world_size_migration); start_step=completed_step+1
+        completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration,allow_world_size_migration=args.allow_world_size_migration,helios_trainable_names=helios_trainable_names); start_step=completed_step+1
         if world_size_migrated:
             seed=set_rank_runtime_seed(rank,start_step)
             if rank==0: print(f'checkpoint world size migration: deterministic per-rank reseed at step {start_step}, rank0 seed {seed}',flush=True)
     elif args.probe_checkpoint:
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
-        payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance); start_step=restored_step
+        payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance,helios_trainable_names=helios_trainable_names); start_step=restored_step
     if args.alpha_zero_baseline:
         configure_geometry_zero_baseline(trainable,runner.memory,pipe.transformer)
     if args.resume:
@@ -660,12 +682,13 @@ def main():
                     for layer in active_corr_layers:
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=capture_correspondence
-                        processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and args.train else None
+                        processor.capture_query_indices=correspondence_plan.query_indices if capture_correspondence and correspondence_plan is not None and (args.train or args.probe_capture) else None
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     is_final_stage=stage_index+1==len(items)
                     stage_scope=nullcontext()
                     with stage_scope:
                         if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_before')
+                        runner.ray_provider.context['sigma']=item['sigmas'].detach().float().mean()
                         prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
                         if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_after')
                         if capture_geometry_diagnostics:
@@ -792,7 +815,7 @@ def main():
             if active_phase['name']=='P1' and (any(grad is None for grad in rho_grads) or not all(torch.isfinite(grad).all() for grad in rho_grads)): raise RuntimeError('P1 rho gradient missing or non-finite')
             if active_phase['name']=='P2':
                 lora_grads=[p.grad for p in lora_params if p.requires_grad and p.grad is not None]
-                if not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads): raise RuntimeError('P2 LoRA gradient missing or non-finite')
+                if lora_params and (not lora_grads or not all(torch.isfinite(g).all() for g in lora_grads)): raise RuntimeError('P2 LoRA gradient missing or non-finite')
             if active_phase['name']=='P3' and losses['corr'].requires_grad:
                 if any(beta.abs().detach()>1e-6 for beta in trainable.conditioner.rho_parameters()):
                     geometry_params=list(trainable.conditioner.geometry_parameters())
@@ -830,7 +853,10 @@ def main():
             'q_projector_pre_norm_rms':_summary('proj_q_rms_before_norm'),'k_projector_pre_norm_rms':_summary('proj_k_rms_before_norm'),
             'rho_q':_summary('rho_q'),'rho_k':_summary('rho_k'),
         }
-        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':losses['sigmas'][-1] if losses['sigmas'] else None,'rms_norm_epsilon':1e-4,'sightline_residual_scale':1.0}
+        _geometry_sigma_value=float(losses['sigmas'][-1]) if losses['sigmas'] else 0.0
+        _geometry_x=max(0.0,min(1.0,_geometry_sigma_value/0.6))
+        _geometry_scale_value=_geometry_x*_geometry_x*(3.0-2.0*_geometry_x)
+        geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':len(losses['sigmas'])-1,'sigma':_geometry_sigma_value,'geometry_sigma_scale':_geometry_scale_value,'rms_norm_epsilon':1e-4,'sightline_residual_scale':1.0}
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'flow_loss':float(losses['fm'].detach()),'corr_loss':float(losses['corr'].detach()),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
@@ -840,7 +866,7 @@ def main():
         checkpoint_due=(step+1)%cadence==0 or step+1==args.max_steps or (args.checkpoint_smoke_step is not None and step+1==args.checkpoint_smoke_step)
         if args.train and checkpoint_due:
             rng_states=gather_rank_rng_states(world_size,device)
-            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states,world_size=world_size,runtime_patch=runtime_patch)
+            if rank==0: save_runtime_checkpoint(output/f'checkpoint-{step:06d}.pt',trainable,runner.memory,pipe.transformer,optimizer,scheduler,step,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,provenance=provenance,rng_states=rng_states,world_size=world_size,runtime_patch=runtime_patch,helios_trainable_names=helios_trainable_names)
             if world_size>1: dist.barrier()
     if world_size>1: dist.destroy_process_group()
 

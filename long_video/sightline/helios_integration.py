@@ -47,6 +47,15 @@ class SightlineHeliosAttnProcessor:
         rays_q,rays_k=self.ray_provider(hidden_states,key_length=key.shape[1],current_length=current_len,**kwargs)
         provider_context=getattr(self.ray_provider,'context',None)
         geometry_enabled=bool(provider_context.get('geometry_enabled',True)) if provider_context is not None else True
+        # One shared high-noise routing scale is derived from the real
+        # scheduler sigma published for this Transformer call.  The same
+        # scalar gates current, native-history, and Memory geometry.
+        geometry_sigma = provider_context.get('sigma',0.0) if provider_context is not None else 0.0
+        geometry_sigma = torch.as_tensor(geometry_sigma, device=query.device, dtype=torch.float32)
+        if geometry_sigma.numel() != 1:
+            geometry_sigma = geometry_sigma.reshape(-1).mean()
+        geometry_sigma_scale = (geometry_sigma / 0.6).clamp(0.0, 1.0)
+        geometry_sigma_scale = geometry_sigma_scale * geometry_sigma_scale * (3.0 - 2.0 * geometry_sigma_scale)
         native_q_rms=None; native_k_rms=None
         if self.conditioner is None or not geometry_enabled:
             scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
@@ -98,7 +107,7 @@ class SightlineHeliosAttnProcessor:
                 dq=torch.cat((dq[:,:len(flags)].masked_fill(~valid_mask,0),dq[:,len(flags):]),dim=1)
         if dq.shape[:3]!=query.shape[:3] or dk.shape[:3]!=key.shape[:3]: raise RuntimeError(f"Sightline delta shape mismatch q={dq.shape}/{query.shape} k={dk.shape}/{key.shape}")
         residual_scale=torch.as_tensor(min(max(float(self.residual_scale),0.0),1.0),device=query.device,dtype=query.dtype)
-        effective_scale=residual_scale if geometry_enabled else torch.zeros_like(residual_scale)
+        effective_scale=(residual_scale*geometry_sigma_scale).to(query.dtype) if geometry_enabled else torch.zeros_like(residual_scale)
         if self.capture_numeric_diagnostics and self.conditioner is not None:
             def rms(value): return float(value.detach().float().square().mean().sqrt().cpu())
             def ratio(delta,native): return float((delta.detach().float().norm()/native.detach().float().norm().clamp_min(1e-30)).cpu())
@@ -130,7 +139,7 @@ class SightlineHeliosAttnProcessor:
                 'gate_weight_rms':parameter_rms(self.conditioner.gate.weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate.weight),
                 'rms_norm_q_weight_rms':parameter_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_rms':parameter_rms(self.conditioner.rms_norm_k.weight),
                 'rms_norm_q_weight_grad_rms':grad_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':grad_rms(self.conditioner.rms_norm_k.weight),
-                'rms_norm_epsilon':GEOMETRY_RMS_EPSILON,'sightline_residual_scale':float(residual_scale.detach().cpu()),
+                'rms_norm_epsilon':GEOMETRY_RMS_EPSILON,'sightline_residual_scale':float(residual_scale.detach().cpu()),'geometry_sigma':float(geometry_sigma.detach().cpu()),'geometry_sigma_scale':float(geometry_sigma_scale.detach().cpu()),
                 'timestep':None,
                 'geometry_enabled':geometry_enabled,
             }

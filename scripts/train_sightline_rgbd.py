@@ -528,7 +528,8 @@ def main():
         capture_geometry_diagnostics=((step+1) % cfg.diagnostics_frequency == 0)
         for processor in pipe.transformer._sightline_processors.values():
             processor.capture_numeric_diagnostics=capture_geometry_diagnostics
-            processor.conditioner.capture_numeric_diagnostics=capture_geometry_diagnostics
+            if processor.conditioner is not None:
+                processor.conditioner.capture_numeric_diagnostics=capture_geometry_diagnostics
         smoke_max_chunks=args.smoke_max_chunks
         if smoke_chunk_sequence:
             smoke_index=step-start_step

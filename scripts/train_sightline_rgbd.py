@@ -262,7 +262,7 @@ def _load_correspondence(record,query_chunk=None,*,kind='all'):
     rows=record.correspondences_for_chunk(query_chunk) if query_chunk is not None else list(record.correspondence_rows())
     if hasattr(rows,'column'):
         qf,kf=rows.column('query_frame'),rows.column('key_frame'); qc,kc=rows.column('query_chunk'),rows.column('key_chunk'); weights=rows.column('weight')
-        qt,kt=rows.column('query_latent_temporal'),rows.column('key_latent_temporal')
+        qt,kt=rows.column('query_t'),rows.column('key_t')
         same=kc==qc
         query_scope=(query_chunk is None or np.all(qc==int(query_chunk)))
         if len(rows) and (np.any(kf>=qf) or np.any(kc>qc) or np.any(same & (kt>=qt)) or not query_scope or np.any(kc<0) or not np.isfinite(weights).all() or np.any(weights<0)):

@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +31,7 @@ def _atomic_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
     os.replace(temporary, path)
 
 
-def _rebuild_parent(root: Path, row: dict, pixel_stride: int) -> tuple[dict[str, np.ndarray], dict]:
+def _rebuild_parent(root: Path, row: dict, pixel_stride: int) -> dict:
     destination = _path(root, row, "correspondence_cache")
     temporary = destination.with_name(destination.name + ".intra.npz")
     stats = build_causal_correspondence_cache(
@@ -50,7 +51,7 @@ def _rebuild_parent(root: Path, row: dict, pixel_stride: int) -> tuple[dict[str,
     keep_cross = existing["key_chunk"] != existing["query_chunk"]
     merged = {key: np.concatenate((existing[key][keep_cross], intra[key])) for key in intra}
     _atomic_npz(destination, merged)
-    return merged, stats
+    return {"record_id": str(row["record_id"]), "intra_rows": int(stats["row_count"])}
 
 
 def _write_unit(root: Path, unit: dict, parent_arrays: dict[str, np.ndarray]) -> None:
@@ -72,24 +73,28 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--unified-root", type=Path, required=True)
     parser.add_argument("--pixel-stride", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args()
     root = args.unified_root.resolve()
     all_rows = json.loads((root / "manifest_all.json").read_text(encoding="utf-8"))["records"]
     parents = {str(row["record_id"]): row for row in all_rows if row.get("memory_eligible", True)}
-    parent_arrays = {}; parent_stats = {}
-    for index, row in enumerate(parents.values(), 1):
-        arrays, stats = _rebuild_parent(root, row, args.pixel_stride)
-        parent_arrays[str(row["record_id"])] = arrays; parent_stats[str(row["record_id"])] = stats
-        print(json.dumps({"completed": index, "total": len(parents), "record_id": row["record_id"], "intra_rows": stats["row_count"]}), flush=True)
+    parent_paths = {record_id: _path(root, row, "correspondence_cache") for record_id, row in parents.items()}
+    def rebuild(row: dict) -> dict:
+        return _rebuild_parent(root, row, args.pixel_stride)
+    with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
+        for index, stats in enumerate(executor.map(rebuild, parents.values()), 1):
+            print(json.dumps({"completed": index, "total": len(parents), **stats}), flush=True)
     unit_path = root / "manifest_train_units_3chunk.json"
     units = json.loads(unit_path.read_text(encoding="utf-8"))["records"]
     written = 0
     for unit in units:
         parent_id = str(unit.get("parent_record_id", unit["record_id"]))
-        if parent_id not in parent_arrays:
+        if parent_id not in parent_paths:
             raise RuntimeError(f"missing parent cache for unit {unit['record_id']}")
-        _write_unit(root, unit, parent_arrays[parent_id]); written += 1
-    print(json.dumps({"parents": len(parent_arrays), "units": written, "schema": "causal-intra-rgbd-v1"}, indent=2), flush=True)
+        with np.load(parent_paths[parent_id], allow_pickle=False) as value:
+            parent_arrays = {key: np.ascontiguousarray(value[key]) for key in value.files}
+        _write_unit(root, unit, parent_arrays); written += 1
+    print(json.dumps({"parents": len(parent_paths), "units": written, "schema": "causal-intra-rgbd-v1"}, indent=2), flush=True)
 
 
 if __name__ == "__main__":

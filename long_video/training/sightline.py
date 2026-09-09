@@ -204,15 +204,17 @@ class _StreamingRGBDRanking(torch.autograd.Function):
             coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()/denominator
             d_gap.mul_(coefficient.view(1,-1,1)).mul_(grad_output.float()/(float(batch_size)*float(head_count)))
             valid_key=negative_valid.view(1,negative_valid.shape[0],negative_valid.shape[1],1,1)
-            count_key=count.view(1,negative_valid.shape[0],1,1,1)
+            # The mean key is [B,M,H,D].  Keep its divisor four-dimensional;
+            # a five-dimensional divisor would prepend a broadcast axis and
+            # accidentally turn query_grad into [B,M,M,H,D].
+            count_key=count.view(1,negative_valid.shape[0],1,1)
             negative_mean_key=(negative_key*valid_key).sum(2)/count_key
             query_grad=d_gap.unsqueeze(-1)*(positive_key-negative_mean_key)*scale
             positive_grad=d_gap.unsqueeze(-1)*query_block*scale
-            negative_grad=(-d_gap.unsqueeze(2).unsqueeze(-1)*query_block.unsqueeze(2)*valid_key/count_key)*scale
+            negative_grad=(-d_gap.unsqueeze(2).unsqueeze(-1)*query_block.unsqueeze(2)*valid_key/count_key.unsqueeze(2))*scale
             grad_query.index_add_(1,rows,query_grad.to(grad_query.dtype))
             grad_key.index_add_(1,positive,positive_grad.to(grad_key.dtype))
             grad_key.index_add_(1,safe_negative.flatten(),negative_grad.flatten(1,2).to(grad_key.dtype))
-        grad_query.mul_(grad_output.to(grad_query.dtype)); grad_key.mul_(grad_output.to(grad_key.dtype))
         return grad_query,grad_key,None,None,None,None,None,None,None,None,None
 
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:

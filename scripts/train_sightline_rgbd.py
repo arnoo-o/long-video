@@ -561,7 +561,6 @@ def _release_rgbd_capture(processors,layers,*,preserve_cross_capture=False):
             processor.last_key_identities=None
             processor.last_attention_bias=None
             processor.capture_full_key=False
-            processor.capture_key_indices=None
 
 def _backward_rgbd_stage(term,trainable):
     """Backprop one RGB-D stage without letting it update the rho schedule."""

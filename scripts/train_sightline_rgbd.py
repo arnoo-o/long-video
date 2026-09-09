@@ -149,6 +149,73 @@ _PREFIX_EXEC_PATCHED='''        if torch.is_grad_enabled() and self.gradient_che
                     return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
 '''
 
+# The pinned training entry point currently imports the older diffusers-style
+# Helios module.  Keep its audited block-loop shape as a second source variant
+# so a prior v1 in-place runtime patch can be upgraded without changing the
+# actual model implementation.
+_PREFIX_SETUP_ORIGINAL_LEGACY='''        # 6. Transformer blocks
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        rotary_emb = rotary_emb.contiguous()'''
+_PREFIX_SETUP_PATCHED_LEGACY='''        prefix_stop_layer = None
+        if attention_kwargs and attention_kwargs.get("sightline_prefix_stop_layer") is not None:
+            prefix_stop_layer = int(attention_kwargs["sightline_prefix_stop_layer"])
+            if not 0 <= prefix_stop_layer < len(self.blocks):
+                raise ValueError(f"sightline prefix stop layer must be in [0, {len(self.blocks) - 1}]")
+
+        # 6. Transformer blocks
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        rotary_emb = rotary_emb.contiguous()'''
+_PREFIX_EXEC_ORIGINAL_LEGACY='''        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for block in self.blocks:
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+        else:
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+'''
+_PREFIX_EXEC_PATCHED_LEGACY='''        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for block_index, block in enumerate(self.blocks):
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+                if prefix_stop_layer is not None and block_index >= prefix_stop_layer:
+                    return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
+        else:
+            for block_index, block in enumerate(self.blocks):
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+                if prefix_stop_layer is not None and block_index >= prefix_stop_layer:
+                    return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
+'''
+_PREFIX_VARIANTS=(
+    (_PREFIX_SETUP_ORIGINAL,_PREFIX_SETUP_PATCHED,_PREFIX_EXEC_ORIGINAL,_PREFIX_EXEC_PATCHED),
+    (_PREFIX_SETUP_ORIGINAL_LEGACY,_PREFIX_SETUP_PATCHED_LEGACY,_PREFIX_EXEC_ORIGINAL_LEGACY,_PREFIX_EXEC_PATCHED_LEGACY),
+)
+
 def _install_memory_efficient_helios_norm(source_file:Path):
     """Install and identify the audited token-blocked Helios runtime patch."""
     text=source_file.read_text()
@@ -157,15 +224,17 @@ def _install_memory_efficient_helios_norm(source_file:Path):
         (_NORM1_PATCHED,_NORM1_ORIGINAL),(_NORM1_EXPERIMENTAL_V1,_NORM1_ORIGINAL),(_NORM1_EXPERIMENTAL_V2,_NORM1_ORIGINAL),
         (_NORM2_PATCHED,_NORM2_ORIGINAL),(_NORM3_PATCHED,_NORM3_ORIGINAL),(_NORM3_EXPERIMENTAL_V1,_NORM3_ORIGINAL),
         (_NORM3_EXPERIMENTAL_V2,_NORM3_ORIGINAL),(_RESIDUAL1_PATCHED,_RESIDUAL1_ORIGINAL),(_RESIDUAL3_PATCHED,_RESIDUAL3_ORIGINAL),
-        (_PREFIX_SETUP_PATCHED,_PREFIX_SETUP_ORIGINAL),(_PREFIX_EXEC_PATCHED,_PREFIX_EXEC_ORIGINAL),
     ): canonical=canonical.replace(patched,original)
-    required=(_NORM1_ORIGINAL,_NORM2_ORIGINAL,_NORM3_ORIGINAL,_RESIDUAL1_ORIGINAL,_RESIDUAL3_ORIGINAL,_PREFIX_SETUP_ORIGINAL,_PREFIX_EXEC_ORIGINAL)
-    if any(value not in canonical for value in required): raise RuntimeError('pinned Helios source no longer matches the audited runtime patch')
+    for setup_original,setup_patched,exec_original,exec_patched in _PREFIX_VARIANTS:
+        canonical=canonical.replace(setup_patched,setup_original).replace(exec_patched,exec_original)
+    prefix_variant=next((variant for variant in _PREFIX_VARIANTS if variant[0] in canonical and variant[2] in canonical),None)
+    required=(_NORM1_ORIGINAL,_NORM2_ORIGINAL,_NORM3_ORIGINAL,_RESIDUAL1_ORIGINAL,_RESIDUAL3_ORIGINAL)
+    if prefix_variant is None or any(value not in canonical for value in required): raise RuntimeError('pinned Helios source no longer matches the audited runtime patch')
     patched=canonical.replace(_IMPORT_ANCHOR,_IMPORT_ANCHOR+'\n'+_PATCH_IMPORT)
     for original,replacement in (
         (_NORM1_ORIGINAL,_NORM1_PATCHED),(_NORM2_ORIGINAL,_NORM2_PATCHED),(_NORM3_ORIGINAL,_NORM3_PATCHED),
         (_RESIDUAL1_ORIGINAL,_RESIDUAL1_PATCHED),(_RESIDUAL3_ORIGINAL,_RESIDUAL3_PATCHED),
-        (_PREFIX_SETUP_ORIGINAL,_PREFIX_SETUP_PATCHED),(_PREFIX_EXEC_ORIGINAL,_PREFIX_EXEC_PATCHED),
+        (prefix_variant[0],prefix_variant[1]),(prefix_variant[2],prefix_variant[3]),
     ): patched=patched.replace(original,replacement)
     if patched!=text: source_file.write_text(patched)
     return {

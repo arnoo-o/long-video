@@ -12,6 +12,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mkdir -p "$output_dir"
 cd "$repo_root"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
+torchrun_bin="/ephemeral/JerryHouse/miniconda3/envs/videox-fun/bin/torchrun"
 
 attempt=0
 while true; do
@@ -23,7 +24,7 @@ while true; do
 
   set +e
   CUDA_VISIBLE_DEVICES="${SIGHTLINE_GPU_LIST:-1,2,3,7}" \
-    torchrun --standalone --nproc_per_node=4 scripts/train_sightline_rgbd.py "${train_args[@]}"
+    "$torchrun_bin" --standalone --nproc_per_node=4 scripts/train_sightline_rgbd.py "${train_args[@]}"
   status=$?
   set -e
 

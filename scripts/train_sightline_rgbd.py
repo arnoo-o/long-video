@@ -990,7 +990,6 @@ def main():
                             del stage_rgbd_metric
                             del layer_rgbd_metrics
                             del stage_rgbd_captures
-                            del stage_rgbd_metric
                         if args.train and capture_rgbd:
                             # Reconfigure the second pass after every RGB-D
                             # stage.  Only final-stage cross layers retain full

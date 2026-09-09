@@ -979,6 +979,11 @@ def main():
                             rgbd_stage_losses[stage_index]=stage_rgbd_metric.detach()
                             _release_rgbd_capture(pipe.transformer._sightline_processors,active_rgbd_layers,preserve_cross_capture=capture_cross)
                             del stage_rgbd_captures
+                            # The RGB-D backward retained this graph only
+                            # until its own gradients were accumulated.  Do
+                            # not keep the metric output alive while the
+                            # stage FM checkpoint is recomputed.
+                            del stage_rgbd_metric
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:

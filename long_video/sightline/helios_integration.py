@@ -18,6 +18,7 @@ class SightlineHeliosAttnProcessor:
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.residual_scale=1.0  # legacy user ablation multiplier; default 1.
+        self.reuse_scale_delta=False; self.scale_delta_override=None; self.last_scale_delta=None
         self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.capture_query_indices=None
         self.capture_key_indices=None
@@ -80,7 +81,11 @@ class SightlineHeliosAttnProcessor:
             # the dtype used when the former full projection was added to Q/K.
             conditioned_q=rays_q[:,-current_len:].to(query.dtype)
             conditioned_k=rays_k[:,-current_len:].to(key.dtype)
-            scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
+            if self.reuse_scale_delta:
+                scale_delta=self.scale_delta_override
+            else:
+                scale_delta=self.conditioner.sample_scale_delta(conditioned_q,self.conditioner.training)
+                self.last_scale_delta=None if scale_delta is None else scale_delta.detach()
             native_q_all=query.flatten(2,3)
             native_k_all=key.flatten(2,3)
             # Compute one detached RMS per batch sample over the complete

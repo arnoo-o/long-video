@@ -118,6 +118,9 @@ class SightlinePipeline:
             processor.capture_query_indices=None
             processor.capture_key_indices=None
             processor.capture_full_key=False
+            processor.reuse_scale_delta=False
+            processor.scale_delta_override=None
+            processor.last_scale_delta=None
             processor.last_attention_bias=None
             processor.last_attention_meta={}; processor.last_current_length=None
 

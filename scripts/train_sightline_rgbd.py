@@ -562,12 +562,12 @@ def _release_rgbd_capture(processors,layers,*,preserve_cross_capture=False):
             processor.last_attention_bias=None
             processor.capture_full_key=False
 
-def _backward_rgbd_stage(term,trainable):
+def _backward_rgbd_stage(term,trainable,*,retain_graph):
     """Backprop one RGB-D stage without letting it update the rho schedule."""
     if not term.requires_grad: return
     saved={id(beta):(None if beta.grad is None else beta.grad.detach().clone())
            for beta in trainable.conditioner.rho_parameters()}
-    term.backward(retain_graph=True)
+    term.backward(retain_graph=bool(retain_graph))
     for beta in trainable.conditioner.rho_parameters():
         beta.grad=saved[id(beta)]
 
@@ -933,20 +933,24 @@ def main():
                     stage_rgbd_plan=rgbd_plans.get(stage_index)
                     capture_rgbd=bool(stage_rgbd_plan is not None)
                     capture_cross=bool(stage_index+1==len(items) and (cross_plan is not None or diagnostic_correspondence))
-                    stage_capture_layers=tuple(sorted(set(active_rgbd_layers if capture_rgbd else ()).union(active_corr_layers if capture_cross else ())))
+                    # The first pass of an RGB-D stage is RGB-D-only.  A final
+                    # stage with cross-chunk supervision gets a separate
+                    # full-K capture on the second pass below.
+                    stage_capture_layers=tuple(active_rgbd_layers if capture_rgbd else (active_corr_layers if capture_cross else ()))
                     for layer in capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
+                        processor.reuse_scale_delta=False; processor.scale_delta_override=None; processor.last_scale_delta=None
                     for layer in stage_capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=True
-                        stage_plans=tuple(plan for plan in (stage_rgbd_plan if capture_rgbd else None,cross_plan if capture_cross else None) if plan is not None)
+                        stage_plans=tuple(plan for plan in (stage_rgbd_plan if capture_rgbd else None,cross_plan if capture_cross and not capture_rgbd else None) if plan is not None)
                         plan_queries=torch.unique(torch.cat([plan.query_indices for plan in stage_plans])) if stage_plans else None
                         processor.capture_query_indices=plan_queries if plan_queries is not None and (args.train or args.probe_capture) else None
                         rgbd_key_plans=(stage_rgbd_plan,) if capture_rgbd else ()
                         plan_keys=tuple(plan.sparse_key_indices for plan in rgbd_key_plans if plan.sparse_key_indices is not None)
                         processor.capture_key_indices=torch.unique(torch.cat(plan_keys)) if plan_keys and (args.train or args.probe_capture) else None
-                        processor.capture_full_key=bool(capture_cross)
+                        processor.capture_full_key=bool(capture_cross and not capture_rgbd and layer in active_corr_layers)
                     capture_correspondence=bool(stage_capture_layers)
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     is_final_stage=stage_index+1==len(items)
@@ -955,22 +959,12 @@ def main():
                         if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_before')
                         prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
                         if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_after')
-                        if capture_geometry_diagnostics:
-                            first_processor=pipe.transformer._sightline_processors[int(cfg.sightline_layers[0])]
-                            diagnostic=first_processor.last_numeric_diagnostics or {}
-                            stage_fields={'stage_index':int(item['stage_index']),'sigma_local':float(item['sigma_local'].detach().float().mean()),'sigma_start':float(item['sigma_start']),'sigma_end':float(item['sigma_end']),'sigma_abs':float(item['sigma_abs'].detach().float().mean()),'geometry_sigma_scale':float(item['geometry_sigma_scale'].detach().float().mean())}
-                            fm_sigma_trace.append({'stage':stage_index,
-                                'item_timestep':float(item['timesteps'].detach().float().mean()),
-                                'processor_timestep':diagnostic.get('timestep'),
-                                'item_sigma':float(item['sigmas'].detach().float().mean()),**stage_fields})
-                            active_stage_trace.append(stage_fields)
-                            if is_final_stage:
-                                backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
-                        if args.train and capture_rgbd and not is_final_stage:
+                        stage_scale_deltas={layer:(None if pipe.transformer._sightline_processors[layer].last_scale_delta is None else pipe.transformer._sightline_processors[layer].last_scale_delta.detach()) for layer in capture_layers}
+                        if args.train and capture_rgbd:
                             # The first RGB-D backward needs only the captured
                             # Q/K branches.  Drop the unrelated stage output
-                            # graph before checkpoint recomputation; FM is
-                            # re-forwarded below after RGB-D graph release.
+                            # graph before checkpoint recomputation.  Both
+                            # RGB-D and FM/cross therefore use separate graphs.
                             final_prediction=None
                             prediction=None
                         if capture_rgbd:
@@ -985,9 +979,9 @@ def main():
                             for rgbd_layer in active_rgbd_layers:
                                 layer_rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,(rgbd_layer,),stage_rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures={rgbd_layer:stage_rgbd_captures[rgbd_layer]})
                                 if args.train and layer_rgbd_metric.requires_grad:
-                                    _backward_rgbd_stage(float(cfg.lambda_rgbd)*rgbd_weights[stage_index]*layer_rgbd_metric/layer_count,trainable)
+                                    _backward_rgbd_stage(float(cfg.lambda_rgbd)*rgbd_weights[stage_index]*layer_rgbd_metric/layer_count,trainable,retain_graph=False)
                                 layer_rgbd_metrics.append(layer_rgbd_metric.detach())
-                                _release_rgbd_capture(pipe.transformer._sightline_processors,(rgbd_layer,),preserve_cross_capture=capture_cross)
+                                _release_rgbd_capture(pipe.transformer._sightline_processors,(rgbd_layer,),preserve_cross_capture=False)
                                 del stage_rgbd_captures[rgbd_layer]
                                 del layer_rgbd_metric
                             stage_rgbd_metric=torch.stack(layer_rgbd_metrics).mean() if layer_rgbd_metrics else torch.zeros((),device=source.device)
@@ -995,21 +989,39 @@ def main():
                             del layer_rgbd_metrics
                             del stage_rgbd_captures
                             del stage_rgbd_metric
-                        if args.train and capture_rgbd and not is_final_stage:
-                            # The RGB-D backward intentionally retained the
-                            # first stage graph, but keeping that graph while
-                            # checkpoint recomputes FM exceeds the two-GPU
-                            # memory budget.  Re-run this same stage input for
-                            # FM after RGB-D has released its graph; this keeps
-                            # RGB-D backward retain_graph=True and FM's sole
-                            # backward retain_graph=False without overlap.
+                        if args.train and capture_rgbd:
+                            # Reconfigure the second pass after every RGB-D
+                            # stage.  Only final-stage cross layers retain full
+                            # K; RGB-D-only layers never do.
                             final_prediction=None
                             del prediction
-                            for layer in active_rgbd_layers:
+                            for layer in capture_layers:
                                 processor=pipe.transformer._sightline_processors[layer]
                                 processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
-                            oom_state['stage']=f'flow_stage_{stage_index}_fm_reforward'
+                                if layer in stage_scale_deltas:
+                                    processor.reuse_scale_delta=True; processor.scale_delta_override=stage_scale_deltas[layer]
+                            second_capture_layers=tuple(active_corr_layers) if capture_cross else ()
+                            for layer in second_capture_layers:
+                                processor=pipe.transformer._sightline_processors[layer]
+                                processor.capture_diagnostics=True
+                                processor.capture_query_indices=cross_plan.query_indices if cross_plan is not None and (args.train or args.probe_capture) else None
+                                processor.capture_key_indices=None
+                                processor.capture_full_key=bool(layer in active_corr_layers)
+                            capture_correspondence=bool(second_capture_layers)
+                            oom_state['stage']=f'flow_stage_{stage_index}_reforward' if not capture_correspondence else 'final_stage_reforward'
                             prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
+                            if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_reforward_after')
+                        if capture_geometry_diagnostics:
+                            first_processor=pipe.transformer._sightline_processors[int(cfg.sightline_layers[0])]
+                            diagnostic=first_processor.last_numeric_diagnostics or {}
+                            stage_fields={'stage_index':int(item['stage_index']),'sigma_local':float(item['sigma_local'].detach().float().mean()),'sigma_start':float(item['sigma_start']),'sigma_end':float(item['sigma_end']),'sigma_abs':float(item['sigma_abs'].detach().float().mean()),'geometry_sigma_scale':float(item['geometry_sigma_scale'].detach().float().mean())}
+                            fm_sigma_trace.append({'stage':stage_index,
+                                'item_timestep':float(item['timesteps'].detach().float().mean()),
+                                'processor_timestep':diagnostic.get('timestep'),
+                                'item_sigma':float(item['sigmas'].detach().float().mean()),**stage_fields})
+                            active_stage_trace.append(stage_fields)
+                            if is_final_stage:
+                                backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:

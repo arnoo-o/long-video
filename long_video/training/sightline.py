@@ -118,6 +118,95 @@ class _StreamingCorrespondence(torch.autograd.Function):
             dk[:,k0:k1].copy_(dk_tile.to(dk.dtype))
         return dq,dk,None,None,None,None,None,None
 
+class _StreamingRGBDRanking(torch.autograd.Function):
+    """Streaming RGB-D ranking with no pairwise autograd graph accumulation."""
+    BLOCK_SIZE=96
+
+    @staticmethod
+    def _pair_loss(augmented_query,augmented_key,native_query,native_key,
+                   positive_indices,negative_indices,negative_mask,margin,temperature):
+        def gather(values,indices):
+            safe=indices.clamp_min(0)
+            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],*indices.shape,values.shape[2],values.shape[3])
+        scale=augmented_query.shape[-1]**-0.5
+        positive_aug=torch.einsum('bmhd,bmhd->bmh',augmented_query,gather(augmented_key,positive_indices)).float().mul(scale)
+        positive_native=torch.einsum('bmhd,bmhd->bmh',native_query,gather(native_key,positive_indices)).float().mul(scale)
+        negative_aug=torch.einsum('bmhd,bmnhd->bmhn',augmented_query,gather(augmented_key,negative_indices)).float().mul(scale)
+        negative_native=torch.einsum('bmhd,bmnhd->bmhn',native_query,gather(native_key,negative_indices)).float().mul(scale)
+        valid=negative_mask.view(1,negative_mask.shape[0],1,-1)
+        count=negative_mask.sum(-1).clamp_min(1).view(1,negative_mask.shape[0],1)
+        negative_delta=(negative_aug-negative_native).masked_fill(~valid,0.0).sum(-1)/count
+        gap=(positive_aug-positive_native)-negative_delta
+        return F.softplus((float(margin)-gap)/float(temperature))
+
+    @staticmethod
+    def forward(ctx,augmented_query,augmented_key,native_query,native_key,
+                positive_indices,positive_mask,negative_indices,negative_mask,
+                weights,margin,temperature):
+        pair_mask=positive_mask & negative_mask.any(-1)
+        pair_rows,pair_slots=torch.nonzero(pair_mask,as_tuple=True)
+        pair_counts=pair_mask.sum(-1)
+        valid_rows=pair_counts>0
+        denominator=weights.float().masked_select(valid_rows).sum()
+        numerator=augmented_query.new_zeros((),dtype=torch.float32)
+        block_size=_StreamingRGBDRanking.BLOCK_SIZE
+        for start in range(0,int(pair_rows.numel()),block_size):
+            stop=min(int(pair_rows.numel()),start+block_size)
+            rows=pair_rows[start:stop]; slots=pair_slots[start:stop]
+            positive=positive_indices[rows,slots]
+            negative=negative_indices[rows,slots]
+            negative_valid=negative_mask[rows,slots]
+            pair_value=_StreamingRGBDRanking._pair_loss(
+                augmented_query.index_select(1,rows),augmented_key,native_query.index_select(1,rows),native_key,
+                positive,negative,negative_valid,margin,temperature).mean((0,2))
+            coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()
+            numerator=numerator+(pair_value*coefficient).sum()
+        value=numerator/denominator.clamp_min(1e-8)
+        ctx.save_for_backward(augmented_query,augmented_key,native_query,native_key,
+                              positive_indices,positive_mask,negative_indices,negative_mask,
+                              weights,pair_rows,pair_slots,pair_counts,denominator)
+        ctx.margin=float(margin); ctx.temperature=float(temperature)
+        return value
+
+    @staticmethod
+    def backward(ctx,grad_output):
+        (augmented_query,augmented_key,native_query,native_key,
+         positive_indices,positive_mask,negative_indices,negative_mask,
+         weights,pair_rows,pair_slots,pair_counts,denominator)=ctx.saved_tensors
+        grad_query=torch.zeros_like(augmented_query)
+        grad_key=torch.zeros_like(augmented_key)
+        if pair_rows.numel()==0:
+            return grad_query,grad_key,None,None,None,None,None,None,None,None,None
+        block_size=_StreamingRGBDRanking.BLOCK_SIZE
+        with torch.enable_grad():
+            for start in range(0,int(pair_rows.numel()),block_size):
+                stop=min(int(pair_rows.numel()),start+block_size)
+                rows=pair_rows[start:stop]; slots=pair_slots[start:stop]
+                positive=positive_indices[rows,slots]
+                negative=negative_indices[rows,slots]
+                negative_valid=negative_mask[rows,slots]
+                query_block=augmented_query.detach().index_select(1,rows).requires_grad_(True)
+                positive_key=augmented_key.detach().index_select(1,positive).requires_grad_(True)
+                safe_negative=negative.clamp_min(0)
+                negative_key=augmented_key.detach().index_select(1,safe_negative.reshape(-1)).reshape(augmented_key.shape[0],*safe_negative.shape,augmented_key.shape[2],augmented_key.shape[3]).requires_grad_(True)
+                native_query_block=native_query.index_select(1,rows)
+                native_positive_key=native_key.index_select(1,positive)
+                native_negative_key=native_key.index_select(1,safe_negative.reshape(-1)).reshape(native_key.shape[0],*safe_negative.shape,native_key.shape[2],native_key.shape[3])
+                positive_delta=torch.einsum('bmhd,bmhd->bmh',query_block,positive_key).float().mul(augmented_query.shape[-1]**-0.5)-torch.einsum('bmhd,bmhd->bmh',native_query_block,native_positive_key).float().mul(augmented_query.shape[-1]**-0.5)
+                negative_delta=torch.einsum('bmhd,bmnhd->bmhn',query_block,negative_key).float().mul(augmented_query.shape[-1]**-0.5)-torch.einsum('bmhd,bmnhd->bmhn',native_query_block,native_negative_key).float().mul(augmented_query.shape[-1]**-0.5)
+                valid=negative_valid.view(1,negative_valid.shape[0],1,-1)
+                count=negative_valid.sum(-1).clamp_min(1).view(1,negative_valid.shape[0],1)
+                negative_mean=negative_delta.masked_fill(~valid,0.0).sum(-1)/count
+                pair_loss=F.softplus((float(ctx.margin)-(positive_delta-negative_mean))/float(ctx.temperature))
+                coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()/denominator
+                block_value=(pair_loss.mean((0,2))*coefficient).sum()
+                gradients=torch.autograd.grad(block_value,(query_block,positive_key,negative_key),allow_unused=True)
+                if gradients[0] is not None: grad_query.index_add_(1,rows,gradients[0].to(grad_query.dtype))
+                if gradients[1] is not None: grad_key.index_add_(1,positive,gradients[1].to(grad_key.dtype))
+                if gradients[2] is not None: grad_key.index_add_(1,safe_negative.reshape(-1),gradients[2].reshape(grad_key.shape[0],-1,grad_key.shape[2],grad_key.shape[3]).to(grad_key.dtype))
+        grad_query.mul_(grad_output.to(grad_query.dtype)); grad_key.mul_(grad_output.to(grad_key.dtype))
+        return grad_query,grad_key,None,None,None,None,None,None,None,None,None
+
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:
     if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
     if not 0<=minimum<max_chunks: raise ValueError('minimum train chunk must be inside the rollout')
@@ -315,37 +404,11 @@ class SightlineTrainable(nn.Module):
             raise ValueError('RGB-D hard negatives must be paired with each positive')
         if not bool(plan.negative_key_t_match):
             raise ValueError('RGB-D hard-negative key-time contract is violated')
-        def gather(values,indices):
-            safe=indices.clamp_min(0)
-            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],*indices.shape,values.shape[2],values.shape[3])
-        scale=augmented_query.shape[-1]**-0.5
-        # Compute one positive and its matched same-time negatives at a time.
-        # This is direct sparse pairwise scoring: no dense K axis, no
-        # [R,P,N,H,D] gather, and no row-chunk bookkeeping.  Accumulating the
-        # scalar pair numerator is algebraically identical to the vectorized
-        # ranking formula while keeping only one negative set live.
-        pair_loss_sum=augmented_query.new_zeros((augmented_query.shape[0],rows,augmented_query.shape[2]),dtype=torch.float32)
-        pair_mask=positive_mask & negative_mask.any(-1)
-        for positive_slot in range(int(positive.shape[1])):
-            positive_indices=positive[:,positive_slot]
-            pos_aug=torch.einsum('brhd,brhd->brh',augmented_query,gather(augmented_key,positive_indices)).float().mul(scale)
-            with torch.no_grad():
-                pos_native=torch.einsum('brhd,brhd->brh',native_query,gather(native_key,positive_indices)).float().mul(scale)
-            negative_indices=negative[:,positive_slot]
-            negative_valid=negative_mask[:,positive_slot]
-            neg_aug=torch.einsum('brhd,brnhd->brhn',augmented_query,gather(augmented_key,negative_indices)).float().mul(scale)
-            with torch.no_grad():
-                neg_native=torch.einsum('brhd,brnhd->brhn',native_query,gather(native_key,negative_indices)).float().mul(scale)
-            neg_count=negative_valid.sum(-1).clamp_min(1).view(1,rows,1)
-            neg_delta=(neg_aug-neg_native).masked_fill(~negative_valid.view(1,rows,1,-1),0.0).sum(-1)/neg_count
-            pair_loss=F.softplus((float(margin)-((pos_aug-pos_native)-neg_delta))/float(temperature)).masked_fill(~(pair_mask[:,positive_slot].view(1,rows,1)),0.0)
-            pair_loss_sum=pair_loss_sum+pair_loss
-        pair_count=pair_mask.sum(-1).clamp_min(1).view(1,rows,1)
-        row_loss=pair_loss_sum/pair_count
-        row_loss=row_loss.mean((0,2))
-        valid_rows=pair_mask.any(-1).to(row_loss.dtype)
-        weights=plan.weights.to(device=row_loss.device,dtype=row_loss.dtype)*valid_rows
-        return (row_loss*weights).sum()/weights.sum().clamp_min(1e-8)
+        return _StreamingRGBDRanking.apply(
+            augmented_query,augmented_key,native_query.detach(),native_key.detach(),
+            positive,positive_mask,negative,negative_mask,
+            plan.weights.to(device=augmented_query.device,dtype=torch.float32),
+            float(margin),float(temperature))
     def lambda_corr(self, progress):
         progress=float(progress); start=self.lambda_corr_decay_start
         if progress <= start: return self.lambda_corr_initial

@@ -123,7 +123,7 @@ log "launching three-GPU overlap training on CUDA_VISIBLE_DEVICES=$train_gpu_lis
       torchrun --standalone --nproc_per_node=3 \
       scripts/train_sightline_rgbd.py "${base_args[@]}" \
       --resume "$checkpoint" \
-      --save-every 1000000 \
+      --save-every 100 \
       --output-dir "$overlap_output" \
       >> "$overlap_log" 2>&1
     status=$?

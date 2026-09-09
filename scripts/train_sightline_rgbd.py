@@ -87,7 +87,7 @@ def _install_memory_efficient_helios_norm(source_file:Path):
     }
 
 def checkpoint_interval(global_step: int) -> int:
-    """The v3 checkpoint contract is one strict 100-step cadence."""
+    """Return the default formal checkpoint cadence."""
     return 100
 
 def _distributed_context():
@@ -591,7 +591,7 @@ def main():
     cfg=load_sightline_config(args.config); total_steps=cfg.p1_steps+cfg.p2_steps+cfg.p3_steps
     args.max_steps=args.max_steps or total_steps
     save_every=args.save_every or cfg.checkpoint_every
-    if args.train and args.save_every is not None and args.save_every not in (60,100): raise ValueError('formal checkpoint cadence only permits 100 before step 1000 or 60 afterward')
+    if args.train and args.save_every is not None and args.save_every not in (50,60,100): raise ValueError('formal checkpoint cadence only permits 50, 60, or 100')
     rank,world_size,device=_distributed_context()
     if world_size>1 and not args.train: raise ValueError('DDP is supported only for training')
     # An explicit CLI opt-in is required when resuming with a different DDP

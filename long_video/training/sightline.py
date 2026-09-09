@@ -316,14 +316,25 @@ class SightlineTrainable(nn.Module):
             return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],rows,*indices.shape[1:],values.shape[2],values.shape[3])
         scale=augmented_query.shape[-1]**-0.5
         pos_aug=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,positive)).float().mul(scale)
-        pos_native=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,positive)).float().mul(scale).detach()
-        neg_aug=torch.einsum('brhd,brpnhd->brhpn',augmented_query,gather(augmented_key,negative)).float().mul(scale)
-        neg_native=torch.einsum('brhd,brpnhd->brhpn',native_query,gather(native_key,negative)).float().mul(scale).detach()
+        with torch.no_grad():
+            pos_native=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,positive)).float().mul(scale)
+        # Do not materialize [B, R, H, P, N] negative logits.  On the
+        # formal 1024-row plan that temporary can exceed the remaining H100
+        # memory even though the final loss only needs the mean over N.
+        # Accumulate one matched negative at a time; this is algebraically
+        # identical and keeps the sparse Q/K contract intact.
+        neg_delta_sum=pos_aug.new_zeros(pos_aug.shape)
+        for negative_slot in range(int(negative.shape[2])):
+            negative_indices=negative[:,:,negative_slot]
+            negative_mask_slot=negative_mask[:,:,negative_slot].view(1,rows,1,-1)
+            neg_aug_slot=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,negative_indices)).float().mul(scale)
+            with torch.no_grad():
+                neg_native_slot=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,negative_indices)).float().mul(scale)
+            neg_delta_sum=neg_delta_sum+(neg_aug_slot-neg_native_slot).masked_fill(~negative_mask_slot,0.0)
         pos_mask=positive_mask.view(1,rows,1,-1)
-        neg_mask=negative_mask.view(1,rows,1,negative.shape[1],negative.shape[2])
         pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0)
         neg_count=negative_mask.sum(-1).clamp_min(1).view(1,rows,1,negative.shape[1])
-        neg_delta=(neg_aug-neg_native).masked_fill(~neg_mask,0.0).sum(-1)/neg_count
+        neg_delta=neg_delta_sum/neg_count
         pair_mask=positive_mask & negative_mask.any(-1)
         pair_mask_view=pair_mask.view(1,rows,1,-1)
         pair_loss=F.softplus((float(margin)-(pos_delta-neg_delta))/float(temperature)).masked_fill(~pair_mask_view,0.0)

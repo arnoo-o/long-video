@@ -162,7 +162,7 @@ wait "$overlap_supervisor" 2>/dev/null || true
 
 log "resuming four-GPU training from checkpoint-000299 on CUDA_VISIBLE_DEVICES=$main_gpu_list"
 nohup env SIGHTLINE_GPU_LIST="$main_gpu_list" \
-  scripts/watch_sightline_4gpu.sh "$output_dir" "${base_args[@]}" \
+  bash scripts/watch_sightline_4gpu.sh "$output_dir" "${base_args[@]}" \
   > "$main_log" 2>&1 < /dev/null &
 main_watcher_pid=$!
 

@@ -966,6 +966,13 @@ def main():
                             active_stage_trace.append(stage_fields)
                             if is_final_stage:
                                 backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
+                        if args.train and capture_rgbd and not is_final_stage:
+                            # The first RGB-D backward needs only the captured
+                            # Q/K branches.  Drop the unrelated stage output
+                            # graph before checkpoint recomputation; FM is
+                            # re-forwarded below after RGB-D graph release.
+                            final_prediction=None
+                            prediction=None
                         if capture_rgbd:
                             stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices,pipe.transformer._sightline_processors[layer].last_capture_key_indices) for layer in active_rgbd_layers}
                             rgbd_capture_seen.add(stage_index)

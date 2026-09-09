@@ -328,7 +328,6 @@ class SightlineTrainable(nn.Module):
         pair_mask=positive_mask & negative_mask.any(-1)
         for positive_slot in range(int(positive.shape[1])):
             positive_indices=positive[:,positive_slot]
-            positive_valid=positive_mask[:,positive_slot].view(1,rows,1)
             pos_aug=torch.einsum('brhd,brhd->brh',augmented_query,gather(augmented_key,positive_indices)).float().mul(scale)
             with torch.no_grad():
                 pos_native=torch.einsum('brhd,brhd->brh',native_query,gather(native_key,positive_indices)).float().mul(scale)

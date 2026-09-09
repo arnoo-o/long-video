@@ -969,20 +969,24 @@ def main():
                         if capture_rgbd:
                             stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices,pipe.transformer._sightline_processors[layer].last_capture_key_indices) for layer in active_rgbd_layers}
                             rgbd_capture_seen.add(stage_index)
-                            # Backpropagate each stage's weighted RGB-D term
-                            # immediately after its capture.  Stage weights are
-                            # detached and the capture is released before the
-                            # next pyramid stage to avoid retaining two Q/K graphs.
-                            stage_rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,stage_rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=stage_rgbd_captures)
-                            if args.train and stage_rgbd_metric.requires_grad:
-                                _backward_rgbd_stage(float(cfg.lambda_rgbd)*rgbd_weights[stage_index]*stage_rgbd_metric,trainable)
-                            rgbd_stage_losses[stage_index]=stage_rgbd_metric.detach()
-                            _release_rgbd_capture(pipe.transformer._sightline_processors,active_rgbd_layers,preserve_cross_capture=capture_cross)
+                            # Backpropagate one captured layer at a time.  The
+                            # stage loss is still the mean over the configured
+                            # layers, but no scalar retains all layer-specific
+                            # RGB-D gather graphs until the backward call.
+                            layer_rgbd_metrics=[]
+                            layer_count=max(1,len(active_rgbd_layers))
+                            for rgbd_layer in active_rgbd_layers:
+                                layer_rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,(rgbd_layer,),stage_rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures={rgbd_layer:stage_rgbd_captures[rgbd_layer]})
+                                if args.train and layer_rgbd_metric.requires_grad:
+                                    _backward_rgbd_stage(float(cfg.lambda_rgbd)*rgbd_weights[stage_index]*layer_rgbd_metric/layer_count,trainable)
+                                layer_rgbd_metrics.append(layer_rgbd_metric.detach())
+                                _release_rgbd_capture(pipe.transformer._sightline_processors,(rgbd_layer,),preserve_cross_capture=capture_cross)
+                                del stage_rgbd_captures[rgbd_layer]
+                                del layer_rgbd_metric
+                            stage_rgbd_metric=torch.stack(layer_rgbd_metrics).mean() if layer_rgbd_metrics else torch.zeros((),device=source.device)
+                            rgbd_stage_losses[stage_index]=stage_rgbd_metric
+                            del layer_rgbd_metrics
                             del stage_rgbd_captures
-                            # The RGB-D backward retained this graph only
-                            # until its own gradients were accumulated.  Do
-                            # not keep the metric output alive while the
-                            # stage FM checkpoint is recomputed.
                             del stage_rgbd_metric
                         if args.train and capture_rgbd and not is_final_stage:
                             # The RGB-D backward intentionally retained the

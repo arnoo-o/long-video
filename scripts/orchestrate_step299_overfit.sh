@@ -58,7 +58,7 @@ log() { echo "$(date -Is) $*"; }
 
 main_pids() {
   ps -eo pid=,args= | awk -v out="$output_dir" '
-    index($0,out) && $0 !~ /orchestrate_step299_overfit\.sh/ && ($0 ~ /watch_sightline_4gpu\.sh/ || $0 ~ /torchrun/ || $0 ~ /train_sightline_rgbd\.py/) {print $1}
+    index($0,out) && $0 !~ /orchestrate_step299_overfit\.sh/ && $0 !~ /awk -v out=/ && ($0 ~ /watch_sightline_4gpu\.sh/ || $0 ~ /torchrun/ || $0 ~ /train_sightline_rgbd\.py/) {print $1}
   ' | sort -nu
 }
 

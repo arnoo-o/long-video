@@ -143,7 +143,7 @@ def _project_world(world: np.ndarray, c2w: np.ndarray, K: np.ndarray):
     return z, uv
 
 
-def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 32, token_width: int = 52, compressed: bool = True) -> dict:
+def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 32, token_width: int = 52, compressed: bool = True, chunk_pairs: list[tuple[int,int]] | None = None) -> dict:
     """Build sparse strict-causal correspondences, including within-chunk pairs."""
     if chunk_count is None:
         if (len(depth_paths) - 1) % CHUNK_STRIDE:
@@ -157,9 +157,11 @@ def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, 
     pixels = np.stack((xx.ravel(), yy.ravel()), axis=1)
     batches: dict[str, list[np.ndarray]] = {key: [] for key in ("query_frame", "key_frame", "query_chunk", "key_chunk", "query_t", "key_t", "query_y", "query_x", "key_y", "key_x", "matched_count", "valid_count", "coverage", "vote", "weight")}
     pair_stats, raw_matches = {}, 0
-    for query_chunk in range(chunk_count):
-        for key_chunk in range(query_chunk + 1):
-            for query_t, local_query in enumerate(LATENT_LOCAL_FRAMES):
+    pair_schedule = ((query_chunk,key_chunk) for query_chunk in range(chunk_count) for key_chunk in range(query_chunk + 1)) if chunk_pairs is None else ((int(query_chunk),int(key_chunk)) for query_chunk,key_chunk in chunk_pairs)
+    for query_chunk,key_chunk in pair_schedule:
+        if not 0 <= key_chunk <= query_chunk < chunk_count:
+            raise ValueError("chunk_pairs must be causal pairs inside chunk_count")
+        for query_t, local_query in enumerate(LATENT_LOCAL_FRAMES):
                 query_frame = int(query_chunk * CHUNK_STRIDE + local_query)
                 for key_t, local_key in enumerate(LATENT_LOCAL_FRAMES):
                     key_frame = int(key_chunk * CHUNK_STRIDE + local_key)

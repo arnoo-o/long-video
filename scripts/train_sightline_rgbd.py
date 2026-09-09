@@ -368,23 +368,40 @@ def _sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sam
     return ([selected[i] for i in choice],[positives[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
 
 def _hard_negative_indices(selected,positives,identities,current_shape,query_length,*,max_negatives=4):
-    """Choose spatially adjacent current-chunk keys absent from RGB-D positives."""
+    """Choose spatially adjacent negatives at each positive's exact key time."""
     _,height,width=map(int,current_shape); candidates=[]
     for index,identity in enumerate(identities):
         if identity[0]!='current': continue
         global_id=int(identity[1][0])
         candidates.append((index,global_id,int(identity[2]),int(identity[3])))
-    negatives=[]; masks=[]
+    negatives=[]; masks=[]; matched_key_t=True; pair_count=0
     for query,positive in zip(selected,positives):
         if not 0<=int(query)<len(identities): raise RuntimeError('RGB-D query index is outside the identity map')
         query_identity=identities[int(query)]; query_global=int(query_identity[1][0]); qy,qx=int(query_identity[2]),int(query_identity[3])
         positive_set=set(int(value) for value in positive)
-        ordered=sorted((value for value in candidates if value[1]<query_global and value[0] not in positive_set),key=lambda value:(abs(value[2]-qy)+abs(value[3]-qx),abs(value[1]-query_global),value[2],value[3],value[0]))
-        chosen=[value[0] for value in ordered[:int(max_negatives)]]
-        negatives.append(chosen); masks.append([True]*len(chosen))
-    max_count=max((len(value) for value in negatives),default=0)
-    if max_count==0: raise RuntimeError('same-chunk RGB-D correspondence has no hard negative key')
-    return negatives,masks
+        row_negatives=[]; row_masks=[]
+        for positive_index in positive:
+            positive_index=int(positive_index)
+            if not 0<=positive_index<len(identities): raise RuntimeError('RGB-D positive key is outside the identity map')
+            positive_identity=identities[positive_index]
+            if positive_identity[0]!='current': raise RuntimeError('RGB-D hard negatives require current-token positives')
+            positive_global=int(positive_identity[1][0]); positive_y=int(positive_identity[2]); positive_x=int(positive_identity[3])
+            # A candidate is legal only when it has exactly the same global
+            # chunk/time identity as this positive.  This prevents the model
+            # from using a temporal gap as the negative ranking signal.
+            ordered=sorted((value for value in candidates
+                            if value[1]==positive_global
+                            and value[1]//8==query_global//8
+                            and value[1]<query_global
+                            and value[0] not in positive_set),
+                           key=lambda value:(abs(value[2]-positive_y)+abs(value[3]-positive_x),value[2],value[3],value[0]))
+            chosen=[value[0] for value in ordered[:int(max_negatives)]]
+            if not chosen: raise RuntimeError('same-key-time RGB-D correspondence has no hard negative key')
+            if any(value[1]!=positive_global for value in ordered[:int(max_negatives)]): matched_key_t=False
+            row_negatives.append(chosen); row_masks.append([True]*len(chosen)); pair_count+=1
+        negatives.append(row_negatives); masks.append(row_masks)
+    if pair_count==0: raise RuntimeError('same-chunk RGB-D correspondence has no positive/negative pair')
+    return negatives,masks,matched_key_t,pair_count
 
 def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,sampling_seed,*,source_shape=None,allowed_key_kinds=None,same_chunk_only=False,with_hard_negatives=False,max_negatives=4):
     """Map GT once for the selected pyramid stage so every layer captures selected Q only."""
@@ -409,14 +426,17 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
     for row,keys in enumerate(positives):
         positive_indices[row,:len(keys)]=torch.as_tensor(keys,device=device); positive_mask[row,:len(keys)]=True
     negative_indices=negative_mask=None
+    negative_key_t_match=True; negative_pair_count=0
     if with_hard_negatives:
-        negatives,negative_rows=_hard_negative_indices(selected,positives,identities,current_shape,query_length,max_negatives=max_negatives)
-        max_negative=max(map(len,negatives),default=0); negative_indices=torch.full((len(selected),max_negative),-1,device=device,dtype=torch.long); negative_mask=torch.zeros_like(negative_indices,dtype=torch.bool)
-        for row,keys in enumerate(negatives):
-            negative_indices[row,:len(keys)]=torch.as_tensor(keys,device=device); negative_mask[row,:len(keys)]=True
+        negatives,negative_rows,negative_key_t_match,negative_pair_count=_hard_negative_indices(selected,positives,identities,current_shape,query_length,max_negatives=max_negatives)
+        max_positive=max(map(len,positives),default=0); max_negative=max((len(value) for row in negatives for value in row),default=0)
+        negative_indices=torch.full((len(selected),max_positive,max_negative),-1,device=device,dtype=torch.long); negative_mask=torch.zeros_like(negative_indices,dtype=torch.bool)
+        for row,row_keys in enumerate(negatives):
+            for positive_index,keys in enumerate(row_keys):
+                negative_indices[row,positive_index,:len(keys)]=torch.as_tensor(keys,device=device); negative_mask[row,positive_index,:len(keys)]=True
     return CorrespondencePlan(torch.as_tensor(selected,device=device,dtype=torch.long),positive_indices,positive_mask,
                               torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags),negative_indices,negative_mask,
-                              int(pre_count),int(mapped_count),tuple(int(value) for value in current_shape))
+                              int(pre_count),int(mapped_count),tuple(int(value) for value in current_shape),bool(negative_key_t_match),int(negative_pair_count))
 
 def _captured_queries(processor,plan,captured,*,native=False,capture_indices=None):
     """Select a plan's queries from the union captured for sparse losses."""
@@ -453,12 +473,34 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,timings=Non
         if native_k.shape[1] < augmented_k.shape[1] and plan.negative_indices is not None:
             # Same-chunk positives/negatives must stay on the native Helios
             # history+current axis; Memory-only keys are never legal here.
-            max_index=torch.maximum(plan.positive_indices.masked_fill(~plan.positive_mask,0),plan.negative_indices.masked_fill(~plan.negative_mask,0)).max()
-            if int(max_index.item())>=native_k.shape[1]: raise RuntimeError('same-chunk RGB-D key escaped the native Helios key axis')
+            positive_max=plan.positive_indices.masked_fill(~plan.positive_mask,0).max()
+            negative_max=plan.negative_indices.masked_fill(~plan.negative_mask,0).max()
+            if max(int(positive_max.item()),int(negative_max.item()))>=native_k.shape[1]: raise RuntimeError('same-chunk RGB-D key escaped the native Helios key axis')
         losses.append(trainable.rgbd_ranking_loss(augmented_q,augmented_k,native_q,native_k,plan,margin=margin,temperature=temperature))
     if timings is not None: timings['rgbd_loss_seconds']=timings.get('rgbd_loss_seconds',0.0)+time.perf_counter()-started
     if not losses: return torch.zeros((),device=plan.query_indices.device)
     return torch.stack(losses).mean()
+
+def _release_rgbd_capture(processors,layers,*,preserve_cross_capture=False):
+    """Drop RGB-D-only Q/K references while preserving an overlapping cross plan."""
+    for layer in layers:
+        processor=processors[layer]
+        processor.last_native_q=processor.last_native_k=None
+        processor.last_augmented_q=processor.last_augmented_k=None
+        if not preserve_cross_capture:
+            processor.last_q=processor.last_k=None
+            processor.last_capture_query_indices=None
+            processor.last_key_identities=None
+            processor.last_attention_bias=None
+
+def _backward_rgbd_stage(term,trainable):
+    """Backprop one RGB-D stage without letting it update the rho schedule."""
+    if not term.requires_grad: return
+    saved={id(beta):(None if beta.grad is None else beta.grad.detach().clone())
+           for beta in trainable.conditioner.rho_parameters()}
+    term.backward(retain_graph=True)
+    for beta in trainable.conditioner.rho_parameters():
+        beta.grad=saved[id(beta)]
 
 def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,plan=None,vram_callback=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
@@ -794,25 +836,30 @@ def main():
                     active=pipe.transformer._sightline_processors[active_corr_layers[0]].memory
                     oom_state['memory_token_count']=len(active.active_identity_metadata()) if active is not None and active.enabled else 0
                 record_vram('active_memory')
-                rgbd_plan=None; cross_plan=None
+                rgbd_plans={}; cross_plan=None
                 correspondence_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)
-                rgbd_stage_index=max(range(len(items)),key=lambda index: float(items[index]['geometry_sigma_scale'].detach().float().mean()))
-                rgbd_stage_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][rgbd_stage_index])
                 final_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][-1])
                 if rgbd_rows is not None and len(rgbd_rows) and not args.alpha_zero_baseline:
-                    current_length=int(rgbd_stage_shape[0]*rgbd_stage_shape[1]*rgbd_stage_shape[2])
-                    rgbd_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_rgbd_layers[0]],rgbd_rows,chunk,current_length,cfg.max_intra_corr_rows,correspondence_seed,source_shape=final_shape,allowed_key_kinds=('current',),same_chunk_only=True,with_hard_negatives=True)
+                    if len(items)!=3: raise RuntimeError('RGB-D stage1/stage2 supervision requires exactly three pyramid stages')
+                    for rgbd_stage_index in (1,2):
+                        rgbd_stage_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][rgbd_stage_index])
+                        current_length=int(rgbd_stage_shape[0]*rgbd_stage_shape[1]*rgbd_stage_shape[2])
+                        rgbd_plans[rgbd_stage_index]=_build_correspondence_plan(pipe.transformer._sightline_processors[active_rgbd_layers[0]],rgbd_rows,chunk,current_length,cfg.max_intra_corr_rows,correspondence_seed+rgbd_stage_index,source_shape=final_shape,allowed_key_kinds=('current',),same_chunk_only=True,with_hard_negatives=True)
                 if cross_rows is not None and len(cross_rows) and not args.alpha_zero_baseline:
                     current_length=int(final_shape[0]*final_shape[1]*final_shape[2])
                     cross_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],cross_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
-                plans=tuple(plan for plan in (rgbd_plan,cross_plan) if plan is not None)
+                plans=tuple(list(rgbd_plans.values())+([cross_plan] if cross_plan is not None else []))
                 if plans:
                     oom_state['k_length']=max(len(plan.identities) for plan in plans)
                     oom_state['selected_q_count']=int(torch.unique(torch.cat([plan.query_indices for plan in plans])).numel())
-                backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_captures={}; rgbd_metric=None
+                rgbd_scales={stage_index:items[stage_index]['geometry_sigma_scale'].detach().float().mean() for stage_index in (1,2)}
+                rgbd_scale_sum=(rgbd_scales[1]+rgbd_scales[2]+torch.as_tensor(1e-8,device=source.device,dtype=torch.float32)).detach()
+                rgbd_weights={stage_index:(rgbd_scales[stage_index]/rgbd_scale_sum).detach() for stage_index in (1,2)}
+                backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_capture_seen=set()
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
-                    capture_rgbd=bool(rgbd_plan is not None and stage_index==rgbd_stage_index)
+                    stage_rgbd_plan=rgbd_plans.get(stage_index)
+                    capture_rgbd=bool(stage_rgbd_plan is not None)
                     capture_cross=bool(stage_index+1==len(items) and (cross_plan is not None or diagnostic_correspondence))
                     stage_capture_layers=tuple(sorted(set(active_rgbd_layers if capture_rgbd else ()).union(active_corr_layers if capture_cross else ())))
                     for layer in capture_layers:
@@ -821,7 +868,7 @@ def main():
                     for layer in stage_capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=True
-                        stage_plans=tuple(plan for plan in (rgbd_plan if capture_rgbd else None,cross_plan if capture_cross else None) if plan is not None)
+                        stage_plans=tuple(plan for plan in (stage_rgbd_plan if capture_rgbd else None,cross_plan if capture_cross else None) if plan is not None)
                         plan_queries=torch.unique(torch.cat([plan.query_indices for plan in stage_plans])) if stage_plans else None
                         processor.capture_query_indices=plan_queries if plan_queries is not None and (args.train or args.probe_capture) else None
                     capture_correspondence=bool(stage_capture_layers)
@@ -844,18 +891,18 @@ def main():
                             if is_final_stage:
                                 backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
                         if capture_rgbd:
-                            rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices) for layer in active_rgbd_layers}
-                            # The selected RGB-D stage may precede the final
-                            # stage.  Backpropagate its sparse loss while its
-                            # checkpoint/capture state is still identical to
-                            # the forward pass; otherwise later-stage capture
-                            # flags make checkpoint recomputation non-deterministic.
-                            if train_rgbd and rgbd_plan is not None:
-                                rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=rgbd_captures)
-                                if args.train and rgbd_metric.requires_grad:
-                                    rgbd_stage_term=float(cfg.lambda_rgbd)*item['geometry_sigma_scale'].detach().float().mean()*rgbd_metric
-                                    rgbd_stage_term.backward(retain_graph=True)
-                                    rgbd_metric=rgbd_metric.detach()
+                            stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices) for layer in active_rgbd_layers}
+                            rgbd_capture_seen.add(stage_index)
+                            # Backpropagate each stage's weighted RGB-D term
+                            # immediately after its capture.  Stage weights are
+                            # detached and the capture is released before the
+                            # next pyramid stage to avoid retaining two Q/K graphs.
+                            stage_rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,stage_rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=stage_rgbd_captures)
+                            if args.train and stage_rgbd_metric.requires_grad:
+                                _backward_rgbd_stage(float(cfg.lambda_rgbd)*rgbd_weights[stage_index]*stage_rgbd_metric,trainable)
+                            rgbd_stage_losses[stage_index]=stage_rgbd_metric.detach()
+                            _release_rgbd_capture(pipe.transformer._sightline_processors,active_rgbd_layers,preserve_cross_capture=capture_cross)
+                            del stage_rgbd_captures
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:
@@ -870,36 +917,41 @@ def main():
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 cross_weight=trainable.lambda_corr(step/total_steps)
                 oom_state['stage']='correspondence_forward'
-                if rgbd_plan is not None and not rgbd_captures:
-                    raise RuntimeError('RGB-D stage did not capture its selected Q/K tensors')
-                if rgbd_metric is None:
-                    rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=rgbd_captures) if train_rgbd and rgbd_plan is not None else fm.new_zeros(())
+                if train_rgbd and set(rgbd_plans)!=rgbd_capture_seen:
+                    raise RuntimeError('RGB-D stage1/stage2 plans did not each capture Q/K')
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,cross_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=cross_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (train_correspondence or diagnostic_correspondence) and cross_rows is not None and len(cross_rows) else fm.new_zeros(())
                 record_vram('correspondence_loss')
-                rgbd=rgbd_metric if train_rgbd else fm.new_zeros(())
+                rgbd_stage_values={stage_index:rgbd_stage_losses.get(stage_index,fm.new_zeros(())).detach() for stage_index in (1,2)}
+                rgbd=(rgbd_weights[1]*rgbd_stage_values[1]+rgbd_weights[2]*rgbd_stage_values[2]) if train_rgbd else fm.new_zeros(())
                 corr=corr_metric if train_correspondence else fm.new_zeros(())
                 final_flow=stage_losses[-1]/len(items)
-                rgbd_scale=items[rgbd_stage_index]['geometry_sigma_scale'].detach().float().mean()
-                rgbd_term=float(cfg.lambda_rgbd)*rgbd_scale*rgbd
+                rgbd_term=float(cfg.lambda_rgbd)*rgbd
                 cross_term=cross_weight*corr
                 total=final_flow+rgbd_term+cross_term if args.train else fm+rgbd_term+cross_term
+                rgbd_plan1=rgbd_plans.get(1); rgbd_plan2=rgbd_plans.get(2)
                 losses.update(fm=fm,rgbd=rgbd,corr=corr,total=total,stage=stage_losses,
                               sigmas=[float(item['sigmas'].mean()) for item in items],
                               sigma_local=[float(item['sigma_local'].detach().float().mean()) for item in items],
                               sigma_abs=[float(item['sigma_abs'].detach().float().mean()) for item in items],
                               geometry_sigma_scale=[float(item['geometry_sigma_scale'].detach().float().mean()) for item in items],
                               sigma_start=[float(item['sigma_start']) for item in items],sigma_end=[float(item['sigma_end']) for item in items],
-                              rgbd_scale=float(rgbd_scale.detach()),rgbd_stage_index=int(rgbd_stage_index),rgbd_sigma_local=float(items[rgbd_stage_index]['sigma_local'].detach().float().mean()),rgbd_sigma_abs=float(items[rgbd_stage_index]['sigma_abs'].detach().float().mean()),rgbd_stage_shape=list(rgbd_stage_shape[1:]),rgbd_mapping_input_count=0 if rgbd_plan is None else int(rgbd_plan.mapping_input_count),rgbd_mapping_output_count=0 if rgbd_plan is None else int(rgbd_plan.mapping_output_count),rgbd_term=rgbd_term.detach(),cross_term=cross_term,cross_weight=float(cross_weight))
+                              rgbd_stage1_loss=float(rgbd_stage_values[1]),rgbd_stage2_loss=float(rgbd_stage_values[2]),
+                              rgbd_stage1_scale=float(rgbd_scales[1].detach()),rgbd_stage2_scale=float(rgbd_scales[2].detach()),
+                              rgbd_stage1_weight=float(rgbd_weights[1].detach()),rgbd_stage2_weight=float(rgbd_weights[2].detach()),
+                              rgbd_stage1_mapping_input_count=0 if rgbd_plan1 is None else int(rgbd_plan1.mapping_input_count),rgbd_stage1_mapping_output_count=0 if rgbd_plan1 is None else int(rgbd_plan1.mapping_output_count),
+                              rgbd_stage2_mapping_input_count=0 if rgbd_plan2 is None else int(rgbd_plan2.mapping_input_count),rgbd_stage2_mapping_output_count=0 if rgbd_plan2 is None else int(rgbd_plan2.mapping_output_count),
+                              rgbd_stage1_negative_key_t_match=True if rgbd_plan1 is None else bool(rgbd_plan1.negative_key_t_match),rgbd_stage2_negative_key_t_match=True if rgbd_plan2 is None else bool(rgbd_plan2.negative_key_t_match),
+                              rgbd_stage1_negative_pair_count=0 if rgbd_plan1 is None else int(rgbd_plan1.negative_pair_count),rgbd_stage2_negative_pair_count=0 if rgbd_plan2 is None else int(rgbd_plan2.negative_pair_count),
+                              rgbd_term=rgbd_term.detach(),cross_term=cross_term,cross_weight=float(cross_weight))
                 if args.train:
                     oom_state['stage']='correspondence_and_fm_backward'
                     timing_sync(); backward_started=time.perf_counter()
                     # Geometry rho controls the bounded residual and is deliberately
                     # FM-only: correspondence trains geometric features but cannot
                     # lower its loss by merely amplifying rho.
-                    if rgbd.requires_grad or corr.requires_grad:
+                    if corr.requires_grad:
                         final_flow.backward(retain_graph=True)
                         flow_rho_grads={id(beta):None if beta.grad is None else beta.grad.detach().clone() for beta in trainable.conditioner.rho_parameters()}
-                        if rgbd_term.requires_grad: rgbd_term.backward(retain_graph=cross_term.requires_grad)
                         if cross_term.requires_grad: cross_term.backward()
                         for beta in trainable.conditioner.rho_parameters(): beta.grad=flow_rho_grads[id(beta)]
                     else:
@@ -1029,7 +1081,7 @@ def main():
         }
         final_stage=len(losses['sigma_abs'])-1 if losses.get('sigma_abs') else -1
         geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':final_stage,'stage_index':final_stage,'sigma_local':losses['sigma_local'][final_stage],'sigma_start':losses['sigma_start'][final_stage],'sigma_end':losses['sigma_end'][final_stage],'sigma_abs':losses['sigma_abs'][final_stage],'geometry_sigma_scale':losses['geometry_sigma_scale'][final_stage],'rms_norm_epsilon':1e-4,'sightline_residual_scale':1.0}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'flow_loss':float(losses['fm'].detach()),'rgbd_loss':float(losses['rgbd'].detach()),'corr_loss':float(losses['corr'].detach()),'total_loss':float(losses['total'].detach()),'rgbd_stage_index':losses['rgbd_stage_index'],'rgbd_sigma_local':losses['rgbd_sigma_local'],'rgbd_sigma_abs':losses['rgbd_sigma_abs'],'rgbd_geometry_sigma_scale':losses['rgbd_scale'],'rgbd_stage_shape':losses['rgbd_stage_shape'],'rgbd_mapping_input_count':losses['rgbd_mapping_input_count'],'rgbd_mapping_output_count':losses['rgbd_mapping_output_count'],'rgbd_valid_correspondence_before_mapping':losses['rgbd_mapping_input_count'],'rgbd_valid_correspondence_after_mapping':losses['rgbd_mapping_output_count'],'rgbd_effective_weight':float(cfg.lambda_rgbd*losses['rgbd_scale']),'cross_effective_weight':losses['cross_weight'],'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'stage_sigma_local':losses['sigma_local'],'stage_sigma_start':losses['sigma_start'],'stage_sigma_end':losses['sigma_end'],'stage_sigma_abs':losses['sigma_abs'],'stage_geometry_sigma_scale':losses['geometry_sigma_scale'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'lambda_rgbd':float(cfg.lambda_rgbd),'m_geo':float(cfg.m_geo),'tau_geo':float(cfg.tau_geo),'max_intra_corr_rows':int(cfg.max_intra_corr_rows),'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'flow_loss':float(losses['fm'].detach()),'rgbd_loss':float(losses['rgbd'].detach()),'corr_loss':float(losses['corr'].detach()),'total_loss':float(losses['total'].detach()),'rgbd_stage1_loss':losses['rgbd_stage1_loss'],'rgbd_stage2_loss':losses['rgbd_stage2_loss'],'rgbd_stage1_scale':losses['rgbd_stage1_scale'],'rgbd_stage2_scale':losses['rgbd_stage2_scale'],'rgbd_stage1_weight':losses['rgbd_stage1_weight'],'rgbd_stage2_weight':losses['rgbd_stage2_weight'],'rgbd_stage1_mapping_input_count':losses['rgbd_stage1_mapping_input_count'],'rgbd_stage1_mapping_output_count':losses['rgbd_stage1_mapping_output_count'],'rgbd_stage2_mapping_input_count':losses['rgbd_stage2_mapping_input_count'],'rgbd_stage2_mapping_output_count':losses['rgbd_stage2_mapping_output_count'],'rgbd_stage1_negative_key_t_match':losses['rgbd_stage1_negative_key_t_match'],'rgbd_stage2_negative_key_t_match':losses['rgbd_stage2_negative_key_t_match'],'rgbd_stage1_negative_pair_count':losses['rgbd_stage1_negative_pair_count'],'rgbd_stage2_negative_pair_count':losses['rgbd_stage2_negative_pair_count'],'rgbd_effective_weight':float(cfg.lambda_rgbd),'cross_effective_weight':losses['cross_weight'],'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'stage_sigma_local':losses['sigma_local'],'stage_sigma_start':losses['sigma_start'],'stage_sigma_end':losses['sigma_end'],'stage_sigma_abs':losses['sigma_abs'],'stage_geometry_sigma_scale':losses['geometry_sigma_scale'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'lambda_rgbd':float(cfg.lambda_rgbd),'m_geo':float(cfg.m_geo),'tau_geo':float(cfg.tau_geo),'max_intra_corr_rows':int(cfg.max_intra_corr_rows),'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

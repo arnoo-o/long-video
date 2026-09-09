@@ -27,6 +27,8 @@ class CorrespondencePlan:
     mapping_input_count: int = 0
     mapping_output_count: int = 0
     stage_shape: tuple = ()
+    negative_key_t_match: bool = True
+    negative_pair_count: int = 0
 
 def _bias_tile(bias, q0, q1, k0, k1):
     if bias.numel()==0: return None
@@ -303,19 +305,33 @@ class SightlineTrainable(nn.Module):
         if negative_mask.any() and int(negative[negative_mask].max().item())>=augmented_key.shape[1]: raise ValueError('RGB-D negative key index is out of bounds for augmented keys')
         if positive_mask.any() and int(positive[positive_mask].max().item())>=native_key.shape[1]: raise ValueError('RGB-D positive key index is out of bounds for native keys')
         if negative_mask.any() and int(negative[negative_mask].max().item())>=native_key.shape[1]: raise ValueError('RGB-D negative key index is out of bounds for native keys')
+        if negative.ndim!=3 or negative_mask.ndim!=3:
+            raise ValueError('RGB-D hard negatives must be stored per positive correspondence')
+        if negative.shape[:2]!=positive.shape or negative_mask.shape!=negative.shape:
+            raise ValueError('RGB-D hard negatives must be paired with each positive')
+        if not bool(plan.negative_key_t_match):
+            raise ValueError('RGB-D hard-negative key-time contract is violated')
         def gather(values,indices):
             safe=indices.clamp_min(0)
-            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],rows,indices.shape[1],values.shape[2],values.shape[3])
+            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],rows,*indices.shape[1:],values.shape[2],values.shape[3])
         scale=augmented_query.shape[-1]**-0.5
         pos_aug=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,positive)).float().mul(scale)
         pos_native=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,positive)).float().mul(scale).detach()
-        neg_aug=torch.einsum('brhd,brnhd->brhn',augmented_query,gather(augmented_key,negative)).float().mul(scale)
-        neg_native=torch.einsum('brhd,brnhd->brhn',native_query,gather(native_key,negative)).float().mul(scale).detach()
-        pos_mask=positive_mask.view(1,rows,1,-1); neg_mask=negative_mask.view(1,rows,1,-1)
-        pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0).sum(-1)/positive_mask.sum(-1).clamp_min(1).view(1,rows,1)
-        neg_delta=(neg_aug-neg_native).masked_fill(~neg_mask,0.0).sum(-1)/negative_mask.sum(-1).clamp_min(1).view(1,rows,1)
-        row_loss=F.softplus((float(margin)-(pos_delta-neg_delta))/float(temperature)).mean((0,2))
-        weights=plan.weights.to(device=row_loss.device,dtype=row_loss.dtype)
+        neg_aug=torch.einsum('brhd,brpnhd->brhpn',augmented_query,gather(augmented_key,negative)).float().mul(scale)
+        neg_native=torch.einsum('brhd,brpnhd->brhpn',native_query,gather(native_key,negative)).float().mul(scale).detach()
+        pos_mask=positive_mask.view(1,rows,1,-1)
+        neg_mask=negative_mask.view(1,rows,1,negative.shape[1],negative.shape[2])
+        pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0)
+        neg_count=negative_mask.sum(-1).clamp_min(1).view(1,rows,1,negative.shape[1])
+        neg_delta=(neg_aug-neg_native).masked_fill(~neg_mask,0.0).sum(-1)/neg_count
+        pair_mask=positive_mask & negative_mask.any(-1)
+        pair_mask_view=pair_mask.view(1,rows,1,-1)
+        pair_loss=F.softplus((float(margin)-(pos_delta-neg_delta))/float(temperature)).masked_fill(~pair_mask_view,0.0)
+        pair_count=pair_mask.sum(-1).clamp_min(1).view(1,rows,1)
+        row_loss=pair_loss.sum(-1)/pair_count
+        row_loss=row_loss.mean((0,2))
+        valid_rows=pair_mask.any(-1).to(row_loss.dtype)
+        weights=plan.weights.to(device=row_loss.device,dtype=row_loss.dtype)*valid_rows
         return (row_loss*weights).sum()/weights.sum().clamp_min(1e-8)
     def lambda_corr(self, progress):
         progress=float(progress); start=self.lambda_corr_decay_start

@@ -11,7 +11,7 @@ import argparse
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -54,6 +54,10 @@ def _rebuild_parent(root: Path, row: dict, pixel_stride: int) -> dict:
     return {"record_id": str(row["record_id"]), "intra_rows": int(stats["row_count"])}
 
 
+def _rebuild_job(arguments: tuple[Path, dict, int]) -> dict:
+    return _rebuild_parent(*arguments)
+
+
 def _write_unit(root: Path, unit: dict, parent_arrays: dict[str, np.ndarray]) -> None:
     offset = int(unit.get("source_frame_start", 0)); count = int(unit["frame_count"])
     chunk_offset = offset // 32
@@ -79,10 +83,9 @@ def main() -> None:
     all_rows = json.loads((root / "manifest_all.json").read_text(encoding="utf-8"))["records"]
     parents = {str(row["record_id"]): row for row in all_rows if row.get("memory_eligible", True)}
     parent_paths = {record_id: _path(root, row, "correspondence_cache") for record_id, row in parents.items()}
-    def rebuild(row: dict) -> dict:
-        return _rebuild_parent(root, row, args.pixel_stride)
-    with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
-        for index, stats in enumerate(executor.map(rebuild, parents.values()), 1):
+    jobs=((root, row, int(args.pixel_stride)) for row in parents.values())
+    with ProcessPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
+        for index, stats in enumerate(executor.map(_rebuild_job, jobs), 1):
             print(json.dumps({"completed": index, "total": len(parents), **stats}), flush=True)
     unit_path = root / "manifest_train_units_3chunk.json"
     units = json.loads(unit_path.read_text(encoding="utf-8"))["records"]

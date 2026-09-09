@@ -984,6 +984,21 @@ def main():
                             # not keep the metric output alive while the
                             # stage FM checkpoint is recomputed.
                             del stage_rgbd_metric
+                        if args.train and capture_rgbd and not is_final_stage:
+                            # The RGB-D backward intentionally retained the
+                            # first stage graph, but keeping that graph while
+                            # checkpoint recomputes FM exceeds the two-GPU
+                            # memory budget.  Re-run this same stage input for
+                            # FM after RGB-D has released its graph; this keeps
+                            # RGB-D backward retain_graph=True and FM's sole
+                            # backward retain_graph=False without overlap.
+                            final_prediction=None
+                            del prediction
+                            for layer in active_rgbd_layers:
+                                processor=pipe.transformer._sightline_processors[layer]
+                                processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
+                            oom_state['stage']=f'flow_stage_{stage_index}_fm_reforward'
+                            prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:

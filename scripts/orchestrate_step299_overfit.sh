@@ -23,19 +23,22 @@ checkpoint="$output_dir/checkpoint-000299.pt"
 release_gpu=7
 train_gpu_list="1,2,3"
 main_gpu_list="1,2,3,7"
-overlap_output="$output_dir/step299-3gpu-overlap"
-inference_output="$output_dir/step299-overfit-inference"
-inference_prefix="$inference_output/arkitscenes__42897628__000000__frames_000_096"
+record_id="scannet__scene0011_01__000008__frames_000_096"
+record_base="/ephemeral/arnoo/sightline-parallel/rgbd_memory_dataset/scannet/processed/records/scannet/scannet__scene0011_01__000008"
+inference_chunks=2
+overlap_output="$output_dir/step299-3gpu-overlap-${record_id}-chunks${inference_chunks}"
+inference_output="$output_dir/step299-overfit-inference-${record_id}-chunks${inference_chunks}"
+inference_prefix="$inference_output/${record_id}"
 main_log="/ephemeral/arnoo/sightline-parallel/train-v10-watch.log"
 overlap_log="$output_dir/step299-3gpu-overlap.log"
 inference_log="$inference_output/inference.log"
 result_file="$inference_output/result.json"
 stop_flag="$overlap_output/STOP"
 
-record_rgb_dir="/ephemeral/arnoo/sightline-parallel/rgbd_memory_dataset/processed_rrd/records/arkitscenes/arkitscenes__42897628__000000/rgb"
-record_intrinsics="/ephemeral/arnoo/sightline-parallel/rgbd_memory_dataset/processed_rrd/records/arkitscenes/arkitscenes__42897628__000000/intrinsics.npy"
-record_c2w="/ephemeral/arnoo/sightline-parallel/rgbd_memory_dataset/processed_rrd/records/arkitscenes/arkitscenes__42897628__000000/c2w_local.npy"
-record_near_depth="0.41449999809265137"
+record_rgb_dir="$record_base/rgb"
+record_intrinsics="$record_base/intrinsics.npy"
+record_c2w="$record_base/c2w_local.npy"
+record_near_depth="1.184000015258789"
 
 export PATH="/ephemeral/JerryHouse/miniconda3/envs/videox-fun/bin:/usr/bin:/bin"
 export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
@@ -149,7 +152,7 @@ CUDA_VISIBLE_DEVICES="$release_gpu" \
   --c2w "$record_c2w" \
   --near-depth "$record_near_depth" \
   --prompt "A stable realistic view of the same scene." \
-  --chunks 3 \
+  --chunks "$inference_chunks" \
   --steps 2 \
   > "$inference_log" 2>&1
 inference_status=$?

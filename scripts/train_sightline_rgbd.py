@@ -305,22 +305,25 @@ def _mapped_correspondences(processor,rows,chunk,identity_index=None,*,allowed_k
     current_shape=next(shape for shape in processor.ray_provider.context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current)
     return _map_correspondence_identities(rows,chunk,current_shape,q.shape[1],identities,identity_index,allowed_key_kinds=allowed_key_kinds,same_chunk_only=same_chunk_only)
 
-def _map_correspondence_identities(rows,chunk,current_shape,query_length,identities,identity_index=None,*,allowed_key_kinds=None,same_chunk_only=False):
+def _map_correspondence_identities(rows,chunk,current_shape,query_length,identities,identity_index=None,*,source_shape=None,allowed_key_kinds=None,same_chunk_only=False):
     """GT-to-attention mapping using layout metadata only, never Q/K values."""
-    current=int(current_shape[0]*current_shape[1]*current_shape[2]); _,height,width=current_shape; q_start=int(query_length)-current
+    current=int(current_shape[0]*current_shape[1]*current_shape[2]); _,height,width=current_shape; source_shape=current_shape if source_shape is None else tuple(int(value) for value in source_shape); _,source_height,source_width=source_shape; q_start=int(query_length)-current
     identity_index=_identity_lookup(identities) if identity_index is None else identity_index
     columns=_correspondence_columns(rows); grouped={}
     for row_index in range(len(columns['query_chunk'])):
         if int(columns['query_chunk'][row_index])!=chunk: continue
-        qt=int(columns['query_latent_temporal'][row_index]); qy=int(columns['query_y'][row_index]); qx=int(columns['query_x'][row_index])
-        if not (0<=qt<current_shape[0] and 0<=qy<height and 0<=qx<width): continue
+        qt=int(columns['query_latent_temporal'][row_index]); qy_final=int(columns['query_y'][row_index]); qx_final=int(columns['query_x'][row_index])
+        if not (0<=qt<current_shape[0] and 0<=qy_final<source_height and 0<=qx_final<source_width): continue
+        qy=min(height-1,(qy_final*height)//source_height); qx=min(width-1,(qx_final*width)//source_width)
         qi=q_start+qt*height*width+qy*width+qx
         key_chunk=int(columns['key_chunk'][row_index]); key_t=int(columns['key_latent_temporal'][row_index])
         if same_chunk_only and (key_chunk!=int(chunk) or key_t>=qt): continue
         global_key=key_chunk*8+key_t
         query_global=chunk*8+qt
         if global_key>query_global: continue
-        ky,kx=int(columns['key_y'][row_index]),int(columns['key_x'][row_index])
+        ky_final,kx_final=int(columns['key_y'][row_index]),int(columns['key_x'][row_index])
+        if not (0<=ky_final<source_height and 0<=kx_final<source_width): continue
+        ky=min(height-1,(ky_final*height)//source_height); kx=min(width-1,(kx_final*width)//source_width)
         factors={'long':4,'mid':2,'short':1}
         native=[]
         for level,factor in factors.items(): native.extend(identity_index.get(('native',global_key,ky//factor,kx//factor,level),()))
@@ -345,6 +348,9 @@ def _map_correspondence_identities(rows,chunk,current_shape,query_length,identit
             for ki in candidates:
                 if 0<=ki<len(identities):
                     source='memory' if ki in memory else ('native' if ki in native else ('source' if ki in source_keys else 'current'))
+                    # Downsampling can map several cache rows to one token
+                    # pair.  Keep one confidence per pair; the max is a
+                    # conservative aggregation and prevents duplicate counts.
                     bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(columns['weight'][row_index])),source)
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
     selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]
@@ -380,13 +386,22 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
     if max_count==0: raise RuntimeError('same-chunk RGB-D correspondence has no hard negative key')
     return negatives,masks
 
-def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,sampling_seed,*,allowed_key_kinds=None,same_chunk_only=False,with_hard_negatives=False,max_negatives=4):
-    """Map GT once before final-stage forward so every layer captures selected Q only."""
+def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,sampling_seed,*,source_shape=None,allowed_key_kinds=None,same_chunk_only=False,with_hard_negatives=False,max_negatives=4):
+    """Map GT once for the selected pyramid stage so every layer captures selected Q only."""
     identities=processor.ray_provider.key_identities(current_length,processor.memory)
     memory_count=len(processor.memory.active_identity_metadata()) if processor.memory is not None and processor.memory.enabled else 0
     query_length=len(identities)-memory_count
     current_shape=next(shape for shape in processor.ray_provider.context['stage_shapes'] if shape[0]*shape[1]*shape[2]==current_length)
-    selected,positives,weights,flags=_map_correspondence_identities(rows,chunk,current_shape,query_length,identities,_identity_lookup(identities),allowed_key_kinds=allowed_key_kinds,same_chunk_only=same_chunk_only)
+    source_shape=current_shape if source_shape is None else tuple(int(value) for value in source_shape)
+    columns=_correspondence_columns(rows); pre_count=0
+    for row_index in range(len(columns['query_chunk'])):
+        qchunk=int(columns['query_chunk'][row_index]); kchunk=int(columns['key_chunk'][row_index]); qt=int(columns['query_latent_temporal'][row_index]); kt=int(columns['key_latent_temporal'][row_index]); qy=int(columns['query_y'][row_index]); qx=int(columns['query_x'][row_index]); ky=int(columns['key_y'][row_index]); kx=int(columns['key_x'][row_index])
+        if qchunk!=int(chunk) or not (0<=qt<current_shape[0] and 0<=qy<source_shape[1] and 0<=qx<source_shape[2] and 0<=ky<source_shape[1] and 0<=kx<source_shape[2]): continue
+        if same_chunk_only and (kchunk!=int(chunk) or kt>=qt): continue
+        if kchunk>qchunk or kchunk<0 or kt<0: continue
+        pre_count+=1
+    selected,positives,weights,flags=_map_correspondence_identities(rows,chunk,current_shape,query_length,identities,_identity_lookup(identities),source_shape=source_shape,allowed_key_kinds=allowed_key_kinds,same_chunk_only=same_chunk_only)
+    mapped_count=sum(len(keys) for keys in positives)
     selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
     max_positive=max(map(len,positives),default=0); device=processor.ray_provider.context['c2w'].device
     positive_indices=torch.full((len(selected),max_positive),-1,device=device,dtype=torch.long)
@@ -400,12 +415,13 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
         for row,keys in enumerate(negatives):
             negative_indices[row,:len(keys)]=torch.as_tensor(keys,device=device); negative_mask[row,:len(keys)]=True
     return CorrespondencePlan(torch.as_tensor(selected,device=device,dtype=torch.long),positive_indices,positive_mask,
-                              torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags),negative_indices,negative_mask)
+                              torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags),negative_indices,negative_mask,
+                              int(pre_count),int(mapped_count),tuple(int(value) for value in current_shape))
 
-def _captured_queries(processor,plan,captured,*,native=False):
+def _captured_queries(processor,plan,captured,*,native=False,capture_indices=None):
     """Select a plan's queries from the union captured for sparse losses."""
     if captured is None: raise RuntimeError('correspondence processor did not capture Q')
-    indices=getattr(processor,'last_capture_query_indices',None)
+    indices=getattr(processor,'last_capture_query_indices',None) if capture_indices is None else capture_indices
     if indices is None:
         if captured.shape[1]==plan.query_indices.numel(): return captured
         indices=plan.query_indices
@@ -417,17 +433,21 @@ def _captured_queries(processor,plan,captured,*,native=False):
         raise RuntimeError('CorrespondencePlan queries were not included in the captured sparse Q union')
     return captured.index_select(1,positions)
 
-def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,timings=None):
+def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,timings=None,captures=None):
     if plan is None or plan.query_indices.numel()==0: return torch.zeros((),device=next(iter(processors.values())).ray_provider.context['c2w'].device)
     missing=[layer for layer in layers if layer not in processors]
     if missing: raise RuntimeError(f'RGB-D correspondence layers have no Sightline processor: {missing}')
     losses=[]; started=time.perf_counter()
     for layer in layers:
         processor=processors[layer]
-        augmented_q=_captured_queries(processor,plan,processor.last_augmented_q if processor.last_augmented_q is not None else processor.last_q)
-        native_q=_captured_queries(processor,plan,processor.last_native_q,native=True)
-        augmented_k=processor.last_augmented_k if processor.last_augmented_k is not None else processor.last_k
-        native_k=processor.last_native_k
+        saved=None if captures is None else captures.get(layer)
+        if saved is None:
+            augmented_q_value=processor.last_augmented_q if processor.last_augmented_q is not None else processor.last_q
+            native_q_value=processor.last_native_q; augmented_k=processor.last_augmented_k if processor.last_augmented_k is not None else processor.last_k; native_k=processor.last_native_k; capture_indices=None
+        else:
+            augmented_q_value,native_q_value,augmented_k,native_k,capture_indices=saved
+        augmented_q=_captured_queries(processor,plan,augmented_q_value,capture_indices=capture_indices)
+        native_q=_captured_queries(processor,plan,native_q_value,native=True,capture_indices=capture_indices)
         if augmented_q is None or native_q is None or augmented_k is None or native_k is None:
             raise RuntimeError('RGB-D processor did not capture native and Sightline Q/K')
         if native_k.shape[1] < augmented_k.shape[1] and plan.negative_indices is not None:
@@ -656,7 +676,8 @@ def main():
         checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
         phase_records=p3_records if phase['name']=='P3' else records
-        eligible_records=[record for record in phase_records if record.chunk_count >= phase['max_chunks'] and (record.memory_eligible or not (phase['memory'] or phase['correspondence'] or bool(args.probe_capture)))]
+        requires_rgbd_data=bool(train_rgbd or phase['memory'] or phase['correspondence'] or bool(args.probe_capture))
+        eligible_records=[record for record in phase_records if record.chunk_count >= phase['max_chunks'] and (record.memory_eligible if requires_rgbd_data else True)]
         if not eligible_records: raise RuntimeError(f"{phase['name']} requires at least one memory-eligible RGB-D record")
         if args.record_index is not None:
             record=phase_records[args.record_index]
@@ -703,6 +724,7 @@ def main():
         train_rgbd=bool(args.train and phase.get('rgbd',False) and not args.alpha_zero_baseline)
         train_correspondence=bool(phase['correspondence'] and train_chunk>0 and not args.alpha_zero_baseline)
         runner.memory.set_enabled(phase['memory'] and train_chunk>0)
+        capture_layers=()
         if train_rgbd or train_correspondence or diagnostic_correspondence:
             if not record.memory_eligible: raise RuntimeError(f"{record.record_id} has no calibrated RGB-D correspondence supervision")
             capture_layers=tuple(sorted(set(active_rgbd_layers).union(active_corr_layers if train_correspondence or diagnostic_correspondence else ())))
@@ -774,27 +796,35 @@ def main():
                 record_vram('active_memory')
                 rgbd_plan=None; cross_plan=None
                 correspondence_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)
+                rgbd_stage_index=max(range(len(items)),key=lambda index: float(items[index]['geometry_sigma_scale'].detach().float().mean()))
+                rgbd_stage_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][rgbd_stage_index])
+                final_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][-1])
                 if rgbd_rows is not None and len(rgbd_rows) and not args.alpha_zero_baseline:
-                    final_shape=runner.ray_provider.context['stage_shapes'][-1]
-                    current_length=int(final_shape[0]*final_shape[1]*final_shape[2])
-                    rgbd_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_rgbd_layers[0]],rgbd_rows,chunk,current_length,cfg.max_intra_corr_rows,correspondence_seed,allowed_key_kinds=('current',),same_chunk_only=True,with_hard_negatives=True)
+                    current_length=int(rgbd_stage_shape[0]*rgbd_stage_shape[1]*rgbd_stage_shape[2])
+                    rgbd_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_rgbd_layers[0]],rgbd_rows,chunk,current_length,cfg.max_intra_corr_rows,correspondence_seed,source_shape=final_shape,allowed_key_kinds=('current',),same_chunk_only=True,with_hard_negatives=True)
                 if cross_rows is not None and len(cross_rows) and not args.alpha_zero_baseline:
-                    final_shape=runner.ray_provider.context['stage_shapes'][-1]
                     current_length=int(final_shape[0]*final_shape[1]*final_shape[2])
                     cross_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],cross_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
                 plans=tuple(plan for plan in (rgbd_plan,cross_plan) if plan is not None)
                 if plans:
                     oom_state['k_length']=max(len(plan.identities) for plan in plans)
                     oom_state['selected_q_count']=int(torch.unique(torch.cat([plan.query_indices for plan in plans])).numel())
-                backward_geometry_diagnostics.clear(); active_stage_trace=[]
+                backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_captures={}
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
-                    capture_correspondence=correspondence_capture_for_stage(stage_index,len(items),bool(plans) or diagnostic_correspondence)
-                    for layer in capture_layers if capture_correspondence else ():
+                    capture_rgbd=bool(rgbd_plan is not None and stage_index==rgbd_stage_index)
+                    capture_cross=bool(stage_index+1==len(items) and (cross_plan is not None or diagnostic_correspondence))
+                    stage_capture_layers=tuple(sorted(set(active_rgbd_layers if capture_rgbd else ()).union(active_corr_layers if capture_cross else ())))
+                    for layer in capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
-                        processor.capture_diagnostics=capture_correspondence
-                        plan_queries=torch.unique(torch.cat([plan.query_indices for plan in plans])) if plans else None
-                        processor.capture_query_indices=plan_queries if capture_correspondence and plan_queries is not None and (args.train or args.probe_capture) else None
+                        processor.capture_diagnostics=False; processor.capture_query_indices=None
+                    for layer in stage_capture_layers:
+                        processor=pipe.transformer._sightline_processors[layer]
+                        processor.capture_diagnostics=True
+                        stage_plans=tuple(plan for plan in (rgbd_plan if capture_rgbd else None,cross_plan if capture_cross else None) if plan is not None)
+                        plan_queries=torch.unique(torch.cat([plan.query_indices for plan in stage_plans])) if stage_plans else None
+                        processor.capture_query_indices=plan_queries if plan_queries is not None and (args.train or args.probe_capture) else None
+                    capture_correspondence=bool(stage_capture_layers)
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     is_final_stage=stage_index+1==len(items)
                     stage_scope=nullcontext()
@@ -813,10 +843,12 @@ def main():
                             active_stage_trace.append(stage_fields)
                             if is_final_stage:
                                 backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
+                        if capture_rgbd:
+                            rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices) for layer in active_rgbd_layers}
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:
-                            timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                            timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(retain_graph=capture_rgbd); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                             # The early-stage backward is complete. Retain only its
                             # scalar metric and sigma; its flow tensors otherwise
                             # remain referenced by ``items`` during the much larger
@@ -827,13 +859,15 @@ def main():
                 fm=torch.stack([loss.detach() if args.train else loss for loss in stage_losses]).mean()
                 cross_weight=trainable.lambda_corr(step/total_steps)
                 oom_state['stage']='correspondence_forward'
-                rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf) if train_rgbd and rgbd_plan is not None else fm.new_zeros(())
+                if rgbd_plan is not None and not rgbd_captures:
+                    raise RuntimeError('RGB-D stage did not capture its selected Q/K tensors')
+                rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=rgbd_captures) if train_rgbd and rgbd_plan is not None else fm.new_zeros(())
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,cross_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=cross_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (train_correspondence or diagnostic_correspondence) and cross_rows is not None and len(cross_rows) else fm.new_zeros(())
                 record_vram('correspondence_loss')
                 rgbd=rgbd_metric if train_rgbd else fm.new_zeros(())
                 corr=corr_metric if train_correspondence else fm.new_zeros(())
                 final_flow=stage_losses[-1]/len(items)
-                rgbd_scale=items[-1]['geometry_sigma_scale'].detach().float().mean()
+                rgbd_scale=items[rgbd_stage_index]['geometry_sigma_scale'].detach().float().mean()
                 rgbd_term=float(cfg.lambda_rgbd)*rgbd_scale*rgbd
                 cross_term=cross_weight*corr
                 total=final_flow+rgbd_term+cross_term if args.train else fm+rgbd_term+cross_term
@@ -843,7 +877,7 @@ def main():
                               sigma_abs=[float(item['sigma_abs'].detach().float().mean()) for item in items],
                               geometry_sigma_scale=[float(item['geometry_sigma_scale'].detach().float().mean()) for item in items],
                               sigma_start=[float(item['sigma_start']) for item in items],sigma_end=[float(item['sigma_end']) for item in items],
-                              rgbd_scale=float(rgbd_scale.detach()),rgbd_term=rgbd_term.detach(),cross_term=cross_term)
+                              rgbd_scale=float(rgbd_scale.detach()),rgbd_stage_index=int(rgbd_stage_index),rgbd_sigma_local=float(items[rgbd_stage_index]['sigma_local'].detach().float().mean()),rgbd_sigma_abs=float(items[rgbd_stage_index]['sigma_abs'].detach().float().mean()),rgbd_stage_shape=list(rgbd_stage_shape[1:]),rgbd_mapping_input_count=0 if rgbd_plan is None else int(rgbd_plan.mapping_input_count),rgbd_mapping_output_count=0 if rgbd_plan is None else int(rgbd_plan.mapping_output_count),rgbd_term=rgbd_term.detach(),cross_term=cross_term)
                 if args.train:
                     oom_state['stage']='correspondence_and_fm_backward'
                     timing_sync(); backward_started=time.perf_counter()
@@ -853,7 +887,7 @@ def main():
                     if rgbd.requires_grad or corr.requires_grad:
                         final_flow.backward(retain_graph=True)
                         flow_rho_grads={id(beta):None if beta.grad is None else beta.grad.detach().clone() for beta in trainable.conditioner.rho_parameters()}
-                        if rgbd_term.requires_grad: rgbd_term.backward(retain_graph=corr_term.requires_grad)
+                        if rgbd_term.requires_grad: rgbd_term.backward(retain_graph=cross_term.requires_grad)
                         if cross_term.requires_grad: cross_term.backward()
                         for beta in trainable.conditioner.rho_parameters(): beta.grad=flow_rho_grads[id(beta)]
                     else:
@@ -983,7 +1017,7 @@ def main():
         }
         final_stage=len(losses['sigma_abs'])-1 if losses.get('sigma_abs') else -1
         geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':final_stage,'stage_index':final_stage,'sigma_local':losses['sigma_local'][final_stage],'sigma_start':losses['sigma_start'][final_stage],'sigma_end':losses['sigma_end'][final_stage],'sigma_abs':losses['sigma_abs'][final_stage],'geometry_sigma_scale':losses['geometry_sigma_scale'][final_stage],'rms_norm_epsilon':1e-4,'sightline_residual_scale':1.0}
-        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'flow_loss':float(losses['fm'].detach()),'rgbd_loss':float(losses['rgbd'].detach()),'corr_loss':float(losses['corr'].detach()),'total_loss':float(losses['total'].detach()),'rgbd_effective_weight':float(cfg.lambda_rgbd*losses['rgbd_scale']),'cross_effective_weight':float(cross_weight),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'stage_sigma_local':losses['sigma_local'],'stage_sigma_start':losses['sigma_start'],'stage_sigma_end':losses['sigma_end'],'stage_sigma_abs':losses['sigma_abs'],'stage_geometry_sigma_scale':losses['geometry_sigma_scale'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'lambda_rgbd':float(cfg.lambda_rgbd),'m_geo':float(cfg.m_geo),'tau_geo':float(cfg.tau_geo),'max_intra_corr_rows':int(cfg.max_intra_corr_rows),'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'flow_loss':float(losses['fm'].detach()),'rgbd_loss':float(losses['rgbd'].detach()),'corr_loss':float(losses['corr'].detach()),'total_loss':float(losses['total'].detach()),'rgbd_stage_index':losses['rgbd_stage_index'],'rgbd_sigma_local':losses['rgbd_sigma_local'],'rgbd_sigma_abs':losses['rgbd_sigma_abs'],'rgbd_geometry_sigma_scale':losses['rgbd_scale'],'rgbd_stage_shape':losses['rgbd_stage_shape'],'rgbd_mapping_input_count':losses['rgbd_mapping_input_count'],'rgbd_mapping_output_count':losses['rgbd_mapping_output_count'],'rgbd_valid_correspondence_before_mapping':losses['rgbd_mapping_input_count'],'rgbd_valid_correspondence_after_mapping':losses['rgbd_mapping_output_count'],'rgbd_effective_weight':float(cfg.lambda_rgbd*losses['rgbd_scale']),'cross_effective_weight':float(cross_weight),'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'stage_sigma_local':losses['sigma_local'],'stage_sigma_start':losses['sigma_start'],'stage_sigma_end':losses['sigma_end'],'stage_sigma_abs':losses['sigma_abs'],'stage_geometry_sigma_scale':losses['geometry_sigma_scale'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'lambda_rgbd':float(cfg.lambda_rgbd),'m_geo':float(cfg.m_geo),'tau_geo':float(cfg.tau_geo),'max_intra_corr_rows':int(cfg.max_intra_corr_rows),'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

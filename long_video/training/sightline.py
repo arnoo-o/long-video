@@ -24,6 +24,9 @@ class CorrespondencePlan:
     flags: tuple
     negative_indices: torch.Tensor|None = None
     negative_mask: torch.Tensor|None = None
+    mapping_input_count: int = 0
+    mapping_output_count: int = 0
+    stage_shape: tuple = ()
 
 def _bias_tile(bias, q0, q1, k0, k1):
     if bias.numel()==0: return None

@@ -73,6 +73,15 @@ def _write_unit(root: Path, unit: dict, parent_arrays: dict[str, np.ndarray]) ->
     _atomic_npz(_path(root, unit, "correspondence_cache"), arrays)
 
 
+def _rebase_units_job(arguments: tuple[Path, Path, list[dict]]) -> int:
+    root, parent_path, units = arguments
+    with np.load(parent_path, allow_pickle=False) as value:
+        parent_arrays = {key: np.ascontiguousarray(value[key]) for key in value.files}
+    for unit in units:
+        _write_unit(root, unit, parent_arrays)
+    return len(units)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--unified-root", type=Path, required=True)
@@ -95,12 +104,11 @@ def main() -> None:
         if parent_id not in parent_paths:
             raise RuntimeError(f"missing parent cache for unit {unit['record_id']}")
         units_by_parent.setdefault(parent_id, []).append(unit)
+    unit_jobs=((root, parent_paths[parent_id], parent_units) for parent_id, parent_units in units_by_parent.items())
     written = 0
-    for parent_id, parent_units in units_by_parent.items():
-        with np.load(parent_paths[parent_id], allow_pickle=False) as value:
-            parent_arrays = {key: np.ascontiguousarray(value[key]) for key in value.files}
-        for unit in parent_units:
-            _write_unit(root, unit, parent_arrays); written += 1
+    with ProcessPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
+        for count in executor.map(_rebase_units_job, unit_jobs):
+            written += int(count)
     print(json.dumps({"parents": len(parent_paths), "units": written, "schema": "causal-intra-rgbd-v1"}, indent=2), flush=True)
 
 

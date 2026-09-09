@@ -323,14 +323,25 @@ class SightlineTrainable(nn.Module):
         # memory even though the final loss only needs the mean over N.
         # Accumulate one matched negative at a time; this is algebraically
         # identical and keeps the sparse Q/K contract intact.
-        neg_delta_sum=pos_aug.new_zeros(pos_aug.shape)
+        neg_delta_sum=None
+        negative_row_chunk=64
         for negative_slot in range(int(negative.shape[2])):
             negative_indices=negative[:,:,negative_slot]
-            negative_mask_slot=negative_mask[:,:,negative_slot].view(1,rows,1,-1)
-            neg_aug_slot=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,negative_indices)).float().mul(scale)
-            with torch.no_grad():
-                neg_native_slot=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,negative_indices)).float().mul(scale)
-            neg_delta_sum=neg_delta_sum+(neg_aug_slot-neg_native_slot).masked_fill(~negative_mask_slot,0.0)
+            slot_blocks=[]
+            for row_start in range(0,rows,negative_row_chunk):
+                row_stop=min(rows,row_start+negative_row_chunk)
+                negative_indices_chunk=negative_indices[row_start:row_stop]
+                negative_mask_chunk=negative_mask[row_start:row_stop,:,negative_slot].view(1,row_stop-row_start,1,-1)
+                augmented_query_chunk=augmented_query[:,row_start:row_stop]
+                native_query_chunk=native_query[:,row_start:row_stop]
+                neg_aug_slot=torch.einsum('brhd,brphd->brhp',augmented_query_chunk,gather(augmented_key,negative_indices_chunk)).float().mul(scale)
+                with torch.no_grad():
+                    neg_native_slot=torch.einsum('brhd,brphd->brhp',native_query_chunk,gather(native_key,negative_indices_chunk)).float().mul(scale)
+                slot_blocks.append((neg_aug_slot-neg_native_slot).masked_fill(~negative_mask_chunk,0.0))
+            slot_delta=torch.cat(slot_blocks,dim=1) if slot_blocks else pos_aug.new_zeros(pos_aug.shape)
+            neg_delta_sum=slot_delta if neg_delta_sum is None else neg_delta_sum+slot_delta
+        if neg_delta_sum is None:
+            neg_delta_sum=pos_aug.new_zeros(pos_aug.shape)
         pos_mask=positive_mask.view(1,rows,1,-1)
         pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0)
         neg_count=negative_mask.sum(-1).clamp_min(1).view(1,rows,1,negative.shape[1])

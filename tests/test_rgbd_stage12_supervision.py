@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 
 def test_hard_negatives_are_paired_at_each_positive_key_time():
@@ -57,6 +58,81 @@ def test_rgbd_ranking_loss_keeps_negative_axis_paired_and_trains_augmented_qk():
     assert augmented_k.grad is not None and augmented_k.grad.abs().sum() > 0
 
 
+def test_streaming_rgbd_ranking_matches_dense_reference_with_confidence_and_upstream_scale():
+    from long_video.training.sightline import CorrespondencePlan, SightlineTrainable
+
+    torch.manual_seed(404)
+    batch, rows, heads, dim, key_count = 3, 4, 3, 5, 19
+    positive = torch.tensor([[1, 2, 3], [4, 5, -1], [6, 6, 7], [8, 9, 10]])
+    positive_mask = torch.tensor([[True, True, True], [True, True, False], [True, True, True], [True, True, True]])
+    positive_weights = torch.tensor([[0.2, 1.7, 3.1], [2.2, 0.4, 0.0], [0.6, 4.0, 0.9], [1.3, 0.1, 2.5]])
+    negative = torch.tensor([
+        [[11, 12, 12, -1], [13, -1, -1, -1], [14, 15, 16, 17]],
+        [[11, 12, -1, -1], [13, 13, 14, -1], [-1, -1, -1, -1]],
+        [[11, -1, -1, -1], [12, 13, 13, 14], [15, 16, -1, -1]],
+        [[11, 12, 13, -1], [14, -1, -1, -1], [15, 15, 16, -1]],
+    ])
+    negative_mask = negative.ge(0)
+    row_weights = torch.tensor([0.7, 1.6, 0.3, 2.4])
+    plan = CorrespondencePlan(
+        query_indices=torch.arange(rows), positive_indices=positive, positive_mask=positive_mask,
+        weights=row_weights, identities=(), flags=(), negative_indices=negative,
+        negative_mask=negative_mask, positive_weights=positive_weights,
+        negative_key_t_match=True, negative_pair_count=int(positive_mask.sum()),
+    )
+    native_q = torch.randn(batch, rows, heads, dim)
+    native_k = torch.randn(batch, key_count, heads, dim)
+    q = torch.randn(batch, rows, heads, dim, requires_grad=True)
+    k = torch.randn(batch, key_count, heads, dim, requires_grad=True)
+
+    def dense_reference(aq, ak):
+        scale = dim ** -0.5
+        safe_positive = positive.clamp_min(0)
+        safe_negative = negative.clamp_min(0)
+        positive_aug = torch.gather(
+            ak[:, None, None].expand(batch, rows, positive.shape[1], key_count, heads, dim),
+            3, safe_positive[None, :, :, None, None, None].expand(batch, rows, positive.shape[1], 1, heads, dim),
+        ).squeeze(3)
+        positive_native = torch.gather(
+            native_k[:, None, None].expand(batch, rows, positive.shape[1], key_count, heads, dim),
+            3, safe_positive[None, :, :, None, None, None].expand(batch, rows, positive.shape[1], 1, heads, dim),
+        ).squeeze(3)
+        negative_aug = torch.gather(
+            ak[:, None, None, None].expand(batch, rows, positive.shape[1], negative.shape[2], key_count, heads, dim),
+            4, safe_negative[None, :, :, :, None, None, None].expand(batch, rows, positive.shape[1], negative.shape[2], 1, heads, dim),
+        ).squeeze(4)
+        negative_native = torch.gather(
+            native_k[:, None, None, None].expand(batch, rows, positive.shape[1], negative.shape[2], key_count, heads, dim),
+            4, safe_negative[None, :, :, :, None, None, None].expand(batch, rows, positive.shape[1], negative.shape[2], 1, heads, dim),
+        ).squeeze(4)
+        query = aq.unsqueeze(2)
+        native_query = native_q.unsqueeze(2)
+        positive_delta = (query * positive_aug).sum(-1) * scale - (native_query * positive_native).sum(-1) * scale
+        negative_delta = ((query.unsqueeze(3) * negative_aug).sum(-1) * scale - (native_query.unsqueeze(3) * negative_native).sum(-1) * scale).permute(0, 1, 2, 4, 3)
+        count = negative_mask.sum(-1).clamp_min(1).to(negative_delta.dtype)
+        negative_mean = negative_delta.masked_fill(~negative_mask[None, :, :, None, :], 0.0).sum(-1) / count[None, :, :, None]
+        gap = positive_delta - negative_mean
+        pair_loss = F.softplus((0.1 - gap) / 0.1)
+        pair_mask = positive_mask & negative_mask.any(-1)
+        confidence = positive_weights * pair_mask
+        per_row = (pair_loss * confidence[None, :, :, None]).sum(2) / confidence.sum(-1).clamp_min(1e-8)[None, :, None]
+        valid_rows = pair_mask.any(-1)
+        return (per_row.mean((0, 2)) * row_weights).sum() / row_weights[valid_rows].sum().clamp_min(1e-8)
+
+    dense_q = q.detach().clone().requires_grad_(True)
+    dense_k = k.detach().clone().requires_grad_(True)
+    dense = dense_reference(dense_q, dense_k)
+    streamed = SightlineTrainable(4, layers=(0,), heads=heads).rgbd_ranking_loss(
+        q, k, native_q, native_k, plan, margin=0.1, temperature=0.1
+    )
+    upstream = 0.37
+    dense_grad = torch.autograd.grad(upstream * dense, (dense_q, dense_k), retain_graph=True)
+    (upstream * streamed).backward()
+    assert torch.allclose(streamed, dense, atol=2e-6, rtol=2e-6)
+    assert torch.allclose(q.grad, dense_grad[0], atol=3e-6, rtol=3e-6)
+    assert torch.allclose(k.grad, dense_grad[1], atol=3e-6, rtol=3e-6)
+
+
 def test_training_source_uses_only_rgbd_stage1_and_stage2():
     source = (Path(__file__).parents[1] / 'scripts' / 'train_sightline_rgbd.py').read_text()
     config = (Path(__file__).parents[1] / 'configs' / 'sightline.yaml').read_text()
@@ -66,3 +142,14 @@ def test_training_source_uses_only_rgbd_stage1_and_stage2():
     assert "lambda_rgbd: 0.006" in config
     assert "rgbd_stage1_negative_key_t_match" in source
     assert "rgbd_stage2_negative_key_t_match" in source
+
+
+def test_total_metric_contains_all_fm_stages_without_a_second_backward_path():
+    from scripts.train_sightline_rgbd import _total_metric
+
+    fm = torch.tensor(0.7)
+    rgbd_term = torch.tensor(0.02, requires_grad=True)
+    cross_term = torch.tensor(0.03, requires_grad=True)
+    total = _total_metric(fm, rgbd_term, cross_term)
+    assert total.item() == 0.75
+    assert not total.requires_grad

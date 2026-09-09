@@ -33,7 +33,7 @@ WARMUP_STEPS=100
 FORMAL_MEMORY_LAYERS=(4,8,16,20,24,32,36)
 LEGACY_999_MEMORY_LAYERS=(4,6,8,16,20,24,32,34,36)
 
-HELIOS_RUNTIME_PATCH_VERSION='sightline-token-blocked-v1'
+HELIOS_RUNTIME_PATCH_VERSION='sightline-token-blocked-v2-prefix'
 _PATCH_IMPORT="""from long_video.sightline.bounded_ops import (
     token_blocked_gated_residual,
     token_blocked_layer_norm,
@@ -62,6 +62,59 @@ _RESIDUAL1_ORIGINAL='        hidden_states = (hidden_states.float() + attn_outpu
 _RESIDUAL1_PATCHED='        hidden_states = token_blocked_gated_residual(hidden_states, attn_output, gate_msa)'
 _RESIDUAL3_ORIGINAL='        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)'
 _RESIDUAL3_PATCHED='        hidden_states = token_blocked_gated_residual(hidden_states, ff_output, c_gate_msa)'
+_PREFIX_SETUP_ORIGINAL='        # 6. Transformer blocks\n        hidden_states = hidden_states.contiguous()'
+_PREFIX_SETUP_PATCHED='''        prefix_stop_layer = None
+        if attention_kwargs and attention_kwargs.get("sightline_prefix_stop_layer") is not None:
+            prefix_stop_layer = int(attention_kwargs["sightline_prefix_stop_layer"])
+            if not 0 <= prefix_stop_layer < len(self.blocks):
+                raise ValueError(f"sightline prefix stop layer must be in [0, {len(self.blocks) - 1}]")
+
+        # 6. Transformer blocks
+        hidden_states = hidden_states.contiguous()'''
+_PREFIX_EXEC_ORIGINAL='''        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for block in self.blocks:
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+        else:
+            for block in self.blocks:
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+'''
+_PREFIX_EXEC_PATCHED='''        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            for block_index, block in enumerate(self.blocks):
+                hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+                if prefix_stop_layer is not None and block_index >= prefix_stop_layer:
+                    return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
+        else:
+            for block_index, block in enumerate(self.blocks):
+                hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    timestep_proj,
+                    rotary_emb,
+                    original_context_length,
+                )
+                if prefix_stop_layer is not None and block_index >= prefix_stop_layer:
+                    return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
+'''
 
 def _install_memory_efficient_helios_norm(source_file:Path):
     """Install and identify the audited token-blocked Helios runtime patch."""
@@ -71,13 +124,15 @@ def _install_memory_efficient_helios_norm(source_file:Path):
         (_NORM1_PATCHED,_NORM1_ORIGINAL),(_NORM1_EXPERIMENTAL_V1,_NORM1_ORIGINAL),(_NORM1_EXPERIMENTAL_V2,_NORM1_ORIGINAL),
         (_NORM2_PATCHED,_NORM2_ORIGINAL),(_NORM3_PATCHED,_NORM3_ORIGINAL),(_NORM3_EXPERIMENTAL_V1,_NORM3_ORIGINAL),
         (_NORM3_EXPERIMENTAL_V2,_NORM3_ORIGINAL),(_RESIDUAL1_PATCHED,_RESIDUAL1_ORIGINAL),(_RESIDUAL3_PATCHED,_RESIDUAL3_ORIGINAL),
+        (_PREFIX_SETUP_PATCHED,_PREFIX_SETUP_ORIGINAL),(_PREFIX_EXEC_PATCHED,_PREFIX_EXEC_ORIGINAL),
     ): canonical=canonical.replace(patched,original)
-    required=(_NORM1_ORIGINAL,_NORM2_ORIGINAL,_NORM3_ORIGINAL,_RESIDUAL1_ORIGINAL,_RESIDUAL3_ORIGINAL)
+    required=(_NORM1_ORIGINAL,_NORM2_ORIGINAL,_NORM3_ORIGINAL,_RESIDUAL1_ORIGINAL,_RESIDUAL3_ORIGINAL,_PREFIX_SETUP_ORIGINAL,_PREFIX_EXEC_ORIGINAL)
     if any(value not in canonical for value in required): raise RuntimeError('pinned Helios source no longer matches the audited runtime patch')
     patched=canonical.replace(_IMPORT_ANCHOR,_IMPORT_ANCHOR+'\n'+_PATCH_IMPORT)
     for original,replacement in (
         (_NORM1_ORIGINAL,_NORM1_PATCHED),(_NORM2_ORIGINAL,_NORM2_PATCHED),(_NORM3_ORIGINAL,_NORM3_PATCHED),
         (_RESIDUAL1_ORIGINAL,_RESIDUAL1_PATCHED),(_RESIDUAL3_ORIGINAL,_RESIDUAL3_PATCHED),
+        (_PREFIX_SETUP_ORIGINAL,_PREFIX_SETUP_PATCHED),(_PREFIX_EXEC_ORIGINAL,_PREFIX_EXEC_PATCHED),
     ): patched=patched.replace(original,replacement)
     if patched!=text: source_file.write_text(patched)
     return {
@@ -212,18 +267,24 @@ def _prompt(pipe,text,device):
     if mask.ndim!=2 or mask.shape[:2]!=embeds.shape[:2]: raise RuntimeError('pinned Helios prompt mask shape mismatch')
     return embeds.detach(),mask.detach()
 
-def _transformer_forward(pipe,noisy,timestep,prompt_embeds,history,current_start):
+def _transformer_forward(pipe,noisy,timestep,prompt_embeds,history,current_start,*,prefix_stop_layer=None):
     """Call native Helios only. Geometry sigma is owned by the caller."""
     indices=native_helios_indices(noisy.device,noisy.shape[0])['current']
+    attention_kwargs={'current_chunk':current_start//8}
+    if prefix_stop_layer is not None:
+        attention_kwargs['sightline_prefix_stop_layer']=int(prefix_stop_layer)
     output=pipe.transformer(hidden_states=noisy.to(pipe.transformer.dtype),timestep=timestep,encoder_hidden_states=prompt_embeds,
         indices_hidden_states=indices,latents_history_long=history['long'][0],indices_latents_history_long=history['long'][1],
         latents_history_mid=history['mid'][0],indices_latents_history_mid=history['mid'][1],
-        latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs={'current_chunk':current_start//8})
+        latents_history_short=history['short'][0],indices_latents_history_short=history['short'][1],attention_kwargs=attention_kwargs,
+        return_dict=False if prefix_stop_layer is not None else True)
+    if prefix_stop_layer is not None:
+        return None
     prediction=output[0] if isinstance(output,(tuple,list)) else getattr(output,'sample',output)
     if prediction.shape!=noisy.shape: raise RuntimeError(f'prediction shape {prediction.shape} != {noisy.shape}')
     return prediction
 
-def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,*,routing_scope_active=False):
+def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,*,routing_scope_active=False,prefix_stop_layer=None):
     """Active FM wrapper; Geometry is timestep-independent."""
     if not isinstance(item,dict) or 'sigmas' not in item or 'timesteps' not in item:
         raise ValueError('active Flow Matching prediction requires item["sigmas"] and item["timesteps"]')
@@ -234,14 +295,20 @@ def _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,*,rout
     # checkpoint recomputation of the stage.  ``sigmas`` is the Helios-local
     # coordinate; Geometry receives the shared absolute coordinate.
     sigma_local=item.get('sigma_local',item['sigmas']).detach().float().mean()
-    sigma_start=float(item.get('sigma_start',item['stage_start_sigma']))
-    sigma_end=float(item.get('sigma_end',item['stage_end_sigma']))
+    sigma_start=float(item.get('sigma_start',item.get('stage_start_sigma',1.0)))
+    sigma_end=float(item.get('sigma_end',item.get('stage_end_sigma',0.0)))
     sigma_abs,geometry_sigma_scale=geometry_sigma_schedule(sigma_local,sigma_start,sigma_end)
     runner.ray_provider.context.update({'stage_index':int(item.get('stage_index',item.get('stage_id',0))),
         'sigma_local':sigma_local,'sigma_start':sigma_start,'sigma_end':sigma_end,
         'sigma_abs':sigma_abs.detach(),'geometry_sigma_scale':geometry_sigma_scale.detach(),
         'sigma':sigma_abs.detach(),'sigma_override':True})
-    return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start)
+    return _transformer_forward(pipe,noisy,item['timesteps'],prompt_embeds,history,current_start,prefix_stop_layer=prefix_stop_layer)
+
+def _rgbd_prefix_forward(pipe,noisy,item,prompt_embeds,history,current_start,stop_layer):
+    """Run the shared Helios path only through the last RGB-D capture block."""
+    if stop_layer is None or int(stop_layer)<0:
+        raise ValueError('RGB-D prefix forward requires a non-negative stop layer')
+    return _model_prediction(pipe,noisy,item,prompt_embeds,history,current_start,prefix_stop_layer=int(stop_layer))
 
 def _generate_detached_chunk(pipe,source,history,prompt_embeds,cfg,chunk,clean_boundary=None):
     """Native Helios autoregressive inference from noise; no target argument exists."""
@@ -353,19 +420,22 @@ def _map_correspondence_identities(rows,chunk,current_shape,query_length,identit
                     # conservative aggregation and prevents duplicate counts.
                     bucket[ki]=(max(bucket.get(ki,(0.0,''))[0],float(columns['weight'][row_index])),source)
     if not grouped: raise RuntimeError('correspondence identities do not map to real attention axes')
-    selected=sorted(grouped); positives=[sorted(grouped[query]) for query in selected]; weights=[max(value[0] for value in grouped[query].values()) for query in selected]
+    selected=sorted(grouped)
+    positives=[sorted(grouped[query]) for query in selected]
+    positive_weights=[[float(grouped[query][key][0]) for key in keys] for query,keys in zip(selected,positives)]
+    weights=[max(value[0] for value in grouped[query].values()) for query in selected]
     flags=[{'has_native_positive':any(value[1] in ('native','source','current') for value in grouped[query].values()),'has_memory_positive':any(value[1]=='memory' for value in grouped[query].values())} for query in selected]
-    return selected,positives,weights,flags
+    return selected,positives,positive_weights,weights,flags
 
-def _sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed):
-    if len(selected)<=max_rows:return selected,positives,weights,flags
+def _sample_correspondence_mapping(selected,positives,positive_weights,weights,flags,max_rows,sampling_seed):
+    if len(selected)<=max_rows:return selected,positives,positive_weights,weights,flags
     memory_indices=[i for i,flag in enumerate(flags) if flag['has_memory_positive']]
     generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed) & ((1<<63)-1))
     order=torch.randperm(len(selected),generator=generator).tolist()
     memory_set=set(memory_indices); memory_order=[i for i in order if i in memory_set]
     chosen_memory=memory_order[:max_rows]; chosen_memory_set=set(chosen_memory)
     choice=(chosen_memory+[i for i in order if i not in chosen_memory_set])[:max_rows]
-    return ([selected[i] for i in choice],[positives[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
+    return ([selected[i] for i in choice],[positives[i] for i in choice],[positive_weights[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
 
 def _hard_negative_indices(selected,positives,identities,current_shape,query_length,*,max_negatives=4):
     """Choose spatially adjacent negatives at each positive's exact key time."""
@@ -423,8 +493,8 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
         if same_chunk_only and (kchunk!=int(chunk) or kt>=qt): continue
         if kchunk>qchunk or kchunk<0 or kt<0: continue
         pre_count+=1
-    selected,positives,weights,flags=_map_correspondence_identities(rows,chunk,current_shape,query_length,identities,_identity_lookup(identities),source_shape=source_shape,allowed_key_kinds=allowed_key_kinds,same_chunk_only=same_chunk_only)
-    selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
+    selected,positives,positive_weights,weights,flags=_map_correspondence_identities(rows,chunk,current_shape,query_length,identities,_identity_lookup(identities),source_shape=source_shape,allowed_key_kinds=allowed_key_kinds,same_chunk_only=same_chunk_only)
+    selected,positives,positive_weights,weights,flags=_sample_correspondence_mapping(selected,positives,positive_weights,weights,flags,max_rows,sampling_seed)
     device=processor.ray_provider.context['c2w'].device
     negative_indices=negative_mask=None; sparse_key_indices=key_index_map=None
     negative_key_t_match=True; negative_pair_count=0
@@ -442,16 +512,21 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
             return None
         selected=[selected[row] for row,_ in filtered]
         positives=[[positives[row][index] for index in keep] for row,keep in filtered]
+        positive_weights=[[positive_weights[row][index] for index in keep] for row,keep in filtered]
         weights=[weights[row] for row,_ in filtered]
         flags=[flags[row] for row,_ in filtered]
         negative_rows=[[negatives[row][index] for index in keep] for row,keep in filtered]
-        negative_pair_count=sum(len(keys) for row in negative_rows for keys in row if keys)
+        # This is a count of valid (query, positive) pairs, not the number of
+        # negative tokens attached to those pairs.
+        negative_pair_count=sum(1 for row in negative_rows for keys in row if keys)
     mapped_count=sum(len(keys) for keys in positives)
     max_positive=max(map(len,positives),default=0)
     positive_indices=torch.full((len(selected),max_positive),-1,device=device,dtype=torch.long)
     positive_mask=torch.zeros_like(positive_indices,dtype=torch.bool)
-    for row,keys in enumerate(positives):
+    positive_weight_tensor=torch.zeros((len(selected),max_positive),device=device,dtype=torch.float32)
+    for row,(keys,confidences) in enumerate(zip(positives,positive_weights)):
         positive_indices[row,:len(keys)]=torch.as_tensor(keys,device=device); positive_mask[row,:len(keys)]=True
+        positive_weight_tensor[row,:len(keys)]=torch.as_tensor(confidences,device=device,dtype=torch.float32)
     if with_hard_negatives:
         max_negative=max((len(value) for row in negative_rows for value in row),default=0)
         negative_indices=torch.full((len(selected),max_positive,max_negative),-1,device=device,dtype=torch.long); negative_mask=torch.zeros_like(negative_indices,dtype=torch.bool)
@@ -472,7 +547,7 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
     return CorrespondencePlan(torch.as_tensor(selected,device=device,dtype=torch.long),positive_indices,positive_mask,
                               torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags),negative_indices,negative_mask,
                               int(pre_count),int(mapped_count),tuple(int(value) for value in current_shape),bool(negative_key_t_match),int(negative_pair_count),
-                              sparse_key_indices,key_index_map)
+                              sparse_key_indices,key_index_map,positive_weight_tensor)
 
 def _captured_queries(processor,plan,captured,*,native=False,capture_indices=None):
     """Select a plan's queries from the union captured for sparse losses."""
@@ -571,6 +646,10 @@ def _backward_rgbd_stage(term,trainable,*,retain_graph):
     for beta in trainable.conditioner.rho_parameters():
         beta.grad=saved[id(beta)]
 
+def _total_metric(fm,rgbd_term,cross_term):
+    """Report the complete objective without creating a second backward path."""
+    return fm + rgbd_term.detach() + cross_term.detach()
+
 def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0,timings=None,plan=None,vram_callback=None):
     if not layers: raise RuntimeError('correspondence is enabled but correspondence_layers is empty')
     missing=[layer for layer in layers if layer not in processors]
@@ -584,11 +663,11 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
             raise RuntimeError('correspondence layers must have identical key identity maps for shared mapping')
     mapping_started=time.perf_counter()
     if plan is None:
-        try: selected,positives,weights,flags=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
+        try: selected,positives,positive_weights,weights,flags=_mapped_correspondences(first,rows,chunk,_identity_lookup(identities))
         except RuntimeError as exc:
             if 'do not map' not in str(exc): raise
-            selected=positives=weights=flags=[]
-        selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
+            selected=positives=positive_weights=weights=flags=[]
+        selected,positives,positive_weights,weights,flags=_sample_correspondence_mapping(selected,positives,positive_weights,weights,flags,max_rows,sampling_seed)
     else:
         if identities != plan.identities: raise RuntimeError('CorrespondencePlan key identities changed during final-stage forward')
         selected=list(range(plan.query_indices.numel())); positives=weights=None; flags=plan.flags
@@ -957,10 +1036,17 @@ def main():
                     stage_scope=nullcontext()
                     with stage_scope:
                         if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_before')
-                        prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
+                        if capture_rgbd:
+                            # The RGB-D pass only needs the shared Helios path
+                            # through the last active Sightline block.  It
+                            # captures Q/K and returns before norm_out/proj_out.
+                            prediction=_rgbd_prefix_forward(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,max(active_rgbd_layers))
+                            final_prediction=None
+                        else:
+                            prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True); final_prediction=prediction
                         if capture_geometry_diagnostics: record_geometry_memory(f'pyramid_stage_{stage_index}_geometry_forward_after')
                         stage_scale_deltas={layer:(None if pipe.transformer._sightline_processors[layer].last_scale_delta is None else pipe.transformer._sightline_processors[layer].last_scale_delta.detach()) for layer in capture_layers}
-                        if args.train and capture_rgbd:
+                        if args.train and capture_rgbd and prediction is not None:
                             # The first RGB-D backward needs only the captured
                             # Q/K branches.  Drop the unrelated stage output
                             # graph before checkpoint recomputation.  Both
@@ -1046,7 +1132,7 @@ def main():
                 final_flow=stage_losses[-1]/len(items)
                 rgbd_term=float(cfg.lambda_rgbd)*rgbd
                 cross_term=cross_weight*corr
-                total=final_flow+rgbd_term+cross_term if args.train else fm+rgbd_term+cross_term
+                total=_total_metric(fm,rgbd_term,cross_term)
                 rgbd_plan1=rgbd_plans.get(1); rgbd_plan2=rgbd_plans.get(2)
                 losses.update(fm=fm,rgbd=rgbd,corr=corr,total=total,stage=stage_losses,
                               sigmas=[float(item['sigmas'].mean()) for item in items],
@@ -1084,7 +1170,7 @@ def main():
                     layer_captures=[]
                     for layer in active_corr_layers:
                         processor=pipe.transformer._sightline_processors[layer]
-                        try: selected,positives,_,_=_mapped_correspondences(processor,cross_rows,chunk)
+                        try: selected,positives,_,_,_=_mapped_correspondences(processor,cross_rows,chunk)
                         except RuntimeError as exc:
                             if 'do not map' in str(exc): continue
                             raise

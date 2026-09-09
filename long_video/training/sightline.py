@@ -33,6 +33,9 @@ class CorrespondencePlan:
     # The plan's positive/negative tensors are expressed in this sparse axis.
     sparse_key_indices: torch.Tensor|None = None
     key_index_map: torch.Tensor|None = None
+    # One confidence per padded positive slot.  ``weights`` remains the
+    # query-level aggregation weight used by the existing correspondence path.
+    positive_weights: torch.Tensor|None = None
 
 def _bias_tile(bias, q0, q1, k0, k1):
     if bias.numel()==0: return None
@@ -142,11 +145,11 @@ class _StreamingRGBDRanking(torch.autograd.Function):
     @staticmethod
     def forward(ctx,augmented_query,augmented_key,native_query,native_key,
                 positive_indices,positive_mask,negative_indices,negative_mask,
-                weights,margin,temperature):
+                weights,positive_weights,margin,temperature):
         pair_mask=positive_mask & negative_mask.any(-1)
         pair_rows,pair_slots=torch.nonzero(pair_mask,as_tuple=True)
-        pair_counts=pair_mask.sum(-1)
-        valid_rows=pair_counts>0
+        positive_weight_sum=positive_weights.masked_fill(~pair_mask,0.0).float().sum(-1)
+        valid_rows=pair_mask.any(-1)
         denominator=weights.float().masked_select(valid_rows).sum()
         numerator=augmented_query.new_zeros((),dtype=torch.float32)
         block_size=_StreamingRGBDRanking.BLOCK_SIZE
@@ -159,12 +162,13 @@ class _StreamingRGBDRanking(torch.autograd.Function):
             pair_value=_StreamingRGBDRanking._pair_loss(
                 augmented_query.index_select(1,rows),augmented_key,native_query.index_select(1,rows),native_key,
                 positive,negative,negative_valid,margin,temperature).mean((0,2))
-            coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()
+            confidence=positive_weights[rows,slots].float()
+            coefficient=weights.index_select(0,rows).float()*confidence/positive_weight_sum.index_select(0,rows).clamp_min(1e-8)
             numerator=numerator+(pair_value*coefficient).sum()
         value=numerator/denominator.clamp_min(1e-8)
         ctx.save_for_backward(augmented_query,augmented_key,native_query,native_key,
                               positive_indices,positive_mask,negative_indices,negative_mask,
-                              weights,pair_rows,pair_slots,pair_counts,denominator)
+                              weights,positive_weights,pair_rows,pair_slots,positive_weight_sum,denominator)
         ctx.margin=float(margin); ctx.temperature=float(temperature)
         return value
 
@@ -172,11 +176,11 @@ class _StreamingRGBDRanking(torch.autograd.Function):
     def backward(ctx,grad_output):
         (augmented_query,augmented_key,native_query,native_key,
          positive_indices,positive_mask,negative_indices,negative_mask,
-         weights,pair_rows,pair_slots,pair_counts,denominator)=ctx.saved_tensors
+         weights,positive_weights,pair_rows,pair_slots,positive_weight_sum,denominator)=ctx.saved_tensors
         grad_query=torch.zeros_like(augmented_query)
         grad_key=torch.zeros_like(augmented_key)
         if pair_rows.numel()==0:
-            return grad_query,grad_key,None,None,None,None,None,None,None,None,None
+            return grad_query,grad_key,None,None,None,None,None,None,None,None,None,None
         block_size=_StreamingRGBDRanking.BLOCK_SIZE
         scale=augmented_query.shape[-1]**-0.5
         batch_size=augmented_query.shape[0]; head_count=augmented_query.shape[2]
@@ -201,7 +205,8 @@ class _StreamingRGBDRanking(torch.autograd.Function):
             gap=positive_delta-negative_mean
             softplus_input=(float(ctx.margin)-gap)/float(ctx.temperature)
             d_gap=(-torch.sigmoid(softplus_input)/float(ctx.temperature))
-            coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()/denominator
+            confidence=positive_weights[rows,slots].float()
+            coefficient=weights.index_select(0,rows).float()*confidence/positive_weight_sum.index_select(0,rows).clamp_min(1e-8)/denominator.clamp_min(1e-8)
             d_gap.mul_(coefficient.view(1,-1,1)).mul_(grad_output.float()/(float(batch_size)*float(head_count)))
             valid_key=negative_valid.view(1,negative_valid.shape[0],negative_valid.shape[1],1,1)
             # The mean key is [B,M,H,D].  Keep its divisor four-dimensional;
@@ -215,7 +220,7 @@ class _StreamingRGBDRanking(torch.autograd.Function):
             grad_query.index_add_(1,rows,query_grad.to(grad_query.dtype))
             grad_key.index_add_(1,positive,positive_grad.to(grad_key.dtype))
             grad_key.index_add_(1,safe_negative.flatten(),negative_grad.flatten(1,2).to(grad_key.dtype))
-        return grad_query,grad_key,None,None,None,None,None,None,None,None,None
+        return grad_query,grad_key,None,None,None,None,None,None,None,None,None,None
 
 def select_train_chunk(max_chunks: int, generator: torch.Generator | None = None, *, minimum: int = 0) -> int:
     if not 1 <= max_chunks <= 6: raise ValueError("max_chunks must be in 1..6")
@@ -403,6 +408,13 @@ class SightlineTrainable(nn.Module):
         if augmented_query.shape[1]!=rows: raise ValueError('RGB-D ranking query count does not match CorrespondencePlan')
         positive=plan.positive_indices; positive_mask=plan.positive_mask
         negative=plan.negative_indices; negative_mask=plan.negative_mask
+        positive_weights=plan.positive_weights
+        if positive_weights is None:
+            positive_weights=torch.ones_like(positive,dtype=torch.float32)
+        if positive_weights.shape!=positive.shape:
+            raise ValueError('RGB-D positive confidence shape must match positive indices')
+        if not torch.isfinite(positive_weights).all() or bool((positive_weights<0).any()):
+            raise ValueError('RGB-D positive confidences must be finite and non-negative')
         if positive.shape[0]!=rows or negative.shape[0]!=rows: raise ValueError('RGB-D ranking plan row count mismatch')
         if positive_mask.any() and int(positive[positive_mask].max().item())>=augmented_key.shape[1]: raise ValueError('RGB-D positive key index is out of bounds for augmented keys')
         if negative_mask.any() and int(negative[negative_mask].max().item())>=augmented_key.shape[1]: raise ValueError('RGB-D negative key index is out of bounds for augmented keys')
@@ -418,6 +430,7 @@ class SightlineTrainable(nn.Module):
             augmented_query,augmented_key,native_query.detach(),native_key.detach(),
             positive,positive_mask,negative,negative_mask,
             plan.weights.to(device=augmented_query.device,dtype=torch.float32),
+            positive_weights.to(device=augmented_query.device,dtype=torch.float32),
             float(margin),float(temperature))
     def lambda_corr(self, progress):
         progress=float(progress); start=self.lambda_corr_decay_start

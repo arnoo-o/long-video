@@ -730,8 +730,8 @@ def test_correspondence_hash_mapping_matches_identity_semantics_and_reuses_layer
     for layer in layers:
         q=torch.randn(1,1,2,2,requires_grad=True); k=torch.randn(1,3,2,2,requires_grad=True)
         processors[layer]=SimpleNamespace(last_q=q,last_k=k,last_current_length=1,ray_provider=SimpleNamespace(context={'stage_shapes':((1,1,1),)}),last_key_identities=identities,last_attention_bias=None)
-    selected,positives,weights,flags=training._mapped_correspondences(processors[4],rows,1)
-    assert selected==[0] and positives==[[0]] and weights==[.7] and flags==[{'has_native_positive':True,'has_memory_positive':False}]
+    selected,positives,positive_weights,weights,flags=training._mapped_correspondences(processors[4],rows,1)
+    assert selected==[0] and positives==[[0]] and positive_weights==[[.7]] and weights==[.7] and flags==[{'has_native_positive':True,'has_memory_positive':False}]
     calls=[]; original=training._mapped_correspondences
     def counted(*args,**kwargs): calls.append(1); return original(*args,**kwargs)
     monkeypatch.setattr(training,'_mapped_correspondences',counted)
@@ -773,7 +773,8 @@ def test_correspondence_plan_exactly_matches_legacy_mapping():
     expected=training._mapped_correspondences(processor,rows,1)
     plan=training._build_correspondence_plan(processor,rows,1,1,1024,7)
     assert plan.query_indices.tolist()==expected[0] and [row[row>=0].tolist() for row in plan.positive_indices]==expected[1]
-    assert plan.weights.tolist()==pytest.approx(expected[2]) and plan.flags==tuple(expected[3])
+    assert plan.positive_weights.tolist()==pytest.approx(expected[2])
+    assert plan.weights.tolist()==pytest.approx(expected[3]) and plan.flags==tuple(expected[4])
 
 def test_formal_correspondence_loss_releases_processor_qk_references():
     from types import SimpleNamespace
@@ -808,11 +809,11 @@ def test_native_memory_overlap_is_multi_positive_and_memory_rows_survive_samplin
     identities=(('native',(1,),0,0,'short'),('current',(8,),0,0,'current'),('memory',(1,),0,0,'memory'))
     processor=SimpleNamespace(last_q=torch.randn(1,1,2,2),last_k=torch.randn(1,3,2,2),last_current_length=1,ray_provider=SimpleNamespace(context={'stage_shapes':((1,1,1),)}),last_key_identities=identities)
     rows=[{'query_chunk':1,'query_latent_temporal':0,'query_y':0,'query_x':0,'key_chunk':0,'key_latent_temporal':1,'key_y':0,'key_x':0,'weight':.9}]
-    selected,positives,weights,flags=training._mapped_correspondences(processor,rows,1)
-    assert selected==[0] and positives==[[0,2]] and weights==[.9]
+    selected,positives,positive_weights,weights,flags=training._mapped_correspondences(processor,rows,1)
+    assert selected==[0] and positives==[[0,2]] and positive_weights==[[.9,.9]] and weights==[.9]
     assert flags==[{'has_native_positive':True,'has_memory_positive':True}]
-    sampled=training._sample_correspondence_mapping(list(range(5)),[[i] for i in range(5)],[1.]*5,[{'has_native_positive':True,'has_memory_positive':i in (3,4)} for i in range(5)],2,7)
-    assert len(sampled[0])==2 and all(flag['has_memory_positive'] for flag in sampled[3])
+    sampled=training._sample_correspondence_mapping(list(range(5)),[[i] for i in range(5)],[[float(i+1)] for i in range(5)],[1.]*5,[{'has_native_positive':True,'has_memory_positive':i in (3,4)} for i in range(5)],2,7)
+    assert len(sampled[0])==2 and all(flag['has_memory_positive'] for flag in sampled[4])
 
 def test_memory_shared_boundaries_are_unique_and_future_filtered():
     memory=LongTermKVMemory(budget=100,pool=1); hidden=torch.randn(1,9,4); rays=torch.randn(1,9,7)
@@ -924,17 +925,66 @@ def test_helios_norm_runtime_patch_records_distinct_fingerprints(tmp_path):
     import scripts.train_sightline_rgbd as training
     original=(training._IMPORT_ANCHOR+'\n'+training._NORM1_ORIGINAL+'\n'+training._NORM2_ORIGINAL+'\n'
               +training._NORM3_ORIGINAL+'\n'+training._RESIDUAL1_ORIGINAL+'\n'
-              +training._RESIDUAL3_ORIGINAL+'\n')
+              +training._RESIDUAL3_ORIGINAL+'\n'+training._PREFIX_SETUP_ORIGINAL+'\n'
+              +training._PREFIX_EXEC_ORIGINAL+'\n')
     source=tmp_path/'transformer.py'; source.write_text(original)
     runtime=training._install_memory_efficient_helios_norm(source)
     patched=source.read_text()
     assert 'token_blocked_layer_norm_modulate' in patched
     assert 'token_blocked_gated_residual' in patched
+    assert 'sightline_prefix_stop_layer' in patched
+    assert 'for block_index, block in enumerate(self.blocks)' in patched
+    assert 'return (None,) if not return_dict else Transformer2DModelOutput(sample=None)' in patched
     assert runtime['version']==training.HELIOS_RUNTIME_PATCH_VERSION
     assert runtime['original_source_sha256']==hashlib.sha256(original.encode()).hexdigest()
     assert runtime['runtime_source_sha256']==hashlib.sha256(patched.encode()).hexdigest()
     assert runtime['runtime_source_sha256']!=runtime['original_source_sha256']
     assert training._install_memory_efficient_helios_norm(source)==runtime
+
+def test_rgbd_prefix_forward_matches_full_capture_and_stops_after_dynamic_layer():
+    from types import SimpleNamespace
+    from scripts.train_sightline_rgbd import _model_prediction, _rgbd_prefix_forward
+
+    class Block(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__(); self.index=index; self.proj=torch.nn.Linear(4,4,bias=False)
+        def forward(self, hidden, *args): return torch.tanh(self.proj(hidden)+0.01*(self.index+1))
+
+    class Transformer(torch.nn.Module):
+        dtype=torch.float32
+        def __init__(self):
+            super().__init__(); self.blocks=torch.nn.ModuleList([Block(i) for i in range(14)]); self.executed=[]; self.captures={}
+        def forward(self, *, hidden_states, attention_kwargs, return_dict=True, **kwargs):
+            self.executed=[]; self.captures={}
+            stop=attention_kwargs.get('sightline_prefix_stop_layer')
+            for index,block in enumerate(self.blocks):
+                hidden_states=block(hidden_states)
+                self.executed.append(index)
+                if index<=11: self.captures[index]=hidden_states
+                if stop is not None and index>=int(stop): return (None,)
+            return (hidden_states,)
+
+    transformer=Transformer(); runner=SimpleNamespace(ray_provider=SimpleNamespace(context={}))
+    pipe=SimpleNamespace(transformer=transformer,_sightline_pipeline=runner)
+    item={'sigmas':torch.tensor(.2),'timesteps':torch.tensor([7]),'stage_index':1,
+          'sigma_local':torch.tensor(.2),'sigma_start':.8,'sigma_end':.3}
+    history={name:(None,None) for name in ('long','mid','short')}
+    noisy=torch.randn(1,2,9,1,1)
+    full_input=noisy.flatten().view(1,-1).requires_grad_()
+    full_noisy=full_input.view_as(noisy)
+    _model_prediction(pipe,full_noisy,item,None,history,0)
+    full_captures={index:value.detach().clone() for index,value in transformer.captures.items()}
+    full_loss=sum(transformer.captures.values()).sum(); full_loss.backward()
+    full_grad=full_input.grad.detach().clone()
+
+    prefix_input=noisy.flatten().view(1,-1).requires_grad_()
+    _rgbd_prefix_forward(pipe,prefix_input.view_as(noisy),item,None,history,0,11)
+    prefix_captures={index:value.detach().clone() for index,value in transformer.captures.items()}
+    prefix_loss=sum(transformer.captures.values()).sum(); prefix_loss.backward()
+    assert transformer.executed==list(range(12))
+    assert set(prefix_captures)==set(range(12))
+    assert all(torch.equal(full_captures[index],prefix_captures[index]) for index in range(12))
+    assert torch.allclose(full_grad,prefix_input.grad,atol=1e-7,rtol=1e-7)
 
 def test_runtime_patch_metadata_preserves_legacy_provenance_compatibility():
     from long_video.training.sightline_checkpoint import _provenance_matches
@@ -1202,7 +1252,7 @@ def test_active_fm_wraps_only_transformer_call_and_clean_capture_needs_no_item()
     class Transformer:
         dtype=torch.float32
         def __call__(self,*,hidden_states,**kwargs): return (hidden_states,)
-    scope=Scope(); pipe=SimpleNamespace(transformer=Transformer(),_sightline_pipeline=scope)
+    scope=Scope(); scope.ray_provider=SimpleNamespace(context={}); pipe=SimpleNamespace(transformer=Transformer(),_sightline_pipeline=scope)
     x=torch.zeros(1,2,9,1,1); history={name:(None,None) for name in ('long','mid','short')}
     assert torch.equal(_model_prediction(pipe,x,{'sigmas':torch.tensor(.05),'timesteps':torch.tensor([99])},None,history,0),x)
     assert scope.events==[]

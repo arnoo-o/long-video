@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from long_video.sightline.conditioning import SightlineConditioner
+from long_video.sightline.geometry import geometry_sigma_schedule
 from long_video.training.sightline import curriculum_phase, install_lora, LoRALinear
 
 def _dense(c,rays,native,kind):
@@ -70,3 +71,20 @@ def test_relative_native_rms_scale_is_detached():
     c.project(rays,native,kind='q').square().mean().backward()
     assert native.grad is None
     assert rays.grad is not None and torch.isfinite(rays.grad).all()
+
+def test_geometry_sigma_contract_is_continuous_across_three_pyramid_stages():
+    # Pinned Helios stages meet at their endpoints; Geometry must follow the
+    # absolute sigma trajectory rather than restarting from each local stage.
+    endpoints=((1.0,.7),(.7,.35),(.35,0.0))
+    sigma_trace=[]; scale_trace=[]
+    for sigma_start,sigma_end in endpoints:
+        sigma_local=torch.linspace(1.0,0.0,17)
+        sigma_abs,scale=geometry_sigma_schedule(sigma_local,sigma_start,sigma_end)
+        sigma_trace.append(sigma_abs); scale_trace.append(scale)
+    sigma_trace=torch.cat(sigma_trace); scale_trace=torch.cat(scale_trace)
+    assert torch.all(torch.diff(sigma_trace)<=1e-6)
+    assert torch.all(torch.diff(scale_trace)<=1e-6)
+    assert sigma_trace[16].item()==pytest.approx(sigma_trace[17].item())
+    assert sigma_trace[33].item()==pytest.approx(sigma_trace[34].item())
+    assert scale_trace[0].item()==pytest.approx(1.0)
+    assert scale_trace[-1].item()==pytest.approx(0.0)

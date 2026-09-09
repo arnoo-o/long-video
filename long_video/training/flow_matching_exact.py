@@ -6,6 +6,7 @@ match the pinned scheduler's ``start_sigmas/end_sigmas`` and per-stage arrays.
 from __future__ import annotations
 import torch
 import torch.nn.functional as F
+from ..sightline.geometry import geometry_sigma_schedule
 
 def _density(batch, device):
     return torch.rand((batch,),device=device)
@@ -61,11 +62,12 @@ def exact_flow_matching_items(pipe, target_latents, *, stage_steps=(2,2,2), devi
             indices=eligible.index_select(0,picks)
         cpu_indices=indices.detach().cpu()
         timesteps=scheduler.timesteps_per_stage[stage][cpu_indices].to(device=device)
-        sigmas=scheduler.sigmas_per_stage[stage][cpu_indices].to(device=device,dtype=start_point.dtype)
-        while sigmas.ndim<start_point.ndim: sigmas=sigmas.unsqueeze(-1)
-        sigma=sigmas
-        noisy=sigma*start_point+(1-sigma)*end_point
+        sigma_local=scheduler.sigmas_per_stage[stage][cpu_indices].to(device=device,dtype=start_point.dtype)
+        sigma_abs,geometry_sigma_scale=geometry_sigma_schedule(sigma_local,start,end)
+        local_view=sigma_local
+        while local_view.ndim<start_point.ndim: local_view=local_view.unsqueeze(-1)
+        noisy=local_view*start_point+(1-local_view)*end_point
         for name,tensor in {'noisy':noisy,'target':start_point-end_point,'start':start_point,'end':end_point}.items():
             if tensor.shape!=current.shape: raise RuntimeError(f'stage {stage} {name} shape mismatch: {tensor.shape} vs {current.shape}')
-        items.append({'stage_id':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigmas,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'stage_start_sigma':start,'stage_end_sigma':end,'use_dynamic_shifting':False})
+        items.append({'stage_id':stage,'stage_index':stage,'noisy_latents':noisy,'timesteps':timesteps,'sigmas':sigma_local,'sigma_local':sigma_local,'sigma_abs':sigma_abs,'geometry_sigma_scale':geometry_sigma_scale,'target':start_point-end_point,'start_point':start_point,'end_point':end_point,'noise':noise[stage],'stage_start_sigma':start,'stage_end_sigma':end,'sigma_start':start,'sigma_end':end,'use_dynamic_shifting':False})
     return items

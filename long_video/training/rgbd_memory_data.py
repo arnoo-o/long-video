@@ -161,7 +161,13 @@ class RGBDMemoryRecord:
         count = len(arrays["query_frame"])
         if any(len(value) != count for value in arrays.values() if value.ndim == 1):
             raise ValueError(f"{self.record_id}: correspondence columns have different lengths")
-        if count and (np.any(arrays["key_frame"] >= arrays["query_frame"]) or np.any(arrays["key_chunk"] >= arrays["query_chunk"]) or np.any(arrays["query_frame"] >= self.frame_count) or np.any(arrays["key_frame"] < 0) or np.any(arrays["query_chunk"] >= self.chunk_count) or np.any(arrays["key_chunk"] < 0)):
+        same_chunk = arrays["key_chunk"] == arrays["query_chunk"]
+        invalid_causality = (
+            np.any(arrays["key_frame"] >= arrays["query_frame"])
+            or np.any((arrays["key_chunk"] > arrays["query_chunk"]))
+            or np.any(same_chunk & (arrays["key_t"] >= arrays["query_t"]))
+        )
+        if count and (invalid_causality or np.any(arrays["query_frame"] >= self.frame_count) or np.any(arrays["key_frame"] < 0) or np.any(arrays["query_chunk"] >= self.chunk_count) or np.any(arrays["key_chunk"] < 0)):
             raise ValueError(f"{self.record_id}: correspondence cache is not strictly causal or out of bounds")
         object.__setattr__(self,"_correspondence_arrays",arrays)
         object.__setattr__(self,"_correspondence_by_query",tuple(np.flatnonzero(arrays["query_chunk"]==chunk).astype(np.int64,copy=False) for chunk in range(self.chunk_count)))

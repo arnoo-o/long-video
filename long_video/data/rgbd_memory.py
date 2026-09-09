@@ -144,7 +144,7 @@ def _project_world(world: np.ndarray, c2w: np.ndarray, K: np.ndarray):
 
 
 def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, K: np.ndarray, output: str | Path, *, chunk_count: int | None = None, pixel_stride: int = 4, depth_abs_tolerance: float = 0.03, depth_rel_tolerance: float = 0.02, cycle_pixels: float = 2.0, token_height: int = 32, token_width: int = 52, compressed: bool = True) -> dict:
-    """Build sparse causal correspondences for every query_chunk/key_chunk pair."""
+    """Build sparse strict-causal correspondences, including within-chunk pairs."""
     if chunk_count is None:
         if (len(depth_paths) - 1) % CHUNK_STRIDE:
             raise ValueError("frame count is not a shared-boundary chunk sequence")
@@ -157,49 +157,49 @@ def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, 
     pixels = np.stack((xx.ravel(), yy.ravel()), axis=1)
     batches: dict[str, list[np.ndarray]] = {key: [] for key in ("query_frame", "key_frame", "query_chunk", "key_chunk", "query_t", "key_t", "query_y", "query_x", "key_y", "key_x", "matched_count", "valid_count", "coverage", "vote", "weight")}
     pair_stats, raw_matches = {}, 0
-    for query_chunk in range(1, chunk_count):
-        for key_chunk in range(query_chunk):
+    for query_chunk in range(chunk_count):
+        for key_chunk in range(query_chunk + 1):
             for query_t, local_query in enumerate(LATENT_LOCAL_FRAMES):
                 query_frame = int(query_chunk * CHUNK_STRIDE + local_query)
                 for key_t, local_key in enumerate(LATENT_LOCAL_FRAMES):
                     key_frame = int(key_chunk * CHUNK_STRIDE + local_key)
-                    if key_frame >= query_frame:
+                    if key_frame >= query_frame or (key_chunk == query_chunk and key_t >= query_t):
                         continue
-                    query_depth = depth_cache[query_frame]
                     key_depth = depth_cache[key_frame]
-                    zq = query_depth[pixels[:, 1], pixels[:, 0]]
-                    valid = np.isfinite(zq) & (zq > 0)
-                    p = pixels[valid]; zq = zq[valid]
-                    if not len(p):
+                    query_depth = depth_cache[query_frame]
+                    zk = key_depth[pixels[:, 1], pixels[:, 0]]
+                    valid = np.isfinite(zk) & (zk > 0)
+                    key_pixels = pixels[valid]; zk = zk[valid]
+                    if not len(key_pixels):
                         continue
-                    inv_kq = np.linalg.inv(K[query_frame])
-                    camera = (inv_kq @ np.stack((p[:, 0] * zq, p[:, 1] * zq, zq), axis=0)).T
-                    world = (c2w[query_frame][:3] @ np.concatenate((camera, np.ones((len(camera), 1))), axis=1).T).T
-                    zk, uvk = _project_world(world, c2w[key_frame], K[key_frame])
-                    finite_uv = np.isfinite(uvk).all(axis=1)
-                    safe_uv = np.where(finite_uv[:, None], uvk, -1.0)
+                    inv_kk = np.linalg.inv(K[key_frame])
+                    camera = (inv_kk @ np.stack((key_pixels[:, 0] * zk, key_pixels[:, 1] * zk, zk), axis=0)).T
+                    world = (c2w[key_frame][:3] @ np.concatenate((camera, np.ones((len(camera), 1))), axis=1).T).T
+                    zq, uvq = _project_world(world, c2w[query_frame], K[query_frame])
+                    finite_uv = np.isfinite(uvq).all(axis=1)
+                    safe_uv = np.where(finite_uv[:, None], uvq, -1.0)
                     rounded = np.rint(np.clip(safe_uv, -1.0, max(WIDTH, HEIGHT) + 1.0)).astype(np.int32)
-                    inside = finite_uv & (zk > 0) & (rounded[:, 0] >= 0) & (rounded[:, 0] < WIDTH) & (rounded[:, 1] >= 0) & (rounded[:, 1] < HEIGHT)
+                    inside = finite_uv & (zq > 0) & (rounded[:, 0] >= 0) & (rounded[:, 0] < WIDTH) & (rounded[:, 1] >= 0) & (rounded[:, 1] < HEIGHT)
                     safe_x = np.clip(rounded[:, 0], 0, WIDTH - 1); safe_y = np.clip(rounded[:, 1], 0, HEIGHT - 1)
-                    observed_key = key_depth[safe_y, safe_x]
-                    tolerance = depth_abs_tolerance + depth_rel_tolerance * np.maximum(zk, observed_key)
-                    consistent = inside & (observed_key > 0) & (np.abs(zk - observed_key) <= tolerance)
+                    observed_query = query_depth[safe_y, safe_x]
+                    tolerance = depth_abs_tolerance + depth_rel_tolerance * np.maximum(zq, observed_query)
+                    consistent = inside & (observed_query > 0) & (np.abs(zq - observed_query) <= tolerance)
                     selected = np.flatnonzero(consistent)
                     if not len(selected):
                         pair_stats[f"{query_frame}->{key_frame}"] = 0
                         continue
-                    key_pixels = rounded[selected]
-                    key_z = observed_key[selected]
-                    key_camera = (np.linalg.inv(K[key_frame]) @ np.stack((key_pixels[:, 0] * key_z, key_pixels[:, 1] * key_z, key_z), axis=0)).T
-                    key_world = (c2w[key_frame][:3] @ np.concatenate((key_camera, np.ones((len(key_camera), 1))), axis=1).T).T
-                    z_back, uv_back = _project_world(key_world, c2w[query_frame], K[query_frame])
-                    query_selected = p[selected]
-                    cycle = np.linalg.norm(uv_back - query_selected, axis=1) <= cycle_pixels
-                    cycle &= np.abs(z_back - zq[selected]) <= (depth_abs_tolerance + depth_rel_tolerance * zq[selected])
+                    query_pixels = rounded[selected]
+                    query_z = observed_query[selected]
+                    query_camera = (np.linalg.inv(K[query_frame]) @ np.stack((query_pixels[:, 0] * query_z, query_pixels[:, 1] * query_z, query_z), axis=0)).T
+                    query_world = (c2w[query_frame][:3] @ np.concatenate((query_camera, np.ones((len(query_camera), 1))), axis=1).T).T
+                    z_back, uv_back = _project_world(query_world, c2w[key_frame], K[key_frame])
+                    key_selected = key_pixels[selected]
+                    cycle = np.linalg.norm(uv_back - key_selected, axis=1) <= cycle_pixels
+                    cycle &= np.abs(z_back - zk[selected]) <= (depth_abs_tolerance + depth_rel_tolerance * zk[selected])
                     selected = selected[cycle]
                     pair_stats[f"{query_frame}->{key_frame}"] = int(len(selected))
                     raw_matches += len(selected)
-                    qp = p[selected]; kp = rounded[selected]
+                    qp = rounded[selected]; kp = key_pixels[selected]
                     # Token coordinates live in the padded 512x832 system.
                     # Original observations occupy only the top 480 rows.
                     qtx = np.minimum(token_width - 1, qp[:, 0] * token_width // PADDED_WIDTH)
@@ -209,7 +209,7 @@ def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, 
                     token_count = token_height * token_width
                     pair_id = (qty * token_width + qtx) * token_count + (kty * token_width + ktx)
                     unique, inverse, counts = np.unique(pair_id, return_inverse=True, return_counts=True)
-                    residual = np.abs(zk[selected] - observed_key[selected])
+                    residual = np.abs(zq[selected] - observed_query[selected])
                     point_weight = np.exp(-residual / np.maximum(tolerance[selected], 1e-6))
                     votes = np.bincount(inverse, weights=point_weight, minlength=len(unique)).astype(np.float32)
                     query_token, key_token = np.divmod(unique, token_count)

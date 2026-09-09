@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
+import torch.nn.functional as F
 from ..sightline.conditioning import LayeredSightlineConditioner
 from ..sightline.correspondence import correspondence_loss
 
@@ -21,6 +22,8 @@ class CorrespondencePlan:
     weights: torch.Tensor
     identities: tuple
     flags: tuple
+    negative_indices: torch.Tensor|None = None
+    negative_mask: torch.Tensor|None = None
 
 def _bias_tile(bias, q0, q1, k0, k1):
     if bias.numel()==0: return None
@@ -146,19 +149,19 @@ def curriculum_phase(step: int, *, p1_steps: int = 400, p2_steps: int = 600, p3_
     """Sightline-v9 2500-step Geometry-only then Memory/correspondence curriculum."""
     if not 0 <= int(step) < 2500: raise ValueError("step is outside the configured training schedule")
     if step < 300:
-        return {"name":"P1","max_chunks":1,"lora":False,"correspondence":False,"memory":False,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+        return {"name":"P1","max_chunks":1,"lora":False,"rgbd":True,"correspondence":False,"memory":False,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
     if step < 600:
-        return {"name":"P1","max_chunks":2,"lora":False,"correspondence":False,"memory":False,"gt_prefix_probability":gt_prefix_probability(step),"sigma_range":(0.,1.)}
+        return {"name":"P1","max_chunks":2,"lora":False,"rgbd":True,"correspondence":False,"memory":False,"gt_prefix_probability":gt_prefix_probability(step),"sigma_range":(0.,1.)}
     if step < 900:
-        return {"name":"P2","max_chunks":2,"lora":False,"correspondence":False,"memory":False,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+        return {"name":"P2","max_chunks":2,"lora":False,"rgbd":True,"correspondence":False,"memory":False,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
     if step < 1000:
-        return {"name":"P2","max_chunks":2,"lora":False,"correspondence":False,"memory":True,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+        return {"name":"P2","max_chunks":2,"lora":False,"rgbd":True,"correspondence":False,"memory":True,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
     if step < 1100: chunks=2
     elif step < 1400: chunks=3
     elif step < 1700: chunks=4
     elif step < 2000: chunks=5
     else: chunks=6
-    return {"name":"P3","max_chunks":chunks,"lora":False,"correspondence":True,"memory":True,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
+    return {"name":"P3","max_chunks":chunks,"lora":False,"rgbd":True,"correspondence":True,"memory":True,"gt_prefix_probability":0.0,"sigma_range":(0.,1.)}
 
 INIT_SEED = 20260826
 
@@ -278,6 +281,39 @@ class SightlineTrainable(nn.Module):
         if selected_query.ndim!=4 or key.ndim!=4: raise ValueError('Q/K must be [B,N,H,D]')
         bias=selected_query.new_empty(0) if additive_bias is None else additive_bias
         return _StreamingCorrespondence.apply(selected_query,key,plan.positive_indices,plan.positive_mask,plan.weights,bias,int(key_block),int(query_block))
+    def rgbd_ranking_loss(self, augmented_query, augmented_key, native_query, native_key, plan, *, margin, temperature):
+        """Rank only Sightline's Q/K logit delta for sparse RGB-D pairs."""
+        if any(value is None for value in (plan.negative_indices,plan.negative_mask)):
+            raise ValueError('RGB-D ranking requires explicit hard negatives')
+        if augmented_query.ndim!=4 or augmented_key.ndim!=4 or native_query.ndim!=4 or native_key.ndim!=4:
+            raise ValueError('RGB-D ranking Q/K tensors must be [B,R/H,K,H,D]')
+        if augmented_query.shape!=native_query.shape:
+            raise ValueError('native and Sightline query shapes must match for RGB-D ranking')
+        if augmented_key.shape[:2]!=native_key.shape[:2] or augmented_key.shape[2:]!=native_key.shape[2:]:
+            raise ValueError('native and Sightline key heads/dimensions must match for RGB-D ranking')
+        rows=plan.query_indices.numel();
+        if augmented_query.shape[1]!=rows: raise ValueError('RGB-D ranking query count does not match CorrespondencePlan')
+        positive=plan.positive_indices; positive_mask=plan.positive_mask
+        negative=plan.negative_indices; negative_mask=plan.negative_mask
+        if positive.shape[0]!=rows or negative.shape[0]!=rows: raise ValueError('RGB-D ranking plan row count mismatch')
+        if positive_mask.any() and int(positive[positive_mask].max().item())>=augmented_key.shape[1]: raise ValueError('RGB-D positive key index is out of bounds for augmented keys')
+        if negative_mask.any() and int(negative[negative_mask].max().item())>=augmented_key.shape[1]: raise ValueError('RGB-D negative key index is out of bounds for augmented keys')
+        if positive_mask.any() and int(positive[positive_mask].max().item())>=native_key.shape[1]: raise ValueError('RGB-D positive key index is out of bounds for native keys')
+        if negative_mask.any() and int(negative[negative_mask].max().item())>=native_key.shape[1]: raise ValueError('RGB-D negative key index is out of bounds for native keys')
+        def gather(values,indices):
+            safe=indices.clamp_min(0)
+            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],rows,indices.shape[1],values.shape[2],values.shape[3])
+        scale=augmented_query.shape[-1]**-0.5
+        pos_aug=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,positive)).float().mul(scale)
+        pos_native=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,positive)).float().mul(scale).detach()
+        neg_aug=torch.einsum('brhd,brnhd->brhn',augmented_query,gather(augmented_key,negative)).float().mul(scale)
+        neg_native=torch.einsum('brhd,brnhd->brhn',native_query,gather(native_key,negative)).float().mul(scale).detach()
+        pos_mask=positive_mask.view(1,rows,1,-1); neg_mask=negative_mask.view(1,rows,1,-1)
+        pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0).sum(-1)/positive_mask.sum(-1).clamp_min(1).view(1,rows,1)
+        neg_delta=(neg_aug-neg_native).masked_fill(~neg_mask,0.0).sum(-1)/negative_mask.sum(-1).clamp_min(1).view(1,rows,1)
+        row_loss=F.softplus((float(margin)-(pos_delta-neg_delta))/float(temperature)).mean((0,2))
+        weights=plan.weights.to(device=row_loss.device,dtype=row_loss.dtype)
+        return (row_loss*weights).sum()/weights.sum().clamp_min(1e-8)
     def lambda_corr(self, progress):
         progress=float(progress); start=self.lambda_corr_decay_start
         if progress <= start: return self.lambda_corr_initial

@@ -49,8 +49,10 @@ def validate_full_record(record) -> int:
                 or not np.array_equal(cloud["timestamps"].astype(np.float64), target)):
             raise ValueError(f"{record.record_id}: pointcloud/source identity mismatch")
     cache = record.load_correspondences(); count = len(cache.get("query_frame", ()))
+    same_chunk = cache["key_chunk"] == cache["query_chunk"]
     if (count == 0 or np.any(cache["key_frame"] >= cache["query_frame"])
-            or np.any(cache["key_chunk"] >= cache["query_chunk"])):
+            or np.any(cache["key_chunk"] > cache["query_chunk"])
+            or np.any(same_chunk & (cache["key_t"] >= cache["query_t"]))):
         raise ValueError(f"{record.record_id}: correspondence is empty or non-causal")
     return count
 

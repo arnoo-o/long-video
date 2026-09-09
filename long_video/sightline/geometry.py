@@ -8,6 +8,26 @@ MODEL_SPATIAL_FACTOR = 64
 VAE_SPATIAL_FACTOR = 8
 
 
+def geometry_sigma_schedule(sigma_local, sigma_start, sigma_end):
+    """Resolve a Helios stage-local sigma into the shared absolute Geometry schedule.
+
+    Helios exposes denoising coordinates locally for each pyramid stage.  The
+    Geometry path must instead see the stage's absolute interval, with the
+    local coordinate running from ``sigma_start`` to ``sigma_end``.
+    """
+    sigma_local = torch.as_tensor(sigma_local)
+    if not (sigma_local.is_floating_point() or sigma_local.is_complex()):
+        sigma_local = sigma_local.float()
+    else:
+        sigma_local = sigma_local.to(dtype=torch.float32)
+    sigma_start = torch.as_tensor(sigma_start, device=sigma_local.device, dtype=sigma_local.dtype)
+    sigma_end = torch.as_tensor(sigma_end, device=sigma_local.device, dtype=sigma_local.dtype)
+    sigma_abs = sigma_end + sigma_local * (sigma_start - sigma_end)
+    x = (sigma_abs / 0.6).clamp(0.0, 1.0)
+    geometry_sigma_scale = x * x * (3.0 - 2.0 * x)
+    return sigma_abs, geometry_sigma_scale
+
+
 def padded_size(height: int, width: int, factor: int = MODEL_SPATIAL_FACTOR) -> tuple[int, int]:
     if min(height, width, factor) < 1:
         raise ValueError("image dimensions and factor must be positive")

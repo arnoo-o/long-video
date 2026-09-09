@@ -187,6 +187,10 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
         hidden=call_kwargs.get('hidden_states')
         if hidden is None: return args,call_kwargs
         stage=flow.stage_for(hidden); coefficient=_scheduler_coefficient(pipe.scheduler,call_kwargs['timestep'],after_step=False)
+        runner=getattr(pipe,'_sightline_pipeline',None)
+        if runner is not None and getattr(runner,'ray_provider',None) is not None and runner.ray_provider.context is not None:
+            runner.ray_provider.context['stage_index']=int(stage.index)
+            runner.ray_provider.context['sigma_override']=False
         hidden=hidden.clone(); hidden[:,:,:1]=stage.at(coefficient).to(hidden)
         call_kwargs=dict(call_kwargs); call_kwargs['hidden_states']=hidden
         return args,call_kwargs
@@ -194,6 +198,10 @@ def stage2_sample_with_boundary(pipe,*,clean_boundary:torch.Tensor|None,**kwargs
     def callback(owner,step,timestep,callback_kwargs):
         if user_callback is not None: callback_kwargs=user_callback(owner,step,timestep,callback_kwargs)
         latents=callback_kwargs['latents'].clone(); stage=flow.stage_for(latents)
+        runner=getattr(pipe,'_sightline_pipeline',None)
+        if runner is not None and getattr(runner,'ray_provider',None) is not None and runner.ray_provider.context is not None:
+            runner.ray_provider.context['stage_index']=int(stage.index)
+            runner.ray_provider.context['sigma_override']=False
         coefficient=_scheduler_coefficient(pipe.scheduler,timestep,after_step=True)
         latents[:,:,:1]=stage.at(coefficient).to(latents)
         return {**callback_kwargs,'latents':latents}

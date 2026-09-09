@@ -5,6 +5,7 @@ import torch
 from .conditioning import GEOMETRY_RMS_EPSILON, SightlineConditioner
 from .rays import token_rays_for_shape, plucker_rays
 from .history import covered_history_chunk_ids
+from .geometry import geometry_sigma_schedule
 
 def helio_source_fingerprint(source_text: str) -> str:
     return hashlib.sha256(source_text.encode()).hexdigest()
@@ -17,7 +18,7 @@ class SightlineHeliosAttnProcessor:
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.residual_scale=1.0  # legacy user ablation multiplier; default 1.
-        self.last_q=None; self.last_k=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
+        self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.capture_query_indices=None
         self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
         self.capture_memory_hidden=False; self.last_hidden_states=None; self.last_pooled_hidden=None; self.last_pooled_grid_shape=None; self.last_current_length=None; self.last_attention_bias=None
@@ -31,6 +32,8 @@ class SightlineHeliosAttnProcessor:
         query=query.unflatten(2,(attn.heads,-1)); key=key.unflatten(2,(attn.heads,-1)); value=value.unflatten(2,(attn.heads,-1))
         if rotary_emb is not None:
             query=self.rotary_apply(query,rotary_emb); key=self.rotary_apply(key,rotary_emb)
+        native_query=query
+        native_key=key
         current_len=original_context_length or query.shape[1]
         if self.capture_memory_hidden:
             shape=next((s for s in (self.ray_provider.context.get('stage_shapes') or ()) if s[0]*s[1]*s[2]==current_len),None)
@@ -50,12 +53,18 @@ class SightlineHeliosAttnProcessor:
         # One shared high-noise routing scale is derived from the real
         # scheduler sigma published for this Transformer call.  The same
         # scalar gates current, native-history, and Memory geometry.
-        geometry_sigma = provider_context.get('sigma',0.0) if provider_context is not None else 0.0
+        geometry_sigma = provider_context.get('sigma_abs',provider_context.get('sigma',0.0)) if provider_context is not None else 0.0
         geometry_sigma = torch.as_tensor(geometry_sigma, device=query.device, dtype=torch.float32)
         if geometry_sigma.numel() != 1:
             geometry_sigma = geometry_sigma.reshape(-1).mean()
-        geometry_sigma_scale = (geometry_sigma / 0.6).clamp(0.0, 1.0)
-        geometry_sigma_scale = geometry_sigma_scale * geometry_sigma_scale * (3.0 - 2.0 * geometry_sigma_scale)
+        geometry_sigma_scale = provider_context.get('geometry_sigma_scale') if provider_context is not None else None
+        if geometry_sigma_scale is None:
+            sigma_local=provider_context.get('sigma_local',geometry_sigma) if provider_context is not None else geometry_sigma
+            sigma_start=provider_context.get('sigma_start',geometry_sigma) if provider_context is not None else geometry_sigma
+            sigma_end=provider_context.get('sigma_end',0.0) if provider_context is not None else 0.0
+            geometry_sigma,geometry_sigma_scale=geometry_sigma_schedule(sigma_local,sigma_start,sigma_end)
+        geometry_sigma_scale=torch.as_tensor(geometry_sigma_scale,device=query.device,dtype=torch.float32)
+        if geometry_sigma_scale.numel()!=1: geometry_sigma_scale=geometry_sigma_scale.reshape(-1).mean()
         native_q_rms=None; native_k_rms=None
         if self.conditioner is None or not geometry_enabled:
             scale_delta=None; dq=torch.zeros_like(query.flatten(2,3)); dk=torch.zeros_like(key.flatten(2,3))
@@ -135,11 +144,13 @@ class SightlineHeliosAttnProcessor:
                 'gate_weight_rms':parameter_rms(self.conditioner.gate.weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate.weight),
                 'rms_norm_q_weight_rms':parameter_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_rms':parameter_rms(self.conditioner.rms_norm_k.weight),
                 'rms_norm_q_weight_grad_rms':grad_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':grad_rms(self.conditioner.rms_norm_k.weight),
-                'rms_norm_epsilon':GEOMETRY_RMS_EPSILON,'sightline_residual_scale':float(residual_scale.detach().cpu()),'geometry_sigma':float(geometry_sigma.detach().cpu()),'geometry_sigma_scale':float(geometry_sigma_scale.detach().cpu()),
+                'rms_norm_epsilon':GEOMETRY_RMS_EPSILON,'sightline_residual_scale':float(residual_scale.detach().cpu()),'geometry_sigma':float(geometry_sigma.detach().cpu()),'sigma_abs':float(geometry_sigma.detach().cpu()),'sigma_local':float(torch.as_tensor(provider_context.get('sigma_local',0.0),device=query.device).float().mean().detach().cpu()) if provider_context is not None else 0.0,'sigma_start':float(provider_context.get('sigma_start',0.0)) if provider_context is not None else 0.0,'sigma_end':float(provider_context.get('sigma_end',0.0)) if provider_context is not None else 0.0,'stage_index':None if provider_context is None or provider_context.get('stage_index') is None else int(provider_context['stage_index']),'geometry_sigma_scale':float(geometry_sigma_scale.detach().cpu()),
                 'timestep':None,
                 'geometry_enabled':geometry_enabled,
             }
         query=query+effective_scale*dq; key=key+effective_scale.to(key.dtype)*dk
+        augmented_query=query
+        augmented_key=key
         history_len=max(0,key.shape[1]-current_len)
         if getattr(attn,'is_amplify_history',False) and history_len:
             scale=1.0+__import__('torch').sigmoid(attn.history_key_scale)*(attn.max_scale-1.0)
@@ -191,13 +202,25 @@ class SightlineHeliosAttnProcessor:
         if self.capture_diagnostics:
             if self.capture_query_indices is None:
                 self.last_q=query
+                self.last_native_q=native_query.detach()
+                self.last_capture_query_indices=torch.arange(query.shape[1],device=query.device,dtype=torch.long)
             else:
                 indices=torch.as_tensor(self.capture_query_indices,device=query.device,dtype=torch.long)
                 self.last_q=query.index_select(1,indices)
+                self.last_native_q=native_query.detach().index_select(1,indices)
+                self.last_capture_query_indices=indices
+            self.last_native_k=native_key.detach()
+            self.last_augmented_q=self.last_q
+            # Preserve Q'/K' immediately after the Sightline residual.  The
+            # final ``last_k`` below may additionally contain native history
+            # scaling or appended Memory keys for the existing cross-chunk
+            # correspondence path; those operations must not enter RGB-D's
+            # Sightline-only delta.
+            self.last_augmented_k=augmented_key
             self.last_k=key; self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
             if len(self.last_key_identities)!=key.shape[1]: raise RuntimeError('key identity map length does not match attention K axis')
         else:
-            self.last_q=None; self.last_k=None
+            self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)
@@ -208,9 +231,12 @@ class SightlineRayProvider:
     def __init__(self, c2w=None, intrinsics=None, *, token_shape=None, source_height, source_width, vae_spatial_factor=8):
         self.token_shape=tuple(token_shape) if token_shape is not None else None; self.source_height=source_height; self.source_width=source_width; self.vae_spatial_factor=vae_spatial_factor
         self.c2w=c2w; self.intrinsics=intrinsics; self.context=None; self._key_identity_cache={}
-    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_global_coverages=None, history_validity=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None):
+    def set_context(self, *, chunk_index, c2w, intrinsics, latent_cameras=None, history_rays=None, history_cameras=None, history_intrinsics=None, history_groups=None, history_token_shapes=None, history_global_coverages=None, history_validity=None, stage=0, sigma=0.0, token_shape=None, stage_shapes=None, stage_index=None, sigma_local=None, sigma_start=None, sigma_end=None, sigma_abs=None, geometry_sigma_scale=None, sigma_override=False):
         if c2w.ndim != 4 or intrinsics.ndim != 4 or c2w.shape[:2] != intrinsics.shape[:2]: raise ValueError("runtime c2w/K must be [B,F,...] with matching shape")
-        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_global_coverages':history_global_coverages,'history_validity':history_validity,'stage':stage,'sigma':sigma,'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
+        local=sigma if sigma_local is None else sigma_local; start=0.0 if sigma_start is None else sigma_start; end=0.0 if sigma_end is None else sigma_end
+        if sigma_abs is None or geometry_sigma_scale is None:
+            resolved_abs,resolved_scale=geometry_sigma_schedule(local,start,end); sigma_abs=resolved_abs; geometry_sigma_scale=resolved_scale
+        self.context={'chunk_index':chunk_index,'c2w':c2w,'intrinsics':intrinsics,'latent_cameras':latent_cameras,'history_rays':history_rays,'history_cameras':history_cameras,'history_intrinsics':history_intrinsics,'history_groups':history_groups,'history_token_shapes':history_token_shapes,'history_global_coverages':history_global_coverages,'history_validity':history_validity,'stage':stage,'stage_index':stage_index,'sigma_local':local,'sigma_start':start,'sigma_end':end,'sigma_abs':sigma_abs,'geometry_sigma_scale':geometry_sigma_scale,'sigma':sigma_abs,'sigma_override':bool(sigma_override),'token_shape':tuple(token_shape) if token_shape is not None else self.token_shape,'stage_shapes':stage_shapes}
         self._key_identity_cache={}
 
     def key_identities(self, current_length, memory=None):

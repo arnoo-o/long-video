@@ -9,7 +9,7 @@ from .history import CameraHistoryState,NativeHistoryState,native_helios_indices
 from .memory import LayerKVMemoryBank
 from .rays import chunk_cameras, temporal_group_cameras
 from .boundary import stage2_sample_with_boundary
-from .geometry import assert_latent_geometry, crop_video, pad_image_bottom_right, padded_size
+from .geometry import assert_latent_geometry, crop_video, geometry_sigma_schedule, pad_image_bottom_right, padded_size
 
 def boundary_enabled_for_chunk(chunk_index:int, off_from_chunk:int|None) -> bool:
     if off_from_chunk is not None and int(off_from_chunk)<1: raise ValueError('boundary can only be disabled from chunk1 or later')
@@ -62,7 +62,39 @@ class SightlinePipeline:
             raise RuntimeError(f'local scheduler timestep {float(needle)} is not uniquely resolvable')
         index=int(matches[0]); sigmas=torch.as_tensor(scheduler.sigmas,device=needle.device,dtype=torch.float32)
         if index>=len(sigmas): raise RuntimeError('local scheduler sigma index is out of range')
-        context['sigma']=sigmas[index].detach()
+        stage_index=context.get('stage_index')
+        hidden=call_kwargs.get('hidden_states') if isinstance(call_kwargs,dict) else None
+        if hidden is None and args: hidden=args[0]
+        shapes=context.get('stage_shapes') or ()
+        if hidden is not None and shapes:
+            if hidden.ndim >= 5:
+                patch=tuple(int(x) for x in self.helios.transformer.config.patch_size)
+                spatial=(int(hidden.shape[-2])//patch[1],int(hidden.shape[-1])//patch[2])
+                matches=[index for index,shape in enumerate(shapes) if tuple(shape[1:])==spatial]
+            elif hidden.ndim == 3:
+                matches=[index for index,shape in enumerate(shapes) if int(shape[0]*shape[1]*shape[2])==int(hidden.shape[1])]
+            else:
+                matches=[]
+            # The boundary callback runs after this hook.  Always prefer the
+            # shape-derived stage so a prior callback cannot leak its stage
+            # index into the next pyramid stage.
+            if len(matches)==1: stage_index=matches[0]
+        if stage_index is None:
+            raise RuntimeError('cannot resolve Helios pyramid stage for Geometry routing')
+        scheduler_starts=getattr(scheduler,'start_sigmas',None); scheduler_ends=getattr(scheduler,'end_sigmas',None)
+        if scheduler_starts is None or scheduler_ends is None:
+            raise RuntimeError('Helios scheduler has no native stage sigma endpoints')
+        try:
+            sigma_start=float(scheduler_starts[int(stage_index)]); sigma_end=float(scheduler_ends[int(stage_index)])
+        except (IndexError,KeyError,TypeError,ValueError) as exc:
+            raise RuntimeError(f'Helios scheduler has no endpoints for pyramid stage {stage_index}') from exc
+        sigma_local=sigmas[index].detach()
+        sigma_abs,geometry_sigma_scale=geometry_sigma_schedule(sigma_local,sigma_start,sigma_end)
+        context.update({'stage_index':int(stage_index),'sigma_local':sigma_local,'sigma_start':sigma_start,'sigma_end':sigma_end,
+                        'sigma_abs':sigma_abs.detach(),'geometry_sigma_scale':geometry_sigma_scale.detach(),
+                        # ``sigma`` remains a compatibility alias, but it is
+                        # now explicitly the absolute Geometry sigma.
+                        'sigma':sigma_abs.detach()})
         return args,call_kwargs
 
     @staticmethod
@@ -80,7 +112,8 @@ class SightlinePipeline:
         self._active_chunk=0; self.runtime=SightlineRuntimeContext(); self.camera_history=CameraHistoryState(); self.history_state=None; self._pending_camera_chunk=None
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
-            processor.last_q=processor.last_k=processor.last_hidden_states=processor.last_key_identities=None
+            processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=None
+            processor.last_hidden_states=processor.last_key_identities=None
             processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None
             processor.capture_query_indices=None
             processor.last_attention_bias=None
@@ -167,18 +200,19 @@ class SightlinePipeline:
             processor.last_hidden_states=None; processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None; processor.capture_memory_hidden=True
         clean_started=time.perf_counter()
         previous_geometry=self.ray_provider.context.get('geometry_enabled',True)
-        previous_sigma=self.ray_provider.context.get('sigma',0.0)
-        previous_override=self.ray_provider.context.get('sigma_override',False)
+        previous_sigma_fields={key:self.ray_provider.context.get(key) for key in ('stage_index','sigma_local','sigma_start','sigma_end','sigma_abs','geometry_sigma_scale','sigma','sigma_override')}
         self.ray_provider.context['geometry_enabled']=False
-        self.ray_provider.context['sigma']=sigma
+        self.ray_provider.context.update({'stage_index':None,'sigma_local':sigma,'sigma_start':sigma,'sigma_end':sigma,
+                                          'sigma_abs':torch.as_tensor(sigma,device=capture_input.device,dtype=torch.float32),
+                                          'geometry_sigma_scale':torch.zeros((),device=capture_input.device,dtype=torch.float32),
+                                          'sigma':sigma})
         self.ray_provider.context['sigma_override']=True
         try:
             capture_fn(capture_input,timestep)
         finally:
             clean_seconds=time.perf_counter()-clean_started
             self.ray_provider.context['geometry_enabled']=previous_geometry
-            self.ray_provider.context['sigma']=previous_sigma
-            self.ray_provider.context['sigma_override']=previous_override
+            self.ray_provider.context.update(previous_sigma_fields)
             for processor in memory_processors: processor.capture_memory_hidden=False
         pending=getattr(self,'_pending_camera_chunk',None)
         if pending is None: raise RuntimeError('Memory capture has no camera trajectory metadata')

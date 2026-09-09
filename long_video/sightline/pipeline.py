@@ -112,10 +112,12 @@ class SightlinePipeline:
         self._active_chunk=0; self.runtime=SightlineRuntimeContext(); self.camera_history=CameraHistoryState(); self.history_state=None; self._pending_camera_chunk=None
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
-            processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=None
+            processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=processor.last_capture_key_indices=None
             processor.last_hidden_states=processor.last_key_identities=None
             processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None
             processor.capture_query_indices=None
+            processor.capture_key_indices=None
+            processor.capture_full_key=False
             processor.last_attention_bias=None
             processor.last_attention_meta={}; processor.last_current_length=None
 

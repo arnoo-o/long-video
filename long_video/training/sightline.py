@@ -29,6 +29,10 @@ class CorrespondencePlan:
     stage_shape: tuple = ()
     negative_key_t_match: bool = True
     negative_pair_count: int = 0
+    # RGB-D capture keeps only this sorted subset of the full Helios key axis.
+    # The plan's positive/negative tensors are expressed in this sparse axis.
+    sparse_key_indices: torch.Tensor|None = None
+    key_index_map: torch.Tensor|None = None
 
 def _bias_tile(bias, q0, q1, k0, k1):
     if bias.numel()==0: return None
@@ -313,39 +317,18 @@ class SightlineTrainable(nn.Module):
             raise ValueError('RGB-D hard-negative key-time contract is violated')
         def gather(values,indices):
             safe=indices.clamp_min(0)
-            # ``indices`` is either the full [R, P] positive table or a
-            # query-row chunk [R_chunk, P] in the streamed negative path.
-            # Reshape by the actual number of indexed rows; using the full
-            # plan row count here corrupts chunked gathers.
-            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],indices.shape[0],*indices.shape[1:],values.shape[2],values.shape[3])
+            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],*indices.shape,values.shape[2],values.shape[3])
         scale=augmented_query.shape[-1]**-0.5
         pos_aug=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,positive)).float().mul(scale)
         with torch.no_grad():
             pos_native=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,positive)).float().mul(scale)
-        # Do not materialize [B, R, H, P, N] negative logits.  On the
-        # formal 1024-row plan that temporary can exceed the remaining H100
-        # memory even though the final loss only needs the mean over N.
-        # Accumulate one matched negative at a time; this is algebraically
-        # identical and keeps the sparse Q/K contract intact.
-        neg_delta_sum=None
-        negative_row_chunk=64
-        for negative_slot in range(int(negative.shape[2])):
-            negative_indices=negative[:,:,negative_slot]
-            slot_blocks=[]
-            for row_start in range(0,rows,negative_row_chunk):
-                row_stop=min(rows,row_start+negative_row_chunk)
-                negative_indices_chunk=negative_indices[row_start:row_stop]
-                negative_mask_chunk=negative_mask[row_start:row_stop,:,negative_slot].view(1,row_stop-row_start,1,-1)
-                augmented_query_chunk=augmented_query[:,row_start:row_stop]
-                native_query_chunk=native_query[:,row_start:row_stop]
-                neg_aug_slot=torch.einsum('brhd,brphd->brhp',augmented_query_chunk,gather(augmented_key,negative_indices_chunk)).float().mul(scale)
-                with torch.no_grad():
-                    neg_native_slot=torch.einsum('brhd,brphd->brhp',native_query_chunk,gather(native_key,negative_indices_chunk)).float().mul(scale)
-                slot_blocks.append((neg_aug_slot-neg_native_slot).masked_fill(~negative_mask_chunk,0.0))
-            slot_delta=torch.cat(slot_blocks,dim=1) if slot_blocks else pos_aug.new_zeros(pos_aug.shape)
-            neg_delta_sum=slot_delta if neg_delta_sum is None else neg_delta_sum+slot_delta
-        if neg_delta_sum is None:
-            neg_delta_sum=pos_aug.new_zeros(pos_aug.shape)
+        # RGB-D keys are already sparse, so compute paired negatives directly
+        # on [R, P, N].  Native logits stay detached while the augmented path
+        # remains fully differentiable.
+        neg_aug=torch.einsum('brhd,brpnhd->brhpn',augmented_query,gather(augmented_key,negative)).float().mul(scale)
+        with torch.no_grad():
+            neg_native=torch.einsum('brhd,brpnhd->brhpn',native_query,gather(native_key,negative)).float().mul(scale)
+        neg_delta_sum=(neg_aug-neg_native).masked_fill(~negative_mask.view(1,rows,1,negative.shape[1],negative.shape[2]),0.0).sum(-1)
         pos_mask=positive_mask.view(1,rows,1,-1)
         pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0)
         neg_count=negative_mask.sum(-1).clamp_min(1).view(1,rows,1,negative.shape[1])

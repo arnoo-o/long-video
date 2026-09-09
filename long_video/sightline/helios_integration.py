@@ -18,8 +18,10 @@ class SightlineHeliosAttnProcessor:
         self.qkv_projection=qkv_projection; self.rotary_apply=rotary_apply; self.attention_dispatch=attention_dispatch
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.residual_scale=1.0  # legacy user ablation multiplier; default 1.
-        self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
+        self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
         self.capture_query_indices=None
+        self.capture_key_indices=None
+        self.capture_full_key=False
         self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
         self.capture_memory_hidden=False; self.last_hidden_states=None; self.last_pooled_hidden=None; self.last_pooled_grid_shape=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
@@ -209,18 +211,29 @@ class SightlineHeliosAttnProcessor:
                 self.last_q=query.index_select(1,indices)
                 self.last_native_q=native_query.detach().index_select(1,indices)
                 self.last_capture_query_indices=indices
-            self.last_native_k=native_key.detach()
+            if self.capture_key_indices is None:
+                key_indices=torch.arange(native_key.shape[1],device=native_key.device,dtype=torch.long)
+            else:
+                key_indices=torch.as_tensor(self.capture_key_indices,device=native_key.device,dtype=torch.long)
+                if key_indices.numel() and (int(key_indices.min())<0 or int(key_indices.max())>=native_key.shape[1]):
+                    raise RuntimeError('RGB-D sparse K capture index is outside the native Helios key axis')
+            self.last_capture_key_indices=key_indices
+            self.last_native_k=native_key.detach().index_select(1,key_indices)
             self.last_augmented_q=self.last_q
             # Preserve Q'/K' immediately after the Sightline residual.  The
             # final ``last_k`` below may additionally contain native history
             # scaling or appended Memory keys for the existing cross-chunk
             # correspondence path; those operations must not enter RGB-D's
             # Sightline-only delta.
-            self.last_augmented_k=augmented_key
-            self.last_k=key; self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
-            if len(self.last_key_identities)!=key.shape[1]: raise RuntimeError('key identity map length does not match attention K axis')
+            self.last_augmented_k=augmented_key.index_select(1,key_indices)
+            # A full K is retained only for the existing cross-chunk
+            # correspondence path.  RGB-D-only stages keep no dense K
+            # reference after the attention call.
+            self.last_k=key if self.capture_full_key or self.capture_key_indices is None else None
+            self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
+            if self.last_k is not None and len(self.last_key_identities)!=key.shape[1]: raise RuntimeError('key identity map length does not match attention K axis')
         else:
-            self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None
+            self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)

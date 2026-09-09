@@ -424,25 +424,55 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
         if kchunk>qchunk or kchunk<0 or kt<0: continue
         pre_count+=1
     selected,positives,weights,flags=_map_correspondence_identities(rows,chunk,current_shape,query_length,identities,_identity_lookup(identities),source_shape=source_shape,allowed_key_kinds=allowed_key_kinds,same_chunk_only=same_chunk_only)
-    mapped_count=sum(len(keys) for keys in positives)
     selected,positives,weights,flags=_sample_correspondence_mapping(selected,positives,weights,flags,max_rows,sampling_seed)
-    max_positive=max(map(len,positives),default=0); device=processor.ray_provider.context['c2w'].device
+    device=processor.ray_provider.context['c2w'].device
+    negative_indices=negative_mask=None; sparse_key_indices=key_index_map=None
+    negative_key_t_match=True; negative_pair_count=0
+    if with_hard_negatives:
+        negatives,negative_masks,negative_key_t_match,negative_pair_count=_hard_negative_indices(selected,positives,identities,current_shape,query_length,max_negatives=max_negatives)
+        # Remove positives that have no legal same-key-time negative, then
+        # remove queries that have no remaining paired supervision.  This is
+        # done before capture so invalid rows never retain Q/K graph state.
+        filtered=[]
+        for row,row_negatives in enumerate(negatives):
+            keep=[index for index,value in enumerate(row_negatives) if value]
+            if keep:
+                filtered.append((row,keep))
+        if not filtered:
+            return None
+        selected=[selected[row] for row,_ in filtered]
+        positives=[[positives[row][index] for index in keep] for row,keep in filtered]
+        weights=[weights[row] for row,_ in filtered]
+        flags=[flags[row] for row,_ in filtered]
+        negative_rows=[[negatives[row][index] for index in keep] for row,keep in filtered]
+        negative_pair_count=sum(len(keys) for row in negative_rows for keys in row if keys)
+    mapped_count=sum(len(keys) for keys in positives)
+    max_positive=max(map(len,positives),default=0)
     positive_indices=torch.full((len(selected),max_positive),-1,device=device,dtype=torch.long)
     positive_mask=torch.zeros_like(positive_indices,dtype=torch.bool)
     for row,keys in enumerate(positives):
         positive_indices[row,:len(keys)]=torch.as_tensor(keys,device=device); positive_mask[row,:len(keys)]=True
-    negative_indices=negative_mask=None
-    negative_key_t_match=True; negative_pair_count=0
     if with_hard_negatives:
-        negatives,negative_rows,negative_key_t_match,negative_pair_count=_hard_negative_indices(selected,positives,identities,current_shape,query_length,max_negatives=max_negatives)
-        max_positive=max(map(len,positives),default=0); max_negative=max((len(value) for row in negatives for value in row),default=0)
+        max_negative=max((len(value) for row in negative_rows for value in row),default=0)
         negative_indices=torch.full((len(selected),max_positive,max_negative),-1,device=device,dtype=torch.long); negative_mask=torch.zeros_like(negative_indices,dtype=torch.bool)
-        for row,row_keys in enumerate(negatives):
+        for row,row_keys in enumerate(negative_rows):
             for positive_index,keys in enumerate(row_keys):
                 negative_indices[row,positive_index,:len(keys)]=torch.as_tensor(keys,device=device); negative_mask[row,positive_index,:len(keys)]=True
+        # Capture only the union of valid positive and negative full-axis keys.
+        full_key_values=[positive_indices[positive_mask],negative_indices[negative_mask]]
+        sparse_key_indices=torch.unique(torch.cat(full_key_values),sorted=True)
+        key_index_map=torch.full((len(identities),),-1,device=device,dtype=torch.long)
+        key_index_map[sparse_key_indices]=torch.arange(sparse_key_indices.numel(),device=device,dtype=torch.long)
+        def remap(values,mask):
+            mapped=torch.full_like(values,-1)
+            mapped[mask]=key_index_map[values[mask]]
+            return mapped
+        positive_indices=remap(positive_indices,positive_mask)
+        negative_indices=remap(negative_indices,negative_mask)
     return CorrespondencePlan(torch.as_tensor(selected,device=device,dtype=torch.long),positive_indices,positive_mask,
                               torch.as_tensor(weights,device=device,dtype=torch.float32),identities,tuple(flags),negative_indices,negative_mask,
-                              int(pre_count),int(mapped_count),tuple(int(value) for value in current_shape),bool(negative_key_t_match),int(negative_pair_count))
+                              int(pre_count),int(mapped_count),tuple(int(value) for value in current_shape),bool(negative_key_t_match),int(negative_pair_count),
+                              sparse_key_indices,key_index_map)
 
 def _captured_queries(processor,plan,captured,*,native=False,capture_indices=None):
     """Select a plan's queries from the union captured for sparse losses."""
@@ -459,6 +489,32 @@ def _captured_queries(processor,plan,captured,*,native=False,capture_indices=Non
         raise RuntimeError('CorrespondencePlan queries were not included in the captured sparse Q union')
     return captured.index_select(1,positions)
 
+def _captured_keys(processor,plan,captured,*,capture_indices=None):
+    """Select a plan's keys from the exact sparse/full capture union."""
+    if captured is None: raise RuntimeError('correspondence processor did not capture K')
+    wanted=plan.sparse_key_indices
+    if wanted is None:
+        if plan.positive_mask.any():
+            wanted=plan.positive_indices[plan.positive_mask]
+        elif plan.negative_mask is not None and plan.negative_mask.any():
+            wanted=plan.negative_indices[plan.negative_mask]
+        else:
+            return captured[:, :0]
+        wanted=torch.unique(wanted.to(device=captured.device,dtype=torch.long),sorted=True)
+    else:
+        wanted=wanted.to(device=captured.device,dtype=torch.long)
+    indices=getattr(processor,'last_capture_key_indices',None) if capture_indices is None else capture_indices
+    if indices is None:
+        if captured.shape[1]==wanted.numel(): return captured
+        indices=torch.arange(captured.shape[1],device=captured.device,dtype=torch.long)
+    else:
+        indices=torch.as_tensor(indices,device=captured.device,dtype=torch.long)
+    if indices.numel()==0 or wanted.numel()==0: return captured[:, :0]
+    positions=torch.searchsorted(indices,wanted)
+    if torch.any(positions>=indices.numel()) or not torch.equal(indices.index_select(0,positions.clamp_max(indices.numel()-1)),wanted):
+        raise RuntimeError('CorrespondencePlan keys were not included in the captured sparse K union')
+    return captured.index_select(1,positions)
+
 def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,timings=None,captures=None):
     if plan is None or plan.query_indices.numel()==0: return torch.zeros((),device=next(iter(processors.values())).ray_provider.context['c2w'].device)
     missing=[layer for layer in layers if layer not in processors]
@@ -469,11 +525,16 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,timings=Non
         saved=None if captures is None else captures.get(layer)
         if saved is None:
             augmented_q_value=processor.last_augmented_q if processor.last_augmented_q is not None else processor.last_q
-            native_q_value=processor.last_native_q; augmented_k=processor.last_augmented_k if processor.last_augmented_k is not None else processor.last_k; native_k=processor.last_native_k; capture_indices=None
+            native_q_value=processor.last_native_q; augmented_k_value=processor.last_augmented_k if processor.last_augmented_k is not None else processor.last_k; native_k_value=processor.last_native_k; capture_indices=None; capture_key_indices=None
         else:
-            augmented_q_value,native_q_value,augmented_k,native_k,capture_indices=saved
+            if len(saved)==5:
+                augmented_q_value,native_q_value,augmented_k_value,native_k_value,capture_indices=saved; capture_key_indices=None
+            else:
+                augmented_q_value,native_q_value,augmented_k_value,native_k_value,capture_indices,capture_key_indices=saved
         augmented_q=_captured_queries(processor,plan,augmented_q_value,capture_indices=capture_indices)
         native_q=_captured_queries(processor,plan,native_q_value,native=True,capture_indices=capture_indices)
+        augmented_k=_captured_keys(processor,plan,augmented_k_value,capture_indices=capture_key_indices)
+        native_k=_captured_keys(processor,plan,native_k_value,capture_indices=capture_key_indices)
         if augmented_q is None or native_q is None or augmented_k is None or native_k is None:
             raise RuntimeError('RGB-D processor did not capture native and Sightline Q/K')
         if native_k.shape[1] < augmented_k.shape[1] and plan.negative_indices is not None:
@@ -496,8 +557,11 @@ def _release_rgbd_capture(processors,layers,*,preserve_cross_capture=False):
         if not preserve_cross_capture:
             processor.last_q=processor.last_k=None
             processor.last_capture_query_indices=None
+            processor.last_capture_key_indices=None
             processor.last_key_identities=None
             processor.last_attention_bias=None
+            processor.capture_full_key=False
+            processor.capture_key_indices=None
 
 def _backward_rgbd_stage(term,trainable):
     """Backprop one RGB-D stage without letting it update the rho schedule."""
@@ -850,7 +914,9 @@ def main():
                     for rgbd_stage_index in (1,2):
                         rgbd_stage_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][rgbd_stage_index])
                         current_length=int(rgbd_stage_shape[0]*rgbd_stage_shape[1]*rgbd_stage_shape[2])
-                        rgbd_plans[rgbd_stage_index]=_build_correspondence_plan(pipe.transformer._sightline_processors[active_rgbd_layers[0]],rgbd_rows,chunk,current_length,cfg.max_intra_corr_rows,correspondence_seed+rgbd_stage_index,source_shape=final_shape,allowed_key_kinds=('current',),same_chunk_only=True,with_hard_negatives=True)
+                        stage_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_rgbd_layers[0]],rgbd_rows,chunk,current_length,cfg.max_intra_corr_rows,correspondence_seed+rgbd_stage_index,source_shape=final_shape,allowed_key_kinds=('current',),same_chunk_only=True,with_hard_negatives=True)
+                        if stage_plan is not None and stage_plan.negative_pair_count>0:
+                            rgbd_plans[rgbd_stage_index]=stage_plan
                 if cross_rows is not None and len(cross_rows) and not args.alpha_zero_baseline:
                     current_length=int(final_shape[0]*final_shape[1]*final_shape[2])
                     cross_plan=_build_correspondence_plan(pipe.transformer._sightline_processors[active_corr_layers[0]],cross_rows,chunk,current_length,cfg.correspondence_rows_per_batch,correspondence_seed)
@@ -859,8 +925,9 @@ def main():
                     oom_state['k_length']=max(len(plan.identities) for plan in plans)
                     oom_state['selected_q_count']=int(torch.unique(torch.cat([plan.query_indices for plan in plans])).numel())
                 rgbd_scales={stage_index:items[stage_index]['geometry_sigma_scale'].detach().float().mean() for stage_index in (1,2)}
-                rgbd_scale_sum=(rgbd_scales[1]+rgbd_scales[2]+torch.as_tensor(1e-8,device=source.device,dtype=torch.float32)).detach()
-                rgbd_weights={stage_index:(rgbd_scales[stage_index]/rgbd_scale_sum).detach() for stage_index in (1,2)}
+                valid_rgbd_stages=tuple(stage_index for stage_index in (1,2) if stage_index in rgbd_plans and rgbd_plans[stage_index].negative_pair_count>0)
+                rgbd_scale_sum=(torch.stack([rgbd_scales[stage_index] for stage_index in valid_rgbd_stages]).sum()+torch.as_tensor(1e-8,device=source.device,dtype=torch.float32)).detach() if valid_rgbd_stages else torch.as_tensor(1e-8,device=source.device,dtype=torch.float32)
+                rgbd_weights={stage_index:((rgbd_scales[stage_index]/rgbd_scale_sum).detach() if stage_index in valid_rgbd_stages else torch.zeros((),device=source.device,dtype=torch.float32)) for stage_index in (1,2)}
                 backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_capture_seen=set()
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
@@ -870,13 +937,17 @@ def main():
                     stage_capture_layers=tuple(sorted(set(active_rgbd_layers if capture_rgbd else ()).union(active_corr_layers if capture_cross else ())))
                     for layer in capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
-                        processor.capture_diagnostics=False; processor.capture_query_indices=None
+                        processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
                     for layer in stage_capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
                         processor.capture_diagnostics=True
                         stage_plans=tuple(plan for plan in (stage_rgbd_plan if capture_rgbd else None,cross_plan if capture_cross else None) if plan is not None)
                         plan_queries=torch.unique(torch.cat([plan.query_indices for plan in stage_plans])) if stage_plans else None
                         processor.capture_query_indices=plan_queries if plan_queries is not None and (args.train or args.probe_capture) else None
+                        rgbd_key_plans=(stage_rgbd_plan,) if capture_rgbd else ()
+                        plan_keys=tuple(plan.sparse_key_indices for plan in rgbd_key_plans if plan.sparse_key_indices is not None)
+                        processor.capture_key_indices=torch.unique(torch.cat(plan_keys)) if plan_keys and (args.train or args.probe_capture) else None
+                        processor.capture_full_key=bool(capture_cross)
                     capture_correspondence=bool(stage_capture_layers)
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     is_final_stage=stage_index+1==len(items)
@@ -897,7 +968,7 @@ def main():
                             if is_final_stage:
                                 backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
                         if capture_rgbd:
-                            stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices) for layer in active_rgbd_layers}
+                            stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices,pipe.transformer._sightline_processors[layer].last_capture_key_indices) for layer in active_rgbd_layers}
                             rgbd_capture_seen.add(stage_index)
                             # Backpropagate each stage's weighted RGB-D term
                             # immediately after its capture.  Stage weights are
@@ -912,7 +983,7 @@ def main():
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:
-                            timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(retain_graph=capture_rgbd); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                            timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(retain_graph=False); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
                             # The early-stage backward is complete. Retain only its
                             # scalar metric and sigma; its flow tensors otherwise
                             # remain referenced by ``items`` during the much larger
@@ -924,7 +995,7 @@ def main():
                 cross_weight=trainable.lambda_corr(step/total_steps)
                 oom_state['stage']='correspondence_forward'
                 if train_rgbd and set(rgbd_plans)!=rgbd_capture_seen:
-                    raise RuntimeError('RGB-D stage1/stage2 plans did not each capture Q/K')
+                    raise RuntimeError('RGB-D plans did not capture exactly their valid sparse Q/K stages')
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,cross_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=cross_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (train_correspondence or diagnostic_correspondence) and cross_rows is not None and len(cross_rows) else fm.new_zeros(())
                 record_vram('correspondence_loss')
                 rgbd_stage_values={stage_index:rgbd_stage_losses.get(stage_index,fm.new_zeros(())).detach() for stage_index in (1,2)}

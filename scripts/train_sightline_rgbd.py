@@ -809,7 +809,7 @@ def main():
                 if plans:
                     oom_state['k_length']=max(len(plan.identities) for plan in plans)
                     oom_state['selected_q_count']=int(torch.unique(torch.cat([plan.query_indices for plan in plans])).numel())
-                backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_captures={}
+                backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_captures={}; rgbd_metric=None
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
                     capture_rgbd=bool(rgbd_plan is not None and stage_index==rgbd_stage_index)
@@ -845,6 +845,17 @@ def main():
                                 backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
                         if capture_rgbd:
                             rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices) for layer in active_rgbd_layers}
+                            # The selected RGB-D stage may precede the final
+                            # stage.  Backpropagate its sparse loss while its
+                            # checkpoint/capture state is still identical to
+                            # the forward pass; otherwise later-stage capture
+                            # flags make checkpoint recomputation non-deterministic.
+                            if train_rgbd and rgbd_plan is not None:
+                                rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=rgbd_captures)
+                                if args.train and rgbd_metric.requires_grad:
+                                    rgbd_stage_term=float(cfg.lambda_rgbd)*item['geometry_sigma_scale'].detach().float().mean()*rgbd_metric
+                                    rgbd_stage_term.backward(retain_graph=True)
+                                    rgbd_metric=rgbd_metric.detach()
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:
@@ -861,7 +872,8 @@ def main():
                 oom_state['stage']='correspondence_forward'
                 if rgbd_plan is not None and not rgbd_captures:
                     raise RuntimeError('RGB-D stage did not capture its selected Q/K tensors')
-                rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=rgbd_captures) if train_rgbd and rgbd_plan is not None else fm.new_zeros(())
+                if rgbd_metric is None:
+                    rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,active_rgbd_layers,rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,timings=perf,captures=rgbd_captures) if train_rgbd and rgbd_plan is not None else fm.new_zeros(())
                 corr_metric=_corr_loss(trainable,pipe.transformer._sightline_processors,cross_rows,chunk,active_corr_layers,cfg.correspondence_rows_per_batch,sampling_seed=correspondence_seed,timings=perf,plan=cross_plan if args.train else None,vram_callback=record_vram if args.profile_timing else None) if (train_correspondence or diagnostic_correspondence) and cross_rows is not None and len(cross_rows) else fm.new_zeros(())
                 record_vram('correspondence_loss')
                 rgbd=rgbd_metric if train_rgbd else fm.new_zeros(())

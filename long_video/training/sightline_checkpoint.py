@@ -4,7 +4,10 @@ import hashlib,io,json,random
 import numpy as np
 from pathlib import Path
 import torch
-SEMANTICS='sightline-v9-layers0-11-helios-modnorm-sigma-smooth'; SCHEMA='sightline-checkpoint-v19'
+# Freezing the complete Helios backbone changes the optimizer scope and is a
+# distinct training contract.  Keep old modulation/norm checkpoints from
+# being resumed silently under the new optimizer layout.
+SEMANTICS='sightline-v9-layers0-11-helios-frozen-sigma-smooth'; SCHEMA='sightline-checkpoint-v20'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)
@@ -50,7 +53,7 @@ def save_checkpoint(path, model, optimizer, scheduler, step, *, config, helios_f
     Path(path).parent.mkdir(parents=True,exist_ok=True); torch.save(payload,path)
 def validate_checkpoint(payload, *, config, helios_fingerprint, layers, memory_config, allow_memory_layer_migration=False, allow_world_size_migration=False):
     if payload.get('sightline_training_semantics_version')!=SEMANTICS or payload.get('sightline_checkpoint_schema_version')!=SCHEMA:
-        raise RuntimeError(f'incompatible Sightline checkpoint: expected {SEMANTICS}/{SCHEMA} for native-relative RMS-gated Geometry; got {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")}')
+        raise RuntimeError(f'incompatible Sightline checkpoint: expected {SEMANTICS}/{SCHEMA} for frozen-Helios Geometry; got {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")}')
     if payload.get('helios_fingerprint')!=helios_fingerprint: raise RuntimeError('Sightline checkpoint provenance mismatch')
     saved_config=payload.get('config',{})
     config_match=payload.get('config_fingerprint')==config_fingerprint(config)

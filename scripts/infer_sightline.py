@@ -83,11 +83,13 @@ def main():
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
-    helios_trainable_names=tuple(name for name,_ in pipe.transformer.named_parameters()
-        if name.startswith('blocks.') and int(name.split('.')[1]) < 12 and
-        (name.endswith('scale_shift_table') or '.norm_q.' in name or '.norm_k.' in name or '.norm2.' in name))
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
+        # New formal runs freeze the complete Helios backbone and therefore
+        # record an empty trainable scope.  For legacy checkpoints, honor the
+        # scope recorded in the payload so inference remains explicit rather
+        # than silently assuming the old block0..11 modulation/norm set.
+        helios_trainable_names=tuple(payload.get('helios_trainable_scope',()))
         provenance=runtime_provenance(pipe,a.model,a.helios_root,model_revision=a.model_revision,transformer_source_sha256=source_fingerprint,runtime_patch=runtime_patch,lora_scope=cfg.lora_scope,helios_trainable_scope=helios_trainable_names)
         restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=asdict(cfg),helios_fingerprint=source_fingerprint,layers=geometry_layers,memory_config={'layers':list(cfg.memory_layers),'pool':cfg.memory_pool,'budget':cfg.memory_budget,'tau_pos':cfg.memory_tau_pos,'tau_angle':cfg.memory_tau_angle},provenance=provenance,helios_trainable_names=helios_trainable_names)
     else:

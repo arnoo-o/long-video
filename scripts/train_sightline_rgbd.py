@@ -466,20 +466,13 @@ def main():
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
         lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
-    # Helios adaptation is deliberately restricted to modulation and norm
-    # parameters in blocks 0..11. Attention/FFN projections and blocks 12+
-    # remain frozen; the names are discovered from this pinned model, never
-    # guessed from an external architecture table.
+    # The formal Sightline run keeps the entire Helios backbone frozen.  This
+    # includes block 0..11 modulation/norm parameters as well as attention,
+    # FFN, and blocks 12+.  Keep an explicit empty scope so optimizer,
+    # checkpoint provenance, and resume preflight cannot silently re-enable a
+    # subset of the backbone.
     helios_trainable_names=[]; helios_trainable=[]
-    for name,parameter in pipe.transformer.named_parameters():
-        parts=name.split('.')
-        if len(parts)>=3 and parts[0]=='blocks' and parts[1].isdigit() and int(parts[1]) < 12:
-            is_modulation=name.endswith('scale_shift_table')
-            is_norm=('.norm_q.' in name or '.norm_k.' in name or '.norm2.' in name)
-            if is_modulation or is_norm:
-                parameter.requires_grad_(True); helios_trainable_names.append(name); helios_trainable.append(parameter)
-    if not helios_trainable_names: raise RuntimeError('pinned Helios exposes no block0..11 modulation/norm parameters')
-    if rank==0: print('Helios trainable modulation/norm parameters:', *helios_trainable_names, sep='\n  ', flush=True)
+    if rank==0: print('Helios trainable parameters: none (entire backbone frozen)', flush=True)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width)
     provider=SightlineRayProvider(source_height=padded_h,source_width=padded_w); runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider); pipe._sightline_pipeline=runner
@@ -505,7 +498,6 @@ def main():
         {'name':'gate','params':gate_params,'lr':cfg.geometry_gate_learning_rate,'weight_decay':0.0},
         {'name':'beta','params':beta_params,'lr':cfg.geometry_beta_learning_rate,'weight_decay':0.0},
         {'name':'memory','params':memory_params,'lr':cfg.memory_learning_rate,'weight_decay':0.01},
-        {'name':'helios_modulation_norm','params':helios_trainable,'lr':cfg.helios_modulation_norm_learning_rate,'weight_decay':cfg.helios_modulation_norm_weight_decay},
     ]
     if lora_params: optimizer_groups.insert(-1,{'name':'lora','params':lora_params,'lr':cfg.lora_learning_rate,'weight_decay':0.01})
     optimizer=torch.optim.AdamW(optimizer_groups,weight_decay=0.0)

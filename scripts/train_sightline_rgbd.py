@@ -675,6 +675,7 @@ def main():
             phase={**phase,'max_chunks':int(smoke_max_chunks)}
         checkpointing=bool(cfg.gradient_checkpointing); _set_gradient_checkpointing(pipe.transformer,checkpointing)
         if args.alpha_zero_baseline: phase={**phase,'memory':False,'lora':False,'correspondence':False}
+        train_rgbd=bool(args.train and phase.get('rgbd',False) and not args.alpha_zero_baseline)
         phase_records=p3_records if phase['name']=='P3' else records
         requires_rgbd_data=bool(train_rgbd or phase['memory'] or phase['correspondence'] or bool(args.probe_capture))
         eligible_records=[record for record in phase_records if record.chunk_count >= phase['max_chunks'] and (record.memory_eligible if requires_rgbd_data else True)]
@@ -721,7 +722,6 @@ def main():
         # Same-chunk RGB-D supervision is valid for every selected train chunk,
         # including the direct-source chunk0 path.  Cross-chunk correspondence
         # remains restricted to Memory-backed P3 frontiers.
-        train_rgbd=bool(args.train and phase.get('rgbd',False) and not args.alpha_zero_baseline)
         train_correspondence=bool(phase['correspondence'] and train_chunk>0 and not args.alpha_zero_baseline)
         runner.memory.set_enabled(phase['memory'] and train_chunk>0)
         capture_layers=()

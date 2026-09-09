@@ -396,11 +396,17 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
                             and value[0] not in positive_set),
                            key=lambda value:(abs(value[2]-positive_y)+abs(value[3]-positive_x),value[2],value[3],value[0]))
             chosen=[value[0] for value in ordered[:int(max_negatives)]]
-            if not chosen: raise RuntimeError('same-key-time RGB-D correspondence has no hard negative key')
+            # A valid RGB-D positive may exhaust its exact key-time bucket
+            # after positive filtering.  Keep the positive paired with an
+            # empty negative list; the ranking loss masks this pair out and
+            # normalizes over the remaining valid pairs.  Never fall back to
+            # another key time, because that would leak temporal distance.
+            if not chosen:
+                row_negatives.append([]); row_masks.append([])
+                continue
             if any(value[1]!=positive_global for value in ordered[:int(max_negatives)]): matched_key_t=False
             row_negatives.append(chosen); row_masks.append([True]*len(chosen)); pair_count+=1
         negatives.append(row_negatives); masks.append(row_masks)
-    if pair_count==0: raise RuntimeError('same-chunk RGB-D correspondence has no positive/negative pair')
     return negatives,masks,matched_key_t,pair_count
 
 def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,sampling_seed,*,source_shape=None,allowed_key_kinds=None,same_chunk_only=False,with_hard_negatives=False,max_negatives=4):

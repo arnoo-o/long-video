@@ -11,6 +11,7 @@ shift
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mkdir -p "$output_dir"
 cd "$repo_root"
+export PYTHONPATH="$repo_root${PYTHONPATH:+:$PYTHONPATH}"
 
 attempt=0
 while true; do

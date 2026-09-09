@@ -319,25 +319,30 @@ class SightlineTrainable(nn.Module):
             safe=indices.clamp_min(0)
             return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],*indices.shape,values.shape[2],values.shape[3])
         scale=augmented_query.shape[-1]**-0.5
-        pos_aug=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,positive)).float().mul(scale)
-        with torch.no_grad():
-            pos_native=torch.einsum('brhd,brphd->brhp',native_query,gather(native_key,positive)).float().mul(scale)
-        # RGB-D keys are already sparse, so compute paired negatives directly
-        # on [R, P, N].  Native logits stay detached while the augmented path
-        # remains fully differentiable.
-        neg_aug=torch.einsum('brhd,brpnhd->brhpn',augmented_query,gather(augmented_key,negative)).float().mul(scale)
-        with torch.no_grad():
-            neg_native=torch.einsum('brhd,brpnhd->brhpn',native_query,gather(native_key,negative)).float().mul(scale)
-        neg_delta_sum=(neg_aug-neg_native).masked_fill(~negative_mask.view(1,rows,1,negative.shape[1],negative.shape[2]),0.0).sum(-1)
-        pos_mask=positive_mask.view(1,rows,1,-1)
-        pos_delta=(pos_aug-pos_native).masked_fill(~pos_mask,0.0)
-        neg_count=negative_mask.sum(-1).clamp_min(1).view(1,rows,1,negative.shape[1])
-        neg_delta=neg_delta_sum/neg_count
+        # Compute one positive and its matched same-time negatives at a time.
+        # This is direct sparse pairwise scoring: no dense K axis, no
+        # [R,P,N,H,D] gather, and no row-chunk bookkeeping.  Accumulating the
+        # scalar pair numerator is algebraically identical to the vectorized
+        # ranking formula while keeping only one negative set live.
+        pair_loss_sum=augmented_query.new_zeros((augmented_query.shape[0],rows,augmented_query.shape[2]),dtype=torch.float32)
         pair_mask=positive_mask & negative_mask.any(-1)
-        pair_mask_view=pair_mask.view(1,rows,1,-1)
-        pair_loss=F.softplus((float(margin)-(pos_delta-neg_delta))/float(temperature)).masked_fill(~pair_mask_view,0.0)
+        for positive_slot in range(int(positive.shape[1])):
+            positive_indices=positive[:,positive_slot]
+            positive_valid=positive_mask[:,positive_slot].view(1,rows,1)
+            pos_aug=torch.einsum('brhd,brhd->brh',augmented_query,gather(augmented_key,positive_indices)).float().mul(scale)
+            with torch.no_grad():
+                pos_native=torch.einsum('brhd,brhd->brh',native_query,gather(native_key,positive_indices)).float().mul(scale)
+            negative_indices=negative[:,positive_slot]
+            negative_valid=negative_mask[:,positive_slot]
+            neg_aug=torch.einsum('brhd,brnhd->brhn',augmented_query,gather(augmented_key,negative_indices)).float().mul(scale)
+            with torch.no_grad():
+                neg_native=torch.einsum('brhd,brnhd->brhn',native_query,gather(native_key,negative_indices)).float().mul(scale)
+            neg_count=negative_valid.sum(-1).clamp_min(1).view(1,rows,1)
+            neg_delta=(neg_aug-neg_native).masked_fill(~negative_valid.view(1,rows,1,-1),0.0).sum(-1)/neg_count
+            pair_loss=F.softplus((float(margin)-((pos_aug-pos_native)-neg_delta))/float(temperature)).masked_fill(~(pair_mask[:,positive_slot].view(1,rows,1)),0.0)
+            pair_loss_sum=pair_loss_sum+pair_loss
         pair_count=pair_mask.sum(-1).clamp_min(1).view(1,rows,1)
-        row_loss=pair_loss.sum(-1)/pair_count
+        row_loss=pair_loss_sum/pair_count
         row_loss=row_loss.mean((0,2))
         valid_rows=pair_mask.any(-1).to(row_loss.dtype)
         weights=plan.weights.to(device=row_loss.device,dtype=row_loss.dtype)*valid_rows

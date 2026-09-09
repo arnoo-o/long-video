@@ -178,32 +178,40 @@ class _StreamingRGBDRanking(torch.autograd.Function):
         if pair_rows.numel()==0:
             return grad_query,grad_key,None,None,None,None,None,None,None,None,None
         block_size=_StreamingRGBDRanking.BLOCK_SIZE
-        with torch.enable_grad():
-            for start in range(0,int(pair_rows.numel()),block_size):
-                stop=min(int(pair_rows.numel()),start+block_size)
-                rows=pair_rows[start:stop]; slots=pair_slots[start:stop]
-                positive=positive_indices[rows,slots]
-                negative=negative_indices[rows,slots]
-                negative_valid=negative_mask[rows,slots]
-                query_block=augmented_query.detach().index_select(1,rows).requires_grad_(True)
-                positive_key=augmented_key.detach().index_select(1,positive).requires_grad_(True)
-                safe_negative=negative.clamp_min(0)
-                negative_key=augmented_key.detach().index_select(1,safe_negative.reshape(-1)).reshape(augmented_key.shape[0],*safe_negative.shape,augmented_key.shape[2],augmented_key.shape[3]).requires_grad_(True)
-                native_query_block=native_query.index_select(1,rows)
-                native_positive_key=native_key.index_select(1,positive)
-                native_negative_key=native_key.index_select(1,safe_negative.reshape(-1)).reshape(native_key.shape[0],*safe_negative.shape,native_key.shape[2],native_key.shape[3])
-                positive_delta=torch.einsum('bmhd,bmhd->bmh',query_block,positive_key).float().mul(augmented_query.shape[-1]**-0.5)-torch.einsum('bmhd,bmhd->bmh',native_query_block,native_positive_key).float().mul(augmented_query.shape[-1]**-0.5)
-                negative_delta=torch.einsum('bmhd,bmnhd->bmhn',query_block,negative_key).float().mul(augmented_query.shape[-1]**-0.5)-torch.einsum('bmhd,bmnhd->bmhn',native_query_block,native_negative_key).float().mul(augmented_query.shape[-1]**-0.5)
-                valid=negative_valid.view(1,negative_valid.shape[0],1,-1)
-                count=negative_valid.sum(-1).clamp_min(1).view(1,negative_valid.shape[0],1)
-                negative_mean=negative_delta.masked_fill(~valid,0.0).sum(-1)/count
-                pair_loss=F.softplus((float(ctx.margin)-(positive_delta-negative_mean))/float(ctx.temperature))
-                coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()/denominator
-                block_value=(pair_loss.mean((0,2))*coefficient).sum()
-                gradients=torch.autograd.grad(block_value,(query_block,positive_key,negative_key),allow_unused=True)
-                if gradients[0] is not None: grad_query.index_add_(1,rows,gradients[0].to(grad_query.dtype))
-                if gradients[1] is not None: grad_key.index_add_(1,positive,gradients[1].to(grad_key.dtype))
-                if gradients[2] is not None: grad_key.index_add_(1,safe_negative.reshape(-1),gradients[2].reshape(grad_key.shape[0],-1,grad_key.shape[2],grad_key.shape[3]).to(grad_key.dtype))
+        scale=augmented_query.shape[-1]**-0.5
+        batch_size=augmented_query.shape[0]; head_count=augmented_query.shape[2]
+        for start in range(0,int(pair_rows.numel()),block_size):
+            stop=min(int(pair_rows.numel()),start+block_size)
+            rows=pair_rows[start:stop]; slots=pair_slots[start:stop]
+            positive=positive_indices[rows,slots]
+            negative=negative_indices[rows,slots]
+            negative_valid=negative_mask[rows,slots]
+            query_block=augmented_query.detach().index_select(1,rows)
+            positive_key=augmented_key.detach().index_select(1,positive)
+            safe_negative=negative.clamp_min(0)
+            negative_key=augmented_key.detach().index_select(1,safe_negative.reshape(-1)).reshape(augmented_key.shape[0],*safe_negative.shape,augmented_key.shape[2],augmented_key.shape[3])
+            native_query_block=native_query.index_select(1,rows)
+            native_positive_key=native_key.index_select(1,positive)
+            native_negative_key=native_key.index_select(1,safe_negative.reshape(-1)).reshape(native_key.shape[0],*safe_negative.shape,native_key.shape[2],native_key.shape[3])
+            positive_delta=torch.einsum('bmhd,bmhd->bmh',query_block,positive_key).float().mul(scale)-torch.einsum('bmhd,bmhd->bmh',native_query_block,native_positive_key).float().mul(scale)
+            negative_delta=torch.einsum('bmhd,bmnhd->bmhn',query_block,negative_key).float().mul(scale)-torch.einsum('bmhd,bmnhd->bmhn',native_query_block,native_negative_key).float().mul(scale)
+            valid=negative_valid.view(1,negative_valid.shape[0],1,-1)
+            count=negative_valid.sum(-1).clamp_min(1).view(1,negative_valid.shape[0],1)
+            negative_mean=negative_delta.masked_fill(~valid,0.0).sum(-1)/count
+            gap=positive_delta-negative_mean
+            softplus_input=(float(ctx.margin)-gap)/float(ctx.temperature)
+            d_gap=(-torch.sigmoid(softplus_input)/float(ctx.temperature))
+            coefficient=weights.index_select(0,rows).float()/pair_counts.index_select(0,rows).float()/denominator
+            d_gap.mul_(coefficient.view(1,-1,1)).mul_(grad_output.float()/(float(batch_size)*float(head_count)))
+            valid_key=negative_valid.view(1,negative_valid.shape[0],negative_valid.shape[1],1,1)
+            count_key=count.view(1,negative_valid.shape[0],1,1,1)
+            negative_mean_key=(negative_key*valid_key).sum(2)/count_key
+            query_grad=d_gap.unsqueeze(-1)*(positive_key-negative_mean_key)*scale
+            positive_grad=d_gap.unsqueeze(-1)*query_block*scale
+            negative_grad=(-d_gap.unsqueeze(2)*query_block.unsqueeze(2)*valid_key/count_key)*scale
+            grad_query.index_add_(1,rows,query_grad.to(grad_query.dtype))
+            grad_key.index_add_(1,positive,positive_grad.to(grad_key.dtype))
+            grad_key.index_add_(1,safe_negative.reshape(-1),negative_grad.reshape(grad_key.shape[0],-1,grad_key.shape[2],grad_key.shape[3]).to(grad_key.dtype))
         grad_query.mul_(grad_output.to(grad_query.dtype)); grad_key.mul_(grad_output.to(grad_key.dtype))
         return grad_query,grad_key,None,None,None,None,None,None,None,None,None
 

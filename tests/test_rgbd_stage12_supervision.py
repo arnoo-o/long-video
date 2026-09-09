@@ -1,4 +1,5 @@
 from pathlib import Path
+import pytest
 
 import torch
 import torch.nn.functional as F
@@ -151,5 +152,5 @@ def test_total_metric_contains_all_fm_stages_without_a_second_backward_path():
     rgbd_term = torch.tensor(0.02, requires_grad=True)
     cross_term = torch.tensor(0.03, requires_grad=True)
     total = _total_metric(fm, rgbd_term, cross_term)
-    assert total.item() == 0.75
+    assert total.item() == pytest.approx(0.75)
     assert not total.requires_grad

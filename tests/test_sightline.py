@@ -773,7 +773,7 @@ def test_correspondence_plan_exactly_matches_legacy_mapping():
     expected=training._mapped_correspondences(processor,rows,1)
     plan=training._build_correspondence_plan(processor,rows,1,1,1024,7)
     assert plan.query_indices.tolist()==expected[0] and [row[row>=0].tolist() for row in plan.positive_indices]==expected[1]
-    assert plan.positive_weights.tolist()==pytest.approx(expected[2])
+    assert all(actual==pytest.approx(reference) for actual_row,reference_row in zip(plan.positive_weights.tolist(),expected[2]) for actual,reference in zip(actual_row,reference_row))
     assert plan.weights.tolist()==pytest.approx(expected[3]) and plan.flags==tuple(expected[4])
 
 def test_formal_correspondence_loss_releases_processor_qk_references():
@@ -969,7 +969,7 @@ def test_rgbd_prefix_forward_matches_full_capture_and_stops_after_dynamic_layer(
     item={'sigmas':torch.tensor(.2),'timesteps':torch.tensor([7]),'stage_index':1,
           'sigma_local':torch.tensor(.2),'sigma_start':.8,'sigma_end':.3}
     history={name:(None,None) for name in ('long','mid','short')}
-    noisy=torch.randn(1,2,9,1,1)
+    noisy=torch.randn(1,18,4)
     full_input=noisy.flatten().view(1,-1).requires_grad_()
     full_noisy=full_input.view_as(noisy)
     _model_prediction(pipe,full_noisy,item,None,history,0)

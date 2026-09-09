@@ -89,14 +89,18 @@ def main() -> None:
             print(json.dumps({"completed": index, "total": len(parents), **stats}), flush=True)
     unit_path = root / "manifest_train_units_3chunk.json"
     units = json.loads(unit_path.read_text(encoding="utf-8"))["records"]
-    written = 0
+    units_by_parent: dict[str, list[dict]] = {}
     for unit in units:
         parent_id = str(unit.get("parent_record_id", unit["record_id"]))
         if parent_id not in parent_paths:
             raise RuntimeError(f"missing parent cache for unit {unit['record_id']}")
+        units_by_parent.setdefault(parent_id, []).append(unit)
+    written = 0
+    for parent_id, parent_units in units_by_parent.items():
         with np.load(parent_paths[parent_id], allow_pickle=False) as value:
             parent_arrays = {key: np.ascontiguousarray(value[key]) for key in value.files}
-        _write_unit(root, unit, parent_arrays); written += 1
+        for unit in parent_units:
+            _write_unit(root, unit, parent_arrays); written += 1
     print(json.dumps({"parents": len(parent_paths), "units": written, "schema": "causal-intra-rgbd-v1"}, indent=2), flush=True)
 
 

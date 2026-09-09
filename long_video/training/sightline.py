@@ -208,7 +208,7 @@ class _StreamingRGBDRanking(torch.autograd.Function):
             negative_mean_key=(negative_key*valid_key).sum(2)/count_key
             query_grad=d_gap.unsqueeze(-1)*(positive_key-negative_mean_key)*scale
             positive_grad=d_gap.unsqueeze(-1)*query_block*scale
-            negative_grad=(-d_gap.unsqueeze(2)*query_block.unsqueeze(2)*valid_key/count_key)*scale
+            negative_grad=(-d_gap.unsqueeze(2).unsqueeze(-1)*query_block.unsqueeze(2)*valid_key/count_key)*scale
             grad_query.index_add_(1,rows,query_grad.to(grad_query.dtype))
             grad_key.index_add_(1,positive,positive_grad.to(grad_key.dtype))
             grad_key.index_add_(1,safe_negative.reshape(-1),negative_grad.reshape(grad_key.shape[0],-1,grad_key.shape[2],grad_key.shape[3]).to(grad_key.dtype))

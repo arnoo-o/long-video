@@ -960,7 +960,15 @@ def test_rgbd_prefix_forward_matches_full_capture_and_stops_after_dynamic_layer(
             for index,block in enumerate(self.blocks):
                 hidden_states=block(hidden_states)
                 self.executed.append(index)
-                if index<=11: self.captures[index]=hidden_states
+                if index<=11:
+                    native_q=hidden_states
+                    native_k=hidden_states*0.5
+                    self.captures[index]={
+                        'native_q':native_q,
+                        'native_k':native_k,
+                        'augmented_q':native_q+0.03*(index+1),
+                        'augmented_k':native_k+0.02*(index+1),
+                    }
                 if stop is not None and index>=int(stop): return (None,)
             return (hidden_states,)
 
@@ -973,17 +981,18 @@ def test_rgbd_prefix_forward_matches_full_capture_and_stops_after_dynamic_layer(
     full_input=noisy.flatten().view(1,-1).requires_grad_()
     full_noisy=full_input.view_as(noisy)
     _model_prediction(pipe,full_noisy,item,None,history,0)
-    full_captures={index:value.detach().clone() for index,value in transformer.captures.items()}
-    full_loss=sum(transformer.captures.values()).sum(); full_loss.backward()
+    assert transformer.executed==list(range(14))
+    full_captures={index:{name:value.detach().clone() for name,value in capture.items()} for index,capture in transformer.captures.items()}
+    full_loss=sum(value.square().sum() for capture in transformer.captures.values() for value in capture.values()); full_loss.backward()
     full_grad=full_input.grad.detach().clone()
 
     prefix_input=noisy.flatten().view(1,-1).requires_grad_()
     _rgbd_prefix_forward(pipe,prefix_input.view_as(noisy),item,None,history,0,11)
-    prefix_captures={index:value.detach().clone() for index,value in transformer.captures.items()}
-    prefix_loss=sum(transformer.captures.values()).sum(); prefix_loss.backward()
+    prefix_captures={index:{name:value.detach().clone() for name,value in capture.items()} for index,capture in transformer.captures.items()}
+    prefix_loss=sum(value.square().sum() for capture in transformer.captures.values() for value in capture.values()); prefix_loss.backward()
     assert transformer.executed==list(range(12))
     assert set(prefix_captures)==set(range(12))
-    assert all(torch.equal(full_captures[index],prefix_captures[index]) for index in range(12))
+    assert all(torch.equal(full_captures[index][name],prefix_captures[index][name]) for index in range(12) for name in ('native_q','native_k','augmented_q','augmented_k'))
     assert torch.allclose(full_grad,prefix_input.grad,atol=1e-7,rtol=1e-7)
 
 def test_runtime_patch_metadata_preserves_legacy_provenance_compatibility():

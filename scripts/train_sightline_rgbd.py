@@ -966,7 +966,7 @@ def main():
                             # graph before checkpoint recomputation.  Both
                             # RGB-D and FM/cross therefore use separate graphs.
                             final_prediction=None
-                            prediction=None
+                            del prediction
                         if capture_rgbd:
                             stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices,pipe.transformer._sightline_processors[layer].last_capture_key_indices) for layer in active_rgbd_layers}
                             rgbd_capture_seen.add(stage_index)
@@ -994,7 +994,6 @@ def main():
                             # stage.  Only final-stage cross layers retain full
                             # K; RGB-D-only layers never do.
                             final_prediction=None
-                            del prediction
                             for layer in capture_layers:
                                 processor=pipe.transformer._sightline_processors[layer]
                                 processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False

@@ -313,7 +313,11 @@ class SightlineTrainable(nn.Module):
             raise ValueError('RGB-D hard-negative key-time contract is violated')
         def gather(values,indices):
             safe=indices.clamp_min(0)
-            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],rows,*indices.shape[1:],values.shape[2],values.shape[3])
+            # ``indices`` is either the full [R, P] positive table or a
+            # query-row chunk [R_chunk, P] in the streamed negative path.
+            # Reshape by the actual number of indexed rows; using the full
+            # plan row count here corrupts chunked gathers.
+            return values.index_select(1,safe.reshape(-1)).reshape(values.shape[0],indices.shape[0],*indices.shape[1:],values.shape[2],values.shape[3])
         scale=augmented_query.shape[-1]**-0.5
         pos_aug=torch.einsum('brhd,brphd->brhp',augmented_query,gather(augmented_key,positive)).float().mul(scale)
         with torch.no_grad():

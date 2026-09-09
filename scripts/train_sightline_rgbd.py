@@ -62,34 +62,53 @@ _RESIDUAL1_ORIGINAL='        hidden_states = (hidden_states.float() + attn_outpu
 _RESIDUAL1_PATCHED='        hidden_states = token_blocked_gated_residual(hidden_states, attn_output, gate_msa)'
 _RESIDUAL3_ORIGINAL='        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)'
 _RESIDUAL3_PATCHED='        hidden_states = token_blocked_gated_residual(hidden_states, ff_output, c_gate_msa)'
-_PREFIX_SETUP_ORIGINAL='        # 6. Transformer blocks\n        hidden_states = hidden_states.contiguous()'
+_PREFIX_SETUP_ORIGINAL='''        # 4. Transformer blocks
+        logits_hidden = []
+        hidden_states = hidden_states.contiguous()
+        encoder_hidden_states = encoder_hidden_states.contiguous()
+        rotary_emb = rotary_emb.contiguous()'''
 _PREFIX_SETUP_PATCHED='''        prefix_stop_layer = None
         if attention_kwargs and attention_kwargs.get("sightline_prefix_stop_layer") is not None:
             prefix_stop_layer = int(attention_kwargs["sightline_prefix_stop_layer"])
             if not 0 <= prefix_stop_layer < len(self.blocks):
                 raise ValueError(f"sightline prefix stop layer must be in [0, {len(self.blocks) - 1}]")
 
-        # 6. Transformer blocks
+        # 4. Transformer blocks
+        logits_hidden = []
         hidden_states = hidden_states.contiguous()'''
 _PREFIX_EXEC_ORIGINAL='''        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for block in self.blocks:
+            for iidx, block in enumerate(self.blocks):
                 hidden_states = self._gradient_checkpointing_func(
                     block,
                     hidden_states,
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
+                    navit_hidden_attention_mask,
+                    navit_encoder_attention_mask,
                     original_context_length,
+                    original_context_length_list,
+                    is_first_denoising_step,
+                    attention_kwargs,
                 )
+                if gan_mode and self.is_use_gan and self.is_use_gan_hooks and iidx in self.gan_hooks:
+                    logits_hidden.append(hidden_states[:, -original_context_length:, :])
         else:
-            for block in self.blocks:
+            for iidx, block in enumerate(self.blocks):
                 hidden_states = block(
                     hidden_states,
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
+                    navit_hidden_attention_mask,
+                    navit_encoder_attention_mask,
                     original_context_length,
+                    original_context_length_list,
+                    is_first_denoising_step,
+                    attention_kwargs,
                 )
+                if gan_mode and self.is_use_gan and self.is_use_gan_hooks and iidx in self.gan_hooks:
+                    logits_hidden.append(hidden_states[:, -original_context_length:, :])
 '''
 _PREFIX_EXEC_PATCHED='''        if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block_index, block in enumerate(self.blocks):
@@ -99,8 +118,15 @@ _PREFIX_EXEC_PATCHED='''        if torch.is_grad_enabled() and self.gradient_che
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
+                    navit_hidden_attention_mask,
+                    navit_encoder_attention_mask,
                     original_context_length,
+                    original_context_length_list,
+                    is_first_denoising_step,
+                    attention_kwargs,
                 )
+                if gan_mode and self.is_use_gan and self.is_use_gan_hooks and block_index in self.gan_hooks:
+                    logits_hidden.append(hidden_states[:, -original_context_length:, :])
                 if prefix_stop_layer is not None and block_index >= prefix_stop_layer:
                     return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
         else:
@@ -110,8 +136,15 @@ _PREFIX_EXEC_PATCHED='''        if torch.is_grad_enabled() and self.gradient_che
                     encoder_hidden_states,
                     timestep_proj,
                     rotary_emb,
+                    navit_hidden_attention_mask,
+                    navit_encoder_attention_mask,
                     original_context_length,
+                    original_context_length_list,
+                    is_first_denoising_step,
+                    attention_kwargs,
                 )
+                if gan_mode and self.is_use_gan and self.is_use_gan_hooks and block_index in self.gan_hooks:
+                    logits_hidden.append(hidden_states[:, -original_context_length:, :])
                 if prefix_stop_layer is not None and block_index >= prefix_stop_layer:
                     return (None,) if not return_dict else Transformer2DModelOutput(sample=None)
 '''

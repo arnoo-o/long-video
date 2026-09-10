@@ -20,7 +20,7 @@ from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
 from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, gt_prefix_probability, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_geometry_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_plan import RGBDSoftTargetPlan, build_rgbd_soft_target_plan
-from long_video.training.rgbd_probability import rgbd_probability_score, rgbd_probability_row_scores
+from long_video.training.rgbd_probability import rgbd_probability_score, rgbd_probability_row_scores, rgbd_probability_row_scores_multi
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
@@ -832,14 +832,18 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,local_scale
         if isinstance(plan,RGBDSoftTargetPlan):
             zero_q=torch.zeros_like(dq); zero_k=torch.zeros_like(dk)
             legal_mask=_captured_rgbd_legal_mask(processor,plan,capture_indices,capture_key_indices)
-            s_native=rgbd_probability_row_scores(native_q.detach(),native_k.detach(),zero_q,zero_k,plan.target_indices,plan.target_weights,plan.target_mask,legal_mask,local_scale=1.0).detach()
             scales=sorted({0.1,max(0.1,min(1.0,float(local_scale))),1.0})
-            scores=[rgbd_probability_row_scores(native_q.detach(),native_k.detach(),dq,dk,plan.target_indices,plan.target_weights,plan.target_mask,legal_mask,local_scale=value) for value in scales]
+            # The native score and all correct-ray auxiliary scales share one
+            # bounded streaming scan.  Scale 0 is exactly the native path;
+            # its detached metric contributes no gradient.
+            correct_scores=rgbd_probability_row_scores_multi(native_q.detach(),native_k.detach(),dq,dk,plan.target_indices,plan.target_weights,plan.target_mask,legal_mask,[0.0,*scales])
+            s_native=correct_scores[0].detach(); scores=[correct_scores[index+1] for index in range(len(scales))]
             wrong_scores=[]
             if plan.wrong_query_rays is not None and plan.wrong_key_rays is not None:
                 wrong_dq=processor.conditioner.project(plan.wrong_query_rays,native_q.flatten(2,3),kind='q',native_rms=processor.conditioner.native_rms(native_q.flatten(2,3)),detach_rho=True).unflatten(-1,(native_q.shape[2],native_q.shape[3]))
                 wrong_dk=processor.conditioner.project(plan.wrong_key_rays,native_k.flatten(2,3),kind='k',native_rms=processor.conditioner.native_rms(native_k.flatten(2,3)),detach_rho=True).unflatten(-1,(native_k.shape[2],native_k.shape[3]))
-                wrong_scores=[rgbd_probability_row_scores(native_q.detach(),native_k.detach(),wrong_dq,wrong_dk,plan.target_indices,plan.target_weights,plan.target_mask,legal_mask,local_scale=value) for value in scales]
+                wrong_score_matrix=rgbd_probability_row_scores_multi(native_q.detach(),native_k.detach(),wrong_dq,wrong_dk,plan.target_indices,plan.target_weights,plan.target_mask,legal_mask,scales)
+                wrong_scores=[wrong_score_matrix[index] for index in range(len(scales))]
             target_values=plan.target_weights.masked_fill(~plan.target_mask,0.0)
             entropy=-(target_values.clamp_min(1e-12)*target_values.clamp_min(1e-12).log()).sum(-1)
             legal_count=legal_mask.sum(-1).float().clamp_min(1.0)

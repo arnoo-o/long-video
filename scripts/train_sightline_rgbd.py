@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from PIL import Image
 from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items

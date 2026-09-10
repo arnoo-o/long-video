@@ -567,10 +567,13 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
         candidates_by_global.setdefault(global_id,[]).append((index,int(identity[2]),int(identity[3])))
     camera_indices=latent_camera_indices().tolist()
     token_pixel_size=((padded_height/height)*(padded_width/width))**0.5
-    c2w_float=c2w.float()
-    intrinsics_float=intrinsics.float()
-    c2w_inverse=torch.linalg.inv(c2w_float)
-    intrinsics_inverse=torch.linalg.inv(intrinsics_float)
+    # The camera tensors are tiny and have no gradient.  Move this metadata
+    # once for the geometric plan construction; doing tiny GPU inverses and a
+    # device-to-host sync for every positive made the planner dominate a step.
+    c2w_np=c2w.detach().float().cpu().numpy()
+    intrinsics_np=intrinsics.detach().float().cpu().numpy()
+    c2w_inverse=np.linalg.inv(c2w_np)
+    intrinsics_inverse=np.linalg.inv(intrinsics_np)
     epipolar_cache={}
     negatives=[]; masks=[]; matched_key_t=True; pair_count=0
     for query,positive in zip(selected,positives):
@@ -596,32 +599,34 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
                 row_negatives.append([]); row_masks.append([]); continue
             camera_pair=(query_t,key_t)
             if camera_pair not in epipolar_cache:
-                query_camera=c2w_float[camera_indices[query_t]]
+                query_camera=c2w_np[camera_indices[query_t]]
                 key_camera_inverse=c2w_inverse[camera_indices[key_t]]
                 query_K_inverse=intrinsics_inverse[camera_indices[query_t]]
                 key_K_inverse=intrinsics_inverse[camera_indices[key_t]]
                 T_kq=key_camera_inverse@query_camera
                 R=T_kq[:3,:3]; translation=T_kq[:3,3]
-                epipolar_cache[camera_pair]=(key_K_inverse.transpose(0,1)@_skew_translation(translation)@R@query_K_inverse,translation)
+                tx,ty,tz=translation
+                skew=np.array(((0.0,-tz,ty),(tz,0.0,-tx),(-ty,tx,0.0)),dtype=np.float32)
+                epipolar_cache[camera_pair]=(key_K_inverse.T@skew@R@query_K_inverse,translation)
             fundamental,translation=epipolar_cache[camera_pair]
             baseline=float(torch.linalg.vector_norm(translation).detach())
             if not np.isfinite(baseline) or baseline<=1e-6:
                 row_negatives.append([]); row_masks.append([]); continue
-            query_xy=torch.tensor([(qx+0.5)*padded_width/width,(qy+0.5)*padded_height/height,1.0],device=fundamental.device,dtype=fundamental.dtype)
+            query_xy=np.asarray([(qx+0.5)*padded_width/width,(qy+0.5)*padded_height/height,1.0],dtype=np.float32)
             line=fundamental@query_xy
-            line_norm=float(torch.linalg.vector_norm(line[:2]).detach())
+            line_norm=float(np.linalg.norm(line[:2]))
             if not np.isfinite(line_norm) or line_norm<=1e-8:
                 row_negatives.append([]); row_masks.append([]); continue
             candidates=candidates_by_global.get(positive_global,())
             band_candidates=[]
             if candidates:
                 candidate_indices=[value[0] for value in candidates]
-                candidate_yx=torch.tensor([(value[1],value[2]) for value in candidates],device=fundamental.device,dtype=fundamental.dtype)
-                candidate_xy=torch.cat(((candidate_yx[:,1:2]+0.5)*padded_width/width,(candidate_yx[:,0:1]+0.5)*padded_height/height,torch.ones((len(candidates),1),device=fundamental.device,dtype=fundamental.dtype)),dim=1)
-                epi_tokens=(torch.abs(candidate_xy@line)/line_norm)/token_pixel_size
-                legal=torch.isfinite(epi_tokens)&(epi_tokens>=2.0)
-                legal_indices=torch.nonzero(legal,as_tuple=False).flatten().tolist()
-                epi_values=epi_tokens.detach().cpu().tolist()
+                candidate_yx=np.asarray([(value[1],value[2]) for value in candidates],dtype=np.float32)
+                candidate_xy=np.column_stack(((candidate_yx[:,1]+0.5)*padded_width/width,(candidate_yx[:,0]+0.5)*padded_height/height,np.ones((len(candidates),),dtype=np.float32)))
+                epi_tokens=(np.abs(candidate_xy@line)/line_norm)/token_pixel_size
+                legal=np.isfinite(epi_tokens)&(epi_tokens>=2.0)
+                legal_indices=np.flatnonzero(legal).tolist()
+                epi_values=epi_tokens.tolist()
                 for candidate_position in legal_indices:
                     candidate_index,candidate_y,candidate_x=candidates[candidate_position]
                     if candidate_index in positive_set:

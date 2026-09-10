@@ -94,15 +94,31 @@ def _as_rows(rows):
     if hasattr(rows, 'column'):
         n=len(rows)
         names=('query_chunk','query_t','query_y','query_x','key_chunk','key_t','key_y','key_x','weight','query_frame','valid_depth_count')
+        # CorrespondenceSlice.column() performs an indexed NumPy gather.  The
+        # old implementation called it once per field *per row*, which made
+        # plan construction CPU-bound for large caches.  Materialize each
+        # available column once, then only perform cheap scalar indexing in
+        # the row loop.  This is representation-only: values and ordering are
+        # unchanged.
+        columns={}
+        for name in names:
+            try:
+                columns[name]=rows.column(name)
+            except (KeyError,ValueError):
+                pass
+        optional=('query_u','query_v','query_depth','key_u_cont','key_v_cont','confidence',
+                  'query_valid_depth_count','query_valid_depth_count_stage0',
+                  'query_valid_depth_count_stage1','query_valid_depth_count_stage2')
+        for name in optional:
+            try:
+                columns[name]=rows.column(name)
+            except (KeyError,ValueError):
+                pass
         result=[]
         for i in range(n):
             item={}
-            for name in names:
-                try: item[name]=rows.column(name)[i]
-                except (KeyError,ValueError): pass
-            for name in ('query_u','query_v','query_depth','key_u_cont','key_v_cont','confidence','query_valid_depth_count','query_valid_depth_count_stage0','query_valid_depth_count_stage1','query_valid_depth_count_stage2'):
-                try: item[name]=rows.column(name)[i]
-                except (KeyError,ValueError): pass
+            for name,values in columns.items():
+                item[name]=values[i]
             result.append(item)
         return result
     return list(rows)

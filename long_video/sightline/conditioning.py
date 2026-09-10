@@ -22,7 +22,11 @@ class SightlineConditioner(nn.Module):
         self.capture_numeric_diagnostics=False; self.last_pre_norm_rms={'q':None,'k':None}; self.last_post_norm_rms={'q':None,'k':None}; self.last_gate_stats={'q':None,'k':None}
     def sample_scale_delta(self,rays,training=None):
         if training is None: training=self.training
-        if training and torch.rand((),device=rays.device)<self.scale_aug_prob: return torch.empty((),device=rays.device,dtype=rays.dtype).uniform_(*self.scale_aug_range)
+        # Keep the disabled/eval path completely RNG-free.  This matters for
+        # the two-forward RGB-D/FM stage split: turning augmentation off must
+        # not perturb the subsequent training random sequence.
+        if not training or self.scale_aug_prob <= 0.0: return None
+        if torch.rand((),device=rays.device)<self.scale_aug_prob: return torch.empty((),device=rays.device,dtype=rays.dtype).uniform_(*self.scale_aug_range)
         return None
     @staticmethod
     def _ordered_rays(rays,kind): return torch.cat((rays[...,3:6],rays[...,:3],rays[...,6:7]),-1) if kind=='k' else rays

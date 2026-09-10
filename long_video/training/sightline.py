@@ -367,8 +367,11 @@ def selected_qk_logits(query, key, query_indices):
 
 class SightlineTrainable(nn.Module):
     def __init__(self, inner_dim, layers=(0,), timestamp_buckets=64, heads=16,
-                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, rho_init=.6):
-        super().__init__(); self.conditioner=LayeredSightlineConditioner(inner_dim,layers,rho_init=rho_init)
+                 lambda_corr=.002, lambda_corr_final=.0005, lambda_corr_decay_start=.56, rho_init=.6,
+                 scale_aug_prob=.3, scale_aug_range=(-1.2,1.6)):
+        super().__init__(); self.conditioner=LayeredSightlineConditioner(
+            inner_dim,layers,rho_init=rho_init,scale_aug_prob=scale_aug_prob,
+            scale_aug_range=scale_aug_range)
         self.lambda_corr_initial=float(lambda_corr); self.lambda_corr_final=float(lambda_corr_final); self.lambda_corr_decay_start=float(lambda_corr_decay_start)
         if not (0. <= self.lambda_corr_decay_start <= 1.) or min(self.lambda_corr_initial,self.lambda_corr_final) < 0.:
             raise ValueError('invalid correspondence loss schedule')
@@ -395,7 +398,13 @@ class SightlineTrainable(nn.Module):
         bias=selected_query.new_empty(0) if additive_bias is None else additive_bias
         return _StreamingCorrespondence.apply(selected_query,key,plan.positive_indices,plan.positive_mask,plan.weights,bias,int(key_block),int(query_block))
     def rgbd_ranking_loss(self, augmented_query, augmented_key, native_query, native_key, plan, *, margin, temperature):
-        """Rank only Sightline's Q/K logit delta for sparse RGB-D pairs."""
+        """Rank only sparse RGB-D ``Q_aux/K_aux`` logit deltas.
+
+        Callers must provide ``Q_aux=stopgrad(Q_native)+Dq`` and the matching
+        ``K_aux``.  The native arguments are detached again here as a hard
+        contract, so this loss cannot train Helios or an earlier hidden-state
+        path.
+        """
         if any(value is None for value in (plan.negative_indices,plan.negative_mask)):
             raise ValueError('RGB-D ranking requires explicit hard negatives')
         if augmented_query.ndim!=4 or augmented_key.ndim!=4 or native_query.ndim!=4 or native_key.ndim!=4:

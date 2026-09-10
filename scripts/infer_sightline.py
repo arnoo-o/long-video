@@ -77,7 +77,7 @@ def main():
         raise RuntimeError('formal inference requires the configured all-layer geometry set; refusing partial Sightline layer installation')
     layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers)))
     set_initialization_seed()
-    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
+    trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init,scale_aug_prob=cfg.scale_augmentation_probability,scale_aug_range=cfg.scale_augmentation_range).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width); provider=SightlineRayProvider(c2w,K,source_height=padded_h,source_width=padded_w)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)

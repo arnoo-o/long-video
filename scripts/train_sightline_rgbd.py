@@ -22,7 +22,7 @@ from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
-from long_video.sightline.rays import canonicalize_c2w
+from long_video.sightline.rays import canonicalize_c2w, latent_camera_indices
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
 from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
 from long_video.sightline.geometry import assert_latent_geometry, geometry_sigma_schedule, padded_size
@@ -539,17 +539,35 @@ def _sample_correspondence_mapping(selected,positives,positive_weights,weights,f
     choice=(chosen_memory+[i for i in order if i not in chosen_memory_set])[:max_rows]
     return ([selected[i] for i in choice],[positives[i] for i in choice],[positive_weights[i] for i in choice],[weights[i] for i in choice],[flags[i] for i in choice])
 
-def _hard_negative_indices(selected,positives,identities,current_shape,query_length,*,max_negatives=4):
-    """Choose spatially adjacent negatives at each positive's exact key time."""
-    _,height,width=map(int,current_shape); candidates=[]
+RGBD_AUX_PADDED_IMAGE_SHAPE=(512,832)
+
+def _skew_translation(translation):
+    tx,ty,tz=translation.unbind(-1)
+    zero=torch.zeros_like(tx)
+    return torch.stack((torch.stack((zero,-tz,ty),-1),torch.stack((tz,zero,-tx),-1),torch.stack((-ty,tx,zero),-1)),-2)
+
+def _hard_negative_indices(selected,positives,identities,current_shape,query_length,*,c2w,intrinsics,max_negatives=4,padded_image_shape=RGBD_AUX_PADDED_IMAGE_SHAPE):
+    """Choose deterministic same-time negatives outside the RGB-D epipolar band."""
+    _,height,width=map(int,current_shape); padded_height,padded_width=map(float,padded_image_shape)
+    if c2w.ndim==4: c2w=c2w[0]
+    if intrinsics.ndim==4: intrinsics=intrinsics[0]
+    if c2w.ndim!=3 or intrinsics.ndim!=3 or c2w.shape[-2:]!=(4,4) or intrinsics.shape[-2:]!=(3,3):
+        raise ValueError('RGB-D hard-negative cameras must be [F,4,4] and [F,3,3] or batched')
+    if int(c2w.shape[0])<33 or int(intrinsics.shape[0])<33:
+        raise ValueError('RGB-D hard-negative cameras require the current 33-frame chunk')
+    candidates=[]
     for index,identity in enumerate(identities):
         if identity[0]!='current': continue
         global_id=int(identity[1][0])
         candidates.append((index,global_id,int(identity[2]),int(identity[3])))
+    camera_indices=latent_camera_indices().tolist()
+    token_pixel_size=((padded_height/height)*(padded_width/width))**0.5
     negatives=[]; masks=[]; matched_key_t=True; pair_count=0
     for query,positive in zip(selected,positives):
         if not 0<=int(query)<len(identities): raise RuntimeError('RGB-D query index is outside the identity map')
-        query_identity=identities[int(query)]; query_global=int(query_identity[1][0]); qy,qx=int(query_identity[2]),int(query_identity[3])
+        query_identity=identities[int(query)]
+        query_global=int(query_identity[1][0]); qy,qx=int(query_identity[2]),int(query_identity[3])
+        query_chunk=query_global//8
         positive_set=set(int(value) for value in positive)
         row_negatives=[]; row_masks=[]
         for positive_index in positive:
@@ -558,25 +576,57 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
             positive_identity=identities[positive_index]
             if positive_identity[0]!='current': raise RuntimeError('RGB-D hard negatives require current-token positives')
             positive_global=int(positive_identity[1][0]); positive_y=int(positive_identity[2]); positive_x=int(positive_identity[3])
-            # A candidate is legal only when it has exactly the same global
-            # chunk/time identity as this positive.  This prevents the model
-            # from using a temporal gap as the negative ranking signal.
-            ordered=sorted((value for value in candidates
-                            if value[1]==positive_global
-                            and value[1]//8==query_global//8
-                            and value[1]<query_global
-                            and value[0] not in positive_set),
-                           key=lambda value:(abs(value[2]-positive_y)+abs(value[3]-positive_x),value[2],value[3],value[0]))
-            chosen=[value[0] for value in ordered[:int(max_negatives)]]
-            # A valid RGB-D positive may exhaust its exact key-time bucket
-            # after positive filtering.  Keep the positive paired with an
-            # empty negative list; the ranking loss masks this pair out and
-            # normalizes over the remaining valid pairs.  Never fall back to
-            # another key time, because that would leak temporal distance.
+            key_chunk=positive_global//8
+            key_t=positive_global-key_chunk*8
+            query_t=query_global-query_chunk*8
+            # The plan already enforces causal same-chunk positives.  Keep the
+            # check here so a malformed hand-built plan cannot silently select
+            # another temporal identity as a negative.
+            if key_chunk!=query_chunk or not (0<=key_t<9 and 0<=query_t<9) or key_t>=query_t:
+                row_negatives.append([]); row_masks.append([]); continue
+            query_camera=c2w[camera_indices[query_t]].float()
+            key_camera=c2w[camera_indices[key_t]].float()
+            query_K=intrinsics[camera_indices[query_t]].float()
+            key_K=intrinsics[camera_indices[key_t]].float()
+            T_kq=torch.linalg.inv(key_camera)@query_camera
+            R=T_kq[:3,:3]; translation=T_kq[:3,3]
+            baseline=float(torch.linalg.vector_norm(translation).detach())
+            if not np.isfinite(baseline) or baseline<=1e-6:
+                row_negatives.append([]); row_masks.append([]); continue
+            fundamental=torch.linalg.inv(key_K).transpose(0,1)@_skew_translation(translation)@R@torch.linalg.inv(query_K)
+            query_xy=torch.tensor([(qx+0.5)*padded_width/width,(qy+0.5)*padded_height/height,1.0],device=fundamental.device,dtype=fundamental.dtype)
+            line=fundamental@query_xy
+            line_norm=float(torch.linalg.vector_norm(line[:2]).detach())
+            if not np.isfinite(line_norm) or line_norm<=1e-8:
+                row_negatives.append([]); row_masks.append([]); continue
+            band_candidates=[]
+            for candidate_index,candidate_global,candidate_y,candidate_x in candidates:
+                if candidate_global!=positive_global or candidate_global//8!=query_chunk or candidate_index in positive_set:
+                    continue
+                candidate_xy=torch.tensor([(candidate_x+0.5)*padded_width/width,(candidate_y+0.5)*padded_height/height,1.0],device=fundamental.device,dtype=fundamental.dtype)
+                epi_pixels=float((line.dot(candidate_xy).abs()/line_norm).detach())
+                epi_tokens=epi_pixels/token_pixel_size
+                if not np.isfinite(epi_tokens) or epi_tokens<2.0:
+                    continue
+                spatial=((candidate_y-positive_y)**2+(candidate_x-positive_x)**2)**0.5
+                band=0 if epi_tokens<4.0 else 1
+                band_candidates.append((band,spatial,candidate_index))
+            if not band_candidates:
+                row_negatives.append([]); row_masks.append([]); continue
+            ordered_bands=[]
+            for band in (0,1):
+                ordered_bands.append(sorted((value for value in band_candidates if value[0]==band),key=lambda value:(value[1],value[2])))
+            chosen=ordered_bands[0][:2]+ordered_bands[1][:2]
+            # If one epipolar band is sparse, fill from the other legal band;
+            # the d_epi>=2 filter remains in force and no time fallback exists.
+            if len(chosen)<int(max_negatives):
+                chosen_indices={value[2] for value in chosen}
+                supplement=sorted((value for value in band_candidates if value[2] not in chosen_indices),key=lambda value:(value[1],value[2]))
+                chosen.extend(supplement[:int(max_negatives)-len(chosen)])
+            chosen=[value[2] for value in chosen[:int(max_negatives)]]
             if not chosen:
-                row_negatives.append([]); row_masks.append([])
-                continue
-            if any(value[1]!=positive_global for value in ordered[:int(max_negatives)]): matched_key_t=False
+                row_negatives.append([]); row_masks.append([]); continue
+            if any(identities[index][1][0]!=positive_global for index in chosen): matched_key_t=False
             row_negatives.append(chosen); row_masks.append([True]*len(chosen)); pair_count+=1
         negatives.append(row_negatives); masks.append(row_masks)
     return negatives,masks,matched_key_t,pair_count
@@ -601,7 +651,10 @@ def _build_correspondence_plan(processor,rows,chunk,current_length,max_rows,samp
     negative_indices=negative_mask=None; sparse_key_indices=key_index_map=None
     negative_key_t_match=True; negative_pair_count=0
     if with_hard_negatives:
-        negatives,negative_masks,negative_key_t_match,negative_pair_count=_hard_negative_indices(selected,positives,identities,current_shape,query_length,max_negatives=max_negatives)
+        context=processor.ray_provider.context
+        negatives,negative_masks,negative_key_t_match,negative_pair_count=_hard_negative_indices(
+            selected,positives,identities,current_shape,query_length,
+            c2w=context['c2w'],intrinsics=context['intrinsics'],max_negatives=max_negatives)
         # Remove positives that have no legal same-key-time negative, then
         # remove queries that have no remaining paired supervision.  This is
         # done before capture so invalid rows never retain Q/K graph state.
@@ -701,8 +754,12 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,timings=Non
         processor=processors[layer]
         saved=None if captures is None else captures.get(layer)
         if saved is None:
-            augmented_q_value=processor.last_augmented_q if processor.last_augmented_q is not None else processor.last_q
-            native_q_value=processor.last_native_q; augmented_k_value=processor.last_augmented_k if processor.last_augmented_k is not None else processor.last_k; native_k_value=processor.last_native_k; capture_indices=None; capture_key_indices=None
+            augmented_q_value=processor.last_rgbd_q
+            native_q_value=processor.last_rgbd_native_q
+            augmented_k_value=processor.last_rgbd_k
+            native_k_value=processor.last_rgbd_native_k
+            capture_indices=processor.last_rgbd_query_indices
+            capture_key_indices=processor.last_rgbd_key_indices
         else:
             if len(saved)==5:
                 augmented_q_value,native_q_value,augmented_k_value,native_k_value,capture_indices=saved; capture_key_indices=None
@@ -729,6 +786,11 @@ def _release_rgbd_capture(processors,layers,*,preserve_cross_capture=False):
     """Drop RGB-D-only Q/K references while preserving an overlapping cross plan."""
     for layer in layers:
         processor=processors[layer]
+        processor.last_rgbd_q=processor.last_rgbd_k=None
+        processor.last_rgbd_native_q=processor.last_rgbd_native_k=None
+        processor.last_rgbd_dq=processor.last_rgbd_dk=None
+        processor.last_rgbd_query_indices=processor.last_rgbd_key_indices=None
+        processor.capture_rgbd=False
         processor.last_native_q=processor.last_native_k=None
         processor.last_augmented_q=processor.last_augmented_k=None
         if not preserve_cross_capture:
@@ -780,6 +842,7 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
         if not selected:
             if plan is not None:
                 processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=None
+                processor.last_rgbd_q=processor.last_rgbd_k=processor.last_rgbd_native_q=processor.last_rgbd_native_k=processor.last_rgbd_dq=processor.last_rgbd_dk=processor.last_rgbd_query_indices=processor.last_rgbd_key_indices=None
                 processor.last_attention_bias=None
             continue
         captured_q=processor.last_q; captured_k=processor.last_k; captured_bias=getattr(processor,'last_attention_bias',None)
@@ -809,6 +872,7 @@ def _corr_loss(trainable,processors,rows,chunk,layers,max_rows,*,sampling_seed=0
         # Do not pin nine full K tensors through processor diagnostics/finalize.
         if plan is not None:
             processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=None
+            processor.last_rgbd_q=processor.last_rgbd_k=processor.last_rgbd_native_q=processor.last_rgbd_native_k=processor.last_rgbd_dq=processor.last_rgbd_dk=processor.last_rgbd_query_indices=processor.last_rgbd_key_indices=None
             processor.last_attention_bias=None
     if timings is not None: timings['correspondence_loss_seconds']+=time.perf_counter()-loss_started
     if not losses: return torch.zeros((),device=first.ray_provider.context['c2w'].device)
@@ -875,7 +939,9 @@ def main():
     set_initialization_seed()
     trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,
         lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,
-        lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init).to(device,dtype=torch.float32)
+        lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init,
+        scale_aug_prob=cfg.scale_augmentation_probability,
+        scale_aug_range=cfg.scale_augmentation_range).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     # The formal Sightline run keeps the entire Helios backbone frozen.  This
     # includes block 0..11 modulation/norm parameters as well as attention,
@@ -1104,10 +1170,13 @@ def main():
                 if plans:
                     oom_state['k_length']=max(len(plan.identities) for plan in plans)
                     oom_state['selected_q_count']=int(torch.unique(torch.cat([plan.query_indices for plan in plans])).numel())
+                # RGB-D auxiliary supervision is intentionally independent of
+                # the FM Geometry routing strength.  The valid stage losses
+                # share the weight equally; geometry_sigma_scale remains a
+                # diagnostic only and never attenuates this auxiliary loss.
                 rgbd_scales={stage_index:items[stage_index]['geometry_sigma_scale'].detach().float().mean() for stage_index in (1,2)}
                 valid_rgbd_stages=tuple(stage_index for stage_index in (1,2) if stage_index in rgbd_plans and rgbd_plans[stage_index].negative_pair_count>0)
-                rgbd_scale_sum=(torch.stack([rgbd_scales[stage_index] for stage_index in valid_rgbd_stages]).sum()+torch.as_tensor(1e-8,device=source.device,dtype=torch.float32)).detach() if valid_rgbd_stages else torch.as_tensor(1e-8,device=source.device,dtype=torch.float32)
-                rgbd_weights={stage_index:((rgbd_scales[stage_index]/rgbd_scale_sum).detach() if stage_index in valid_rgbd_stages else torch.zeros((),device=source.device,dtype=torch.float32)) for stage_index in (1,2)}
+                rgbd_weights={stage_index:(torch.as_tensor(1.0/len(valid_rgbd_stages),device=source.device,dtype=torch.float32).detach() if stage_index in valid_rgbd_stages else torch.zeros((),device=source.device,dtype=torch.float32)) for stage_index in (1,2)}
                 backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_capture_seen=set()
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
@@ -1120,11 +1189,15 @@ def main():
                     stage_capture_layers=tuple(active_rgbd_layers if capture_rgbd else (active_corr_layers if capture_cross else ()))
                     for layer in capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
-                        processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
+                        processor.capture_diagnostics=False; processor.capture_rgbd=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
                         processor.reuse_scale_delta=False; processor.scale_delta_override=None; processor.last_scale_delta=None
                     for layer in stage_capture_layers:
                         processor=pipe.transformer._sightline_processors[layer]
-                        processor.capture_diagnostics=True
+                        # RGB-D-only passes use only the explicit auxiliary
+                        # fields; keeping real last_q/last_k here would pin a
+                        # second copy of the sparse capture unnecessarily.
+                        processor.capture_diagnostics=bool(capture_cross and not capture_rgbd)
+                        processor.capture_rgbd=bool(capture_rgbd and layer in active_rgbd_layers)
                         stage_plans=tuple(plan for plan in (stage_rgbd_plan if capture_rgbd else None,cross_plan if capture_cross and not capture_rgbd else None) if plan is not None)
                         plan_queries=torch.unique(torch.cat([plan.query_indices for plan in stage_plans])) if stage_plans else None
                         processor.capture_query_indices=plan_queries if plan_queries is not None and (args.train or args.probe_capture) else None
@@ -1156,7 +1229,7 @@ def main():
                             final_prediction=None
                             del prediction
                         if capture_rgbd:
-                            stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_augmented_q,pipe.transformer._sightline_processors[layer].last_native_q,pipe.transformer._sightline_processors[layer].last_augmented_k,pipe.transformer._sightline_processors[layer].last_native_k,pipe.transformer._sightline_processors[layer].last_capture_query_indices,pipe.transformer._sightline_processors[layer].last_capture_key_indices) for layer in active_rgbd_layers}
+                            stage_rgbd_captures={layer:(pipe.transformer._sightline_processors[layer].last_rgbd_q,pipe.transformer._sightline_processors[layer].last_rgbd_native_q,pipe.transformer._sightline_processors[layer].last_rgbd_k,pipe.transformer._sightline_processors[layer].last_rgbd_native_k,pipe.transformer._sightline_processors[layer].last_rgbd_query_indices,pipe.transformer._sightline_processors[layer].last_rgbd_key_indices) for layer in active_rgbd_layers}
                             rgbd_capture_seen.add(stage_index)
                             # Backpropagate one captured stage at a time.  The
                             # stage loss is still the mean over the configured
@@ -1185,13 +1258,14 @@ def main():
                             final_prediction=None
                             for layer in capture_layers:
                                 processor=pipe.transformer._sightline_processors[layer]
-                                processor.capture_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
+                                processor.capture_diagnostics=False; processor.capture_rgbd=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
                                 if layer in stage_scale_deltas:
                                     processor.reuse_scale_delta=True; processor.scale_delta_override=stage_scale_deltas[layer]
                             second_capture_layers=tuple(active_corr_layers) if capture_cross else ()
                             for layer in second_capture_layers:
                                 processor=pipe.transformer._sightline_processors[layer]
                                 processor.capture_diagnostics=True
+                                processor.capture_rgbd=False
                                 processor.capture_query_indices=cross_plan.query_indices if cross_plan is not None and (args.train or args.probe_capture) else None
                                 processor.capture_key_indices=None
                                 processor.capture_full_key=bool(layer in active_corr_layers)
@@ -1327,6 +1401,8 @@ def main():
             for name,value in memory_timings.items(): perf[name]+=value
             for processor in pipe.transformer._sightline_processors.values():
                 processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=None
+                processor.last_rgbd_q=processor.last_rgbd_k=processor.last_rgbd_native_q=processor.last_rgbd_native_k=processor.last_rgbd_dq=processor.last_rgbd_dk=processor.last_rgbd_query_indices=processor.last_rgbd_key_indices=None
+                processor.capture_rgbd=False
                 processor.last_hidden_states=processor.last_key_identities=None
                 processor.last_attention_bias=None
             if not keep_graph: perf['prefix_generation_seconds']+=time.perf_counter()-chunk_started

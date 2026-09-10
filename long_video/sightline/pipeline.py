@@ -113,11 +113,13 @@ class SightlinePipeline:
         self.memory.reset()
         for processor in getattr(self.helios.transformer,'_sightline_processors',{}).values():
             processor.last_q=processor.last_k=processor.last_native_q=processor.last_native_k=processor.last_augmented_q=processor.last_augmented_k=processor.last_capture_query_indices=processor.last_capture_key_indices=None
+            processor.last_rgbd_q=processor.last_rgbd_k=processor.last_rgbd_native_q=processor.last_rgbd_native_k=processor.last_rgbd_dq=processor.last_rgbd_dk=processor.last_rgbd_query_indices=processor.last_rgbd_key_indices=None
             processor.last_hidden_states=processor.last_key_identities=None
             processor.last_pooled_hidden=None; processor.last_pooled_grid_shape=None
             processor.capture_query_indices=None
             processor.capture_key_indices=None
             processor.capture_full_key=False
+            processor.capture_rgbd=False
             processor.reuse_scale_delta=False
             processor.scale_delta_override=None
             processor.last_scale_delta=None

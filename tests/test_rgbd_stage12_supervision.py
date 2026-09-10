@@ -8,25 +8,40 @@ import torch.nn.functional as F
 def test_hard_negatives_are_paired_at_each_positive_key_time():
     from scripts.train_sightline_rgbd import _hard_negative_indices
 
-    # Query global time 10 has two positives at different key times.  Each
-    # time has spatially nearby non-positive current tokens available.
+    # Query global time 10 has two positives at different key times.  The
+    # camera baseline makes the epipolar line horizontal, so same-line tokens
+    # are ignored and only off-epipolar candidates can be selected.
     identities = (
         ('current', (10,), 4, 4, 'current'),
-        ('current', (8,), 5, 5, 'current'),
-        ('current', (9,), 2, 2, 'current'),
-        ('current', (8,), 5, 6, 'current'),
-        ('current', (8,), 7, 7, 'current'),
-        ('current', (9,), 2, 3, 'current'),
         ('current', (9,), 4, 4, 'current'),
+        ('current', (8,), 3, 3, 'current'),
+        ('current', (9,), 4, 5, 'current'),  # d_epi=0: ignore
+        ('current', (9,), 2, 5, 'current'),  # d_epi=2: mid band
+        ('current', (9,), 0, 4, 'current'),  # d_epi=4: far band
+        ('current', (9,), 1, 1, 'current'),  # d_epi=3: mid band
+        ('current', (9,), 0, 6, 'current'),  # d_epi=4: far band
+        ('current', (8,), 3, 4, 'current'),  # d_epi=0: ignore
+        ('current', (8,), 1, 4, 'current'),  # d_epi=2: mid band
+        ('current', (8,), 0, 3, 'current'),  # d_epi=3: mid band
+        ('current', (8,), 7, 3, 'current'),  # d_epi=4: far band
     )
+    c2w = torch.eye(4).repeat(33, 1, 1)
+    c2w[8, 0, 3] = 0.2
+    intrinsics = torch.eye(3).repeat(33, 1, 1)
+    intrinsics[:, 0, 0] = 100.0
+    intrinsics[:, 1, 1] = 100.0
+    intrinsics[:, 0, 2] = 4.0
+    intrinsics[:, 1, 2] = 4.0
     negatives, masks, matched, pair_count = _hard_negative_indices(
-        [0], [[1, 2]], identities, (8, 8, 8), 8, max_negatives=2
+        [0], [[1, 2]], identities, (3, 8, 8), 33,
+        c2w=c2w, intrinsics=intrinsics, max_negatives=4
     )
 
     assert matched is True
     assert pair_count == 2
-    assert masks == [[[True, True], [True, True]]]
-    assert [[identities[index][1][0] for index in pair] for pair in negatives[0]] == [[8, 8], [9, 9]]
+    assert all(all(mask) for mask in masks[0])
+    assert 3 not in negatives[0][0] and 8 not in negatives[0][1]
+    assert all(identities[index][1][0] == positive_time for pair, positive_time in zip(negatives[0], (9, 8)) for index in pair)
 
 
 def test_rgbd_ranking_loss_keeps_negative_axis_paired_and_trains_augmented_qk():
@@ -35,8 +50,8 @@ def test_rgbd_ranking_loss_keeps_negative_axis_paired_and_trains_augmented_qk():
     trainable = SightlineTrainable(4, layers=(0,), heads=1)
     augmented_q = torch.randn(1, 1, 1, 4, requires_grad=True)
     augmented_k = torch.randn(1, 7, 1, 4, requires_grad=True)
-    native_q = torch.randn(1, 1, 1, 4)
-    native_k = torch.randn(1, 7, 1, 4)
+    native_q = torch.randn(1, 1, 1, 4, requires_grad=True)
+    native_k = torch.randn(1, 7, 1, 4, requires_grad=True)
     plan = CorrespondencePlan(
         query_indices=torch.tensor([0]),
         positive_indices=torch.tensor([[1, 2]]),
@@ -57,6 +72,17 @@ def test_rgbd_ranking_loss_keeps_negative_axis_paired_and_trains_augmented_qk():
     assert torch.isfinite(loss)
     assert augmented_q.grad is not None and augmented_q.grad.abs().sum() > 0
     assert augmented_k.grad is not None and augmented_k.grad.abs().sum() > 0
+    assert native_q.grad is None and native_k.grad is None
+
+
+def test_disabled_scale_augmentation_does_not_consume_rng():
+    from long_video.sightline.conditioning import SightlineConditioner
+
+    conditioner = SightlineConditioner(4, scale_aug_prob=0.0)
+    rays = torch.randn(2, 3, 7)
+    state = torch.random.get_rng_state()
+    assert conditioner.sample_scale_delta(rays, training=True) is None
+    assert torch.equal(state, torch.random.get_rng_state())
 
 
 def test_streaming_rgbd_ranking_matches_dense_reference_with_confidence_and_upstream_scale():
@@ -140,9 +166,12 @@ def test_training_source_uses_only_rgbd_stage1_and_stage2():
     assert "for rgbd_stage_index in (1,2)" in source
     assert "stage_rgbd_plan=rgbd_plans.get(stage_index)" in source
     assert "rgbd_stage_index=max(" not in source
-    assert "lambda_rgbd: 0.006" in config
+    assert "lambda_rgbd: 0.01" in config
+    assert "scale_augmentation_probability: 0.0" in config
     assert "rgbd_stage1_negative_key_t_match" in source
     assert "rgbd_stage2_negative_key_t_match" in source
+    assert "rgbd_scale_sum" not in source
+    assert "1.0/len(valid_rgbd_stages)" in source
 
 
 def test_total_metric_contains_all_fm_stages_without_a_second_backward_path():

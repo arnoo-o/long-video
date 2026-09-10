@@ -19,7 +19,12 @@ class SightlineHeliosAttnProcessor:
         self.attention_backend=attention_backend; self.parallel_config=parallel_config
         self.residual_scale=1.0  # legacy user ablation multiplier; default 1.
         self.reuse_scale_delta=False; self.scale_delta_override=None; self.last_scale_delta=None
-        self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None; self.last_key_identities=None; self.last_attention_meta={}; self.capture_diagnostics=False
+        self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None; self.last_key_identities=None
+        # RGB-D auxiliary capture is deliberately separate from the real
+        # attention capture.  It stores only sparse Q_aux/K_aux and the raw
+        # unscaled Sightline deltas for this layer.
+        self.last_rgbd_q=None; self.last_rgbd_k=None; self.last_rgbd_native_q=None; self.last_rgbd_native_k=None; self.last_rgbd_dq=None; self.last_rgbd_dk=None; self.last_rgbd_query_indices=None; self.last_rgbd_key_indices=None
+        self.last_attention_meta={}; self.capture_diagnostics=False; self.capture_rgbd=False
         self.capture_query_indices=None
         self.capture_key_indices=None
         self.capture_full_key=False
@@ -208,14 +213,12 @@ class SightlineHeliosAttnProcessor:
                 raise RuntimeError('attention mask key axis must equal final K length')
         if self.capture_diagnostics:
             if self.capture_query_indices is None:
-                self.last_q=query
-                self.last_native_q=native_query.detach()
-                self.last_capture_query_indices=torch.arange(query.shape[1],device=query.device,dtype=torch.long)
+                query_indices=torch.arange(query.shape[1],device=query.device,dtype=torch.long)
             else:
-                indices=torch.as_tensor(self.capture_query_indices,device=query.device,dtype=torch.long)
-                self.last_q=query.index_select(1,indices)
-                self.last_native_q=native_query.detach().index_select(1,indices)
-                self.last_capture_query_indices=indices
+                query_indices=torch.as_tensor(self.capture_query_indices,device=query.device,dtype=torch.long)
+            self.last_q=query.index_select(1,query_indices)
+            self.last_native_q=native_query.detach().index_select(1,query_indices)
+            self.last_capture_query_indices=query_indices
             if self.capture_key_indices is None:
                 key_indices=torch.arange(native_key.shape[1],device=native_key.device,dtype=torch.long)
             else:
@@ -238,7 +241,34 @@ class SightlineHeliosAttnProcessor:
             self.last_key_identities=self.ray_provider.key_identities(current_len,self.memory)
             if self.last_k is not None and len(self.last_key_identities)!=key.shape[1]: raise RuntimeError('key identity map length does not match attention K axis')
         else:
-            self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None
+            self.last_q=None; self.last_k=None; self.last_native_q=None; self.last_native_k=None; self.last_augmented_q=None; self.last_augmented_k=None; self.last_capture_query_indices=None; self.last_capture_key_indices=None; self.last_key_identities=None
+        if self.capture_rgbd:
+            # RGB-D must see the current layer's unscaled Dq/Dk only.  In
+            # particular, do not reuse ``last_augmented_*``: those tensors are
+            # the real attention path and include geometry_sigma_scale,
+            # history handling, and possibly Memory/cross keys.
+            if self.capture_query_indices is None:
+                rgbd_query_indices=torch.arange(query.shape[1],device=query.device,dtype=torch.long)
+            else:
+                rgbd_query_indices=torch.as_tensor(self.capture_query_indices,device=query.device,dtype=torch.long)
+            if self.capture_key_indices is None:
+                rgbd_key_indices=torch.arange(native_key.shape[1],device=native_key.device,dtype=torch.long)
+            else:
+                rgbd_key_indices=torch.as_tensor(self.capture_key_indices,device=native_key.device,dtype=torch.long)
+                if rgbd_key_indices.numel() and (int(rgbd_key_indices.min())<0 or int(rgbd_key_indices.max())>=native_key.shape[1]):
+                    raise RuntimeError('RGB-D sparse K capture index is outside the native Helios key axis')
+            rgbd_native_q=native_query.detach().index_select(1,rgbd_query_indices)
+            rgbd_native_k=native_key.detach().index_select(1,rgbd_key_indices)
+            rgbd_dq=dq.index_select(1,rgbd_query_indices)
+            rgbd_dk=dk.index_select(1,rgbd_key_indices)
+            self.last_rgbd_native_q=rgbd_native_q; self.last_rgbd_native_k=rgbd_native_k
+            self.last_rgbd_dq=rgbd_dq; self.last_rgbd_dk=rgbd_dk
+            self.last_rgbd_q=rgbd_native_q+rgbd_dq
+            self.last_rgbd_k=rgbd_native_k+rgbd_dk
+            self.last_rgbd_query_indices=rgbd_query_indices
+            self.last_rgbd_key_indices=rgbd_key_indices
+        else:
+            self.last_rgbd_q=None; self.last_rgbd_k=None; self.last_rgbd_native_q=None; self.last_rgbd_native_k=None; self.last_rgbd_dq=None; self.last_rgbd_dk=None; self.last_rgbd_query_indices=None; self.last_rgbd_key_indices=None
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)

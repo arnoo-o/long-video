@@ -555,13 +555,23 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
         raise ValueError('RGB-D hard-negative cameras must be [F,4,4] and [F,3,3] or batched')
     if int(c2w.shape[0])<33 or int(intrinsics.shape[0])<33:
         raise ValueError('RGB-D hard-negative cameras require the current 33-frame chunk')
-    candidates=[]
+    # Index candidates by their exact key frame.  The previous implementation
+    # scanned every current token for every positive, which made the
+    # off-epipolar filter quadratic in the number of stage tokens.  A negative
+    # is allowed only at the positive's key time, so this grouping is exactly
+    # equivalent while reducing each query to one frame-sized candidate set.
+    candidates_by_global={}
     for index,identity in enumerate(identities):
         if identity[0]!='current': continue
         global_id=int(identity[1][0])
-        candidates.append((index,global_id,int(identity[2]),int(identity[3])))
+        candidates_by_global.setdefault(global_id,[]).append((index,int(identity[2]),int(identity[3])))
     camera_indices=latent_camera_indices().tolist()
     token_pixel_size=((padded_height/height)*(padded_width/width))**0.5
+    c2w_float=c2w.float()
+    intrinsics_float=intrinsics.float()
+    c2w_inverse=torch.linalg.inv(c2w_float)
+    intrinsics_inverse=torch.linalg.inv(intrinsics_float)
+    epipolar_cache={}
     negatives=[]; masks=[]; matched_key_t=True; pair_count=0
     for query,positive in zip(selected,positives):
         if not 0<=int(query)<len(identities): raise RuntimeError('RGB-D query index is outside the identity map')
@@ -584,33 +594,42 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
             # another temporal identity as a negative.
             if key_chunk!=query_chunk or not (0<=key_t<9 and 0<=query_t<9) or key_t>=query_t:
                 row_negatives.append([]); row_masks.append([]); continue
-            query_camera=c2w[camera_indices[query_t]].float()
-            key_camera=c2w[camera_indices[key_t]].float()
-            query_K=intrinsics[camera_indices[query_t]].float()
-            key_K=intrinsics[camera_indices[key_t]].float()
-            T_kq=torch.linalg.inv(key_camera)@query_camera
-            R=T_kq[:3,:3]; translation=T_kq[:3,3]
+            camera_pair=(query_t,key_t)
+            if camera_pair not in epipolar_cache:
+                query_camera=c2w_float[camera_indices[query_t]]
+                key_camera_inverse=c2w_inverse[camera_indices[key_t]]
+                query_K_inverse=intrinsics_inverse[camera_indices[query_t]]
+                key_K_inverse=intrinsics_inverse[camera_indices[key_t]]
+                T_kq=key_camera_inverse@query_camera
+                R=T_kq[:3,:3]; translation=T_kq[:3,3]
+                epipolar_cache[camera_pair]=(key_K_inverse.transpose(0,1)@_skew_translation(translation)@R@query_K_inverse,translation)
+            fundamental,translation=epipolar_cache[camera_pair]
             baseline=float(torch.linalg.vector_norm(translation).detach())
             if not np.isfinite(baseline) or baseline<=1e-6:
                 row_negatives.append([]); row_masks.append([]); continue
-            fundamental=torch.linalg.inv(key_K).transpose(0,1)@_skew_translation(translation)@R@torch.linalg.inv(query_K)
             query_xy=torch.tensor([(qx+0.5)*padded_width/width,(qy+0.5)*padded_height/height,1.0],device=fundamental.device,dtype=fundamental.dtype)
             line=fundamental@query_xy
             line_norm=float(torch.linalg.vector_norm(line[:2]).detach())
             if not np.isfinite(line_norm) or line_norm<=1e-8:
                 row_negatives.append([]); row_masks.append([]); continue
+            candidates=candidates_by_global.get(positive_global,())
             band_candidates=[]
-            for candidate_index,candidate_global,candidate_y,candidate_x in candidates:
-                if candidate_global!=positive_global or candidate_global//8!=query_chunk or candidate_index in positive_set:
-                    continue
-                candidate_xy=torch.tensor([(candidate_x+0.5)*padded_width/width,(candidate_y+0.5)*padded_height/height,1.0],device=fundamental.device,dtype=fundamental.dtype)
-                epi_pixels=float((line.dot(candidate_xy).abs()/line_norm).detach())
-                epi_tokens=epi_pixels/token_pixel_size
-                if not np.isfinite(epi_tokens) or epi_tokens<2.0:
-                    continue
-                spatial=((candidate_y-positive_y)**2+(candidate_x-positive_x)**2)**0.5
-                band=0 if epi_tokens<4.0 else 1
-                band_candidates.append((band,spatial,candidate_index))
+            if candidates:
+                candidate_indices=[value[0] for value in candidates]
+                candidate_yx=torch.tensor([(value[1],value[2]) for value in candidates],device=fundamental.device,dtype=fundamental.dtype)
+                candidate_xy=torch.cat(((candidate_yx[:,1:2]+0.5)*padded_width/width,(candidate_yx[:,0:1]+0.5)*padded_height/height,torch.ones((len(candidates),1),device=fundamental.device,dtype=fundamental.dtype)),dim=1)
+                epi_tokens=(torch.abs(candidate_xy@line)/line_norm)/token_pixel_size
+                legal=torch.isfinite(epi_tokens)&(epi_tokens>=2.0)
+                legal_indices=torch.nonzero(legal,as_tuple=False).flatten().tolist()
+                epi_values=epi_tokens.detach().cpu().tolist()
+                for candidate_position in legal_indices:
+                    candidate_index,candidate_y,candidate_x=candidates[candidate_position]
+                    if candidate_index in positive_set:
+                        continue
+                    epi_value=float(epi_values[candidate_position])
+                    spatial=((candidate_y-positive_y)**2+(candidate_x-positive_x)**2)**0.5
+                    band=0 if epi_value<4.0 else 1
+                    band_candidates.append((band,spatial,candidate_index))
             if not band_candidates:
                 row_negatives.append([]); row_masks.append([]); continue
             ordered_bands=[]

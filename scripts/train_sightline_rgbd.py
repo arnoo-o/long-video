@@ -609,7 +609,7 @@ def _hard_negative_indices(selected,positives,identities,current_shape,query_len
                 skew=np.array(((0.0,-tz,ty),(tz,0.0,-tx),(-ty,tx,0.0)),dtype=np.float32)
                 epipolar_cache[camera_pair]=(key_K_inverse.T@skew@R@query_K_inverse,translation)
             fundamental,translation=epipolar_cache[camera_pair]
-            baseline=float(torch.linalg.vector_norm(translation).detach())
+            baseline=float(np.linalg.norm(translation))
             if not np.isfinite(baseline) or baseline<=1e-6:
                 row_negatives.append([]); row_masks.append([]); continue
             query_xy=np.asarray([(qx+0.5)*padded_width/width,(qy+0.5)*padded_height/height,1.0],dtype=np.float32)

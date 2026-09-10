@@ -47,15 +47,17 @@ def _setup(args):
     pipe.text_encoder.eval().requires_grad_(False); pipe.vae.eval().requires_grad_(False)
     heads=int(pipe.transformer.config.num_attention_heads); inner=int(pipe.transformer.config.attention_head_dim*heads)
     set_initialization_seed()
-    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads).to(device,dtype=torch.float32)
+    trainable=SightlineTrainable(inner,layers=cfg.sightline_layers,heads=heads,rho_init=cfg.rho_init,scale_aug_prob=cfg.scale_augmentation_probability,scale_aug_range=cfg.scale_augmentation_range).to(device,dtype=torch.float32)
     for parameter in pipe.transformer.parameters(): parameter.requires_grad_(False)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank)
     ph,pw=padded_size(cfg.source_height,cfg.source_width)
     provider=SightlineRayProvider(source_height=ph,source_width=pw)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=trainable.conditioner,ray_provider=provider)
     runner.memory.to(device=device,dtype=torch.bfloat16); runner.memory.set_enabled(False)
-    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,layers=cfg.sightline_layers,
-        helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
+    install_sightline_attention(pipe.transformer,trainable.conditioner,provider,
+        layers=tuple(sorted(set(cfg.sightline_layers).union(cfg.memory_layers).union(cfg.correspondence_layers))),
+        sightline_layers=cfg.sightline_layers,memory_layers=cfg.memory_layers,
+        correspondence_layers=cfg.correspondence_layers,helios_module=helios_source,memory=runner.memory)
     return cfg,pipe,trainable,runner,provider
 
 

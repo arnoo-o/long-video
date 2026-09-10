@@ -13,6 +13,8 @@ from torch import nn
 import torch.nn.functional as F
 from ..sightline.conditioning import LayeredSightlineConditioner
 from ..sightline.correspondence import correspondence_loss
+from .rgbd_plan import RGBDSoftTargetPlan
+from .rgbd_probability import StreamingRGBDProbabilityScore, rgbd_probability_score
 
 @dataclass(frozen=True)
 class CorrespondencePlan:

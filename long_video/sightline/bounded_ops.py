@@ -12,7 +12,32 @@ import torch.nn.functional as F
 
 
 DEFAULT_TOKEN_TILE = 512
-GEOMETRY_RMS_EPSILON = 1.0e-4
+GEOMETRY_RMS_EPSILON = 0.05 ** 2
+
+
+def token_blocked_sightline_geometry_project(rays, projection, beta, *,
+                                             native_rms=None,
+                                             token_tile=DEFAULT_TOKEN_TILE):
+    """Compute ``0.5*sigmoid(beta)*native_rms*soft_rms(project(rays))``.
+
+    The result is assembled a token tile at a time.  ``native_rms`` is
+    detached by the caller and the projector is the only differentiable ray
+    branch, which is also the exact branch used by RGB-D auxiliary passes.
+    """
+    if rays.shape[-1] != 7:
+        raise ValueError('Sightline rays must have seven features')
+    if native_rms is None:
+        native_rms = torch.ones((*rays.shape[:-1], 1), device=rays.device, dtype=torch.float32)
+    native_rms = native_rms.detach().float()
+    flat = rays.reshape(-1, 7)
+    flat_rms = native_rms.reshape(-1, 1)
+    pieces = []
+    for start in range(0, flat.shape[0], int(token_tile)):
+        stop = min(flat.shape[0], start + int(token_tile))
+        raw = torch.nn.functional.linear(flat[start:stop].float(), projection.weight.float())
+        normalized = raw / torch.sqrt(raw.square().mean(dim=-1, keepdim=True) + 0.05 ** 2)
+        pieces.append(0.5 * beta.float().sigmoid() * flat_rms[start:stop] * normalized)
+    return torch.cat(pieces, dim=0).to(rays.dtype).reshape(*rays.shape[:-1], projection.weight.shape[0])
 
 
 def _slice_token(value: torch.Tensor | None, start: int, stop: int, tokens: int):

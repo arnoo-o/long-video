@@ -6,6 +6,7 @@ from .conditioning import GEOMETRY_RMS_EPSILON, SightlineConditioner
 from .rays import token_rays_for_shape, plucker_rays
 from .history import covered_history_chunk_ids
 from .geometry import geometry_sigma_schedule
+from ..training.rgbd_probability import attention_mask_to_legal_mask
 
 def helio_source_fingerprint(source_text: str) -> str:
     return hashlib.sha256(source_text.encode()).hexdigest()
@@ -23,12 +24,12 @@ class SightlineHeliosAttnProcessor:
         # RGB-D auxiliary capture is deliberately separate from the real
         # attention capture.  It stores only sparse Q_aux/K_aux and the raw
         # unscaled Sightline deltas for this layer.
-        self.last_rgbd_q=None; self.last_rgbd_k=None; self.last_rgbd_native_q=None; self.last_rgbd_native_k=None; self.last_rgbd_dq=None; self.last_rgbd_dk=None; self.last_rgbd_query_indices=None; self.last_rgbd_key_indices=None
+        self.last_rgbd_q=None; self.last_rgbd_k=None; self.last_rgbd_native_q=None; self.last_rgbd_native_k=None; self.last_rgbd_dq=None; self.last_rgbd_dk=None; self.last_rgbd_rays_q=None; self.last_rgbd_rays_k=None; self.last_rgbd_query_indices=None; self.last_rgbd_key_indices=None
         self.last_attention_meta={}; self.capture_diagnostics=False; self.capture_rgbd=False
         self.capture_query_indices=None
         self.capture_key_indices=None
         self.capture_full_key=False
-        self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None
+        self.capture_numeric_diagnostics=False; self.last_numeric_diagnostics=None; self.last_rgbd_legal_mask=None
         self.capture_memory_hidden=False; self.last_hidden_states=None; self.last_pooled_hidden=None; self.last_pooled_grid_shape=None; self.last_current_length=None; self.last_attention_bias=None
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None,
                  rotary_emb=None, original_context_length=None, original_context_length_list=None, **kwargs):
@@ -96,10 +97,12 @@ class SightlineHeliosAttnProcessor:
             # Compute one detached RMS per batch sample over the complete
             # native Q/K sequence for this layer.  All current/history
             # projections and Memory K reuse these exact values.
-            native_q_rms=SightlineConditioner.native_rms(native_q_all)
-            native_k_rms=SightlineConditioner.native_rms(native_k_all)
+            native_q_rms_all=SightlineConditioner.native_rms(native_q_all)
+            native_k_rms_all=SightlineConditioner.native_rms(native_k_all)
             native_q=native_q_all[:,-current_len:]
             native_k=native_k_all[:,-current_len:]
+            native_q_rms=SightlineConditioner.native_rms(native_q)
+            native_k_rms=SightlineConditioner.native_rms(native_k)
             try:
                 dq=self.conditioner.project(conditioned_q,native_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta,native_rms=native_q_rms)
                 dk=self.conditioner.project(conditioned_k,native_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta,native_rms=native_k_rms)
@@ -110,8 +113,8 @@ class SightlineHeliosAttnProcessor:
                 dq=self.conditioner.project(conditioned_q,kind='q',training=self.conditioner.training,scale_delta=scale_delta)
                 dk=self.conditioner.project(conditioned_k,kind='k',training=self.conditioner.training,scale_delta=scale_delta)
             if history_len:
-                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta,native=native_q_all[:,:history_len],native_rms=native_q_rms)
-                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta,native=native_k_all[:,:history_len],native_rms=native_k_rms)
+                pooled_q=self.ray_provider.project_history(self.conditioner,kind='q',scale_delta=scale_delta,native=native_q_all[:,:history_len],native_rms=native_q_rms_all[:,:history_len])
+                pooled_k=self.ray_provider.project_history(self.conditioner,kind='k',scale_delta=scale_delta,native=native_k_all[:,:history_len],native_rms=native_k_rms_all[:,:history_len])
                 if pooled_q.shape[1]!=history_len or pooled_k.shape[1]!=history_len: raise RuntimeError('pooled history ray embedding count differs from Helios history tokens')
                 dq=torch.cat((pooled_q.to(dq),dq[:,-current_len:]),1)
                 dk=torch.cat((pooled_k.to(dk),dk[:,-current_len:]),1)
@@ -148,15 +151,11 @@ class SightlineHeliosAttnProcessor:
                 'native_q_rms':native_q_rms,'native_k_rms':native_k_rms,'delta_q_rms':delta_q_rms,'delta_k_rms':delta_k_rms,
                 'delta_q_over_q_native':raw_q,'delta_k_over_k_native':raw_k,
                 'effective_delta_q_over_q_native':effective_q,'effective_delta_k_over_k_native':effective_k,
-                'proj_q_rms_before_norm':self.conditioner.last_pre_norm_rms['q'],'proj_k_rms_before_norm':self.conditioner.last_pre_norm_rms['k'],
-                'proj_q_rms_after_norm':self.conditioner.last_post_norm_rms['q'],'proj_k_rms_after_norm':self.conditioner.last_post_norm_rms['k'],
-                'gate_q':self.conditioner.last_gate_stats['q'],'gate_k':self.conditioner.last_gate_stats['k'],
+                'proj_q_raw_rms':self.conditioner.last_pre_norm_rms['q'],'proj_k_raw_rms':self.conditioner.last_pre_norm_rms['k'],
+                'proj_q_soft_gain':self.conditioner.last_soft_gain['q'],'proj_k_soft_gain':self.conditioner.last_soft_gain['k'],
                 'q_projector_weight_rms':parameter_rms(self.conditioner.q_proj.weight),'k_projector_weight_rms':parameter_rms(self.conditioner.k_proj.weight),
                 'q_projector_grad_rms':grad_rms(self.conditioner.q_proj.weight),'k_projector_grad_rms':grad_rms(self.conditioner.k_proj.weight),
-                'gate_weight_rms':parameter_rms(self.conditioner.gate.weight),'gate_weight_grad_rms':grad_rms(self.conditioner.gate.weight),
-                'rms_norm_q_weight_rms':parameter_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_rms':parameter_rms(self.conditioner.rms_norm_k.weight),
-                'rms_norm_q_weight_grad_rms':grad_rms(self.conditioner.rms_norm_q.weight),'rms_norm_k_weight_grad_rms':grad_rms(self.conditioner.rms_norm_k.weight),
-                'rms_norm_epsilon':GEOMETRY_RMS_EPSILON,'sightline_residual_scale':float(residual_scale.detach().cpu()),'geometry_sigma':float(geometry_sigma.detach().cpu()),'sigma_abs':float(geometry_sigma.detach().cpu()),'sigma_local':float(torch.as_tensor(provider_context.get('sigma_local',0.0),device=query.device).float().mean().detach().cpu()) if provider_context is not None else 0.0,'sigma_start':float(provider_context.get('sigma_start',0.0)) if provider_context is not None else 0.0,'sigma_end':float(provider_context.get('sigma_end',0.0)) if provider_context is not None else 0.0,'stage_index':None if provider_context is None or provider_context.get('stage_index') is None else int(provider_context['stage_index']),'geometry_sigma_scale':float(geometry_sigma_scale.detach().cpu()),
+                'soft_rms_epsilon':0.05,'sightline_residual_scale':float(residual_scale.detach().cpu()),'geometry_sigma':float(geometry_sigma.detach().cpu()),'sigma_abs':float(geometry_sigma.detach().cpu()),'sigma_local':float(torch.as_tensor(provider_context.get('sigma_local',0.0),device=query.device).float().mean().detach().cpu()) if provider_context is not None else 0.0,'sigma_start':float(provider_context.get('sigma_start',0.0)) if provider_context is not None else 0.0,'sigma_end':float(provider_context.get('sigma_end',0.0)) if provider_context is not None else 0.0,'stage_index':None if provider_context is None or provider_context.get('stage_index') is None else int(provider_context['stage_index']),'geometry_sigma_scale':float(geometry_sigma_scale.detach().cpu()),
                 'timestep':None,
                 'geometry_enabled':geometry_enabled,
             }
@@ -200,7 +199,7 @@ class SightlineHeliosAttnProcessor:
                 native_history_chunk_ids=native_chunks,
                 effective_geometry_scale=effective_scale,
                 geometry_enabled=geometry_enabled,
-                native_k_rms=native_k_rms,
+                native_k_rms=None,
                 **memory_kwargs)
             mem_count=self.last_attention_meta.get('memory_tokens',0)
             if mem_count and attention_mask is not None:
@@ -263,12 +262,27 @@ class SightlineHeliosAttnProcessor:
             rgbd_dk=dk.index_select(1,rgbd_key_indices)
             self.last_rgbd_native_q=rgbd_native_q; self.last_rgbd_native_k=rgbd_native_k
             self.last_rgbd_dq=rgbd_dq; self.last_rgbd_dk=rgbd_dk
+            self.last_rgbd_rays_q=rays_q.index_select(1,rgbd_query_indices).detach()
+            self.last_rgbd_rays_k=rays_k.index_select(1,rgbd_key_indices).detach()
             self.last_rgbd_q=rgbd_native_q+rgbd_dq
             self.last_rgbd_k=rgbd_native_k+rgbd_dk
             self.last_rgbd_query_indices=rgbd_query_indices
             self.last_rgbd_key_indices=rgbd_key_indices
+            if attention_mask is None:
+                self.last_rgbd_legal_mask=torch.ones((query.shape[0],rgbd_query_indices.numel(),rgbd_key_indices.numel()),device=query.device,dtype=torch.bool)
+            else:
+                mask=attention_mask
+                legal=attention_mask_to_legal_mask(mask)
+                if legal.ndim==2: legal=legal[:,None,None,:]
+                elif legal.ndim==3: legal=legal[:,None,:,:]
+                elif legal.ndim!=4: raise RuntimeError('unsupported Helios attention mask rank for RGB-D capture')
+                legal=legal.to(torch.bool)
+                qindex=rgbd_query_indices.clamp_max(legal.shape[-2]-1)
+                kindex=rgbd_key_indices.clamp_max(legal.shape[-1]-1)
+                legal=legal.index_select(-2,qindex).index_select(-1,kindex).all(1)
+                self.last_rgbd_legal_mask=legal
         else:
-            self.last_rgbd_q=None; self.last_rgbd_k=None; self.last_rgbd_native_q=None; self.last_rgbd_native_k=None; self.last_rgbd_dq=None; self.last_rgbd_dk=None; self.last_rgbd_query_indices=None; self.last_rgbd_key_indices=None
+            self.last_rgbd_q=None; self.last_rgbd_k=None; self.last_rgbd_native_q=None; self.last_rgbd_native_k=None; self.last_rgbd_dq=None; self.last_rgbd_dk=None; self.last_rgbd_rays_q=None; self.last_rgbd_rays_k=None; self.last_rgbd_legal_mask=None; self.last_rgbd_query_indices=None; self.last_rgbd_key_indices=None
         out=self.attention_dispatch(query,key,value,attn_mask=attention_mask,dropout_p=0.0,is_causal=False,backend=self.attention_backend,parallel_config=self.parallel_config)
         if out.ndim!=4: raise RuntimeError(f"pinned Helios attention returned unexpected shape {out.shape}")
         out=out.flatten(2,3).type_as(query)
@@ -316,8 +330,9 @@ class SightlineRayProvider:
         if T is None or H is None or W is None: raise RuntimeError("real Helios token_shape is required; refusing to guess")
         current_count=T*H*W
         if current_length != current_count: raise RuntimeError(f"runtime context current_length={current_length} != ray grid tokens={current_count}")
-        rays=token_rays_for_shape(c2w,intrinsics,(B,T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(B,current_count,7)
-        if key_length == current_count: return rays,rays
+        rays_q=token_rays_for_shape(c2w,intrinsics,(B,T,H,W,1),source_height=self.source_height,source_width=self.source_width,kind='q').reshape(B,current_count,7)
+        rays_k=token_rays_for_shape(c2w,intrinsics,(B,T,H,W,1),source_height=self.source_height,source_width=self.source_width,kind='k').reshape(B,current_count,7)
+        if key_length == current_count: return rays_q,rays_k
         history=kwargs.get('history_rays',context.get('history_rays'))
         if history is None and context.get('history_groups') is not None:
             groups=context['history_groups']; rays_by_group=[]
@@ -325,21 +340,39 @@ class SightlineRayProvider:
             if not shapes: raise RuntimeError('actual native history token shapes are required')
             for name in ('long','mid','short'):
                 ht,hh,hw=shapes[name]
-                rays_by_group.append(torch.zeros(B,ht*hh*hw,7,device=rays.device,dtype=rays.dtype))
+                rays_by_group.append(torch.zeros(B,ht*hh*hw,7,device=rays_q.device,dtype=rays_q.dtype))
             history=torch.cat(rays_by_group,1)
         if history is None and context.get('history_cameras') is not None:
             hc=context['history_cameras']; hk=context.get('history_intrinsics')
             if hk is None: hk=intrinsics[:, :hc.shape[1]]
             if hc.shape[1] < 1: raise RuntimeError("history camera set is empty")
-            history=plucker_rays(hc,hk,H,W,source_height=self.source_height,source_width=self.source_width).reshape(B,-1,7)
+            history=plucker_rays(hc,hk,H,W,source_height=self.source_height,source_width=self.source_width,kind='q').reshape(B,-1,7)
         if history is None: raise RuntimeError("history rays are required for attention with history tokens")
         expected=key_length-current_count
         if history.shape[:1] != (B,) or history.shape[-1] != 7:
             raise RuntimeError(f"invalid history ray shape: history={tuple(history.shape)}, key={key_length}, current={current_count}")
         if history.shape[1] != expected:
             raise RuntimeError(f"history ray count does not exactly match native Helios context: history={tuple(history.shape)}, key={key_length}, current={current_count}, token_shape={(T,H,W)}")
-        all_rays=torch.cat((history.to(rays),rays),1)
-        return all_rays,all_rays
+        # History was prepared in the canonical Q convention.  Rebuild its K
+        # convention through the same encoder instead of swapping moments in a
+        # downstream conditioner.
+        if isinstance(history, (tuple, list)) and len(history) == 2:
+            history_q, history_k = (value.to(rays_q) for value in history)
+        else:
+            # Legacy callers may provide only the Q encoding.  Decode its
+            # bounded Pluecker moment and re-encode through the single public
+            # feature function; no hand-written moment swap or normalization
+            # is part of the formal path.
+            from .rays import encode_plucker_feature
+            history_q=history.to(rays_q)
+            direction=history_q[..., :3]
+            moment_soft=history_q[..., 3:6]
+            radius=torch.expm1(history_q[..., 6:7]).add(0.05).clamp_min(0.05)
+            origin=torch.cross(direction,moment_soft*radius,dim=-1)
+            history_k=encode_plucker_feature(origin,direction,'k').to(rays_q)
+        all_q=torch.cat((history_q,rays_q),1)
+        all_k=torch.cat((history_k,rays_k),1)
+        return all_q,all_k
 
     def project_history(self,conditioner,*,kind,scale_delta,native=None,native_rms=None):
         """Project each real camera ray first, then pool temporal embeddings."""
@@ -350,7 +383,7 @@ class SightlineRayProvider:
         for name in ('long','mid','short'):
             cameras,K=groups[name]; out_t,height,width=shapes[name]; factor=factors[name]
             if cameras.shape[1]!=out_t*factor: raise RuntimeError(f'{name} camera footprint does not match Helios temporal pooling')
-            rays=plucker_rays(cameras,K,height,width,source_height=self.source_height,source_width=self.source_width)
+            rays=plucker_rays(cameras,K,height,width,source_height=self.source_height,source_width=self.source_width,kind=kind)
             count=out_t*height*width
             native_group=None if native is None else native[:,offset:offset+count*1]
             # Native history is stored at the pooled token resolution.  Repeat
@@ -367,31 +400,46 @@ class SightlineRayProvider:
                 # Repeat each pooled temporal plane over the real camera
                 # footprint before applying the per-token native RMS.
                 native_grid=native_grid.unsqueeze(2).expand(-1,-1,factor,-1,-1,-1).reshape(bsz,out_t*factor,height,width,width_native)
-                projected=conditioner.project(rays_t,native_grid,kind=kind,training=conditioner.training,scale_delta=scale_delta,native_rms=native_rms)
+                rms_group=None if native_rms is None else native_rms[:,offset:offset+count]
+                if rms_group is not None:
+                    rms_group=rms_group.reshape(bsz,out_t,height,width,1).unsqueeze(2).expand(-1,-1,factor,-1,-1,-1).reshape(bsz,out_t*factor,height,width,1)
+                projected=conditioner.project(rays_t,native_grid,kind=kind,training=conditioner.training,scale_delta=scale_delta,native_rms=rms_group)
             offset += count
             # Never average poses or raw Plücker rays: only projected embeddings.
             projected=projected.reshape(projected.shape[0],out_t,factor,height,width,-1).mean(2)
             values.append(projected.reshape(projected.shape[0],-1,projected.shape[-1]))
         return torch.cat(values,1)
 
-    def current_rays(self, token_shape):
-        T,H,W=token_shape; return token_rays_for_shape(self.context['c2w'],self.context['intrinsics'],(self.context['c2w'].shape[0],T,H,W,1),source_height=self.source_height,source_width=self.source_width).reshape(self.context['c2w'].shape[0],-1,7)
+    def current_rays(self, token_shape, *, kind='k'):
+        T,H,W=token_shape; return token_rays_for_shape(self.context['c2w'],self.context['intrinsics'],(self.context['c2w'].shape[0],T,H,W,1),source_height=self.source_height,source_width=self.source_width,kind=kind).reshape(self.context['c2w'].shape[0],-1,7)
 
-def install_sightline_attention(transformer, conditioner, ray_provider, *, layers, helios_module, memory=None, memory_layers=None):
+def install_sightline_attention(transformer, conditioner, ray_provider, *, layers=None,
+                                sightline_layers=None, memory_layers=None,
+                                correspondence_layers=None, helios_module,
+                                memory=None):
     transformer._sightline_ray_provider=ray_provider
     blocks=list(getattr(transformer,'transformer_blocks',None) or getattr(transformer,'blocks',()))
-    if not layers: raise ValueError("Sightline selected layers must be explicit")
+    if sightline_layers is None:
+        if layers is None:
+            raise ValueError("Sightline selected layers must be explicit")
+        sightline_layers=tuple(int(x) for x in layers if hasattr(conditioner,'for_layer') and str(int(x)) in conditioner.layers)
+    sightline_layers=tuple(sorted(set(map(int,sightline_layers))))
+    memory_layers=tuple(sorted(set(map(int,memory_layers or ()))))
+    correspondence_layers=tuple(sorted(set(map(int,correspondence_layers or ()))))
+    processor_layers=tuple(sorted(set(layers or ()) | set(sightline_layers) | set(memory_layers) | set(correspondence_layers)))
+    if not processor_layers:
+        raise ValueError("Sightline selected layers must be explicit")
     installed=[]
     if memory is not None and hasattr(memory,'bind_rope'): memory.bind_rope(transformer.rope)
-    for index in layers:
+    for index in processor_layers:
         if not isinstance(index,int) or index<0 or index>=len(blocks): raise ValueError(f"invalid Helios layer {index}")
         attn=getattr(blocks[index],'attn1',None)
         if attn is None: raise RuntimeError(f"layer {index} has no self-attention")
-        enabled_memory_layers=set(layers if memory_layers is None else memory_layers)
+        enabled_memory_layers=set(memory_layers)
         layer_memory=memory.for_layer(index) if memory is not None and hasattr(memory,'for_layer') and index in enabled_memory_layers else (memory if memory is not None and not hasattr(memory,'for_layer') and index in enabled_memory_layers else None)
         if layer_memory is not None and memory is not None:
             layer_memory.timestamp=memory.timestamp
-        layer_conditioner=conditioner.for_layer(index) if hasattr(conditioner,'for_layer') and str(index) in conditioner.layers else None
+        layer_conditioner=conditioner.for_layer(index) if index in sightline_layers and hasattr(conditioner,'for_layer') and str(index) in conditioner.layers else None
         native=helios_module.HeliosAttnProcessor()
         processor=SightlineHeliosAttnProcessor(layer_conditioner,ray_provider,memory=layer_memory,qkv_projection=helios_module._get_qkv_projections,rotary_apply=helios_module.apply_rotary_emb_transposed,attention_dispatch=helios_module.dispatch_attention_fn,attention_backend=native._attention_backend,parallel_config=native._parallel_config)
         processor.layer_index=int(index)

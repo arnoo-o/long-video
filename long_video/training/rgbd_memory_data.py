@@ -162,10 +162,13 @@ class RGBDMemoryRecord:
         if any(len(value) != count for value in arrays.values() if value.ndim == 1):
             raise ValueError(f"{self.record_id}: correspondence columns have different lengths")
         same_chunk = arrays["key_chunk"] == arrays["query_chunk"]
+        # Cross-chunk rows remain strictly causal.  Intra-chunk rows are the
+        # independently projected ordered anchor pairs and may run in either
+        # temporal direction, but self-pairs are never legal.
         invalid_causality = (
-            np.any(arrays["key_frame"] >= arrays["query_frame"])
+            np.any((~same_chunk) & (arrays["key_chunk"] >= arrays["query_chunk"]))
+            or np.any(same_chunk & (arrays["key_t"] == arrays["query_t"]))
             or np.any((arrays["key_chunk"] > arrays["query_chunk"]))
-            or np.any(same_chunk & (arrays["key_t"] >= arrays["query_t"]))
         )
         if count and (invalid_causality or np.any(arrays["query_frame"] >= self.frame_count) or np.any(arrays["key_frame"] < 0) or np.any(arrays["query_chunk"] >= self.chunk_count) or np.any(arrays["key_chunk"] < 0)):
             raise ValueError(f"{self.record_id}: correspondence cache is not strictly causal or out of bounds")
@@ -184,7 +187,7 @@ class RGBDMemoryRecord:
             return
         count = len(cache["query_frame"])
         for index in range(count):
-            yield {
+            row = {
                 "query_frame": int(cache["query_frame"][index]),
                 "key_frame": int(cache["key_frame"][index]),
                 "query_chunk": int(cache["query_chunk"][index]),
@@ -201,6 +204,17 @@ class RGBDMemoryRecord:
                 "coverage": float(cache.get("coverage", np.ones(count, np.float32))[index]),
                 "vote": float(cache.get("vote", cache["weight"])[index]),
             }
+            if "query_u" in cache:
+                row.update({"query_u": float(cache["query_u"][index]), "query_v": float(cache["query_v"][index]),
+                            "query_depth": float(cache.get("query_depth", np.zeros(count))[index]),
+                            "key_u_cont": float(cache["key_u_cont"][index]), "key_v_cont": float(cache["key_v_cont"][index]),
+                            "confidence": float(cache.get("confidence", cache["weight"])[index]),
+                            "query_valid_depth_count": int(cache.get("query_valid_depth_count", np.ones(count))[index])})
+                for stage in range(3):
+                    key=f"query_valid_depth_count_stage{stage}"
+                    if key in cache:
+                        row[key]=int(cache[key][index])
+            yield row
 
     def validate(self) -> None:
         missing = [key for key in REQUIRED_KEYS if key not in self.raw]

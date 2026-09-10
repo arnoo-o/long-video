@@ -74,15 +74,15 @@ def main():
     geometry_layers=tuple(int(x) for x in a.layers.split(',') if x) or tuple(cfg.sightline_layers)
     if not geometry_layers: raise ValueError('select at least one Sightline self-attention layer via --layers or config')
     if tuple(geometry_layers) != tuple(cfg.sightline_layers):
-        raise RuntimeError('formal inference requires the configured all-layer geometry set; refusing partial Sightline layer installation')
-    layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers)))
+        raise RuntimeError('formal inference requires the configured Sightline layer set; refusing partial installation')
+    layers=tuple(sorted(set(geometry_layers).union(cfg.memory_layers).union(cfg.correspondence_layers)))
     set_initialization_seed()
     trainable=SightlineTrainable(inner,layers=geometry_layers,heads=int(pipe.transformer.config.num_attention_heads),lambda_corr=cfg.lambda_corr,lambda_corr_final=cfg.lambda_corr_final,lambda_corr_decay_start=cfg.lambda_corr_decay_start,rho_init=cfg.rho_init,scale_aug_prob=cfg.scale_augmentation_probability,scale_aug_range=cfg.scale_augmentation_range).to('cuda',dtype=torch.float32); conditioner=trainable.conditioner
     padded_h,padded_w=padded_size(cfg.source_height,cfg.source_width); provider=SightlineRayProvider(c2w,K,source_height=padded_h,source_width=padded_w)
     runner=SightlinePipeline(pipe,config=cfg,conditioner=conditioner,ray_provider=provider)
     runner.memory.to(device='cuda',dtype=torch.bfloat16)
     install_lora(pipe.transformer,cfg.lora_layers,rank=cfg.lora_rank) if cfg.lora_layers else None
-    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,helios_module=helios_source,memory=runner.memory,memory_layers=cfg.memory_layers)
+    install_sightline_attention(pipe.transformer,conditioner,provider,layers=layers,sightline_layers=cfg.sightline_layers,memory_layers=cfg.memory_layers,correspondence_layers=cfg.correspondence_layers,helios_module=helios_source,memory=runner.memory)
     if a.checkpoint:
         payload=torch.load(a.checkpoint,map_location='cpu')
         # New formal runs freeze the complete Helios backbone and therefore

@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from long_video.data.rgbd_memory import build_causal_correspondence_cache
+from long_video.data.rgbd_memory import build_intra_correspondence_cache
 
 
 def _path(root: Path, row: dict, key: str) -> Path:
@@ -34,14 +34,13 @@ def _atomic_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
 def _rebuild_parent(root: Path, row: dict, pixel_stride: int) -> dict:
     destination = _path(root, row, "correspondence_cache")
     temporary = destination.with_name(destination.name + ".intra.npz")
-    stats = build_causal_correspondence_cache(
+    stats = build_intra_correspondence_cache(
         sorted(_path(root, row, "depth_dir").glob("*.png")),
         np.load(_path(root, row, "c2w_abs")),
         np.load(_path(root, row, "intrinsics")),
         temporary,
         chunk_count=int(row["chunk_count"]),
         pixel_stride=pixel_stride,
-        chunk_pairs=[(chunk, chunk) for chunk in range(int(row["chunk_count"]))],
     )
     with np.load(temporary, allow_pickle=False) as value:
         intra = {key: np.ascontiguousarray(value[key]) for key in value.files}
@@ -49,7 +48,20 @@ def _rebuild_parent(root: Path, row: dict, pixel_stride: int) -> dict:
     with np.load(destination, allow_pickle=False) as value:
         existing = {key: np.ascontiguousarray(value[key]) for key in value.files}
     keep_cross = existing["key_chunk"] != existing["query_chunk"]
-    merged = {key: np.concatenate((existing[key][keep_cross], intra[key])) for key in intra}
+    cross_count=int(np.count_nonzero(keep_cross)); intra_count=int(len(intra['query_frame']))
+    merged={}
+    for key in set(existing)|set(intra):
+        if key in existing: cross_value=existing[key][keep_cross]
+        else:
+            dtype=intra[key].dtype
+            cross_value=np.zeros((cross_count,),dtype=dtype)
+        if key in intra: intra_value=intra[key]
+        else:
+            dtype=existing[key].dtype
+            if key in {'weight','confidence','coverage','vote'}: intra_value=np.ones((intra_count,),dtype=dtype)
+            elif key in {'matched_count','valid_count','query_valid_depth_count'}: intra_value=np.ones((intra_count,),dtype=dtype)
+            else: intra_value=np.zeros((intra_count,),dtype=dtype)
+        merged[key]=np.concatenate((cross_value,intra_value))
     _atomic_npz(destination, merged)
     return {"record_id": str(row["record_id"]), "intra_rows": int(stats["row_count"])}
 

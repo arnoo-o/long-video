@@ -228,6 +228,108 @@ def build_causal_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray, 
     return {"row_count": len(arrays["query_frame"]), "raw_match_count": int(raw_matches), "pair_counts": pair_stats, "pixel_stride": pixel_stride, "token_grid": [token_height, token_width]}
 
 
+def build_intra_correspondence_cache(depth_paths: list[Path], c2w: np.ndarray,
+                                    K: np.ndarray, output: str | Path, *,
+                                    chunk_count: int, pixel_stride: int = 8,
+                                    depth_abs_tolerance: float = 0.03,
+                                    depth_rel_tolerance: float = 0.02,
+                                    cycle_pixels: float = 2.0,
+                                    compressed: bool = True) -> dict:
+    """Build both directions of the nine-anchor intra-chunk point table.
+
+    This is intentionally independent of ``build_causal_correspondence_cache``:
+    that older builder is the causal cross-chunk path.  Every ordered pair of
+    distinct anchors below runs query-depth -> world -> key projection, so a
+    reverse direction is never made by swapping columns from a forward pass.
+    """
+    expected=1+CHUNK_STRIDE*int(chunk_count)
+    if not 1<=int(chunk_count)<=6 or len(depth_paths)!=expected or c2w.shape!=(expected,4,4) or K.shape!=(expected,3,3):
+        raise ValueError('intra cache inputs must be a 1..6 chunk shared-boundary sequence')
+    anchor_depth={}
+    for chunk in range(int(chunk_count)):
+        for temporal,local in enumerate(LATENT_LOCAL_FRAMES):
+            frame=chunk*CHUNK_STRIDE+int(local); anchor_depth[frame]=_depth(depth_paths[frame])
+    yy,xx=np.mgrid[0:HEIGHT:pixel_stride,0:WIDTH:pixel_stride]
+    valid_pixel=yy<480
+    pixels=np.stack((xx[valid_pixel].ravel(),yy[valid_pixel].ravel()),axis=1).astype(np.float64)
+    valid_depth_count={frame:int(np.count_nonzero(np.isfinite(depth[0:480])&(depth[0:480]>0))) for frame,depth in anchor_depth.items()}
+    stage_valid_depth_count={}
+    for frame,depth in anchor_depth.items():
+        valid=np.isfinite(depth)&(depth>0)
+        stage_values=[]
+        for stage_h,stage_w in ((8,13),(16,26),(32,52)):
+            counts=np.zeros((stage_h,stage_w),dtype=np.int32)
+            for y in range(stage_h):
+                y0=min(480,int(np.floor(y*512/stage_h))); y1=min(480,int(np.floor((y+1)*512/stage_h)))
+                for x in range(stage_w):
+                    x0=int(np.floor(x*832/stage_w)); x1=int(np.floor((x+1)*832/stage_w))
+                    counts[y,x]=int(np.count_nonzero(valid[y0:y1,x0:x1]))
+            stage_values.append(counts)
+        stage_valid_depth_count[frame]=stage_values
+    names=('query_frame','key_frame','query_chunk','key_chunk','query_t','key_t','query_y','query_x','key_y','key_x','query_u','query_v','query_depth','key_u_cont','key_v_cont','confidence','weight','query_valid_depth_count','query_valid_depth_count_stage0','query_valid_depth_count_stage1','query_valid_depth_count_stage2')
+    batches={name:[] for name in names}; raw_matches=0; pair_stats={}
+    for chunk in range(int(chunk_count)):
+        for query_t,query_local in enumerate(LATENT_LOCAL_FRAMES):
+            query_frame=chunk*CHUNK_STRIDE+int(query_local); query_depth=anchor_depth[query_frame]
+            q_u=pixels[:,0]; q_v=pixels[:,1]; q_z=query_depth[q_v.astype(np.int64),q_u.astype(np.int64)]
+            q_valid=np.isfinite(q_z)&(q_z>0)
+            if not q_valid.any(): continue
+            q_pixels=pixels[q_valid]; q_z=q_z[q_valid].astype(np.float64)
+            inv_kq=np.linalg.inv(K[query_frame])
+            camera_q=(inv_kq@np.stack((q_pixels[:,0]*q_z,q_pixels[:,1]*q_z,q_z),axis=0)).T
+            world=(c2w[query_frame][:3]@np.concatenate((camera_q,np.ones((len(camera_q),1))),axis=1).T).T
+            for key_t,key_local in enumerate(LATENT_LOCAL_FRAMES):
+                if key_t==query_t: continue
+                key_frame=chunk*CHUNK_STRIDE+int(key_local); key_depth=anchor_depth[key_frame]
+                camera_k=(np.linalg.inv(c2w[key_frame])[:3]@np.concatenate((world,np.ones((len(world),1))),axis=1).T).T
+                z_proj=camera_k[:,2]; uvw=(K[key_frame]@camera_k.T).T
+                finite=np.isfinite(uvw).all(axis=1)&np.isfinite(z_proj)&(z_proj>0)&(np.abs(uvw[:,2])>1e-12)
+                uv=uvw[:,:2]/np.maximum(uvw[:,2:3],1e-12)
+                inside=finite&(uv[:,0]>=0)&(uv[:,0]<WIDTH)&(uv[:,1]>=0)&(uv[:,1]<480)
+                if not inside.any(): pair_stats[f'{query_frame}->{key_frame}']=0; continue
+                safe_x=np.clip(np.rint(uv[:,0]).astype(np.int64),0,WIDTH-1); safe_y=np.clip(np.rint(uv[:,1]).astype(np.int64),0,HEIGHT-1)
+                z_obs=key_depth[safe_y,safe_x].astype(np.float64)
+                tolerance=depth_abs_tolerance+depth_rel_tolerance*np.maximum(z_proj,z_obs)
+                consistent=inside&np.isfinite(z_obs)&(z_obs>0)&(np.abs(z_obs-z_proj)<=tolerance)
+                selected=np.flatnonzero(consistent)
+                if not len(selected): pair_stats[f'{query_frame}->{key_frame}']=0; continue
+                # A second projection from the visible key sample is the cycle
+                # check.  It also rejects foreground points hidden at the key.
+                kp=np.stack((safe_x[selected],safe_y[selected]),axis=1).astype(np.float64); zk=z_obs[selected]
+                camera_back=(np.linalg.inv(K[key_frame])@np.stack((kp[:,0]*zk,kp[:,1]*zk,zk),axis=0)).T
+                world_back=(c2w[key_frame][:3]@np.concatenate((camera_back,np.ones((len(camera_back),1))),axis=1).T).T
+                camera_back_q=(np.linalg.inv(c2w[query_frame])[:3]@np.concatenate((world_back,np.ones((len(world_back),1))),axis=1).T).T
+                uvw_back=(K[query_frame]@camera_back_q.T).T; uv_back=uvw_back[:,:2]/np.maximum(uvw_back[:,2:3],1e-12)
+                cycle=np.isfinite(uv_back).all(axis=1)&(np.linalg.norm(uv_back-q_pixels[selected],axis=1)<=cycle_pixels)
+                selected=selected[cycle]
+                pair_stats[f'{query_frame}->{key_frame}']=int(len(selected)); raw_matches+=len(selected)
+                if not len(selected): continue
+                qsel=q_pixels[selected]; zsel=q_z[selected]; uvsel=uv[selected]; zkey=z_obs[selected]
+                residual=np.abs(zkey-z_proj[selected]); tol=tolerance[selected]
+                cycle_error=np.linalg.norm(uv_back[cycle]-q_pixels[selected],axis=1) if cycle.any() else np.zeros((len(selected),),np.float64)
+                confidence=np.exp(-residual/np.maximum(tol,1e-6))*np.exp(-cycle_error/max(cycle_pixels,1e-6)).astype(np.float32)
+                for name,value in {
+                    'query_frame':np.full(len(selected),query_frame,np.int32),'key_frame':np.full(len(selected),key_frame,np.int32),
+                    'query_chunk':np.full(len(selected),chunk,np.int32),'key_chunk':np.full(len(selected),chunk,np.int32),
+                    'query_t':np.full(len(selected),query_t,np.int32),'key_t':np.full(len(selected),key_t,np.int32),
+                    'query_y':np.floor(qsel[:,1]*32/480).astype(np.int32),'query_x':np.floor(qsel[:,0]*52/832).astype(np.int32),
+                    'key_y':np.floor(uvsel[:,1]*32/480).astype(np.int32),'key_x':np.floor(uvsel[:,0]*52/832).astype(np.int32),
+                    'query_u':qsel[:,0].astype(np.float32),'query_v':qsel[:,1].astype(np.float32),'query_depth':zsel.astype(np.float32),
+                    'key_u_cont':uvsel[:,0].astype(np.float32),'key_v_cont':uvsel[:,1].astype(np.float32),
+                    'confidence':confidence,'weight':confidence,'query_valid_depth_count':np.full(len(selected),valid_depth_count[query_frame],np.int32),
+                    'query_valid_depth_count_stage0':np.asarray([stage_valid_depth_count[query_frame][0][int(np.floor(qsel[i,1]*8/512)),int(np.floor(qsel[i,0]*13/832))] for i in range(len(selected))],np.int32),
+                    'query_valid_depth_count_stage1':np.asarray([stage_valid_depth_count[query_frame][1][int(np.floor(qsel[i,1]*16/512)),int(np.floor(qsel[i,0]*26/832))] for i in range(len(selected))],np.int32),
+                    'query_valid_depth_count_stage2':np.asarray([stage_valid_depth_count[query_frame][2][int(np.floor(qsel[i,1]*32/512)),int(np.floor(qsel[i,0]*52/832))] for i in range(len(selected))],np.int32),
+                }.items(): batches[name].append(value)
+    arrays={}
+    integer={'query_frame','key_frame','query_chunk','key_chunk','query_t','key_t','query_y','query_x','key_y','key_x','query_valid_depth_count'}
+    for name in names:
+        arrays[name]=np.concatenate(batches[name]).astype(np.int32 if name in integer else np.float32,copy=False) if batches[name] else np.asarray([],dtype=np.int32 if name in integer else np.float32)
+    destination=Path(output); destination.parent.mkdir(parents=True,exist_ok=True)
+    (np.savez_compressed if compressed else np.savez)(destination,**arrays)
+    return {'row_count':len(arrays['query_frame']),'raw_match_count':int(raw_matches),'pair_counts':pair_stats,'anchor_frames':LATENT_LOCAL_FRAMES.tolist(),'pixel_stride':int(pixel_stride),'schema':'rgbd-intra-point-v2'}
+
+
 def sequence_split(dataset: str, sequence_id: str, *, val_fraction: float = 0.2) -> str:
     value = int(hashlib.sha256(f"{dataset}/{sequence_id}".encode()).hexdigest()[:8], 16) / 2**32
     return "val" if value < val_fraction else "train"

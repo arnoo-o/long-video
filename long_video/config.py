@@ -5,9 +5,9 @@ import yaml
 @dataclass(frozen=True)
 class SightlineConfig:
     ray_epsilon: float; scale_augmentation_probability: float; scale_augmentation_range: tuple[float,float]; sightline_enabled:bool; rho_init:float
-    history_sizes: tuple[int,int,int]; chunk_length:int; chunk_stride:int; sightline_layers:tuple[int,...]; memory_layers:tuple[int,...]; correspondence_layers:tuple[int,...]
+    history_sizes: tuple[int,int,int]; chunk_length:int; chunk_stride:int; sightline_layers:tuple[int,...]; memory_layers:tuple[int,...]; correspondence_layers:tuple[int,...]; rgbd_prefix_stop_layer:int
     lora_layers:tuple[int,...]; lora_rank:int; lora_scope:str; memory_pool:int; memory_budget:int; memory_tau_pos:float; memory_tau_angle:float; lambda_corr:float; lambda_corr_final:float; lambda_rgbd:float; m_geo:float; tau_geo:float; max_intra_corr_rows:int
-    geometry_projector_weight_decay:float; geometry_rmsnorm_weight_decay:float; geometry_gate_learning_rate:float; geometry_beta_learning_rate:float; helios_modulation_norm_learning_rate:float; helios_modulation_norm_weight_decay:float
+    geometry_projector_weight_decay:float; geometry_beta_learning_rate:float; helios_modulation_norm_learning_rate:float; helios_modulation_norm_weight_decay:float
     lambda_corr_decay_start:float; learning_rate:float; lora_learning_rate:float; memory_learning_rate:float; warmup_ratio:float; grad_clip:float; bf16:bool; accumulation_steps:int; high_noise_bias:float; teacher_forcing_ratio:float; self_rollout_ratio:float; memory_write_sigma:float; correspondence_rows_per_batch:int; gradient_checkpointing:bool; diagnostics_frequency:int; phase:str; model_id:str; source_height:int; source_width:int; chunk_count:int; pyramid_steps:tuple[int,...]; data_path:str; latent_cache_path:str; correspondence_cache_path:str; output_path:str
     sightline_training_semantics_version:str; sightline_correspondence_schema_version:str; sightline_checkpoint_schema_version:str; p1_steps:int; p2_steps:int; p3_steps:int; ddp_world_size:int; checkpoint_every:int
 def load_sightline_config(path: str|Path) -> SightlineConfig:
@@ -25,8 +25,9 @@ def load_sightline_config(path: str|Path) -> SightlineConfig:
         if any(int(x)<0 for x in raw[key]): raise ValueError(f'invalid {key}')
     if not (0<=raw['lambda_corr_decay_start']<=1) or raw['diagnostics_frequency']<1 or min(float(raw['lambda_rgbd']),float(raw['m_geo']),float(raw['tau_geo']))<=0 or int(raw['max_intra_corr_rows'])<1: raise ValueError('invalid schedule/diagnostic configuration')
     if raw['phase'] not in ('P1','P2','P3') or raw['chunk_count'] not in range(1,7) or tuple(raw['pyramid_steps'])!=(2,2,2): raise ValueError('invalid phase/chunk/stage configuration')
+    if int(raw['rgbd_prefix_stop_layer'])!=12: raise ValueError('RGB-D prefix_stop_layer must be 12')
     if (raw['p1_steps'],raw['p2_steps'],raw['p3_steps'])!=(600,400,1500) or raw['ddp_world_size'] not in range(1,5) or raw['checkpoint_every']!=100 or raw['diagnostics_frequency'] not in (5,10): raise ValueError('Sightline-v9 schedule must total 2500 steps, DDP=1..4, checkpoint=100')
-    if min(raw['learning_rate'],raw['lora_learning_rate'],raw['memory_learning_rate'],raw['geometry_gate_learning_rate'],raw['geometry_beta_learning_rate'],raw['helios_modulation_norm_learning_rate'])<=0: raise ValueError('invalid optimizer learning rate')
-    if raw['geometry_projector_weight_decay']<0 or raw['geometry_rmsnorm_weight_decay']<0 or raw['helios_modulation_norm_weight_decay']<0: raise ValueError('invalid Geometry weight decay')
+    if min(raw['learning_rate'],raw['lora_learning_rate'],raw['memory_learning_rate'],raw['geometry_beta_learning_rate'],raw['helios_modulation_norm_learning_rate'])<=0: raise ValueError('invalid optimizer learning rate')
+    if raw['geometry_projector_weight_decay']<0 or raw['helios_modulation_norm_weight_decay']<0: raise ValueError('invalid Geometry weight decay')
     if raw['source_height']<=0 or raw['source_width']<=0 or raw['accumulation_steps']<1 or raw['correspondence_rows_per_batch']<1: raise ValueError('invalid data/training configuration')
     return SightlineConfig(**{k:(tuple(v) if k.endswith('_layers') or k=='history_sizes' else tuple(v) if k=='scale_augmentation_range' else v) for k,v in raw.items()})

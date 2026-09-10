@@ -866,8 +866,9 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,local_scale
             for bucket in range(4):
                 selected=plan.bucket.eq(bucket)
                 if bool(selected.any()):
-                    weights=plan.query_weights[selected]
-                    bucket_losses.append((weights*row_loss[selected]).sum()/weights.sum().clamp_min(1e-12))
+                    weights=plan.query_weights[selected].to(device=row_loss.device,dtype=row_loss.dtype)
+                    bucket_row_loss=row_loss[..., selected]
+                    bucket_losses.append((bucket_row_loss*weights.unsqueeze(0)).sum(-1).div(weights.sum().clamp_min(1e-12)).mean())
             if bucket_losses:
                 losses.append(torch.stack(bucket_losses).mean())
             continue

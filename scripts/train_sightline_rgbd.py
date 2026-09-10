@@ -4,7 +4,7 @@ The historical filename is retained as a legacy compatibility entry point.
 Formal training data is loaded exclusively through RGBDMemoryRecord.
 """
 from __future__ import annotations
-import argparse, copy, hashlib, json, os, random, sys, time
+import argparse, copy, hashlib, json, math, os, random, sys, time
 from contextlib import nullcontext
 # Must be set before importing/initializing CUDA; callers may override it.
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')

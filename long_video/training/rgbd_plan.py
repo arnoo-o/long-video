@@ -127,11 +127,15 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
     legacy_h=legacy_token_shape[1] if legacy_token_shape is not None else H
     legacy_w=legacy_token_shape[2] if legacy_token_shape is not None else W
     full_by_identity={}
+    current_indices_by_time={}
     for index,identity in enumerate(identities):
         if len(identity)<4: continue
         kind, times, y, x = identity[:4]
         if kind == 'current' and len(times)==1:
-            full_by_identity[(int(times[0]),int(y),int(x))]=int(index)
+            global_time=int(times[0])
+            full_index=int(index)
+            full_by_identity[(global_time,int(y),int(x))]=full_index
+            current_indices_by_time.setdefault(global_time,[]).append(full_index)
     grouped={}
     input_count=0
     motions={}
@@ -215,9 +219,10 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         total=sum(target.values())
         for p,(full_index,value) in enumerate(sorted(target.items())):
             target_indices[r,p]=sparse_set[full_index]; target_values[r,p]=float(value)/max(total,1e-12); target_mask[r,p]=True
-        for full_index,identity in enumerate(identities):
-            if len(identity)>=4 and identity[0]=='current' and int(identity[1][0])==key_time and full_index in sparse_set:
-                legal_mask[r,sparse_set[full_index]]=True
+        for full_index in current_indices_by_time.get(key_time,()):
+            sparse_index=sparse_set.get(full_index)
+            if sparse_index is not None:
+                legal_mask[r,sparse_index]=True
         query_weights.append(coverage*confidence); key_times.append(key_time); coverages.append(coverage); confidences.append(confidence); motions.append(motion)
         m=motion/16.; buckets.append(0 if m<.5 else 1 if m<1.5 else 2 if m<3 else 3)
     wrong_query_rays=wrong_key_rays=None

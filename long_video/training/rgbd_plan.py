@@ -229,18 +229,31 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
     target_mask=torch.zeros_like(target_values,dtype=torch.bool)
     legal_mask=torch.zeros((len(selected),len(sparse)),dtype=torch.bool,device=device)
     query_indices=torch.as_tensor([entry[0] for entry in selected],dtype=torch.long,device=device)
+    target_index_rows=[]; target_value_rows=[]
+    legal_by_time={}
+    for key_time in involved_times:
+        legal_by_time[key_time]=[sparse_set[full_index] for full_index in current_indices_by_time.get(key_time,()) if full_index in sparse_set]
+    legal_row_indices=[]; legal_column_indices=[]
     query_weights=[]; key_times=[]; coverages=[]; confidences=[]; motions=[]; buckets=[]
     for r,entry in enumerate(selected):
         _,key_time,target,coverage,confidence,motion=entry
         total=sum(target.values())
+        index_row=[]; value_row=[]
         for p,(full_index,value) in enumerate(sorted(target.items())):
-            target_indices[r,p]=sparse_set[full_index]; target_values[r,p]=float(value)/max(total,1e-12); target_mask[r,p]=True
-        for full_index in current_indices_by_time.get(key_time,()):
-            sparse_index=sparse_set.get(full_index)
-            if sparse_index is not None:
-                legal_mask[r,sparse_index]=True
+            index_row.append(sparse_set[full_index]); value_row.append(float(value)/max(total,1e-12))
+        target_index_rows.append(index_row+[-1]*(max_support-len(index_row)))
+        target_value_rows.append(value_row+[0.0]*(max_support-len(value_row)))
+        target_times=legal_by_time.get(key_time,())
+        legal_row_indices.extend([r]*len(target_times)); legal_column_indices.extend(target_times)
         query_weights.append(coverage*confidence); key_times.append(key_time); coverages.append(coverage); confidences.append(confidence); motions.append(motion)
         m=motion/16.; buckets.append(0 if m<.5 else 1 if m<1.5 else 2 if m<3 else 3)
+    # Fill each sparse plan tensor with one device-side indexed write instead
+    # of launching one CUDA assignment per target/key token.
+    target_indices.copy_(torch.as_tensor(target_index_rows,dtype=torch.long,device=device))
+    target_values.copy_(torch.as_tensor(target_value_rows,dtype=torch.float32,device=device))
+    target_mask.copy_(target_indices.ge(0))
+    if legal_row_indices:
+        legal_mask[torch.as_tensor(legal_row_indices,dtype=torch.long,device=device),torch.as_tensor(legal_column_indices,dtype=torch.long,device=device)]=True
     wrong_query_rays=wrong_key_rays=None
     separation_values=None
     if c2w is not None and intrinsics is not None:

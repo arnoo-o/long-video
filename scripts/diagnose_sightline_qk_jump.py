@@ -31,7 +31,7 @@ from long_video.training.sightline_data import (
 from scripts.train_sightline_rgbd import _lr_multiplier, _model_prediction, _prompt, _set_gradient_checkpointing
 
 
-PROMPT = "A stable realistic view of the same scene."
+PROMPT = "A realistic video of the same scene."
 NUMERIC_FIELDS = (
     "proj_q_rms_before_norm", "proj_k_rms_before_norm", "delta_q_rms",
     "delta_k_rms", "delta_q_over_q_native", "delta_k_over_k_native",

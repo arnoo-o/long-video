@@ -9,10 +9,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from .bounded_ops import DEFAULT_TOKEN_TILE, token_blocked_sightline_geometry_project
-
-
-GEOMETRY_RMS_EPSILON = 0.05 ** 2
+from .bounded_ops import DEFAULT_TOKEN_TILE, GEOMETRY_RMS_EPSILON, token_blocked_sightline_geometry_project
 MAX_DIAGNOSTIC_QUANTILE_VALUES = 262_144
 
 
@@ -25,7 +22,7 @@ def _bounded_quantile_sample(values: torch.Tensor) -> torch.Tensor:
 
 
 def soft_rms(value: torch.Tensor) -> torch.Tensor:
-    return value / torch.sqrt(value.float().square().mean(dim=-1, keepdim=True) + 0.05 ** 2)
+    return value / torch.sqrt(value.float().square().mean(dim=-1, keepdim=True) + GEOMETRY_RMS_EPSILON)
 
 
 class SightlineConditioner(nn.Module):
@@ -93,7 +90,7 @@ class SightlineConditioner(nn.Module):
                 raw = (self.q_proj if kind == 'q' else self.k_proj)(
                     rays.reshape(-1, 7).to(self.q_proj.weight.dtype)).float()
                 raw_rms = raw.square().mean(-1).sqrt()
-                gain = raw_rms / torch.sqrt(raw_rms.square() + 0.05 ** 2)
+                gain = raw_rms / torch.sqrt(raw_rms.square() + GEOMETRY_RMS_EPSILON)
                 sample = _bounded_quantile_sample(gain)
                 self.last_pre_norm_rms[kind] = float(raw_rms.mean())
                 self.last_soft_gain[kind] = {

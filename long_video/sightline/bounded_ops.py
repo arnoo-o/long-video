@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 
 DEFAULT_TOKEN_TILE = 512
-GEOMETRY_RMS_EPSILON = 0.05 ** 2
+GEOMETRY_RMS_EPSILON = 0.005 ** 2
 
 
 def token_blocked_sightline_geometry_project(rays, projection, beta, *,
@@ -35,7 +35,7 @@ def token_blocked_sightline_geometry_project(rays, projection, beta, *,
     for start in range(0, flat.shape[0], int(token_tile)):
         stop = min(flat.shape[0], start + int(token_tile))
         raw = torch.nn.functional.linear(flat[start:stop].float(), projection.weight.float())
-        normalized = raw / torch.sqrt(raw.square().mean(dim=-1, keepdim=True) + 0.05 ** 2)
+        normalized = raw / torch.sqrt(raw.square().mean(dim=-1, keepdim=True) + GEOMETRY_RMS_EPSILON)
         pieces.append(0.5 * beta.float().sigmoid() * flat_rms[start:stop] * normalized)
     return torch.cat(pieces, dim=0).to(rays.dtype).reshape(*rays.shape[:-1], projection.weight.shape[0])
 

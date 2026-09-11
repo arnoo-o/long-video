@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import math
 import numpy as np
 import torch
-from ..sightline.rays import token_rays_for_shape
+from ..sightline.rays import latent_camera_indices, token_rays_for_shape
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,8 @@ class RGBDSoftTargetPlan:
     motion_px: torch.Tensor
     motion_stage2: torch.Tensor
     bucket: torch.Tensor
+    bucket_selected_counts: tuple = ()
+    bucket_motion_stats: tuple = ()
     wrong_query_rays: torch.Tensor|None = None
     wrong_key_rays: torch.Tensor|None = None
     separation_px: torch.Tensor|None = None
@@ -129,7 +131,8 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
                                 device=None, source_height: int = 512,
                                 source_width: int = 832,
                                 legacy_token_shape: tuple[int,int,int] | None = (9,32,52),
-                                c2w: torch.Tensor|None = None, intrinsics: torch.Tensor|None = None):
+                                c2w: torch.Tensor|None = None, intrinsics: torch.Tensor|None = None,
+                                near_depth: float|None = None):
     """Build a target distribution for one real ``(T,H,W)`` Helios grid.
 
     The plan owns a sparse K axis containing all spatial K tokens for the
@@ -164,7 +167,8 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         qu=_pixel(row,'query_u','query_x',source_width/legacy_w)
         kv=float(row.get('key_v_cont',_pixel(row,'key_v','key_y',source_height/legacy_h)))
         ku=float(row.get('key_u_cont',_pixel(row,'key_u','key_x',source_width/legacy_w)))
-        if not (np.isfinite((qu,qv,ku,kv)).all() and 0<=qv<480 and 0<=qu<source_width and 0<=kv<480 and 0<=ku<source_width):
+        query_depth=float(row.get('query_depth',float('nan')))
+        if not (np.isfinite((qu,qv,ku,kv,query_depth)).all() and query_depth>0 and 0<=qv<480 and 0<=qu<source_width and 0<=kv<480 and 0<=ku<source_width):
             continue
         qx=int(math.floor((qu+0.5)*W/source_width)); qy=int(math.floor((qv+0.5)*H/source_height))
         if not (0<=qx<W and 0<=qy<H): continue
@@ -179,8 +183,9 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         splats=((y0,x0,(1-dy)*(1-dx)),(y0,x0+1,(1-dy)*dx),(y0+1,x0,dy*(1-dx)),(y0+1,x0+1,dy*dx))
         stage_field={8:'query_valid_depth_count_stage0',16:'query_valid_depth_count_stage1',32:'query_valid_depth_count_stage2'}.get(H)
         valid_depth_value=row.get(stage_field,row.get('query_valid_depth_count',row.get('valid_depth_count',1.0))) if stage_field else row.get('query_valid_depth_count',row.get('valid_depth_count',1.0))
-        bucket=grouped.setdefault((q_index,global_k),{'target':{},'confidence':[],'pixel_count':0,'valid_depth':float(valid_depth_value),'motion':[]})
+        bucket=grouped.setdefault((q_index,global_k),{'target':{},'confidence':[],'pixel_count':0,'valid_depth':float(valid_depth_value),'motion':[],'points':[]})
         bucket['pixel_count']+=1; bucket['confidence'].append(confidence); bucket['motion'].append(math.hypot(ku-qu,kv-qv))
+        bucket['points'].append((qu,qv,query_depth,confidence))
         for yy,xx,weight in splats:
             if weight<=0 or not (0<=yy<H and 0<=xx<W): continue
             key_index=full_by_identity.get((global_k,yy,xx))
@@ -204,16 +209,28 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         m=entry[5]/16.0
         index=0 if m<.5 else 1 if m<1.5 else 2 if m<3 else 3
         bucketed[index].append(entry)
+    generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed)&((1<<63)-1))
     selected=[]
     for values in bucketed:
-        selected.extend(values[:256])
+        order=torch.randperm(len(values),generator=generator).tolist()
+        selected.extend(values[i] for i in order[:min(256,len(values))])
     if len(selected)<min(max_rows,len(entries)):
         chosen={id(x) for x in selected}; remaining=[x for x in entries if id(x) not in chosen]
-        generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed)&((1<<63)-1))
         order=torch.randperm(len(remaining),generator=generator).tolist()
         selected.extend(remaining[i] for i in order[:max_rows-len(selected)])
     selected=selected[:max_rows]
     selected.sort(key=lambda x:(x[0],x[1]))
+    bucket_selected_counts=tuple(sum(1 for entry in selected if (0 if entry[5]/16.0<.5 else 1 if entry[5]/16.0<1.5 else 2 if entry[5]/16.0<3 else 3)==bucket_index) for bucket_index in range(4))
+    bucket_motion_stats=[]
+    for bucket_index in range(4):
+        values=[float(entry[5]) for entry in selected if (0 if entry[5]/16.0<.5 else 1 if entry[5]/16.0<1.5 else 2 if entry[5]/16.0<3 else 3)==bucket_index]
+        ordered=sorted(values)
+        bucket_motion_stats.append({
+            'selected_count':len(values),
+            'motion_px_mean':float(np.mean(values)) if values else 0.0,
+            'motion_px_p50':float(np.quantile(ordered,.5)) if values else 0.0,
+            'motion_px_p90':float(np.quantile(ordered,.9)) if values else 0.0,
+        })
     # RGB-D prefix captures every spatial K token for each involved key time;
     # target support itself may be small, but the probability normalizer must
     # see the complete legal same-time spatial axis.
@@ -257,6 +274,7 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
     wrong_query_rays=wrong_key_rays=None
     separation_values=None
     if c2w is not None and intrinsics is not None:
+        camera_indices=latent_camera_indices().tolist()
         poses=c2w if c2w.ndim==4 else c2w.unsqueeze(0)
         Ks=intrinsics if intrinsics.ndim==4 else intrinsics.unsqueeze(0)
         delta=torch.linalg.inv(poses[:,:1])@poses
@@ -274,25 +292,39 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         wrong_query_rays=torch.stack(q_values,1).detach() if q_values else None
         wrong_key_rays=torch.stack(k_values,1).detach() if k_values else None
         separation=[]
+        pose_inverse=torch.linalg.inv(poses)
+        wrong_pose_inverse=torch.linalg.inv(wrong_poses)
+        depth_scale=1.0 if near_depth is None else 1.0/float(near_depth)
         for entry in selected:
             identity=identities[int(entry[0])]; qt=int(identity[1][0])-int(chunk)*8; kt=int(entry[1])-int(chunk)*8
-            u=(float(identity[3])+0.5)*source_width/W-0.5; v=(float(identity[2])+0.5)*source_height/H-0.5
-            pix=torch.tensor([u,v,1.0],device=poses.device,dtype=poses.dtype).view(1,3,1).expand(poses.shape[0],-1,-1)
-            xq=torch.linalg.solve(Ks[:,qt*4],pix).squeeze(-1)
-            world=(poses[:,qt*4,:3,:3]@xq.unsqueeze(-1)).squeeze(-1)+poses[:,qt*4,:3,3]
-            correct=(torch.linalg.inv(poses[:,kt*4])[:,:3,:3]@world.unsqueeze(-1)).squeeze(-1)+torch.linalg.inv(poses[:,kt*4])[:,:3,3]
-            wrong=(torch.linalg.inv(wrong_poses[:,kt*4])[:,:3,:3]@((wrong_poses[:,qt*4,:3,:3]@xq.unsqueeze(-1)).squeeze(-1)+wrong_poses[:,qt*4,:3,3]).unsqueeze(-1)).squeeze(-1)+torch.linalg.inv(wrong_poses[:,kt*4])[:,:3,3]
-            uv_correct=(Ks[:,kt*4]@correct.unsqueeze(-1)).squeeze(-1); uv_correct=uv_correct[:,:2]/uv_correct[:,2:].clamp_min(1e-12)
-            uv_wrong=(Ks[:,kt*4]@wrong.unsqueeze(-1)).squeeze(-1); valid=wrong[:,2]>0
-            uv_wrong=uv_wrong[:,:2]/uv_wrong[:,2:].clamp_min(1e-12)
-            sep=torch.where(valid,torch.linalg.vector_norm(uv_wrong-uv_correct,dim=-1),torch.full_like(valid.float(),float('inf')))
-            separation.append(sep.mean())
+            q_camera=int(camera_indices[qt]); k_camera=int(camera_indices[kt])
+            point_values=grouped[(int(entry[0]),int(entry[1]))].get('points',())
+            point_separations=[]; point_weights=[]
+            for u,v,depth,confidence in point_values:
+                pix=torch.tensor([float(u),float(v),1.0],device=poses.device,dtype=poses.dtype).view(1,3,1).expand(poses.shape[0],-1,-1)
+                xq=(float(depth)*depth_scale)*torch.linalg.solve(Ks[:,q_camera],pix).squeeze(-1)
+                world=(poses[:,q_camera,:3,:3]@xq.unsqueeze(-1)).squeeze(-1)+poses[:,q_camera,:3,3]
+                correct=(pose_inverse[:,k_camera,:3,:3]@world.unsqueeze(-1)).squeeze(-1)+pose_inverse[:,k_camera,:3,3]
+                wrong_world=(wrong_poses[:,q_camera,:3,:3]@xq.unsqueeze(-1)).squeeze(-1)+wrong_poses[:,q_camera,:3,3]
+                wrong=(wrong_pose_inverse[:,k_camera,:3,:3]@wrong_world.unsqueeze(-1)).squeeze(-1)+wrong_pose_inverse[:,k_camera,:3,3]
+                uv_correct=(Ks[:,k_camera]@correct.unsqueeze(-1)).squeeze(-1); uv_correct=uv_correct[:,:2]/uv_correct[:,2:].clamp_min(1e-12)
+                uv_wrong=(Ks[:,k_camera]@wrong.unsqueeze(-1)).squeeze(-1); uv_wrong=uv_wrong[:,:2]/uv_wrong[:,2:].clamp_min(1e-12)
+                distance=torch.linalg.vector_norm(uv_wrong-uv_correct,dim=-1)
+                distance=torch.where((correct[:,2]>0)&(wrong[:,2]>0),distance,torch.full_like(distance,float('inf')))
+                point_separations.append(distance); point_weights.append(float(confidence))
+            if point_separations:
+                distances=torch.stack(point_separations,dim=1)
+                weights_tensor=torch.as_tensor(point_weights,device=poses.device,dtype=poses.dtype).view(1,-1)
+                finite=bool(torch.isfinite(distances).all())
+                separation.append((distances*weights_tensor).sum(1)/weights_tensor.sum().clamp_min(1e-12) if finite else torch.full((poses.shape[0],),float('inf'),device=poses.device,dtype=poses.dtype))
+            else:
+                separation.append(torch.zeros((poses.shape[0],),device=poses.device,dtype=poses.dtype))
         separation_values=torch.stack(separation).detach() if separation else None
     return RGBDSoftTargetPlan(
         query_indices,torch.as_tensor(sparse,dtype=torch.long,device=device),target_indices,target_values,target_mask,legal_mask,
         torch.as_tensor(query_weights,dtype=torch.float32,device=device),torch.as_tensor(key_times,dtype=torch.long,device=device),
         torch.as_tensor(coverages,dtype=torch.float32,device=device),torch.as_tensor(confidences,dtype=torch.float32,device=device),
-        tuple(identities),tuple(map(int,stage_shape)),int(input_count),len(selected),torch.as_tensor(motions,dtype=torch.float32,device=device),torch.as_tensor(motions,dtype=torch.float32,device=device)/16.,torch.as_tensor(buckets,dtype=torch.long,device=device),wrong_query_rays,wrong_key_rays,separation_values.to(device) if separation_values is not None and device is not None else separation_values)
+        tuple(identities),tuple(map(int,stage_shape)),int(input_count),len(selected),torch.as_tensor(motions,dtype=torch.float32,device=device),torch.as_tensor(motions,dtype=torch.float32,device=device)/16.,torch.as_tensor(buckets,dtype=torch.long,device=device),bucket_selected_counts,tuple(bucket_motion_stats),wrong_query_rays,wrong_key_rays,separation_values.to(device) if separation_values is not None and device is not None else separation_values)
 
 
 __all__=['RGBDSoftTargetPlan','build_rgbd_soft_target_plan']

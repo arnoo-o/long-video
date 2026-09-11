@@ -7,7 +7,7 @@ import torch
 # Freezing the complete Helios backbone changes the optimizer scope and is a
 # distinct training contract.  Keep old modulation/norm checkpoints from
 # being resumed silently under the new optimizer layout.
-SEMANTICS='sightline-v11-layers0-11-helios-frozen-rgbd-aux-offepipolar-no-scale'; SCHEMA='sightline-checkpoint-v21'
+SEMANTICS='sightline-v13-stage012-rgbd-soft-probability-rms005-wrongdepth-randbucket'; SCHEMA='sightline-checkpoint-v21'
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)

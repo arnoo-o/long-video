@@ -160,18 +160,45 @@ def test_streaming_rgbd_ranking_matches_dense_reference_with_confidence_and_upst
     assert torch.allclose(k.grad, dense_grad[1], atol=3e-6, rtol=3e-6)
 
 
-def test_training_source_uses_only_rgbd_stage1_and_stage2():
+def test_training_source_uses_all_rgbd_stages_with_fixed_auxiliary_scales():
     source = (Path(__file__).parents[1] / 'scripts' / 'train_sightline_rgbd.py').read_text()
     config = (Path(__file__).parents[1] / 'configs' / 'sightline.yaml').read_text()
-    assert "for rgbd_stage_index in (1,2)" in source
+    assert "for rgbd_stage_index in (0,1,2)" in source
     assert "stage_rgbd_plan=rgbd_plans.get(stage_index)" in source
     assert "rgbd_stage_index=max(" not in source
-    assert "lambda_rgbd: 0.01" in config
+    assert "lambda_rgbd: 0.02" in config
     assert "scale_augmentation_probability: 0.0" in config
-    assert "rgbd_stage1_negative_key_t_match" in source
+    assert "rgbd_stage0_loss" in source
+    assert "rgbd_stage0_mapping_output_count" in source
+    assert "rgbd_stage0_negative_key_t_match" in source
     assert "rgbd_stage2_negative_key_t_match" in source
     assert "rgbd_scale_sum" not in source
     assert "1.0/len(valid_rgbd_stages)" in source
+    assert "rgbd_aux_scales=(0.25,0.5,1.0)" in source
+    assert "local_scale=float(item['geometry_sigma_scale']" not in source
+
+
+def test_wrong_camera_separation_uses_real_query_depth():
+    from long_video.training.rgbd_plan import build_rgbd_soft_target_plan
+    identities=tuple(
+        ('current',(time,),y,x,'current')
+        for time in range(9) for y in range(2) for x in range(2)
+    )
+    rows=lambda depth: [{
+        'query_chunk':0,'query_t':2,'key_chunk':0,'key_t':1,
+        'query_u':100.0,'query_v':100.0,'query_depth':depth,
+        'key_u_cont':100.0,'key_v_cont':100.0,'confidence':1.0,
+        'query_valid_depth_count_stage0':1.0,
+    }]
+    c2w=torch.eye(4).repeat(1,33,1,1)
+    c2w[:,4,0,3]=0.2
+    intrinsics=torch.eye(3).repeat(1,33,1,1)
+    intrinsics[:,:,0,0]=100.0; intrinsics[:,:,1,1]=100.0
+    intrinsics[:,:,0,2]=416.0; intrinsics[:,:,1,2]=256.0
+    p1=build_rgbd_soft_target_plan(rows(1.0),identities,(9,2,2),chunk=0,device=torch.device('cpu'),c2w=c2w,intrinsics=intrinsics)
+    p2=build_rgbd_soft_target_plan(rows(2.0),identities,(9,2,2),chunk=0,device=torch.device('cpu'),c2w=c2w,intrinsics=intrinsics)
+    assert p1 is not None and p2 is not None
+    assert float(p1.separation_px[0]) > float(p2.separation_px[0]) * 1.5
 
 
 def test_total_metric_contains_all_fm_stages_without_a_second_backward_path():

@@ -151,7 +151,7 @@ CUDA_VISIBLE_DEVICES="$release_gpu" \
   --intrinsics "$record_intrinsics" \
   --c2w "$record_c2w" \
   --near-depth "$record_near_depth" \
-  --prompt "A stable realistic view of the same scene." \
+  --prompt "A realistic video of the same scene." \
   --chunks "$inference_chunks" \
   --steps 2 \
   > "$inference_log" 2>&1

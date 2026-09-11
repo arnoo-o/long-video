@@ -1,6 +1,6 @@
 """Geometry-free Sightline inference using the pinned Helios pipeline."""
 from __future__ import annotations
-import argparse, hashlib, json, sys
+import argparse, hashlib, json, random, re, sys
 from dataclasses import asdict
 from pathlib import Path
 import numpy as np
@@ -30,11 +30,20 @@ def resize_source(image, K, height=384, width=640):
     return image,K
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--disable-memory',action='store_true'); p.add_argument('--sightline-residual-scale',type=float,default=1.0); p.add_argument('--near-depth',type=float,help='Metric trajectory near-depth in metres.'); p.add_argument('--trajectory-near-depth-normalized',action='store_true',help='Declare input c2w/controls translations are already near-depth normalized.'); p.add_argument('--boundary-off-from-chunk',type=int); p.add_argument('--prompt',default=''); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int); p.add_argument('--layers',default=''); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--source',required=True); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--out',required=True); p.add_argument('--helios-root',required=True); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--checkpoint'); p.add_argument('--checkpoint-step',type=int); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--disable-memory',action='store_true'); p.add_argument('--sightline-residual-scale',type=float,default=1.0); p.add_argument('--near-depth',type=float,help='Metric trajectory near-depth in metres.'); p.add_argument('--trajectory-near-depth-normalized',action='store_true',help='Declare input c2w/controls translations are already near-depth normalized.'); p.add_argument('--boundary-off-from-chunk',type=int); p.add_argument('--prompt',default='A realistic video of the same scene.'); p.add_argument('--negative-prompt',default=''); p.add_argument('--intrinsics',required=True); p.add_argument('--c2w'); p.add_argument('--controls'); p.add_argument('--chunks',type=int,default=6); p.add_argument('--steps',type=int); p.add_argument('--layers',default=''); p.add_argument('--camera-mode',choices=('correct','wrong_reversed','geometry_off'),default='correct'); p.add_argument('--seed',type=int,default=0); a=p.parse_args()
     if not 1<=a.chunks<=6: raise ValueError('--chunks must be 1..6')
     if bool(a.c2w)==bool(a.controls): raise ValueError('provide exactly one of --c2w or --controls')
     if bool(a.checkpoint)==bool(a.alpha_zero_baseline): raise ValueError('provide --checkpoint, or explicitly select --alpha-zero-baseline')
     if bool(a.near_depth is not None)==bool(a.trajectory_near_depth_normalized): raise ValueError('provide exactly one of --near-depth (metres) or --trajectory-near-depth-normalized')
+    checkpoint_step=a.checkpoint_step
+    if checkpoint_step is None and a.checkpoint:
+        match=re.search(r'checkpoint-(\d+)',str(a.checkpoint))
+        checkpoint_step=int(match.group(1)) if match else None
+    if checkpoint_step is not None and checkpoint_step<300:
+        if a.chunks!=1: raise ValueError('checkpoints before step 300 must be tested with exactly one chunk')
+        a.disable_memory=True
+    random.seed(int(a.seed)); np.random.seed(int(a.seed)%(2**32-1)); torch.manual_seed(int(a.seed))
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(int(a.seed))
     sys.path.insert(0,a.helios_root)
     from long_video.config import load_sightline_config
     from long_video.training.sightline import SightlineTrainable, install_lora, configure_geometry_zero_baseline, set_initialization_seed
@@ -63,6 +72,8 @@ def main():
     needed=1+a.chunks*32
     if c2w.shape[0] < needed: c2w=np.concatenate((c2w,np.repeat(c2w[-1:],needed-c2w.shape[0],0)),0)
     c2w=c2w[:needed]
+    if a.camera_mode=='wrong_reversed':
+        c2w=np.flip(c2w,axis=0).copy()
     near_depth=1.0 if a.trajectory_near_depth_normalized else float(a.near_depth)
     if not np.isfinite(near_depth) or near_depth <= 0: raise ValueError('--near-depth must be finite and positive metres')
     c2w=canonicalize_c2w(torch.from_numpy(c2w[None]),near_depth).to('cuda',dtype=torch.float32)
@@ -95,9 +106,9 @@ def main():
     else:
         configure_geometry_zero_baseline(trainable,runner.memory,pipe.transformer)
     memory_enabled=configure_inference_memory(runner,a.alpha_zero_baseline or a.disable_memory)
-    residual_scale=configure_sightline_residual_scale(pipe.transformer,a.sightline_residual_scale)
+    residual_scale=configure_sightline_residual_scale(pipe.transformer,0.0 if a.camera_mode=='geometry_off' else a.sightline_residual_scale)
     trainable.eval(); conditioner.eval()
     runner.assert_geometry_free_imports()
     result=runner.generate(prompt=a.prompt,negative_prompt=a.negative_prompt,image=image,height=cfg.source_height,width=cfg.source_width,num_frames=1+a.chunks*32,steps=a.steps,c2w=c2w,intrinsics=K,boundary_off_from_chunk=a.boundary_off_from_chunk)
-    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'memory_enabled':memory_enabled,'sightline_residual_scale':residual_scale,'near_depth':near_depth,'trajectory_near_depth_normalized':bool(a.trajectory_near_depth_normalized),'geometry_routing':'sigma_smoothstep_0p6','boundary_off_from_chunk':a.boundary_off_from_chunk,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
+    frames=np.asarray(getattr(result,'frames',result)); output=Path(a.out).with_suffix('.npy'); output.parent.mkdir(parents=True,exist_ok=True); np.save(output,frames); print(json.dumps({'pipeline':'sightline_helios','chunks':a.chunks,'layers':layers,'memory_enabled':memory_enabled,'sightline_residual_scale':residual_scale,'camera_mode':a.camera_mode,'seed':int(a.seed),'checkpoint_step':checkpoint_step,'near_depth':near_depth,'trajectory_near_depth_normalized':bool(a.trajectory_near_depth_normalized),'geometry_routing':'sigma_smoothstep_0p6','boundary_off_from_chunk':a.boundary_off_from_chunk,'helios_source_fingerprint':source_fingerprint,'frames':int(frames.shape[1] if frames.ndim>1 else len(frames)),'out':str(output)}))
 if __name__=='__main__': main()

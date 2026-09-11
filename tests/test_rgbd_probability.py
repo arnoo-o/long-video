@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from long_video.training.rgbd_probability import rgbd_probability_score, rgbd_probability_row_scores_multi
+from long_video.training.rgbd_probability import rgbd_probability_score, rgbd_probability_row_scores_multi, rgbd_log_mass_rows
 
 
 def _dense_score(native_q, native_k, dq, dk, target_indices, target_weights,
@@ -105,4 +105,62 @@ def test_streaming_probability_bf16_matches_dense_reference_on_cuda():
     mask=indices.ge(0); legal=torch.ones(rows,keys,device=device,dtype=torch.bool)
     dense=_dense_score(native_q,native_k,dq.detach().clone().requires_grad_(True),dk.detach().clone().requires_grad_(True),indices,weights,mask,legal,.8,torch.ones(rows,device=device))
     streamed=rgbd_probability_score(native_q,native_k,dq,dk,indices,weights,mask,legal,.8,torch.ones(rows,device=device))
+    assert torch.allclose(streamed.float(),dense.float(),atol=2e-2,rtol=2e-2)
+
+
+def _dense_log_mass(native_q,native_k,dq,dk,indices,weights,mask,legal,local_scale):
+    b,rows,heads,dim=native_q.shape
+    q=native_q.detach()+local_scale*dq; k=native_k.detach()+local_scale*dk
+    logits=torch.einsum('brhd,bkhd->brhk',q,k)*dim**-0.5
+    legal_b=legal.unsqueeze(0).unsqueeze(2)
+    probs=torch.softmax(logits.masked_fill(~legal_b,-torch.inf),dim=-1)
+    target=torch.zeros(b,rows,k.shape[1],device=q.device,dtype=torch.float32)
+    safe=indices.clamp_min(0)
+    valid=mask&indices.ge(0)&weights.gt(0)
+    for batch in range(b):
+        for row in range(rows):
+            row_legal=legal[row,safe[row]]
+            row_valid=valid[row]&row_legal
+            target[batch,row].index_add_(0,safe[row,row_valid],weights[row,row_valid].float())
+    target=target/target.sum(-1,keepdim=True).clamp_min(1e-12)
+    mass=(probs*target.unsqueeze(2)).sum(-1).mean(2)
+    return mass.clamp_min(1e-12).log().mean(0)
+
+
+def test_streaming_log_mass_matches_dense_forward_and_qk_gradients():
+    torch.manual_seed(4401)
+    b,rows,heads,dim,keys=2,6,3,5,19
+    native_q=torch.randn(b,rows,heads,dim)
+    native_k=torch.randn(b,keys,heads,dim)
+    indices=torch.tensor([[1,2,2,7,8,9],[3,4,5,-1,-1,-1],[6,7,8,9,10,-1],[11,12,-1,-1,-1,-1],[13,14,15,16,-1,-1],[17,18,1,1,-1,-1]])
+    weights=torch.tensor([[.2,.4,.9,.1,.3,.2],[1.7,.3,.8,0.,0.,0.],[.5,2.,.1,.4,.2,0.],[.1,.2,0.,0.,0.,0.],[.1,.2,.3,.4,0.,0.],[.6,.4,.2,.1,0.,0.]])
+    mask=indices.ge(0)
+    legal=torch.ones(rows,keys,dtype=torch.bool)
+    legal[1,0:2]=False; legal[2,0:5]=False; legal[4,18]=False
+    scale=.73
+    dq=torch.randn_like(native_q,requires_grad=True); dk=torch.randn_like(native_k,requires_grad=True)
+    ref_q=dq.detach().clone().requires_grad_(True); ref_k=dk.detach().clone().requires_grad_(True)
+    dense=_dense_log_mass(native_q,native_k,ref_q,ref_k,indices,weights,mask,legal,scale)
+    streamed=rgbd_log_mass_rows(native_q,native_k,dq,dk,indices,weights,mask,legal,scale)
+    upstream=.37
+    dense_grad=torch.autograd.grad(upstream*dense.sum(),(ref_q,ref_k),retain_graph=True)
+    (upstream*streamed.sum()).backward()
+    assert torch.allclose(streamed,dense,atol=3e-6,rtol=3e-6)
+    assert torch.allclose(dq.grad,dense_grad[0],atol=8e-6,rtol=8e-6)
+    assert torch.allclose(dk.grad,dense_grad[1],atol=8e-6,rtol=8e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable')
+def test_streaming_log_mass_bf16_cuda_matches_dense():
+    torch.manual_seed(4402)
+    device=torch.device('cuda'); b,rows,heads,dim,keys=2,4,2,8,13
+    native_q=torch.randn(b,rows,heads,dim,device=device,dtype=torch.bfloat16)
+    native_k=torch.randn(b,keys,heads,dim,device=device,dtype=torch.bfloat16)
+    indices=torch.tensor([[1,2,2,3],[4,5,6,-1],[7,8,-1,-1],[9,10,11,12]],device=device)
+    weights=torch.tensor([[.2,.4,.9,.1],[1.7,.3,.8,0.],[.5,2.,0.,0.],[.1,.2,.3,.4]],device=device)
+    mask=indices.ge(0); legal=torch.ones(rows,keys,device=device,dtype=torch.bool); legal[1,0:2]=False; legal[2,0:3]=False
+    dq=torch.randn_like(native_q,requires_grad=True); dk=torch.randn_like(native_k,requires_grad=True)
+    ref_q=dq.detach().clone().requires_grad_(True); ref_k=dk.detach().clone().requires_grad_(True)
+    dense=_dense_log_mass(native_q,native_k,ref_q,ref_k,indices,weights,mask,legal,.8)
+    streamed=rgbd_log_mass_rows(native_q,native_k,dq,dk,indices,weights,mask,legal,.8)
     assert torch.allclose(streamed.float(),dense.float(),atol=2e-2,rtol=2e-2)

@@ -382,6 +382,95 @@ def rgbd_probability_row_scores_multi(native_q,native_k,dq,dk,target_indices,tar
     return StreamingRGBDProbabilityScores.apply(native_q,native_k,dq,dk,target_indices,target_weights,target_mask,legal_mask,scales)
 
 
+class StreamingRGBDLogMass(Function):
+    """Streaming log mass of a soft RGB-D support over the real current K axis.
+
+    The native tensors are detached.  Only the sparse Geometry deltas receive
+    gradients, and both passes use bounded key blocks.  The target support is
+    gathered in support blocks, so this never constructs a query-by-all-keys
+    tensor (and in particular never includes history/Memory keys).
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def _target_weights(indices, weights, mask, legal, key_count):
+        safe=indices.to(device=legal.device,dtype=torch.long).clamp(0,max(key_count-1,0))
+        valid=mask.to(device=legal.device,dtype=torch.bool)&indices.ge(0).to(device=legal.device)&weights.gt(0).to(device=legal.device)
+        legal_target=legal.gather(2,safe.unsqueeze(0).expand(legal.shape[0],-1,-1))
+        values=weights.to(device=legal.device,dtype=torch.float32).unsqueeze(0).expand(legal.shape[0],-1,-1)
+        values=values*valid.unsqueeze(0).float()*legal_target.float()
+        return safe,values/values.sum(-1,keepdim=True).clamp_min(1e-12),valid.unsqueeze(0)&legal_target
+
+    @staticmethod
+    def forward(ctx,native_q,native_k,dq,dk,target_indices,target_weights,target_mask,legal_mask,local_scale):
+        batch,rows,heads,dim=native_q.shape
+        q0=native_q.detach().float(); k0=native_k.detach().float(); dq0=dq.float(); dk0=dk.float()
+        has_legal=legal_mask is not None and legal_mask.numel()!=0
+        score_rows=torch.zeros((rows,),device=dq.device,dtype=torch.float32)
+        scale=float(local_scale.detach().float().item())
+        for q0_index in range(0,rows,QUERY_BLOCK):
+            q1=min(rows,q0_index+QUERY_BLOCK); legal=_legal_block(legal_mask if has_legal else None,batch,q0_index,q1,k0.shape[1],dq.device)
+            q=q0[:,q0_index:q1]+scale*dq0[:,q0_index:q1]; k=k0+scale*dk0
+            logz=_log_normalizer_block(q,k,legal,dim**-0.5,KEY_BLOCK)
+            indices,values,valid=StreamingRGBDLogMass._target_weights(target_indices[q0_index:q1],target_weights[q0_index:q1],target_mask[q0_index:q1],legal,k0.shape[1])
+            mass_h=torch.zeros((batch,heads,q1-q0_index),device=dq.device,dtype=torch.float32)
+            for p0 in range(0,indices.shape[1],KEY_BLOCK):
+                p1=min(indices.shape[1],p0+KEY_BLOCK); safe=indices[:,p0:p1]
+                kt=k[:,safe.reshape(-1)].reshape(batch,q1-q0_index,p1-p0,heads,dim)
+                logits=torch.einsum('bqhd,bqphd->bhqp',q,kt).mul_(dim**-0.5)
+                probs=torch.exp(logits-logz.unsqueeze(-1)).masked_fill(~valid[:, :, p0:p1].unsqueeze(1),0.0)
+                mass_h.add_((probs*values[:, :, p0:p1].unsqueeze(1)).sum(-1))
+            score_rows[q0_index:q1]=mass_h.mean(1).clamp_min(1e-12).log().mean(0)
+        ctx.save_for_backward(native_q.detach(),native_k.detach(),dq,dk,target_indices,target_weights.float(),target_mask,
+                              legal_mask if has_legal else dq.new_empty(0,dtype=torch.bool))
+        ctx.local_scale=scale; ctx.query_block=QUERY_BLOCK; ctx.key_block=KEY_BLOCK
+        return score_rows
+
+    @staticmethod
+    def backward(ctx,grad_output):
+        native_q,native_k,dq,dk,target_indices,target_weights,target_mask,legal_mask=ctx.saved_tensors
+        batch,rows,heads,dim=native_q.shape; scale=dim**-0.5; local_scale=ctx.local_scale; has_legal=legal_mask.numel()!=0
+        q0=native_q.float(); k0=native_k.float(); dq0=dq.float(); dk0=dk.float()
+        grad_q=torch.zeros_like(q0); grad_k=torch.zeros_like(k0)
+        for q0_index in range(0,rows,ctx.query_block):
+            q1=min(rows,q0_index+ctx.query_block); legal=_legal_block(legal_mask if has_legal else None,batch,q0_index,q1,k0.shape[1],dq.device)
+            q=q0[:,q0_index:q1]+local_scale*dq0[:,q0_index:q1]; k=k0+local_scale*dk0
+            logz=_log_normalizer_block(q,k,legal,scale,ctx.key_block)
+            indices,values,valid=StreamingRGBDLogMass._target_weights(target_indices[q0_index:q1],target_weights[q0_index:q1],target_mask[q0_index:q1],legal,k0.shape[1])
+            mass_h=torch.zeros((batch,heads,q1-q0_index),device=dq.device,dtype=torch.float32)
+            for p0 in range(0,indices.shape[1],ctx.key_block):
+                p1=min(indices.shape[1],p0+ctx.key_block); safe=indices[:,p0:p1]
+                kt=k[:,safe.reshape(-1)].reshape(batch,q1-q0_index,p1-p0,heads,dim)
+                logits=torch.einsum('bqhd,bqphd->bhqp',q,kt).mul_(scale)
+                probs=torch.exp(logits-logz.unsqueeze(-1)).masked_fill(~valid[:, :, p0:p1].unsqueeze(1),0.0)
+                mass_h.add_((probs*values[:, :, p0:p1].unsqueeze(1)).sum(-1))
+            mass_bar=mass_h.mean(1).clamp_min(1e-12)
+            upstream=grad_output[q0_index:q1].to(device=dq.device,dtype=torch.float32).view(1,1,-1,1)/float(batch)
+            for start in range(0,k0.shape[1],ctx.key_block):
+                stop=min(k0.shape[1],start+ctx.key_block); key_count=stop-start
+                logits=torch.einsum('bqhd,bkhd->bhqk',q,k[:,start:stop]).mul_(scale)
+                valid_k=legal[:,:,start:stop].unsqueeze(1)
+                probs=torch.exp(logits-logz.unsqueeze(-1)).masked_fill(~valid_k,0.0)
+                rel=(target_indices[q0_index:q1]-start).clamp(0,max(key_count-1,0))
+                target_block=torch.zeros((batch,q1-q0_index,key_count),device=dq.device,dtype=torch.float32)
+                target_valid=valid&target_indices[q0_index:q1].ge(start).unsqueeze(0)&target_indices[q0_index:q1].lt(stop).unsqueeze(0)
+                target_block.scatter_add_(2,rel.unsqueeze(0).expand(batch,-1,-1),values.masked_fill(~target_valid,0.0))
+                dlogits=probs*(target_block.unsqueeze(1)-mass_h.unsqueeze(-1))/float(heads)
+                dlogits=dlogits/mass_bar.unsqueeze(1).unsqueeze(-1)
+                dlogits=dlogits*upstream
+                grad_q[:,q0_index:q1]+=torch.einsum('bhqk,bkhd->bqhd',dlogits,k[:,start:stop]).mul_(scale)
+                grad_k[:,start:stop]+=torch.einsum('bhqk,bqhd->bkhd',dlogits,q).mul_(scale)
+        return (None,None,(grad_q*local_scale).to(dq.dtype),(grad_k*local_scale).to(dk.dtype),None,None,None,None,None)
+
+
+def rgbd_log_mass_rows(native_q,native_k,dq,dk,target_indices,target_weights,target_mask,legal_mask,local_scale=1.0):
+    scale=torch.as_tensor(local_scale,device=dq.device,dtype=torch.float32)
+    return StreamingRGBDLogMass.apply(native_q,native_k,dq,dk,target_indices,target_weights,target_mask,legal_mask,scale)
+
+
 __all__ = ['StreamingRGBDProbabilityScore', 'rgbd_probability_score',
            'rgbd_probability_row_scores', 'rgbd_probability_row_scores_multi',
-           'StreamingRGBDProbabilityScores', 'attention_mask_to_legal_mask']
+           'StreamingRGBDProbabilityScores', 'StreamingRGBDLogMass',
+           'rgbd_log_mass_rows', 'attention_mask_to_legal_mask']

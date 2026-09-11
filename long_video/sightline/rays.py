@@ -71,6 +71,25 @@ def canonicalize_c2w(c2w: torch.Tensor, near_depth: torch.Tensor | float | None 
     return normalize_c2w_translation(torch.linalg.inv(c2w[:, :1]) @ c2w, near_depth)
 
 
+def anchored_inverse_c2w(c2w: torch.Tensor) -> torch.Tensor:
+    """Return the anchored inverse trajectory without changing frame zero.
+
+    ``c2w`` is already in the caller's canonical/near-depth convention.  The
+    helper intentionally performs no second normalization: it only inverts
+    motion relative to the first camera, preserving the anchor and all camera
+    intrinsics supplied by the caller.
+    """
+    squeeze = False
+    if c2w.ndim == 3:
+        c2w = c2w.unsqueeze(0)
+        squeeze = True
+    if c2w.ndim != 4 or c2w.shape[-2:] != (4, 4) or c2w.shape[1] < 1:
+        raise ValueError("c2w must be [B,T,4,4] or [T,4,4]")
+    delta = torch.linalg.inv(c2w[:, :1]) @ c2w
+    wrong = c2w[:, :1] @ torch.linalg.inv(delta)
+    return wrong[:, 0] if squeeze else wrong
+
+
 def normalize_c2w_translation(c2w: torch.Tensor, near_depth: torch.Tensor | float | None) -> torch.Tensor:
     if near_depth is None:
         return c2w

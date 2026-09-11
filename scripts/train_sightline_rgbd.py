@@ -20,13 +20,13 @@ from long_video.config import load_sightline_config
 from long_video.training.flow_matching_exact import exact_flow_matching_items
 from long_video.training.sightline import CorrespondencePlan, SightlineTrainable, install_lora, curriculum_phase, gt_prefix_probability, select_train_chunk, run_single_graph_chunks, run_causal_prefix_chunks, selected_qk_logits, set_initialization_seed, set_rank_runtime_seed, broadcast_and_assert_trainables, configure_geometry_zero_baseline, set_lora_enabled, prefix_chunk_should_capture_memory, correspondence_capture_for_stage
 from long_video.training.rgbd_plan import RGBDSoftTargetPlan, build_rgbd_soft_target_plan
-from long_video.training.rgbd_probability import rgbd_probability_score, rgbd_probability_row_scores, rgbd_probability_row_scores_multi
+from long_video.training.rgbd_probability import rgbd_probability_score, rgbd_probability_row_scores, rgbd_probability_row_scores_multi, rgbd_log_mass_rows
 from long_video.training.rgbd_memory_data import load_rgbd_memory_manifest
 from long_video.data.rgbd_memory import _depth as _load_processed_depth
 from long_video.training.sightline_data import load_latent_tensor, validate_latent_cache, require_overlap_validation, resolve_continuous_latent_cache, validate_rgbd_record_latent
 from long_video.training.sightline_checkpoint import save_runtime_checkpoint, restore_runtime_checkpoint, runtime_provenance, gather_rank_rng_states
 from long_video.sightline.helios_integration import SightlineRayProvider, install_sightline_attention
-from long_video.sightline.rays import canonicalize_c2w, latent_camera_indices
+from long_video.sightline.rays import anchored_inverse_c2w, canonicalize_c2w, latent_camera_indices
 from long_video.sightline.history import NativeHistoryState,native_helios_indices
 from long_video.sightline.pipeline import SightlinePipeline, prepare_source_condition
 from long_video.sightline.geometry import assert_latent_geometry, geometry_sigma_schedule, padded_size
@@ -841,6 +841,59 @@ def _captured_rgbd_legal_mask(processor,plan,capture_indices,capture_key_indices
     if kpos.numel() and (kpos.max()>=kaxis.numel() or not torch.equal(kaxis.index_select(0,kpos),kwanted)): raise RuntimeError('RGB-D legal mask is missing a selected key')
     return plan.legal_mask & legal.index_select(1,qpos).index_select(2,kpos)
 
+def _captured_legal_mask(processor,wanted_queries,capture_indices,capture_key_indices,device):
+    """Select the exact dispatch legal mask for a different RGB-D query set."""
+    legal=getattr(processor,'last_rgbd_legal_mask',None)
+    if legal is None:
+        return torch.ones((1,wanted_queries.numel(),torch.as_tensor(capture_key_indices).numel()),device=device,dtype=torch.bool)
+    qaxis=torch.as_tensor(capture_indices,device=legal.device,dtype=torch.long)
+    kaxis=torch.as_tensor(capture_key_indices,device=legal.device,dtype=torch.long)
+    wanted_queries=wanted_queries.to(legal.device,dtype=torch.long)
+    qpos=torch.searchsorted(qaxis,wanted_queries); kpos=torch.arange(kaxis.numel(),device=legal.device)
+    if qpos.numel() and (qpos.max()>=qaxis.numel() or not torch.equal(qaxis.index_select(0,qpos),wanted_queries)):
+        raise RuntimeError('RGB-D legal mask is missing a spacetime query')
+    return legal.index_select(1,qpos).index_select(2,kpos)
+
+def _select_captured_axis(captured,axis,wanted):
+    if captured is None: raise RuntimeError('missing sparse capture tensor')
+    axis=torch.as_tensor(axis,device=captured.device,dtype=torch.long)
+    wanted=torch.as_tensor(wanted,device=captured.device,dtype=torch.long)
+    if wanted.numel()==0: return captured[:, :0]
+    positions=torch.searchsorted(axis,wanted)
+    if torch.any(positions>=axis.numel()) or not torch.equal(axis.index_select(0,positions.clamp_max(axis.numel()-1)),wanted):
+        raise RuntimeError('requested sparse capture axis is incomplete')
+    return captured.index_select(1,positions)
+
+def _bucket_reduce(values,weights,buckets,valid=None):
+    """Four-motion-bucket equal reduction used by spatial and spacetime rows."""
+    values=values.reshape(-1); weights=weights.reshape(-1).to(values); buckets=buckets.reshape(-1)
+    valid=torch.ones_like(buckets,dtype=torch.bool) if valid is None else valid.reshape(-1).to(torch.bool)
+    bucket_values=[]
+    for bucket in range(4):
+        selected=buckets.eq(bucket)&valid
+        if bool(selected.any()):
+            w=weights[selected]
+            bucket_values.append((values[selected]*w).sum()/w.sum().clamp_min(1e-12))
+    return torch.stack(bucket_values).mean() if bucket_values else values.new_zeros(())
+
+def _snapshot_fm_geometry(processors,layers):
+    """Copy diagnostics from the just-completed FM forward before any pass overwrites them."""
+    result={}
+    for layer in layers:
+        value=processors[layer].last_numeric_diagnostics
+        if value is None: continue
+        value=copy.deepcopy(value)
+        value.update({
+            'raw_dq_over_q':value.get('delta_q_over_q_native'),
+            'raw_dk_over_k':value.get('delta_k_over_k_native'),
+            'effective_dq_over_q':value.get('effective_delta_q_over_q_native'),
+            'effective_dk_over_k':value.get('effective_delta_k_over_k_native'),
+            'projector_raw_rms':{'q':value.get('proj_q_raw_rms'),'k':value.get('proj_k_raw_rms')},
+            'soft_gain':{'q':value.get('proj_q_soft_gain'),'k':value.get('proj_k_soft_gain')},
+        })
+        result[str(layer)]=value
+    return result
+
 def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,local_scales=(0.25,0.5,1.0),timings=None,captures=None,rgbd_diagnostics=None):
     if plan is None or plan.query_indices.numel()==0: return torch.zeros((),device=next(iter(processors.values())).ray_provider.context['c2w'].device)
     missing=[layer for layer in layers if layer not in processors]
@@ -903,9 +956,13 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,local_scale
             headroom=(smax-s_native).clamp_min(0.0).detach()
             margins=torch.stack([torch.minimum(torch.full_like(headroom,0.1*value),0.5*headroom) for value in scales])
             row_native=torch.stack([F.relu(margins[i]-(scores[i]-s_native)) for i in range(len(scores))]).mean(0)
+            separation_ok=torch.ones((plan.query_indices.numel(),),device=s_native.device,dtype=torch.bool)
             if wrong_scores:
                 pixel_per_token={8:64.0,16:32.0,32:16.0}.get(int(plan.stage_shape[1]),512.0/max(int(plan.stage_shape[1]),1))
-                separation_ok=torch.ones((plan.query_indices.numel(),),device=s_native.device,dtype=torch.bool) if plan.separation_px is None else plan.separation_px.ge(0.5*pixel_per_token)
+                if plan.separation_px is not None:
+                    separation=plan.separation_px.to(s_native.device)
+                    separation=separation.mean(-1) if separation.ndim>1 else separation
+                    separation_ok=separation.ge(0.5*pixel_per_token)
                 wrong_gap=torch.stack([scores[i]-wrong_scores[i] for i in range(len(scores))])
                 row_wrong=torch.stack([F.relu(0.1*scales[i]-wrong_gap[i]) for i in range(len(scores))]).mean(0)
                 row_wrong=row_wrong*separation_ok.float()
@@ -918,12 +975,55 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,local_scale
             e_target=torch.minimum(torch.full_like(headroom,math.log(2.0)),0.9*headroom).detach()
             absolute=F.relu(e_target-(scores[-1]+legal_count.log()))
             row_loss=row_loss+0.25*absolute
+            spacetime_loss=row_loss.new_zeros(())
+            spacetime_diag={}
+            if (plan.spacetime_query_indices is not None and plan.spacetime_query_indices.numel()
+                    and plan.spacetime_target_indices is not None and plan.spacetime_target_indices.shape[1]):
+                spacetime_queries=plan.spacetime_query_indices.to(native_q.device)
+                sp_native_q=_select_captured_axis(native_q_value,capture_indices,spacetime_queries)
+                sp_dq=_select_captured_axis(dq_value,capture_indices,spacetime_queries)
+                sp_ray_q=_select_captured_axis(processor.last_rgbd_rays_q,capture_indices,spacetime_queries)
+                if not sp_dq.requires_grad and processor.conditioner is not None:
+                    sp_dq=processor.conditioner.project(sp_ray_q,sp_native_q.flatten(2,3),kind='q',native_rms=processor.conditioner.native_rms(sp_native_q.flatten(2,3)),detach_rho=True).unflatten(-1,(sp_native_q.shape[2],sp_native_q.shape[3]))
+                zero_sp_q=torch.zeros_like(sp_dq); zero_sp_k=torch.zeros_like(dk)
+                sp_legal=_captured_legal_mask(processor,spacetime_queries,capture_indices,capture_key_indices,native_q.device)
+                sp_native=rgbd_log_mass_rows(sp_native_q.detach(),native_k.detach(),zero_sp_q,zero_sp_k,plan.spacetime_target_indices,plan.spacetime_target_weights,plan.spacetime_target_mask,sp_legal,0.0)
+                sp_correct=rgbd_log_mass_rows(sp_native_q.detach(),native_k.detach(),sp_dq,dk,plan.spacetime_target_indices,plan.spacetime_target_weights,plan.spacetime_target_mask,sp_legal,1.0)
+                sp_wrong=None
+                if plan.spacetime_wrong_query_rays is not None and plan.wrong_key_rays is not None and processor.conditioner is not None:
+                    sp_wrong_dq=processor.conditioner.project(plan.spacetime_wrong_query_rays.to(native_q.device),sp_native_q.flatten(2,3),kind='q',native_rms=processor.conditioner.native_rms(sp_native_q.flatten(2,3)),detach_rho=True).unflatten(-1,(sp_native_q.shape[2],sp_native_q.shape[3]))
+                    sp_wrong_dk=processor.conditioner.project(plan.wrong_key_rays.to(native_k.device),native_k.flatten(2,3),kind='k',native_rms=processor.conditioner.native_rms(native_k.flatten(2,3)),detach_rho=True).unflatten(-1,(native_k.shape[2],native_k.shape[3]))
+                    sp_wrong=rgbd_log_mass_rows(sp_native_q.detach(),native_k.detach(),sp_wrong_dq,sp_wrong_dk,plan.spacetime_target_indices,plan.spacetime_target_weights,plan.spacetime_target_mask,sp_legal,1.0)
+                st_native_margin=torch.minimum(torch.full_like(sp_native,0.05),0.5*(-sp_native.detach()))
+                st_native_loss=F.relu(st_native_margin-(sp_correct-sp_native))
+                st_row=st_native_loss
+                st_wrong_gain=None
+                st_separation_ok=torch.zeros_like(st_row,dtype=torch.bool)
+                if sp_wrong is not None:
+                    st_wrong_margin=torch.minimum(torch.full_like(sp_wrong,0.05),0.5*(-sp_wrong.detach()))
+                    st_wrong_gain=sp_correct-sp_wrong
+                    st_separation=plan.spacetime_separation_px.to(st_row.device) if plan.spacetime_separation_px is not None else torch.zeros_like(st_row)
+                    st_separation=st_separation.mean(-1) if st_separation.ndim>1 else st_separation
+                    pixel_per_token={8:64.0,16:32.0,32:16.0}.get(int(plan.stage_shape[1]),512.0/max(int(plan.stage_shape[1]),1))
+                    st_separation_ok=st_separation.ge(0.5*pixel_per_token)
+                    st_row=st_row+F.relu(st_wrong_margin-st_wrong_gain)*st_separation_ok.float()
+                spacetime_loss=_bucket_reduce(st_row,plan.spacetime_query_weights.to(st_row.device),plan.spacetime_bucket.to(st_row.device))
+                spacetime_diag={'spacetime_loss':float(spacetime_loss.detach()),
+                                'spacetime_correct_vs_native_log_mass':float((sp_correct-sp_native).mean().detach()),
+                                'spacetime_correct_vs_wrong_log_mass':(None if st_wrong_gain is None else float(st_wrong_gain.mean().detach())),
+                                'spacetime_wrong_supervised_fraction':float(st_separation_ok.float().mean().detach())}
+            row_loss_scalar=_bucket_reduce(row_loss.mean(0),plan.query_weights,plan.bucket)
             if rgbd_diagnostics is not None:
                 conditioner=processor.conditioner
                 layer_diag={
                     'local_aux_scales':list(scales),
                     'correct_vs_native_probability_gain':[float((score-s_native).mean().detach()) for score in scores],
                     'correct_vs_wrong_probability_gain':([float((scores[index]-wrong_scores[index]).mean().detach()) for index in range(len(scores))] if wrong_scores else None),
+                    'correct_vs_native_all':float((torch.stack(scores).mean(0)-s_native).mean().detach()),
+                    'correct_vs_native_supervised':float(_bucket_reduce(torch.stack(scores).mean(0)-s_native,plan.query_weights,plan.bucket).detach()),
+                    'correct_vs_wrong_all':(float((torch.stack(scores)-torch.stack(wrong_scores)).mean().detach()) if wrong_scores else None),
+                    'correct_vs_wrong_supervised':(float(_bucket_reduce(torch.stack(scores).mean(0)-torch.stack(wrong_scores).mean(0),plan.query_weights,plan.bucket,separation_ok).detach()) if wrong_scores and bool(separation_ok.any()) else None),
+                    'wrong_supervised_fraction':float((plan.query_weights.to(separation_ok.device)*separation_ok.float()).sum().div(plan.query_weights.to(separation_ok.device).sum().clamp_min(1e-12)).detach()),
                     'aux_dq_over_q_native':float((dq.detach().float().norm()/native_q.detach().float().norm().clamp_min(1e-30)).cpu()),
                     'aux_dk_over_k_native':float((dk.detach().float().norm()/native_k.detach().float().norm().clamp_min(1e-30)).cpu()),
                 }
@@ -944,16 +1044,9 @@ def _rgbd_loss(trainable,processors,layers,plan,*,margin,temperature,local_scale
                             'rho_q':float(conditioner.rho_values()[0].detach()),
                             'rho_k':float(conditioner.rho_values()[1].detach()),
                         })
+                layer_diag.update(spacetime_diag)
                 rgbd_diagnostics[str(layer)]=layer_diag
-            bucket_losses=[]
-            for bucket in range(4):
-                selected=plan.bucket.eq(bucket)
-                if bool(selected.any()):
-                    weights=plan.query_weights[selected].to(device=row_loss.device,dtype=row_loss.dtype)
-                    bucket_row_loss=row_loss[..., selected]
-                    bucket_losses.append((bucket_row_loss*weights.unsqueeze(0)).sum(-1).div(weights.sum().clamp_min(1e-12)).mean())
-            if bucket_losses:
-                losses.append(torch.stack(bucket_losses).mean())
+            losses.append(row_loss_scalar+0.25*spacetime_loss)
             continue
         augmented_q=_captured_queries(processor,plan,augmented_q_value,capture_indices=capture_indices)
         augmented_k=_captured_keys(processor,plan,augmented_k_value,capture_indices=capture_key_indices)
@@ -1000,9 +1093,10 @@ def _backward_rgbd_stage(term,trainable,*,retain_graph):
     for beta in trainable.conditioner.rho_parameters():
         beta.grad=saved[id(beta)]
 
-def _total_metric(fm,rgbd_term,cross_term):
+def _total_metric(fm,rgbd_term,cross_term,camera_term=None):
     """Report the complete objective without creating a second backward path."""
-    return fm + rgbd_term.detach() + cross_term.detach()
+    camera_term=fm.new_zeros(()) if camera_term is None else camera_term
+    return fm + rgbd_term.detach() + cross_term.detach() + camera_term.detach()
 
 def _calibration_state(parameters):
     """Snapshot RNG streams and trainable bytes for side-effect-free calibration."""
@@ -1162,7 +1256,7 @@ def _install_oom_profiler(output,device,rank,state):
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--config',default='configs/sightline.yaml'); p.add_argument('--model',required=True); p.add_argument('--model-revision'); p.add_argument('--helios-root',required=True); p.add_argument('--manifest',required=True); p.add_argument('--p3-manifest')
-    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--allow-world-size-migration',action='store_true'); p.add_argument('--skip-manifest-validation',action='store_true',help='Skip repeated per-record validation only when these exact manifests were already validated successfully.'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
+    p.add_argument('--expected-records',type=int); p.add_argument('--max-steps',type=int); p.add_argument('--resume'); p.add_argument('--allow-memory-layer-migration',action='store_true'); p.add_argument('--allow-world-size-migration',action='store_true'); p.add_argument('--allow-objective-migration',action='store_true'); p.add_argument('--skip-manifest-validation',action='store_true',help='Skip repeated per-record validation only when these exact manifests were already validated successfully.'); p.add_argument('--output-dir',required=True); p.add_argument('--save-every',type=int); p.add_argument('--latent-cache-root')
     p.add_argument('--prompt',default='A realistic video of the same scene.'); p.add_argument('--probe-only',action='store_true'); p.add_argument('--probe-checkpoint'); p.add_argument('--probe-layers',default=''); p.add_argument('--probe-capture'); p.add_argument('--probe-step',type=int,default=1000); p.add_argument('--alpha-zero-baseline',action='store_true'); p.add_argument('--record-index',type=int); p.add_argument('--train-chunk',type=int); p.add_argument('--checkpoint-smoke-step',type=int); p.add_argument('--smoke-max-chunks',type=int); p.add_argument('--smoke-max-chunks-sequence'); p.add_argument('--profile-timing',action='store_true'); p.add_argument('--calibrate-rgbd-lambda',action='store_true'); p.add_argument('--calibration-batches',type=int,default=16); p.add_argument('--lambda-rgbd',type=float); p.add_argument('--train',action='store_true'); args=p.parse_args()
     if not (args.train or args.probe_only) or args.train==args.probe_only: raise ValueError('select exactly one of --train or --probe-only')
     cfg=load_sightline_config(args.config)
@@ -1265,13 +1359,13 @@ def main():
     world_size_migrated=False
     if args.resume:
         payload=torch.load(args.resume,map_location='cpu'); world_size_migrated=int(payload.get('rng_world_size',-1))!=world_size
-        completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration,allow_world_size_migration=args.allow_world_size_migration,helios_trainable_names=helios_trainable_names); start_step=completed_step+1
+        completed_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,optimizer=optimizer,scheduler=scheduler,restore_rng=True,provenance=provenance,rank=rank,world_size=world_size,allow_memory_layer_migration=args.allow_memory_layer_migration,allow_world_size_migration=args.allow_world_size_migration,allow_objective_migration=args.allow_objective_migration,helios_trainable_names=helios_trainable_names); start_step=completed_step+1
         if world_size_migrated:
             seed=set_rank_runtime_seed(rank,start_step)
             if rank==0: print(f'checkpoint world size migration: deterministic per-rank reseed at step {start_step}, rank0 seed {seed}',flush=True)
     elif args.probe_checkpoint:
         if not args.probe_only: raise ValueError('--probe-checkpoint is only valid with --probe-only')
-        payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance,helios_trainable_names=helios_trainable_names); start_step=restored_step
+        payload=torch.load(args.probe_checkpoint,map_location='cpu'); restored_step=restore_runtime_checkpoint(payload,trainable,runner.memory,pipe.transformer,config=config,helios_fingerprint=fingerprint,layers=cfg.sightline_layers,memory_config=memory_config,restore_rng=False,provenance=provenance,allow_objective_migration=args.allow_objective_migration,helios_trainable_names=helios_trainable_names); start_step=restored_step
     if args.alpha_zero_baseline:
         configure_geometry_zero_baseline(trainable,runner.memory,pipe.transformer)
     if args.resume:
@@ -1384,7 +1478,7 @@ def main():
                     'memory_allocated':int(torch.cuda.memory_allocated(device)),
                     'max_memory_allocated':int(torch.cuda.max_memory_allocated(device)),
                 }
-        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; fm_sigma_trace=[]; backward_geometry_diagnostics={}; optimizer.zero_grad(set_to_none=True)
+        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; fm_sigma_trace=[]; fm_geometry_diagnostics={}; optimizer.zero_grad(set_to_none=True)
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
             chunk_started=time.perf_counter()
@@ -1449,7 +1543,9 @@ def main():
                 rgbd_scales={stage_index:torch.ones((),device=source.device,dtype=torch.float32) for stage_index in (0,1,2)}
                 valid_rgbd_stages=tuple(stage_index for stage_index in (0,1,2) if stage_index in rgbd_plans and rgbd_plans[stage_index].mapping_output_count>0)
                 rgbd_weights={stage_index:(torch.as_tensor(1.0/len(valid_rgbd_stages),device=source.device,dtype=torch.float32).detach() if stage_index in valid_rgbd_stages else torch.zeros((),device=source.device,dtype=torch.float32)) for stage_index in (0,1,2)}
-                backward_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_diagnostics={}; rgbd_stage_gradients={}; rgbd_capture_seen=set()
+                fm_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_diagnostics={}; rgbd_stage_gradients={}; rgbd_capture_seen=set()
+                camera_fm_loss_value=torch.zeros((),device=source.device,dtype=torch.float32)
+                camera_fm_enabled=False; camera_fm_separation_tokens=0.0; camera_fm_relative_gap=None; camera_fm_correct=None; camera_fm_wrong=None; camera_fm_grad_rms=None; camera_fm_grad_ratio=None; camera_fm_grad_cosine=None
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()
                 for stage_index,item in enumerate(items):
                     stage_rgbd_plan=rgbd_plans.get(stage_index)
@@ -1474,12 +1570,21 @@ def main():
                             processor.conditioner.capture_numeric_diagnostics=bool(capture_geometry_diagnostics and not capture_rgbd)
                         processor.capture_rgbd=bool(capture_rgbd and layer in active_rgbd_layers)
                         stage_plans=tuple(plan for plan in (stage_rgbd_plan if capture_rgbd else None,cross_plan if capture_cross and not capture_rgbd else None) if plan is not None)
-                        plan_queries=torch.unique(torch.cat([plan.query_indices for plan in stage_plans])) if stage_plans else None
+                        query_parts=[plan.query_indices for plan in stage_plans]
+                        if capture_rgbd and stage_rgbd_plan.spacetime_query_indices is not None and stage_rgbd_plan.spacetime_query_indices.numel():
+                            query_parts.append(stage_rgbd_plan.spacetime_query_indices)
+                        plan_queries=torch.unique(torch.cat(query_parts)) if query_parts else None
                         processor.capture_query_indices=plan_queries if plan_queries is not None and (args.train or args.probe_capture) else None
                         rgbd_key_plans=(stage_rgbd_plan,) if capture_rgbd else ()
                         plan_keys=tuple(plan.sparse_key_indices for plan in rgbd_key_plans if plan.sparse_key_indices is not None)
                         processor.capture_key_indices=torch.unique(torch.cat(plan_keys)) if plan_keys and (args.train or args.probe_capture) else None
                         processor.capture_full_key=bool(capture_cross and not capture_rgbd and layer in active_corr_layers)
+                    if capture_geometry_diagnostics and not capture_rgbd:
+                        for layer in active_rgbd_layers:
+                            processor=pipe.transformer._sightline_processors[layer]
+                            processor.capture_numeric_diagnostics=True
+                            processor.last_numeric_diagnostics=None
+                            if processor.conditioner is not None: processor.conditioner.capture_numeric_diagnostics=True
                     capture_correspondence=bool(stage_capture_layers)
                     oom_state['stage']='final_stage_forward' if capture_correspondence else f'flow_stage_{stage_index}_forward'
                     is_final_stage=stage_index+1==len(items)
@@ -1511,9 +1616,10 @@ def main():
                             # layers.  Each entry is only a custom-autograd
                             # scalar; pairwise graphs are recomputed in its
                             # streaming backward implementation.
+                            stage_rgbd_diagnostics={}
                             layer_rgbd_metrics=[]
                             for rgbd_layer in active_rgbd_layers:
-                                layer_rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,(rgbd_layer,),stage_rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,local_scales=rgbd_aux_scales,timings=perf,captures={rgbd_layer:stage_rgbd_captures[rgbd_layer]},rgbd_diagnostics=rgbd_diagnostics)
+                                layer_rgbd_metric=_rgbd_loss(trainable,pipe.transformer._sightline_processors,(rgbd_layer,),stage_rgbd_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,local_scales=rgbd_aux_scales,timings=perf,captures={rgbd_layer:stage_rgbd_captures[rgbd_layer]},rgbd_diagnostics=stage_rgbd_diagnostics)
                                 layer_rgbd_metrics.append(layer_rgbd_metric)
                                 del layer_rgbd_metric
                             stage_rgbd_metric=torch.stack(layer_rgbd_metrics).mean() if layer_rgbd_metrics else torch.zeros((),device=source.device)
@@ -1526,6 +1632,7 @@ def main():
                                 } for layer in active_rgbd_layers
                             }
                             rgbd_stage_losses[stage_index]=stage_rgbd_metric.detach()
+                            rgbd_diagnostics[str(stage_index)]=stage_rgbd_diagnostics
                             for rgbd_layer in active_rgbd_layers:
                                 _release_rgbd_capture(pipe.transformer._sightline_processors,(rgbd_layer,),preserve_cross_capture=False)
                                 del stage_rgbd_captures[rgbd_layer]
@@ -1542,6 +1649,12 @@ def main():
                                 processor.capture_diagnostics=False; processor.capture_rgbd=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
                                 if layer in stage_scale_deltas:
                                     processor.reuse_scale_delta=True; processor.scale_delta_override=stage_scale_deltas[layer]
+                            if capture_geometry_diagnostics:
+                                for layer in active_rgbd_layers:
+                                    processor=pipe.transformer._sightline_processors[layer]
+                                    processor.capture_numeric_diagnostics=True
+                                    processor.last_numeric_diagnostics=None
+                                    if processor.conditioner is not None: processor.conditioner.capture_numeric_diagnostics=True
                             second_capture_layers=tuple(active_corr_layers) if capture_cross else ()
                             for layer in second_capture_layers:
                                 processor=pipe.transformer._sightline_processors[layer]
@@ -1566,15 +1679,60 @@ def main():
                                 'processor_timestep':diagnostic.get('timestep'),
                                 'item_sigma':float(item['sigmas'].detach().float().mean()),**stage_fields})
                             active_stage_trace.append(stage_fields)
-                            if not capture_rgbd:
-                                # Snapshot the diagnostics from the forward
-                                # that owns this FM backward before the next
-                                # prefix/rollout can touch the processors.
-                                backward_geometry_diagnostics.update(copy.deepcopy({str(layer):pipe.transformer._sightline_processors[layer].last_numeric_diagnostics for layer in cfg.sightline_layers if pipe.transformer._sightline_processors[layer].last_numeric_diagnostics is not None}))
+                            # This is the actual correct-camera FM forward,
+                            # including the reforward after an RGB-D prefix.
+                            # Snapshot every layer before the next stage can
+                            # overwrite processor-local state.
+                            fm_geometry_diagnostics[str(stage_index)]=_snapshot_fm_geometry(pipe.transformer._sightline_processors,active_rgbd_layers)
                         if capture_correspondence: record_vram('final_stage_forward')
                         stage_loss=(prediction.float()-item['target'].float()).square().mean(); stage_losses.append(stage_loss)
                         if args.train and not is_final_stage:
+                            geometry_params=list(trainable.conditioner.geometry_parameters())
+                            fm_grad_before={id(parameter):(None if parameter.grad is None else parameter.grad.detach().clone()) for parameter in geometry_params}
                             timing_sync(); backward_started=time.perf_counter(); (stage_loss/len(items)).backward(retain_graph=False); timing_sync(); perf['backward_seconds']+=time.perf_counter()-backward_started
+                            if stage_index==0 and stage_rgbd_plan is not None and stage_rgbd_plan.separation_px is not None:
+                                separation=stage_rgbd_plan.separation_px.to(stage_loss.device)
+                                separation=separation.mean(-1) if separation.ndim>1 else separation
+                                camera_fm_separation_tokens=float((stage_rgbd_plan.query_weights.to(stage_loss.device)*separation/64.0).sum().div(stage_rgbd_plan.query_weights.to(stage_loss.device).sum().clamp_min(1e-12)).detach())
+                                camera_fm_enabled=bool(camera_fm_separation_tokens>=0.5)
+                                if camera_fm_enabled:
+                                    base_context=dict(provider.context)
+                                    saved_capture={processor:{name:getattr(processor,name) for name in ('capture_rgbd','capture_diagnostics','capture_numeric_diagnostics','capture_query_indices','capture_key_indices','capture_full_key')} for processor in pipe.transformer._sightline_processors.values()}
+                                    wrong_prediction=None
+                                    try:
+                                        wrong_context=dict(base_context); wrong_context['c2w']=anchored_inverse_c2w(base_context['c2w'])
+                                        provider.context=wrong_context
+                                        for processor in pipe.transformer._sightline_processors.values():
+                                            processor.capture_rgbd=False; processor.capture_diagnostics=False; processor.capture_numeric_diagnostics=False; processor.capture_query_indices=None; processor.capture_key_indices=None; processor.capture_full_key=False
+                                            if processor.conditioner is not None: processor.conditioner.capture_numeric_diagnostics=False
+                                        wrong_prediction=_model_prediction(pipe,item['noisy_latents'],item,prompt_embeds,history,chunk*8,routing_scope_active=True)
+                                        d_correct=stage_loss.detach()
+                                        d_wrong=(wrong_prediction.float()-item['target'].float()).square().mean()
+                                        camera_fm_correct=float(d_correct)
+                                        camera_fm_wrong=float(d_wrong.detach())
+                                        relative_gap_tensor=(d_wrong-d_correct)/max(float(d_correct),0.02)
+                                        camera_fm_relative_gap=float(relative_gap_tensor.detach())
+                                        camera_loss=F.relu(torch.as_tensor(0.05,device=stage_loss.device)-relative_gap_tensor)
+                                        camera_fm_loss_value=camera_loss.detach()
+                                        camera_grads=torch.autograd.grad(camera_loss,geometry_params,allow_unused=True,retain_graph=False)
+                                        fm_grads=[]; cam_grads=[]
+                                        for parameter,before,gradient in ((parameter,fm_grad_before[id(parameter)],gradient) for parameter,gradient in zip(geometry_params,camera_grads)):
+                                            current=parameter.grad
+                                            fm_gradient=torch.zeros_like(parameter) if current is None else current-(torch.zeros_like(parameter) if before is None else before)
+                                            scaled=torch.zeros_like(parameter) if gradient is None else gradient.detach()*float(cfg.lambda_camera_fm)
+                                            parameter.grad=(torch.zeros_like(parameter) if current is None else current)+scaled
+                                            fm_grads.append(fm_gradient.reshape(-1)); cam_grads.append(scaled.reshape(-1))
+                                        fm_vector=torch.cat(fm_grads); cam_vector=torch.cat(cam_grads)
+                                        fm_norm=fm_vector.norm(); cam_norm=cam_vector.norm()
+                                        camera_fm_grad_rms=float(cam_vector.square().mean().sqrt())
+                                        camera_fm_grad_ratio=float(cam_norm/(fm_norm+1e-12))
+                                        camera_fm_grad_cosine=float((cam_vector*fm_vector).sum()/(cam_norm*fm_norm+1e-12))
+                                    finally:
+                                        if wrong_prediction is not None: del wrong_prediction
+                                        provider.context=base_context
+                                        for processor,values in saved_capture.items():
+                                            for name,value in values.items(): setattr(processor,name,value)
+                                            if processor.conditioner is not None: processor.conditioner.capture_numeric_diagnostics=bool(values['capture_numeric_diagnostics'])
                             # The early-stage backward is complete. Retain only its
                             # scalar metric and sigma; its flow tensors otherwise
                             # remain referenced by ``items`` during the much larger
@@ -1595,7 +1753,8 @@ def main():
                 final_flow=stage_losses[-1]/len(items)
                 rgbd_term=float(cfg.lambda_rgbd)*rgbd
                 cross_term=cross_weight*corr
-                total=_total_metric(fm,rgbd_term,cross_term)
+                camera_term=float(cfg.lambda_camera_fm)*camera_fm_loss_value
+                total=_total_metric(fm,rgbd_term,cross_term,camera_term)
                 rgbd_plan0=rgbd_plans.get(0); rgbd_plan1=rgbd_plans.get(1); rgbd_plan2=rgbd_plans.get(2)
                 losses.update(fm=fm,rgbd=rgbd,corr=corr,total=total,stage=stage_losses,
                               sigmas=[float(item['sigmas'].mean()) for item in items],
@@ -1618,7 +1777,7 @@ def main():
                               rgbd_stage1_negative_key_t_match=True if rgbd_plan1 is None else bool(rgbd_plan1.negative_key_t_match),rgbd_stage2_negative_key_t_match=True if rgbd_plan2 is None else bool(rgbd_plan2.negative_key_t_match),
                               rgbd_stage0_negative_pair_count=0 if rgbd_plan0 is None else int(rgbd_plan0.negative_pair_count),
                               rgbd_stage1_negative_pair_count=0 if rgbd_plan1 is None else int(rgbd_plan1.negative_pair_count),rgbd_stage2_negative_pair_count=0 if rgbd_plan2 is None else int(rgbd_plan2.negative_pair_count),
-                              rgbd_term=rgbd_term.detach(),cross_term=cross_term,cross_weight=float(cross_weight),rgbd_diagnostics=rgbd_diagnostics,rgbd_stage_gradients=rgbd_stage_gradients)
+                              rgbd_term=rgbd_term.detach(),cross_term=cross_term,camera_term=camera_term.detach(),camera_fm_loss=camera_fm_loss_value.detach(),camera_fm_enabled=camera_fm_enabled,camera_fm_correct=camera_fm_correct,camera_fm_wrong=camera_fm_wrong,camera_fm_relative_gap=camera_fm_relative_gap,camera_fm_separation_tokens=camera_fm_separation_tokens,camera_fm_grad_rms=camera_fm_grad_rms,camera_fm_to_fm_grad_ratio=camera_fm_grad_ratio,camera_fm_vs_fm_grad_cosine=camera_fm_grad_cosine,camera_fm_warning=bool(camera_fm_grad_ratio is not None and camera_fm_grad_ratio>0.3),fm_geometry_diagnostics=copy.deepcopy(fm_geometry_diagnostics),cross_weight=float(cross_weight),rgbd_diagnostics=rgbd_diagnostics,rgbd_stage_gradients=rgbd_stage_gradients)
                 if args.train:
                     oom_state['stage']='correspondence_and_fm_backward'
                     timing_sync(); backward_started=time.perf_counter()
@@ -1654,7 +1813,7 @@ def main():
                     base_context=dict(provider.context); normal_step_time=time.perf_counter()-started; ablation_started=time.perf_counter()
                     memory_enabled_by_layer={layer:bank.enabled for layer,bank in runner.memory.banks.items()}
                     with torch.no_grad():
-                        provider.context=dict(base_context); provider.context['c2w']=base_context['c2w'].flip(1)
+                        provider.context=dict(base_context); provider.context['c2w']=anchored_inverse_c2w(base_context['c2w'])
                         wrong=_model_prediction(pipe,final['noisy_latents'],final,prompt_embeds,history,chunk*8)
                         runner.memory.set_enabled(False); provider.context=base_context
                         zero=_model_prediction(pipe,final['noisy_latents'],final,prompt_embeds,history,chunk*8)
@@ -1738,33 +1897,37 @@ def main():
         rho_q,rho_k=trainable.conditioner.rho_values()
         lr_groups={f"lr_{group.get('name', index)}":float(group['lr']) for index,group in enumerate(optimizer.param_groups)}
         step_seconds=time.perf_counter()-started
-        diagnostics=copy.deepcopy(backward_geometry_diagnostics) if capture_geometry_diagnostics else {}
+        diagnostics=copy.deepcopy(fm_geometry_diagnostics) if capture_geometry_diagnostics else {}
         if capture_geometry_diagnostics:
             def _parameter_rms(parameter): return float(parameter.detach().float().square().mean().sqrt().cpu())
             def _grad_rms(parameter): return None if parameter.grad is None else float(parameter.grad.detach().float().square().mean().sqrt().cpu())
-            for layer_text,diagnostic in diagnostics.items():
-                conditioner=trainable.conditioner.for_layer(int(layer_text))
-                diagnostic.update({
-                    'q_projector_weight_rms':_parameter_rms(conditioner.q_proj.weight),'k_projector_weight_rms':_parameter_rms(conditioner.k_proj.weight),
-                    'q_projector_grad_rms':_grad_rms(conditioner.q_proj.weight),'k_projector_grad_rms':_grad_rms(conditioner.k_proj.weight),
-                    'q_projector_raw_rms':conditioner.last_pre_norm_rms['q'],'k_projector_raw_rms':conditioner.last_pre_norm_rms['k'],
-                    'q_projector_soft_gain':conditioner.last_soft_gain['q'],'k_projector_soft_gain':conditioner.last_soft_gain['k'],
-                    'rho_q_grad_rms':_grad_rms(conditioner.beta_q),'rho_k_grad_rms':_grad_rms(conditioner.beta_k),
-                    'rho_q':float(conditioner.rho_values()[0].detach().cpu()),'rho_k':float(conditioner.rho_values()[1].detach().cpu()),
-                })
-        def _summary(field):
-            values=[float(value[field]) for value in diagnostics.values() if value.get(field) is not None]
+            for stage_key,stage_diagnostics in diagnostics.items():
+                for layer_text,diagnostic in stage_diagnostics.items():
+                    conditioner=trainable.conditioner.for_layer(int(layer_text))
+                    diagnostic.update({
+                        'q_projector_weight_rms':_parameter_rms(conditioner.q_proj.weight),'k_projector_weight_rms':_parameter_rms(conditioner.k_proj.weight),
+                        'q_projector_grad_rms':_grad_rms(conditioner.q_proj.weight),'k_projector_grad_rms':_grad_rms(conditioner.k_proj.weight),
+                        'q_projector_raw_rms':diagnostic.get('proj_q_raw_rms'),'k_projector_raw_rms':diagnostic.get('proj_k_raw_rms'),
+                        'q_projector_soft_gain':diagnostic.get('proj_q_soft_gain'),'k_projector_soft_gain':diagnostic.get('proj_k_soft_gain'),
+                        'rho_q_grad_rms':_grad_rms(conditioner.beta_q),'rho_k_grad_rms':_grad_rms(conditioner.beta_k),
+                        'rho_q':float(conditioner.rho_values()[0].detach().cpu()),'rho_k':float(conditioner.rho_values()[1].detach().cpu()),
+                    })
+        def _summary(stage_diagnostics,field):
+            values=[float(value[field]) for value in stage_diagnostics.values() if value.get(field) is not None]
             if not values: return {}
             ordered=sorted(values); return {'mean':sum(values)/len(values),'p50':ordered[len(ordered)//2],'p95':ordered[min(len(ordered)-1,round(.95*(len(ordered)-1)))],'max':max(values),'min':min(values)}
-        geometry_aggregate={} if not capture_geometry_diagnostics else {
-            'q_residual_ratio':_summary('delta_q_over_q_native'),'k_residual_ratio':_summary('delta_k_over_k_native'),
-            'effective_q_residual_ratio':_summary('effective_delta_q_over_q_native'),'effective_k_residual_ratio':_summary('effective_delta_k_over_k_native'),
-            'q_projector_pre_norm_rms':_summary('proj_q_raw_rms'),'k_projector_pre_norm_rms':_summary('proj_k_raw_rms'),
-            'rho_q':_summary('rho_q'),'rho_k':_summary('rho_k'),
-        }
+        def _stage_geometry_aggregate(stage_diagnostics):
+            return {
+                'q_residual_ratio':_summary(stage_diagnostics,'delta_q_over_q_native'),'k_residual_ratio':_summary(stage_diagnostics,'delta_k_over_k_native'),
+                'effective_q_residual_ratio':_summary(stage_diagnostics,'effective_delta_q_over_q_native'),'effective_k_residual_ratio':_summary(stage_diagnostics,'effective_delta_k_over_k_native'),
+                'q_projector_pre_norm_rms':_summary(stage_diagnostics,'proj_q_raw_rms'),'k_projector_pre_norm_rms':_summary(stage_diagnostics,'proj_k_raw_rms'),
+                'rho_q':_summary(stage_diagnostics,'rho_q'),'rho_k':_summary(stage_diagnostics,'rho_k'),
+            }
+        geometry_aggregate={} if not capture_geometry_diagnostics else {str(stage):_stage_geometry_aggregate(stage_diagnostics) for stage,stage_diagnostics in diagnostics.items()}
         final_stage=len(losses['sigma_abs'])-1 if losses.get('sigma_abs') else -1
         geometry_context={} if not capture_geometry_diagnostics else {'step':step,'phase':phase['name'],'train_chunk':train_chunk,'pyramid_stage':final_stage,'stage_index':final_stage,'sigma_local':losses['sigma_local'][final_stage],'sigma_start':losses['sigma_start'][final_stage],'sigma_end':losses['sigma_end'][final_stage],'sigma_abs':losses['sigma_abs'][final_stage],'geometry_sigma_scale':losses['geometry_sigma_scale'][final_stage],'soft_rms_epsilon':0.005,'sightline_residual_scale':1.0}
         row={'step':step,'record':record.trajectory_id,'phase':phase['name'],'max_chunks':phase['max_chunks'],'window_start_chunk':window_start,'train_chunk':train_chunk,'executed_chunks':len(policies),'policies':policies,'gt_prefix_probability':gt_prefix_p,'gt_prefix_used':use_gt_prefix,'correct_ray_loss':probe_payload.get('correct_ray_loss'),'wrong_ray_loss':probe_payload.get('wrong_ray_loss'),'camera_sensitivity':probe_payload.get('camera_sensitivity'),'fm_correct':probe_payload.get('fm_correct'),'fm_wrong':probe_payload.get('fm_wrong'),'fm_geometry_off':probe_payload.get('fm_geometry_off'),'flow_loss':float(losses['fm'].detach()),'rgbd_loss':float(losses['rgbd'].detach()),'corr_loss':float(losses['corr'].detach()),'total_loss':float(losses['total'].detach()),'rgbd_stage0_loss':losses['rgbd_stage0_loss'],'rgbd_stage1_loss':losses['rgbd_stage1_loss'],'rgbd_stage2_loss':losses['rgbd_stage2_loss'],'rgbd_stage0_scale':losses['rgbd_stage0_scale'],'rgbd_stage1_scale':losses['rgbd_stage1_scale'],'rgbd_stage2_scale':losses['rgbd_stage2_scale'],'rgbd_stage0_geometry_sigma_scale':losses['rgbd_stage0_geometry_sigma_scale'],'rgbd_stage1_geometry_sigma_scale':losses['rgbd_stage1_geometry_sigma_scale'],'rgbd_stage2_geometry_sigma_scale':losses['rgbd_stage2_geometry_sigma_scale'],'rgbd_stage0_local_aux_scales':losses['rgbd_stage0_local_aux_scales'],'rgbd_stage1_local_aux_scales':losses['rgbd_stage1_local_aux_scales'],'rgbd_stage2_local_aux_scales':losses['rgbd_stage2_local_aux_scales'],'rgbd_stage0_weight':losses['rgbd_stage0_weight'],'rgbd_stage1_weight':losses['rgbd_stage1_weight'],'rgbd_stage2_weight':losses['rgbd_stage2_weight'],'rgbd_stage0_mapping_input_count':losses['rgbd_stage0_mapping_input_count'],'rgbd_stage0_mapping_output_count':losses['rgbd_stage0_mapping_output_count'],'rgbd_stage1_mapping_input_count':losses['rgbd_stage1_mapping_input_count'],'rgbd_stage1_mapping_output_count':losses['rgbd_stage1_mapping_output_count'],'rgbd_stage2_mapping_input_count':losses['rgbd_stage2_mapping_input_count'],'rgbd_stage2_mapping_output_count':losses['rgbd_stage2_mapping_output_count'],'rgbd_stage0_bucket_selected_count':losses['rgbd_stage0_bucket_selected_count'],'rgbd_stage0_bucket_motion_stats':losses['rgbd_stage0_bucket_motion_stats'],'rgbd_stage1_bucket_selected_count':losses['rgbd_stage1_bucket_selected_count'],'rgbd_stage1_bucket_motion_stats':losses['rgbd_stage1_bucket_motion_stats'],'rgbd_stage2_bucket_selected_count':losses['rgbd_stage2_bucket_selected_count'],'rgbd_stage2_bucket_motion_stats':losses['rgbd_stage2_bucket_motion_stats'],'rgbd_stage0_negative_key_t_match':losses['rgbd_stage0_negative_key_t_match'],'rgbd_stage1_negative_key_t_match':losses['rgbd_stage1_negative_key_t_match'],'rgbd_stage2_negative_key_t_match':losses['rgbd_stage2_negative_key_t_match'],'rgbd_stage0_negative_pair_count':losses['rgbd_stage0_negative_pair_count'],'rgbd_stage1_negative_pair_count':losses['rgbd_stage1_negative_pair_count'],'rgbd_stage2_negative_pair_count':losses['rgbd_stage2_negative_pair_count'],'rgbd_stage_gradients':losses.get('rgbd_stage_gradients',{}),'rgbd_effective_weight':float(cfg.lambda_rgbd),'cross_effective_weight':losses['cross_weight'],'stage_losses':[float(x.detach()) for x in losses['stage']],'stage_sigmas':losses['sigmas'],'stage_sigma_local':losses['sigma_local'],'stage_sigma_start':losses['sigma_start'],'stage_sigma_end':losses['sigma_end'],'stage_sigma_abs':losses['sigma_abs'],'stage_geometry_sigma_scale':losses['geometry_sigma_scale'],'sampled_sigma':losses['sigmas'],'fm_sigma_trace':fm_sigma_trace if capture_geometry_diagnostics else [],'sigma_band':sigma_band,'rho_q':rho_q,'rho_k':rho_k,'geometry_diagnostics':diagnostics,'geometry_diagnostic_context':geometry_context,'geometry_aggregate':geometry_aggregate,'geometry_memory_diagnostics':geometry_memory_diagnostics,'rgbd_diagnostics':losses.get('rgbd_diagnostics',{}),'lambda_rgbd':float(cfg.lambda_rgbd),'m_geo':float(cfg.m_geo),'tau_geo':float(cfg.tau_geo),'max_intra_corr_rows':int(cfg.max_intra_corr_rows),'initialization_hash':initialization_hash,'grad_norm':float(grad_norm),'lr':scheduler.get_last_lr()[0],**lr_groups,'gradient_checkpointing':checkpointing,'helios_runtime_patch':runtime_patch,'seconds':step_seconds,'step_total_seconds':step_seconds,**perf,'timing_synchronized':bool(args.profile_timing),'uses_future_gt':False}
+        row.update({'fm_stage0_correct':losses.get('camera_fm_correct'),'fm_stage0_wrong':losses.get('camera_fm_wrong'),'fm_stage0_relative_wrong_gap':losses.get('camera_fm_relative_gap'),'camera_fm_loss':float(losses.get('camera_fm_loss',0.0)),'camera_fm_enabled':losses.get('camera_fm_enabled',False),'camera_fm_separation_tokens':losses.get('camera_fm_separation_tokens',0.0),'camera_fm_grad_rms':losses.get('camera_fm_grad_rms'),'camera_fm_to_fm_grad_ratio':losses.get('camera_fm_to_fm_grad_ratio'),'camera_fm_vs_fm_grad_cosine':losses.get('camera_fm_vs_fm_grad_cosine'),'camera_fm_warning':losses.get('camera_fm_warning',False)})
         if rank==0 and (args.profile_timing or capture_geometry_diagnostics or step==start_step or step+1==stop):
             with metrics.open('a') as handle: handle.write(json.dumps(row)+'\n')
         if args.probe_capture:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import math
 import numpy as np
 import torch
-from ..sightline.rays import latent_camera_indices, token_rays_for_shape
+from ..sightline.rays import anchored_inverse_c2w, latent_camera_indices, token_rays_for_shape
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,14 @@ class RGBDSoftTargetPlan:
     wrong_query_rays: torch.Tensor|None = None
     wrong_key_rays: torch.Tensor|None = None
     separation_px: torch.Tensor|None = None
+    spacetime_query_indices: torch.Tensor|None = None
+    spacetime_target_indices: torch.Tensor|None = None
+    spacetime_target_weights: torch.Tensor|None = None
+    spacetime_target_mask: torch.Tensor|None = None
+    spacetime_query_weights: torch.Tensor|None = None
+    spacetime_bucket: torch.Tensor|None = None
+    spacetime_wrong_query_rays: torch.Tensor|None = None
+    spacetime_separation_px: torch.Tensor|None = None
 
     @property
     def weights(self):
@@ -202,6 +210,47 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         motion=float(np.average(value['motion'],weights=value['confidence'])) if value['motion'] else 0.0
         entries.append((q_index,key_time,value['target'],coverage,mean_conf,motion))
     if not entries: return None
+    # Build the query-level spacetime candidates before row sampling.  A
+    # query's support is the union of every valid key time; a repeated 3D
+    # point at another time remains a valid member of that union.
+    spacetime_grouped={}
+    for q_index,key_time,target,coverage,confidence,motion in entries:
+        value=spacetime_grouped.setdefault(q_index,{'target':{},'pixel_count':0,'valid_depth':1.0,'confidence':[],'motion':[],'points':[]})
+        for full_index,target_weight in target.items():
+            value['target'][full_index]=value['target'].get(full_index,0.0)+float(target_weight)
+        original=grouped[(int(q_index),int(key_time))]
+        value['pixel_count']+=int(original.get('pixel_count',0))
+        value['valid_depth']=max(value['valid_depth'],float(original.get('valid_depth',1.0)))
+        value['confidence'].extend(float(x) for x in original.get('confidence',()))
+        value['motion'].extend(float(x) for x in original.get('motion',()))
+        value['points'].extend((int(key_time),)+tuple(point) for point in original.get('points',()))
+    spacetime_candidates=[]
+    for q_index,value in spacetime_grouped.items():
+        if not value['target']:
+            continue
+        coverage=min(1.0,float(value['pixel_count'])/max(float(value['valid_depth']),1.0))
+        confidence=float(np.mean(value['confidence'])) if value['confidence'] else 0.0
+        motion=float(np.average(value['motion'],weights=value['confidence'])) if value['motion'] else 0.0
+        spacetime_candidates.append((q_index,value['target'],coverage,confidence,motion,value['points']))
+    spacetime_candidates.sort(key=lambda x:(x[4]/16.0,x[0]))
+    spacetime_bucketed=[[] for _ in range(4)]
+    for candidate in spacetime_candidates:
+        m=candidate[4]/16.0
+        spacetime_bucketed[0 if m<.5 else 1 if m<1.5 else 2 if m<3 else 3].append(candidate)
+    generator=torch.Generator(device='cpu').manual_seed(int(sampling_seed+7919)&((1<<63)-1))
+    spacetime_selected=[]
+    for values in spacetime_bucketed:
+        order=torch.randperm(len(values),generator=generator).tolist()
+        spacetime_selected.extend(values[i] for i in order[:min(32,len(values))])
+    spacetime_cap=min(128,len(spacetime_candidates))
+    if len(spacetime_selected)<spacetime_cap:
+        chosen={id(x) for x in spacetime_selected}
+        remaining=[x for x in spacetime_candidates if id(x) not in chosen]
+        order=torch.randperm(len(remaining),generator=generator).tolist()
+        spacetime_selected.extend(remaining[i] for i in order[:spacetime_cap-len(spacetime_selected)])
+    spacetime_selected=spacetime_selected[:spacetime_cap]
+    spacetime_selected.sort(key=lambda x:x[0])
+
     # Motion buckets are defined on the aggregated row, not raw points.
     entries.sort(key=lambda x:(x[5]/16.0,x[0],x[1]))
     bucketed=[[] for _ in range(4)]
@@ -234,7 +283,11 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
     # RGB-D prefix captures every spatial K token for each involved key time;
     # target support itself may be small, but the probability normalizer must
     # see the complete legal same-time spatial axis.
-    involved_times={int(entry[1]) for entry in selected}
+    # Keep every key time from the pre-sampling legal set so the spacetime
+    # normalizer covers the complete current chunk (9 times x spatial grid).
+    # Spacetime normalization is over the complete current chunk, not only
+    # times which happened to contribute a sampled target row.
+    involved_times=set(range(int(chunk)*8,int(chunk)*8+9))
     sparse=sorted({key for entry in selected for key in entry[2]} | {
         int(index) for index,identity in enumerate(identities)
         if len(identity)>=4 and identity[0]=='current' and int(identity[1][0]) in involved_times
@@ -264,6 +317,23 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         legal_row_indices.extend([r]*len(target_times)); legal_column_indices.extend(target_times)
         query_weights.append(coverage*confidence); key_times.append(key_time); coverages.append(coverage); confidences.append(confidence); motions.append(motion)
         m=motion/16.; buckets.append(0 if m<.5 else 1 if m<1.5 else 2 if m<3 else 3)
+    spacetime_query_indices=torch.as_tensor([entry[0] for entry in spacetime_selected],dtype=torch.long,device=device)
+    spacetime_max_support=max((len(entry[1]) for entry in spacetime_selected),default=0)
+    spacetime_target_indices=torch.full((len(spacetime_selected),spacetime_max_support),-1,dtype=torch.long,device=device)
+    spacetime_target_weights=torch.zeros((len(spacetime_selected),spacetime_max_support),dtype=torch.float32,device=device)
+    for row,(_,target,_,_,_,_) in enumerate(spacetime_selected):
+        total=max(sum(target.values()),1e-12)
+        values=sorted(target.items())
+        spacetime_target_indices[row,:len(values)]=torch.as_tensor([sparse_set[index] for index,_ in values],device=device)
+        spacetime_target_weights[row,:len(values)]=torch.as_tensor([float(value)/total for _,value in values],device=device)
+    spacetime_target_mask=spacetime_target_indices.ge(0)
+    spacetime_query_weights=torch.as_tensor([entry[2]*entry[3] for entry in spacetime_selected],dtype=torch.float32,device=device)
+    spacetime_motions=torch.as_tensor([entry[4] for entry in spacetime_selected],dtype=torch.float32,device=device)
+    spacetime_bucket=torch.where(
+        spacetime_motions/16.<.5, torch.zeros_like(spacetime_motions,dtype=torch.long),
+        torch.where(spacetime_motions/16.<1.5, torch.ones_like(spacetime_motions,dtype=torch.long),
+                    torch.where(spacetime_motions/16.<3, torch.full_like(spacetime_motions,2,dtype=torch.long),
+                                torch.full_like(spacetime_motions,3,dtype=torch.long))))
     # Fill each sparse plan tensor with one device-side indexed write instead
     # of launching one CUDA assignment per target/key token.
     target_indices.copy_(torch.as_tensor(target_index_rows,dtype=torch.long,device=device))
@@ -273,12 +343,13 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         legal_mask[torch.as_tensor(legal_row_indices,dtype=torch.long,device=device),torch.as_tensor(legal_column_indices,dtype=torch.long,device=device)]=True
     wrong_query_rays=wrong_key_rays=None
     separation_values=None
+    spacetime_wrong_query_rays=None
+    spacetime_separation_values=None
     if c2w is not None and intrinsics is not None:
         camera_indices=latent_camera_indices().tolist()
         poses=c2w if c2w.ndim==4 else c2w.unsqueeze(0)
         Ks=intrinsics if intrinsics.ndim==4 else intrinsics.unsqueeze(0)
-        delta=torch.linalg.inv(poses[:,:1])@poses
-        wrong_poses=poses[:,:1]@torch.linalg.inv(delta)
+        wrong_poses=anchored_inverse_c2w(poses)
         qgrid=token_rays_for_shape(wrong_poses,Ks,(poses.shape[0],T,H,W,1),source_height=source_height,source_width=source_width,kind='q').reshape(poses.shape[0],-1,7)
         kgrid=token_rays_for_shape(wrong_poses,Ks,(poses.shape[0],T,H,W,1),source_height=source_height,source_width=source_width,kind='k').reshape(poses.shape[0],-1,7)
         q_values=[]
@@ -291,6 +362,11 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
             k_values.append(kgrid[:,temporal*H*W+int(identity[2])*W+int(identity[3])])
         wrong_query_rays=torch.stack(q_values,1).detach() if q_values else None
         wrong_key_rays=torch.stack(k_values,1).detach() if k_values else None
+        spacetime_q_values=[]
+        for entry in spacetime_selected:
+            identity=identities[int(entry[0])]; temporal=int(identity[1][0])-int(chunk)*8
+            spacetime_q_values.append(qgrid[:,temporal*H*W+int(identity[2])*W+int(identity[3])])
+        spacetime_wrong_query_rays=torch.stack(spacetime_q_values,1).detach() if spacetime_q_values else None
         separation=[]
         pose_inverse=torch.linalg.inv(poses)
         wrong_pose_inverse=torch.linalg.inv(wrong_poses)
@@ -320,11 +396,45 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
             else:
                 separation.append(torch.zeros((poses.shape[0],),device=poses.device,dtype=poses.dtype))
         separation_values=torch.stack(separation).detach() if separation else None
+        spacetime_separation=[]
+        for entry in spacetime_selected:
+            q_index=int(entry[0]); identity=identities[q_index]; qt=int(identity[1][0])-int(chunk)*8
+            point_separations=[]; point_weights=[]
+            for point in entry[5]:
+                key_time,u,v,depth,confidence=point
+                kt=int(key_time)-int(chunk)*8
+                q_camera=int(camera_indices[qt]); k_camera=int(camera_indices[kt])
+                pix=torch.tensor([float(u),float(v),1.0],device=poses.device,dtype=poses.dtype).view(1,3,1).expand(poses.shape[0],-1,-1)
+                xq=(float(depth)*depth_scale)*torch.linalg.solve(Ks[:,q_camera],pix).squeeze(-1)
+                world=(poses[:,q_camera,:3,:3]@xq.unsqueeze(-1)).squeeze(-1)+poses[:,q_camera,:3,3]
+                correct=(pose_inverse[:,k_camera,:3,:3]@world.unsqueeze(-1)).squeeze(-1)+pose_inverse[:,k_camera,:3,3]
+                wrong_world=(wrong_poses[:,q_camera,:3,:3]@xq.unsqueeze(-1)).squeeze(-1)+wrong_poses[:,q_camera,:3,3]
+                wrong=(wrong_pose_inverse[:,k_camera,:3,:3]@wrong_world.unsqueeze(-1)).squeeze(-1)+wrong_pose_inverse[:,k_camera,:3,3]
+                uv_correct=(Ks[:,k_camera]@correct.unsqueeze(-1)).squeeze(-1); uv_correct=uv_correct[:,:2]/uv_correct[:,2:].clamp_min(1e-12)
+                uv_wrong=(Ks[:,k_camera]@wrong.unsqueeze(-1)).squeeze(-1); uv_wrong=uv_wrong[:,:2]/uv_wrong[:,2:].clamp_min(1e-12)
+                distance=torch.linalg.vector_norm(uv_wrong-uv_correct,dim=-1)
+                distance=torch.where((correct[:,2]>0)&(wrong[:,2]>0),distance,torch.full_like(distance,float('inf')))
+                point_separations.append(distance); point_weights.append(float(confidence))
+            if point_separations:
+                distances=torch.stack(point_separations,dim=1)
+                weights_tensor=torch.as_tensor(point_weights,device=poses.device,dtype=poses.dtype).view(1,-1)
+                finite=bool(torch.isfinite(distances).all())
+                spacetime_separation.append((distances*weights_tensor).sum(1)/weights_tensor.sum().clamp_min(1e-12) if finite else torch.full((poses.shape[0],),float('inf'),device=poses.device,dtype=poses.dtype))
+            else:
+                spacetime_separation.append(torch.zeros((poses.shape[0],),device=poses.device,dtype=poses.dtype))
+        spacetime_separation_values=torch.stack(spacetime_separation).detach() if spacetime_separation else None
+        if separation_values is not None and separation_values.ndim>1: separation_values=separation_values.mean(-1)
+        if spacetime_separation_values is not None and spacetime_separation_values.ndim>1: spacetime_separation_values=spacetime_separation_values.mean(-1)
     return RGBDSoftTargetPlan(
         query_indices,torch.as_tensor(sparse,dtype=torch.long,device=device),target_indices,target_values,target_mask,legal_mask,
         torch.as_tensor(query_weights,dtype=torch.float32,device=device),torch.as_tensor(key_times,dtype=torch.long,device=device),
         torch.as_tensor(coverages,dtype=torch.float32,device=device),torch.as_tensor(confidences,dtype=torch.float32,device=device),
-        tuple(identities),tuple(map(int,stage_shape)),int(input_count),len(selected),torch.as_tensor(motions,dtype=torch.float32,device=device),torch.as_tensor(motions,dtype=torch.float32,device=device)/16.,torch.as_tensor(buckets,dtype=torch.long,device=device),bucket_selected_counts,tuple(bucket_motion_stats),wrong_query_rays,wrong_key_rays,separation_values.to(device) if separation_values is not None and device is not None else separation_values)
+        tuple(identities),tuple(map(int,stage_shape)),int(input_count),len(selected),torch.as_tensor(motions,dtype=torch.float32,device=device),torch.as_tensor(motions,dtype=torch.float32,device=device)/16.,torch.as_tensor(buckets,dtype=torch.long,device=device),bucket_selected_counts,tuple(bucket_motion_stats),wrong_query_rays,wrong_key_rays,separation_values.to(device) if separation_values is not None and device is not None else separation_values,
+        spacetime_query_indices=spacetime_query_indices,spacetime_target_indices=spacetime_target_indices,
+        spacetime_target_weights=spacetime_target_weights,spacetime_target_mask=spacetime_target_mask,
+        spacetime_query_weights=spacetime_query_weights,spacetime_bucket=spacetime_bucket,
+        spacetime_wrong_query_rays=spacetime_wrong_query_rays,
+        spacetime_separation_px=spacetime_separation_values.to(device) if spacetime_separation_values is not None and device is not None else spacetime_separation_values)
 
 
 __all__=['RGBDSoftTargetPlan','build_rgbd_soft_target_plan']

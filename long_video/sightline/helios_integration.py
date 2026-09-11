@@ -426,7 +426,11 @@ def install_sightline_attention(transformer, conditioner, ray_provider, *, layer
     sightline_layers=tuple(sorted(set(map(int,sightline_layers))))
     memory_layers=tuple(sorted(set(map(int,memory_layers or ()))))
     correspondence_layers=tuple(sorted(set(map(int,correspondence_layers or ()))))
-    processor_layers=tuple(sorted(set(layers or ()) | set(sightline_layers) | set(memory_layers) | set(correspondence_layers)))
+    # Every installed processor is the exact union of the three routing
+    # contracts.  ``layers`` is retained only as a backwards-compatible
+    # argument for callers; allowing it to add processors would silently
+    # install Geometry-capable blocks outside the configured routing plan.
+    processor_layers=tuple(sorted(set(sightline_layers) | set(memory_layers) | set(correspondence_layers)))
     if not processor_layers:
         raise ValueError("Sightline selected layers must be explicit")
     installed=[]

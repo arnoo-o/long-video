@@ -20,7 +20,7 @@ memory_tau_angle: 0.78539816339
 lambda_corr: 0.002
 lambda_corr_final: 0.0005
 lambda_rgbd: 0.02
-lambda_camera_fm: 0.01
+lambda_camera_fm: 0.0
 m_geo: 0.1
 tau_geo: 0.1
 max_intra_corr_rows: 1024
@@ -53,9 +53,9 @@ data_path: ""
 latent_cache_path: ""
 correspondence_cache_path: ""
 output_path: ""
-sightline_training_semantics_version: sightline-v14-stage012-rgbd-conditional-spacetime-camera-fm-rms005
+sightline_training_semantics_version: sightline-v15-stage012-rgbd-conditional-spatial-cross-time-support-mass-camera-fm-diagnostic-only-rms005
 sightline_correspondence_schema_version: sightline-correspondence-v9-causal-intra-rgbd
-sightline_checkpoint_schema_version: sightline-checkpoint-v22
+sightline_checkpoint_schema_version: sightline-checkpoint-v23
 p1_steps: 600
 p2_steps: 400
 p3_steps: 1500

@@ -232,32 +232,40 @@ def _fixed_checkpoint_probe(args,cfg,pipe,trainable,runner,provider,record,targe
         full_correct=prefixes[-1]['fm_correct']; full_wrong=prefixes[-1]['fm_wrong']
         off=run_fm((),base_c2w)
 
-        # Capture the selected stage-0 RGB-D rows with the same fixed item.
-        _prepare(runner,target,history)
-        stage_shape=tuple(int(value) for value in provider.context['stage_shapes'][0])
+        # Capture all three real RGB-D stages with the same fixed record,
+        # seed, trajectory and target.  Each stage keeps its real token grid.
         rows=_load_correspondence(record,0,kind='intra')
-        processor=pipe.transformer._sightline_processors[sightline_layers[0]]
-        identities=processor.ray_provider.key_identities(int(np.prod(stage_shape)),processor.memory)
-        plan=build_rgbd_soft_target_plan(rows,identities,stage_shape,chunk=0,max_rows=cfg.max_intra_corr_rows,sampling_seed=args.noise_seed,device=target.device,source_height=512,source_width=832,c2w=provider.context['c2w'],intrinsics=provider.context['intrinsics'],near_depth=record.near_depth)
-        rgbd_layers={}
-        if plan is not None:
-            query_parts=[plan.query_indices]
-            if plan.spacetime_query_indices is not None: query_parts.append(plan.spacetime_query_indices)
+        rgbd_stages={}; plans={}
+        for stage_index in (0,1,2):
+            stage_shape=tuple(int(value) for value in provider.context['stage_shapes'][stage_index])
+            processor=pipe.transformer._sightline_processors[sightline_layers[0]]
+            identities=processor.ray_provider.key_identities(int(np.prod(stage_shape)),processor.memory)
+            stage_plan=build_rgbd_soft_target_plan(rows,identities,stage_shape,chunk=0,max_rows=cfg.max_intra_corr_rows,sampling_seed=args.noise_seed+stage_index,device=target.device,source_height=512,source_width=832,c2w=provider.context['c2w'],intrinsics=provider.context['intrinsics'],near_depth=record.near_depth)
+            if stage_plan is None:
+                continue
+            plans[stage_index]=stage_plan
+            stage_item,_,_=_fixed_item(pipe,target,args.sigma,stage_id=stage_index)
+            query_parts=[stage_plan.query_indices]
+            if stage_plan.spacetime_query_indices is not None and stage_plan.spacetime_query_indices.numel():
+                query_parts.append(stage_plan.spacetime_query_indices)
             query_indices=torch.unique(torch.cat(query_parts))
-            key_indices=plan.sparse_key_indices
+            key_indices=stage_plan.sparse_key_indices
             for layer in sightline_layers:
                 proc=pipe.transformer._sightline_processors[layer]
                 proc.capture_rgbd=True; proc.capture_query_indices=query_indices; proc.capture_key_indices=key_indices; proc.capture_numeric_diagnostics=False
                 if proc.conditioner is not None: proc.conditioner.capture_numeric_diagnostics=False
             _prepare(runner,target,history)
-            with torch.no_grad(): _rgbd_prefix_forward(pipe,item['noisy_latents'],item,prompt,history.groups(),0,int(cfg.rgbd_prefix_stop_layer))
+            with torch.no_grad():
+                _rgbd_prefix_forward(pipe,stage_item['noisy_latents'],stage_item,prompt,history.groups(),0,int(cfg.rgbd_prefix_stop_layer))
             captures={layer:(pipe.transformer._sightline_processors[layer].last_rgbd_native_q,pipe.transformer._sightline_processors[layer].last_rgbd_native_k,pipe.transformer._sightline_processors[layer].last_rgbd_dq,pipe.transformer._sightline_processors[layer].last_rgbd_dk,pipe.transformer._sightline_processors[layer].last_rgbd_query_indices,pipe.transformer._sightline_processors[layer].last_rgbd_key_indices) for layer in sightline_layers}
+            layer_values={}
             for layer in sightline_layers:
                 diag={}
                 with torch.enable_grad():
-                    loss=_rgbd_loss(trainable,pipe.transformer._sightline_processors,(layer,),plan,margin=cfg.m_geo,temperature=cfg.tau_geo,local_scales=(.25,.5,1.0),captures={layer:captures[layer]},rgbd_diagnostics=diag)
-                rgbd_layers[str(layer)]={'loss':float(loss.detach()),**diag.get(str(layer),{})}
+                    loss=_rgbd_loss(trainable,pipe.transformer._sightline_processors,(layer,),stage_plan,margin=cfg.m_geo,temperature=cfg.tau_geo,local_scales=(.25,.5,1.0),captures={layer:captures[layer]},rgbd_diagnostics=diag)
+                layer_values[str(layer)]={'loss':float(loss.detach()),**diag.get(str(layer),{})}
                 del loss
+            rgbd_stages[str(stage_index)]={'loss':float(np.mean([v['loss'] for v in layer_values.values()])), 'stage_shape':list(stage_shape), 'mapping_input_count':stage_plan.mapping_input_count, 'mapping_output_count':stage_plan.mapping_output_count, 'layers':layer_values}
             _release_rgbd_capture(pipe.transformer._sightline_processors,sightline_layers)
     finally:
         provider.context=original_context
@@ -267,8 +275,12 @@ def _fixed_checkpoint_probe(args,cfg,pipe,trainable,runner,provider,record,targe
             if processor.conditioner is not None: processor.conditioner.capture_numeric_diagnostics=False
     return {'checkpoint':args.checkpoint,'completed_step':args.completed_step,'requested_sigma':args.sigma,'sampled_sigma':actual,'timestep':timestep,
         'fm_correct':full_correct,'fm_wrong':full_wrong,'fm_geometry_off':off,'relative_wrong_gap':(full_wrong-full_correct)/max(full_correct,.02),
-        'rgbd_plan_mapping_input_count':0 if plan is None else plan.mapping_input_count,'rgbd_plan_mapping_output_count':0 if plan is None else plan.mapping_output_count,
-        'rgbd_conditional_spatial':rgbd_layers,'prefixes':prefixes}
+        'rgbd_stage_losses':{stage:values['loss'] for stage,values in rgbd_stages.items()},
+        'rgbd_stages':rgbd_stages,
+        'rgbd_conditional_spatial':rgbd_stages.get('0',{}).get('layers',{}),
+        'rgbd_plan_mapping_input_count':0 if '0' not in plans else plans[0].mapping_input_count,
+        'rgbd_plan_mapping_output_count':0 if '0' not in plans else plans[0].mapping_output_count,
+        'prefixes':prefixes}
 
 
 def _summary(rows,fields):

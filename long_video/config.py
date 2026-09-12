@@ -23,7 +23,7 @@ def load_sightline_config(path: str|Path) -> SightlineConfig:
     if raw['lora_scope']=='disabled' and raw['lora_layers']: raise ValueError('disabled LoRA scope requires an empty lora_layers list')
     for key in ('sightline_layers','memory_layers','correspondence_layers','lora_layers'):
         if any(int(x)<0 for x in raw[key]): raise ValueError(f'invalid {key}')
-    if not (0<=raw['lambda_corr_decay_start']<=1) or raw['diagnostics_frequency']<1 or min(float(raw['lambda_rgbd']),float(raw['lambda_camera_fm']),float(raw['m_geo']),float(raw['tau_geo']))<=0 or int(raw['max_intra_corr_rows'])<1: raise ValueError('invalid schedule/diagnostic configuration')
+    if not (0<=raw['lambda_corr_decay_start']<=1) or raw['diagnostics_frequency']<1 or min(float(raw['lambda_rgbd']),float(raw['m_geo']),float(raw['tau_geo']))<=0 or float(raw['lambda_camera_fm'])<0 or int(raw['max_intra_corr_rows'])<1: raise ValueError('invalid schedule/diagnostic configuration')
     if raw['phase'] not in ('P1','P2','P3') or raw['chunk_count'] not in range(1,7) or tuple(raw['pyramid_steps'])!=(2,2,2): raise ValueError('invalid phase/chunk/stage configuration')
     if int(raw['rgbd_prefix_stop_layer'])!=12: raise ValueError('RGB-D prefix_stop_layer must be 12')
     if (raw['p1_steps'],raw['p2_steps'],raw['p3_steps'])!=(600,400,1500) or raw['ddp_world_size'] not in range(1,5) or raw['checkpoint_every']!=100 or raw['diagnostics_frequency'] not in (5,10): raise ValueError('Sightline-v9 schedule must total 2500 steps, DDP=1..4, checkpoint=100')

@@ -176,6 +176,12 @@ def test_training_source_uses_all_rgbd_stages_with_fixed_auxiliary_scales():
     assert "1.0/len(valid_rgbd_stages)" in source
     assert "rgbd_aux_scales=(0.25,0.5,1.0)" in source
     assert "local_scale=float(item['geometry_sigma_scale']" not in source
+    assert "camera_fm_training_gradient_disabled':True" in source
+    assert "autograd.grad(camera_loss" not in source
+    assert "total=_total_metric(fm,rgbd_term,cross_term)" in source
+    assert "exclude_query_times=plan.spacetime_query_times" in source
+    assert "key_times=plan.spacetime_key_times" in source
+    assert "camera_fm_diagnostic_only" in source
 
 
 def test_wrong_camera_separation_uses_real_query_depth():

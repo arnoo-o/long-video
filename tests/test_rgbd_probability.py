@@ -114,16 +114,15 @@ def _dense_log_mass(native_q,native_k,dq,dk,indices,weights,mask,legal,local_sca
     logits=torch.einsum('brhd,bkhd->brhk',q,k)*dim**-0.5
     legal_b=legal.unsqueeze(0).unsqueeze(2)
     probs=torch.softmax(logits.masked_fill(~legal_b,-torch.inf),dim=-1)
-    target=torch.zeros(b,rows,k.shape[1],device=q.device,dtype=torch.float32)
+    support=torch.zeros(b,rows,k.shape[1],device=q.device,dtype=torch.bool)
     safe=indices.clamp_min(0)
     valid=mask&indices.ge(0)&weights.gt(0)
     for batch in range(b):
         for row in range(rows):
-            row_legal=legal[row,safe[row]]
-            row_valid=valid[row]&row_legal
-            target[batch,row].index_add_(0,safe[row,row_valid],weights[row,row_valid].float())
-    target=target/target.sum(-1,keepdim=True).clamp_min(1e-12)
-    mass=(probs*target.unsqueeze(2)).sum(-1).mean(2)
+            row_valid=valid[row]&legal[row,safe[row]]
+            if bool(row_valid.any()):
+                support[batch,row].index_fill_(0,torch.unique(safe[row,row_valid]),True)
+    mass=(probs*support.unsqueeze(2)).sum(-1).mean(2)
     return mass.clamp_min(1e-12).log().mean(0)
 
 
@@ -164,3 +163,25 @@ def test_streaming_log_mass_bf16_cuda_matches_dense():
     dense=_dense_log_mass(native_q,native_k,ref_q,ref_k,indices,weights,mask,legal,.8)
     streamed=rgbd_log_mass_rows(native_q,native_k,dq,dk,indices,weights,mask,legal,.8)
     assert torch.allclose(streamed.float(),dense.float(),atol=2e-2,rtol=2e-2)
+
+
+
+def test_log_mass_support_ignores_target_confidence_after_support_selection():
+    torch.manual_seed(5512)
+    native_q=torch.randn(1,2,2,4)
+    native_k=torch.randn(1,9,2,4)
+    indices=torch.tensor([[1,1,4,-1],[2,6,6,-1]])
+    mask=indices.ge(0)
+    legal=torch.ones(2,9,dtype=torch.bool)
+    dq1=torch.randn_like(native_q,requires_grad=True)
+    dk1=torch.randn_like(native_k,requires_grad=True)
+    dq2=dq1.detach().clone().requires_grad_(True)
+    dk2=dk1.detach().clone().requires_grad_(True)
+    weights1=torch.tensor([[.1,.2,.7,0.],[.3,.4,.3,0.]])
+    weights2=torch.tensor([[7.,.01,.0001,0.],[.001,9.,.2,0.]])
+    a=rgbd_log_mass_rows(native_q,native_k,dq1,dk1,indices,weights1,mask,legal,.8)
+    b=rgbd_log_mass_rows(native_q,native_k,dq2,dk2,indices,weights2,mask,legal,.8)
+    assert torch.allclose(a,b,atol=3e-6,rtol=3e-6)
+    a.sum().backward(); b.sum().backward()
+    assert torch.allclose(dq1.grad,dq2.grad,atol=8e-6,rtol=8e-6)
+    assert torch.allclose(dk1.grad,dk2.grad,atol=8e-6,rtol=8e-6)

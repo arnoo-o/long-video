@@ -7,8 +7,12 @@ import torch
 # Freezing the complete Helios backbone changes the optimizer scope and is a
 # distinct training contract.  Keep old modulation/norm checkpoints from
 # being resumed silently under the new optimizer layout.
-SEMANTICS='sightline-v14-stage012-rgbd-conditional-spacetime-camera-fm-rms005'; SCHEMA='sightline-checkpoint-v22'
-LEGACY_OBJECTIVE_VERSIONS={('sightline-v13-stage012-rgbd-soft-probability-rms005-wrongdepth-randbucket','sightline-checkpoint-v21'),('sightline-v13-stage012-rgbd-soft-probability-rms005-wrongdepth-randbucket','sightline-checkpoint-v22')}
+SEMANTICS='sightline-v15-stage012-rgbd-conditional-spatial-cross-time-support-mass-camera-fm-diagnostic-only-rms005'; SCHEMA='sightline-checkpoint-v23'
+LEGACY_OBJECTIVE_VERSIONS={
+    ('sightline-v13-stage012-rgbd-soft-probability-rms005-wrongdepth-randbucket','sightline-checkpoint-v21'),
+    ('sightline-v13-stage012-rgbd-soft-probability-rms005-wrongdepth-randbucket','sightline-checkpoint-v22'),
+    ('sightline-v14-stage012-rgbd-conditional-spacetime-camera-fm-rms005','sightline-checkpoint-v22'),
+}
 def config_fingerprint(config): return hashlib.sha256(json.dumps(config,sort_keys=True,default=str).encode()).hexdigest()
 def scheduler_config_fingerprint(config):
     config=dict(config)
@@ -127,7 +131,7 @@ def save_runtime_checkpoint(path, trainable, memory, transformer, optimizer, sch
 def restore_runtime_checkpoint(payload, trainable, memory, transformer, *, config, helios_fingerprint, layers, memory_config, optimizer=None, scheduler=None, restore_rng=False, provenance=None, rank=0, world_size=1, allow_memory_layer_migration=False, allow_world_size_migration=False, allow_objective_migration=False, helios_trainable_names=()):
     migrated=validate_checkpoint(payload,config=config,helios_fingerprint=helios_fingerprint,layers=layers,memory_config=memory_config,allow_memory_layer_migration=allow_memory_layer_migration,allow_world_size_migration=allow_world_size_migration,allow_objective_migration=allow_objective_migration)
     if migrated and int(rank)==0:
-        print(f'Explicit objective migration: {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")} -> {SEMANTICS}/{SCHEMA}; preserving projector/rho/optimizer/scheduler/RNG state.',flush=True)
+        print(f'Explicit objective migration: {payload.get("sightline_training_semantics_version")}/{payload.get("sightline_checkpoint_schema_version")} -> {SEMANTICS}/{SCHEMA}; preserving projector/rho/optimizer/scheduler/RNG state; camera-FM training gradient disabled.',flush=True)
     if provenance is not None and not _provenance_matches(payload.get('runtime_provenance'),provenance): raise RuntimeError('Sightline checkpoint runtime provenance mismatch')
     trainable.load_state_dict(payload['trainable'],strict=True)
     memory_missing_type=False

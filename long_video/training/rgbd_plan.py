@@ -36,6 +36,8 @@ class RGBDSoftTargetPlan:
     spacetime_target_indices: torch.Tensor|None = None
     spacetime_target_weights: torch.Tensor|None = None
     spacetime_target_mask: torch.Tensor|None = None
+    spacetime_query_times: torch.Tensor|None = None
+    spacetime_key_times: torch.Tensor|None = None
     spacetime_query_weights: torch.Tensor|None = None
     spacetime_bucket: torch.Tensor|None = None
     spacetime_wrong_query_rays: torch.Tensor|None = None
@@ -328,6 +330,8 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         spacetime_target_weights[row,:len(values)]=torch.as_tensor([float(value)/total for _,value in values],device=device)
     spacetime_target_mask=spacetime_target_indices.ge(0)
     spacetime_query_weights=torch.as_tensor([entry[2]*entry[3] for entry in spacetime_selected],dtype=torch.float32,device=device)
+    spacetime_query_times=torch.as_tensor([int(identities[int(entry[0])][1][0]) for entry in spacetime_selected],dtype=torch.long,device=device)
+    spacetime_key_times=torch.as_tensor([int(identities[int(full_index)][1][0]) for full_index in sparse],dtype=torch.long,device=device)
     spacetime_motions=torch.as_tensor([entry[4] for entry in spacetime_selected],dtype=torch.float32,device=device)
     spacetime_bucket=torch.where(
         spacetime_motions/16.<.5, torch.zeros_like(spacetime_motions,dtype=torch.long),
@@ -432,6 +436,7 @@ def build_rgbd_soft_target_plan(rows, identities, stage_shape, *, chunk: int,
         tuple(identities),tuple(map(int,stage_shape)),int(input_count),len(selected),torch.as_tensor(motions,dtype=torch.float32,device=device),torch.as_tensor(motions,dtype=torch.float32,device=device)/16.,torch.as_tensor(buckets,dtype=torch.long,device=device),bucket_selected_counts,tuple(bucket_motion_stats),wrong_query_rays,wrong_key_rays,separation_values.to(device) if separation_values is not None and device is not None else separation_values,
         spacetime_query_indices=spacetime_query_indices,spacetime_target_indices=spacetime_target_indices,
         spacetime_target_weights=spacetime_target_weights,spacetime_target_mask=spacetime_target_mask,
+        spacetime_query_times=spacetime_query_times,spacetime_key_times=spacetime_key_times,
         spacetime_query_weights=spacetime_query_weights,spacetime_bucket=spacetime_bucket,
         spacetime_wrong_query_rays=spacetime_wrong_query_rays,
         spacetime_separation_px=spacetime_separation_values.to(device) if spacetime_separation_values is not None and device is not None else spacetime_separation_values)

@@ -1589,6 +1589,7 @@ def main():
                 rgbd_plans={}; cross_plan=None
                 correspondence_seed=int(hashlib.sha256(f'{step}:{record.trajectory_id}'.encode()).hexdigest()[:16],16)
                 final_shape=tuple(int(value) for value in runner.ray_provider.context['stage_shapes'][-1])
+                fm_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_diagnostics={}; rgbd_stage_gradients={}; rgbd_capture_seen=set(); rgbd_projector_grads={}; fm_projector_grads={}; gradient_diagnostic_enabled=bool(capture_geometry_diagnostics or args.probe_capture)
                 if rgbd_rows is not None and len(rgbd_rows) and not args.alpha_zero_baseline:
                     if len(items)!=3: raise RuntimeError('RGB-D stage0/stage1/stage2 supervision requires exactly three pyramid stages')
                     for rgbd_stage_index in (0,1,2):
@@ -1613,7 +1614,6 @@ def main():
                 rgbd_scales={stage_index:torch.ones((),device=source.device,dtype=torch.float32) for stage_index in (0,1,2)}
                 valid_rgbd_stages=tuple(stage_index for stage_index in (0,1,2) if stage_index in rgbd_plans and rgbd_plans[stage_index].mapping_output_count>0)
                 rgbd_weights={stage_index:(torch.as_tensor(1.0/len(valid_rgbd_stages),device=source.device,dtype=torch.float32).detach() if stage_index in valid_rgbd_stages else torch.zeros((),device=source.device,dtype=torch.float32)) for stage_index in (0,1,2)}
-                fm_geometry_diagnostics.clear(); active_stage_trace=[]; rgbd_stage_losses={}; rgbd_diagnostics={}; rgbd_stage_gradients={}; rgbd_capture_seen=set(); rgbd_projector_grads={}; fm_projector_grads={}; gradient_diagnostic_enabled=bool(capture_geometry_diagnostics or args.probe_capture)
                 camera_fm_loss_value=torch.zeros((),device=source.device,dtype=torch.float32)
                 camera_fm_enabled=False; camera_fm_separation_tokens=0.0; camera_fm_relative_gap=None; camera_fm_correct=None; camera_fm_wrong=None; camera_fm_geometry_off=None
                 stage_losses=[]; final_prediction=None; fm_sigma_trace.clear()

@@ -1548,9 +1548,10 @@ def main():
                     'memory_allocated':int(torch.cuda.memory_allocated(device)),
                     'max_memory_allocated':int(torch.cuda.max_memory_allocated(device)),
                 }
-        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; fm_sigma_trace=[]; fm_geometry_diagnostics={}; optimizer.zero_grad(set_to_none=True)
+        history_state=NativeHistoryState(source,fake); generated_prefix=[]; losses={}; probe_payload={}; fm_sigma_trace=[]; fm_geometry_diagnostics={}; rgbd_projector_grads={}; fm_projector_grads={}; gradient_diagnostic_enabled=False; optimizer.zero_grad(set_to_none=True)
         started=time.perf_counter()
         def forward_chunk(chunk,keep_graph):
+            nonlocal rgbd_projector_grads, fm_projector_grads, gradient_diagnostic_enabled
             chunk_started=time.perf_counter()
             history=history_state.groups(); coverage=history_state.coverage()
             if not keep_graph:
